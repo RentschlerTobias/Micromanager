@@ -1,0 +1,15 @@
+{
+  "name": "jev-dictator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "An OpenCode v2 plugin that orchestrates sub-agents, with TypeSafe Jev making the decisions",
+  "scripts": {
+    "test": "node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.0",
+    "typescript": "^5.9.3"
+  }
+}
