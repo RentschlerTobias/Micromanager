@@ -1,6 +1,6 @@
 # jev-dictator: an OpenCode orchestrator driven by Jev
 
-Status: planned (2026-10-01). Phase 0 (spike) done, results below; Phase 1 not started.
+Status (2026-10-01): Phase 0 (spike) and Phase 1 done; Phase 2 next.
 
 ## Context
 An OpenCode plugin that orchestrates sub-agents the way oh-my-openagent (OmO) does: it splits a job into

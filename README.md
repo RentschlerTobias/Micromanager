@@ -8,3 +8,37 @@ decisions:
 - whether a sub-agent's question or permission request is answered by Jev or goes to the user.
 
 Status: planning. See [docs/plan.md](docs/plan.md).
+
+## Install
+
+```bash
+./install.sh            # links src/plugin.ts into ~/.config/opencode/plugins/jev-dictator.ts
+./install.sh --remove
+```
+
+Restart the OpenCode server afterwards (plugins load at start). Requires opencode v2 (tested with 2.0.18).
+
+## Use
+
+Pick the agent **dictator** in OpenCode and give it a job. It splits the job into sub-tasks and delegates each
+one to a role sub-agent (`dictator-explore`, `-research`, `-plan`, `-code`, `-test`, `-visual`, `-write`,
+`-debug`, `-review`, `-oracle`). Each role has its own rights (see `src/roles.ts`). OpenCode asks you before
+every delegation. The plugin sets the model per role (OpenCode Go: glm-5.3-flash, qwen3.8-flash,
+deepseek-v4.1-flash).
+
+Optional overrides in `~/.config/opencode/jev-dictator.jsonc`:
+
+```jsonc
+{
+  "models": { "code": ["opencode-go/deepseek-v4.1-flash", "opencode-go/glm-5.3-flash"] },
+  "vision": "opencode-go/qwen3.8-flash"
+}
+```
+
+## Develop
+
+```bash
+npm install       # typescript + @types/node, for the type check only
+npm test          # node's test runner, TypeScript runs as is
+npm run typecheck
+```
