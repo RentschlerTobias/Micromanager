@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+import { DEFAULT_FLOORS, type Floors } from "./decide.ts"
 import { DEFAULT_ROUTING, type Routing } from "./routing.ts"
 import { roleById, type RoleId } from "./roles.ts"
 
@@ -50,16 +51,33 @@ export function parseRouting(text: string): Routing {
   return { models, vision }
 }
 
-export function loadRouting(path = configPath()): { routing: Routing; error?: string } {
+export function parseFloors(text: string): Floors {
+  const raw = (JSON.parse(stripComments(text)) as { floors?: Record<string, unknown> }).floors ?? {}
+  const floors: Record<string, number> = { ...DEFAULT_FLOORS }
+  for (const [key, value] of Object.entries(raw)) {
+    if (!(key in DEFAULT_FLOORS)) throw new Error(`unknown floor ${JSON.stringify(key)}`)
+    const max = key === "risk" ? 2 : 1
+    if (typeof value !== "number" || value < 0 || value > max) throw new Error(`floors.${key} must be a number from 0 to ${max}`)
+    floors[key] = value
+  }
+  return floors as unknown as Floors
+}
+
+export interface Settings {
+  readonly routing: Routing
+  readonly floors: Floors
+}
+
+export function loadSettings(path = configPath()): Settings & { error?: string } {
   let text: string
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { routing: DEFAULT_ROUTING } // no file: the defaults
+    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS } // no file: the defaults
   }
   try {
-    return { routing: parseRouting(text) }
+    return { routing: parseRouting(text), floors: parseFloors(text) }
   } catch (err) {
-    return { routing: DEFAULT_ROUTING, error: `${path}: ${String(err)}` }
+    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, error: `${path}: ${String(err)}` }
   }
 }

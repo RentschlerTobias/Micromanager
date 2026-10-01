@@ -157,8 +157,8 @@ export function roleById(id: string): Role | undefined {
   return ROLES.find((r) => r.id === id)
 }
 
-// The dictator itself: plans and delegates, never edits or runs commands. Every delegation asks the user
-// first (decision 2026-10-01: each worker is confirmed individually).
+// The dictator itself: plans and delegates, never edits or runs commands. Every delegation is a question
+// ("ask"), which goes to Jev first and to the user only when Jev is not sure enough (src/decide.ts).
 export const DICTATOR = {
   agent: "dictator",
   description: "Orchestrator: splits a job into sub-tasks and delegates each to a role sub-agent.",
@@ -175,7 +175,7 @@ For a job:
 3. Delegate each sub-task with the subagent tool to the matching role agent:
 ${lines.join("\n")}
    Put the sub-task and its acceptance points into the prompt. The model is chosen for you; do not set one.
-   The user confirms each delegation; if they decline, re-plan or ask what they want.
+   Each delegation is approved first (by Jev or the user); if it is declined, re-plan or ask the user.
 4. Run sub-tasks one after another for now, in dependency order.
 5. When all are done, give a short summary: what each sub-agent did and whether its acceptance points are met.
 
