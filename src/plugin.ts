@@ -10,7 +10,7 @@ import { decide, type PermissionRequest } from "./decide.ts"
 import { routeSubagentCall, type ToolCall } from "./hooks.ts"
 import { Jev, apiKey } from "./jev.ts"
 import { record } from "./journal.ts"
-import { DICTATOR } from "./roles.ts"
+import { DICTATOR, ROLES } from "./roles.ts"
 
 // What the permission hook "evaluate" gets (opencode 2.0.18): the planned effect can be changed in place.
 interface Evaluation {
@@ -69,9 +69,13 @@ export default {
       log("info", `${routed.role} -> ${routed.model} (${routed.reason})`)
     })
 
-    // Every question goes to Jev first: it answers itself when sure enough, else the user is asked as usual.
+    // The dictator's own agents only: build, plan and every other agent are never touched.
+    const ours = new Set([DICTATOR.agent, ...ROLES.map((role) => role.agent)])
+
+    // Every question of the dictator and its sub-agents goes to Jev first: it answers itself when sure enough,
+    // else the user is asked as usual.
     await ctx.permission.hook("evaluate", async (evaluation) => {
-      if (evaluation.effect !== "ask") return
+      if (evaluation.effect !== "ask" || !ours.has(evaluation.agent)) return
       const request: PermissionRequest = {
         sessionID: evaluation.sessionID,
         agent: evaluation.agent,

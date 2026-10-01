@@ -27,7 +27,7 @@ export function agentsFrom(base: AgentInfo): AgentInfo[] {
     id: role.agent,
     name: `Dictator ${role.id}`,
     mode: "subagent" as const,
-    hidden: false,
+    hidden: true, // only the dictator delegates to them; build and plan never see them
     description: role.description,
     system: role.system,
     permissions: [...base.permissions, ...role.rules],

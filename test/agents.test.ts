@@ -27,6 +27,7 @@ test("the dictator and every role become agents that keep the user's base rules"
   assert.deepEqual(ids, ["dictator", ...ROLES.map((r) => r.agent)])
   const explorer = draft.agents.get("dictator-explore")!
   assert.equal(explorer.mode, "subagent")
+  assert.equal(explorer.hidden, true) // not offered to build or plan
   assert.deepEqual(explorer.permissions.slice(0, 2), base.permissions)
   assert.ok(explorer.permissions.some((r) => r.action === "edit" && r.effect === "deny"))
   assert.equal(draft.agents.get("dictator")!.mode, "primary")
