@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>jev-dictator flow</title>
+  <style>
+    :root {
+      --bg: #f4f4f5; --panel: #ffffff; --panel-2: #fafafa; --fg: #18181b; --muted: #71717a; --line: #e4e4e7;
+      --accent: #0d9488; --accent-soft: #ccfbf1; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
+      --c-entry: #64748b; --c-route: #7c3aed; --c-guard: #dc2626; --c-check: #0891b2; --c-jev: #0d9488;
+      --c-floor: #d97706; --c-allow: #16a34a; --c-deny: #dc2626; --c-user: #4f46e5;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0c0c0e; --panel: #17171a; --panel-2: #1d1d21; --fg: #f4f4f5; --muted: #a1a1aa; --line: #2a2a30;
+        --accent: #2dd4bf; --accent-soft: #134e4a; --shadow: 0 1px 2px rgba(0,0,0,.4);
+        --c-entry: #94a3b8; --c-route: #a78bfa; --c-guard: #f87171; --c-check: #22d3ee; --c-jev: #2dd4bf;
+        --c-floor: #fbbf24; --c-allow: #4ade80; --c-deny: #f87171; --c-user: #818cf8;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg);
+           color: var(--fg); height: 100vh; display: flex; flex-direction: column; }
+    button, input { font: inherit; color: inherit; }
+    .btn { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 6px 12px;
+           cursor: pointer; display: inline-flex; gap: 6px; align-items: center; }
+    .btn:hover { border-color: var(--accent); }
+    .btn:disabled { opacity: .4; cursor: default; border-color: var(--line); }
+    header { display: flex; gap: 10px; align-items: center; padding: 12px 18px; background: var(--panel);
+             border-bottom: 1px solid var(--line); }
+    header h1 { font-size: 16px; font-weight: 650; margin: 0 auto 0 4px; letter-spacing: -.01em; }
+    header h1 span { color: var(--muted); font-weight: 450; }
+    .pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: var(--panel-2); color: var(--muted);
+            border: 1px solid var(--line); white-space: nowrap; }
+    .pill.on { color: var(--accent); border-color: var(--accent); }
+    .pill.bad { color: var(--c-guard); border-color: var(--c-guard); }
+
+    .layout { flex: 1; display: grid; grid-template-columns: 320px 1fr; min-height: 0; transition: grid-template-columns .2s; }
+    .layout.collapsed { grid-template-columns: 0 1fr; }
+    aside { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column;
+            min-height: 0; overflow: hidden; }
+    .aside-head { padding: 12px 14px 8px; display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--line); }
+    .aside-head .row { display: flex; justify-content: space-between; align-items: center; }
+    .aside-head b { font-size: 13px; }
+    .aside-head input { border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; background: var(--panel-2); width: 100%; }
+    .filter { font-size: 12px; color: var(--accent); cursor: pointer; }
+    #entries { overflow-y: auto; flex: 1; padding: 6px; }
+    .entry { padding: 9px 10px; border-radius: 10px; cursor: pointer; border: 1px solid transparent; margin-bottom: 2px; }
+    .entry:hover { background: var(--panel-2); }
+    .entry.sel { background: var(--panel-2); border-color: var(--accent); }
+    .entry .said { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .entry .meta { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .chip { font-size: 11.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor;
+            white-space: nowrap; line-height: 1.6; }
+    .chip.fill { color: #fff !important; border-color: transparent; }
+
+    main { overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 14px; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); }
+    .card-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    .card-head h2 { font-size: 14px; margin: 0 auto 0 0; font-weight: 650; }
+    .card-body { padding: 14px 16px; }
+    .hint { color: var(--muted); font-size: 12.5px; }
+    .grid2 { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+    @media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
+
+    svg { width: 100%; display: block; }
+    svg .node rect { fill: var(--panel-2); stroke: var(--line); stroke-width: 1.2; }
+    svg .node .bar { stroke: none; }
+    svg .node .title { fill: var(--fg); font-size: 13px; font-weight: 600; }
+    svg .node .sub { fill: var(--muted); font-size: 11.5px; }
+    svg .node .count { fill: var(--muted); font-size: 11px; }
+    svg .node { cursor: pointer; }
+    svg .node.dim { opacity: .62; }
+    svg .node.on rect { fill: var(--panel); stroke-width: 2.4; }
+    svg .node.on .sub { fill: var(--fg); }
+    svg .edge { stroke: var(--line); stroke-width: 1.6; fill: none; marker-end: url(#arrow); }
+    svg .edge.on { stroke: var(--accent); stroke-width: 3; marker-end: url(#arrow-on); }
+    svg .stage { fill: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .12em; text-anchor: middle; }
+    svg .elabel { fill: var(--muted); font-size: 11px; text-anchor: middle; }
+    #arrow path { fill: var(--line); } #arrow-on path { fill: var(--accent); }
+    svg text { text-anchor: middle; dominant-baseline: middle; font-family: inherit; }
+    #explain { min-height: 22px; margin-top: 10px; }
+    #explain b { color: var(--fg); }
+
+    .steps { list-style: none; margin: 0; padding: 0; }
+    .step { position: relative; padding: 0 0 16px 30px; }
+    .step::before { content: ""; position: absolute; left: 9px; top: 20px; bottom: 0; width: 2px; background: var(--line); }
+    .step:last-child::before { display: none; }
+    .dot { position: absolute; left: 0; top: 2px; width: 20px; height: 20px; border-radius: 50%; display: grid;
+           place-items: center; font-size: 11px; color: #fff; font-weight: 700; }
+    .step h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 3px; font-weight: 600; }
+    .step .big { font-size: 15px; overflow-wrap: anywhere; }
+    .meters { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px; }
+    .meter { font-size: 12px; color: var(--muted); min-width: 150px; }
+    .meter .track { height: 6px; background: var(--line); border-radius: 3px; margin-top: 3px; overflow: hidden; }
+    .meter .fill { height: 100%; border-radius: 3px; }
+    .kv { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+
+    .usage h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 12px 0 6px; font-weight: 600; }
+    .usage h3:first-child { margin-top: 0; }
+    .urow { display: grid; grid-template-columns: minmax(0, 1fr) 90px 28px; gap: 8px; align-items: center; padding: 3px 6px;
+            border-radius: 8px; cursor: pointer; font-size: 13px; }
+    .urow:hover { background: var(--panel-2); }
+    .urow.sel { background: var(--accent-soft); }
+    .urow .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; font-size: 12.5px; }
+    .urow .track { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
+    .urow .fill { height: 100%; border-radius: 4px; }
+    .urow .n { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .usage h3 .n { float: right; text-transform: none; }
+    .empty { color: var(--muted); font-size: 13px; }
+    kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 5px; }
+    code { font: 12px ui-monospace, monospace; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+    .drop { position: fixed; inset: 0; background: rgba(13,148,136,.08); border: 3px dashed var(--accent); z-index: 9;
+            display: none; place-items: center; font-size: 18px; color: var(--accent); }
+    .drop.show { display: grid; }
+  </style>
+</head>
+<body>
+  <header>
+    <button class="btn" id="toggle" title="Show or hide the list (h)">☰ List</button>
+    <h1>jev-dictator <span>· how a call is routed and a permission decided</span></h1>
+    <button class="btn" id="load" title="Open a decisions.jsonl from disk">Open decisions.jsonl</button>
+    <input type="file" id="file" accept=".jsonl,.ndjson,.json,.log,text/plain" hidden>
+    <span id="source" class="pill">○ no data</span>
+  </header>
+  <div class="layout" id="layout">
+    <aside>
+      <div class="aside-head">
+        <div class="row"><b id="count">Decisions</b><span id="filter" class="filter" hidden></span></div>
+        <input id="search" placeholder="Search agents, actions, reasons…" autocomplete="off">
+      </div>
+      <div id="entries"></div>
+    </aside>
+    <main>
+      <section class="card">
+        <div class="card-head">
+          <h2>Decision chart</h2>
+          <span class="hint">Click a box to see what it does; every path ends at Allow, Deny or the user.</span>
+        </div>
+        <div class="card-body">
+          <svg id="chart" viewBox="-40 -50 1700 740" role="img" aria-label="Decision chart"></svg>
+          <div id="explain" class="hint"></div>
+        </div>
+      </section>
+      <div class="grid2">
+        <section class="card">
+          <div class="card-head">
+            <h2 id="entry-title">Decision</h2>
+            <button class="btn" id="prev" title="Newer (↑ or k)">↑</button>
+            <button class="btn" id="next" title="Older (↓ or j)">↓</button>
+          </div>
+          <div class="card-body" id="detail"><span class="empty">No decision selected.</span></div>
+        </section>
+        <section class="card">
+          <div class="card-head"><h2>Used</h2><span class="hint">click to filter</span></div>
+          <div class="card-body usage" id="usage"></div>
+        </section>
+      </div>
+      <p class="hint">
+        Data: <code>~/.local/state/jev-dictator/decisions.jsonl</code> — open it with the button above or drop it on
+        this page. <kbd>↑</kbd> <kbd>↓</kbd> step · <kbd>h</kbd> list · <kbd>/</kbd> search.
+      </p>
+    </main>
+  </div>
+  <div class="drop" id="drop">Drop decisions.jsonl</div>
+  <script src="flow.js"></script>
+</body>
+</html>

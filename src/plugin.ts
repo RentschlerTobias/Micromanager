@@ -66,6 +66,17 @@ export default {
       const routed = routeSubagentCall(call, routing)
       if (!routed) return
       tasks.set(String(call.input.agent), String(call.input.prompt ?? ""))
+      // What the router decided, next to the permission decisions, so /flow can show the whole path.
+      record({
+        kind: "routing",
+        sessionID: call.sessionID,
+        agent: call.agent,
+        role: routed.role,
+        requested: String(call.input.agent ?? ""),
+        model: routed.model,
+        reason: routed.reason,
+        prompt: String(call.input.prompt ?? "").slice(0, 300),
+      })
       log("info", `${routed.role} -> ${routed.model} (${routed.reason})`)
     })
 

@@ -35,6 +35,15 @@ Optional overrides in `~/.config/opencode/jev-dictator.jsonc`:
 }
 ```
 
+## Flow chart
+
+`docs/flow.html` is a self-contained page (no server) that shows how the plugin decides: the model routing lane
+(role → needs → model) and the permission lane (hard rules → deleted paths → Jev → the floors → allow / deny /
+user). Open it in a browser and load `~/.local/state/jev-dictator/decisions.jsonl` with the button or by dropping
+it on the page; over http a `decisions.jsonl` next to the page is picked up automatically. Each decision is
+listed, and selecting one highlights the exact path it took through the chart. The journal holds `permission`
+entries (from `src/decide.ts`) and `routing` entries (from the subagent hook in `src/plugin.ts`).
+
 ## Develop
 
 ```bash
