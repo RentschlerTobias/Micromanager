@@ -1,0 +1,443 @@
+<title>Dictator Decision Flow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a tall SVG flow on the left, a sticky detail panel on the right; sections below explain Jev batching and the role x skill/tool matrix. */
+:root {
+  --bg: #f3f5f8; --surface: #ffffff; --fg: #18202b; --muted: #5a6677; --line: #c9d1dc; --edge: #7b8797;
+  --jev: #2563c9; --jev-soft: #e3ecfb;
+  --llm: #7a45c8; --llm-soft: #efe7fa;
+  --code: #4c5a6b; --code-soft: #e8ecf1;
+  --user: #b7790c; --user-soft: #fbf0d9;
+  --worker: #1f8a5c; --worker-soft: #e1f3ea;
+  --skill: #c2410c; --tool: #0e7490;
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11161d; --surface: #19202a; --fg: #e4e9f0; --muted: #98a3b3; --line: #2e3846; --edge: #7c889a;
+    --jev: #6b9cf0; --jev-soft: #1c2a42; --llm: #b28ef0; --llm-soft: #2a2140; --code: #a7b3c2; --code-soft: #232c38;
+    --user: #e3ad4a; --user-soft: #35291a; --worker: #4fc48f; --worker-soft: #17302a; --skill: #fb8c5a; --tool: #3cc4dd;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11161d; --surface: #19202a; --fg: #e4e9f0; --muted: #98a3b3; --line: #2e3846; --edge: #7c889a;
+  --jev: #6b9cf0; --jev-soft: #1c2a42; --llm: #b28ef0; --llm-soft: #2a2140; --code: #a7b3c2; --code-soft: #232c38;
+  --user: #e3ad4a; --user-soft: #35291a; --worker: #4fc48f; --worker-soft: #17302a; --skill: #fb8c5a; --tool: #3cc4dd;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font: 15px/1.55 var(--font-body); }
+.wrap { max-width: 1280px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 64px; }
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: 2rem; font-weight: 700; }
+h2 { font-size: 1.45rem; font-weight: 700; margin-block: 48px 12px; }
+h3 { font-size: 1.05rem; font-weight: 700; }
+p { max-width: 68ch; margin: 0; }
+code, .mono { font-family: var(--font-mono); font-size: 0.86em; }
+.lede { color: var(--muted); margin-top: 8px; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; margin-block: 20px 14px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 0.85rem; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 12px; height: 12px; border-radius: 3px; border: 2px solid; }
+.filters { display: flex; flex-wrap: wrap; gap: 6px; }
+.filters button {
+  font: 600 0.82rem var(--font-body); color: var(--fg); background: var(--surface); border: 1px solid var(--line);
+  border-radius: 999px; padding: 5px 12px; cursor: pointer;
+}
+.filters button[aria-pressed="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+.filters button:focus-visible, .node:focus-visible { outline: 3px solid var(--jev); outline-offset: 2px; }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 20px; align-items: start; }
+.chart { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+.chart svg { display: block; width: 100%; min-width: 640px; height: auto; }
+.panel {
+  position: sticky; top: calc(env(safe-area-inset-top, 0px) + 12px); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 10px; padding: 18px; min-width: 0;
+  max-height: calc(100vh - 24px); overflow-y: auto;
+}
+.panel .kind { font: 600 0.72rem var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; }
+.panel h3 { font-size: 1.25rem; margin-block: 4px 8px; }
+.panel dl { margin: 12px 0 0; display: grid; gap: 12px; }
+.panel dt { font: 600 0.72rem var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.panel dd { margin: 3px 0 0; }
+.panel ul { margin: 0; padding-left: 18px; }
+.panel li { margin-block: 2px; }
+.chip { display: inline-block; font: 600 0.75rem var(--font-mono); padding: 1px 7px; border-radius: 5px; margin: 2px 4px 2px 0; border: 1px solid; }
+.chip.s { color: var(--skill); border-color: var(--skill); }
+.chip.t { color: var(--tool); border-color: var(--tool); }
+.chip.q { color: var(--jev); border-color: var(--jev); }
+/* svg */
+.node rect { stroke-width: 2; }
+.node { cursor: pointer; transition: opacity 0.15s; }
+.node text.t { font: 700 13.5px var(--font-body); fill: var(--fg); }
+.node text.s { font: 400 11.5px var(--font-body); fill: var(--muted); }
+.node.sel rect.box { stroke-width: 3.5; }
+.k-jev rect.box { fill: var(--jev-soft); stroke: var(--jev); }
+.k-llm rect.box { fill: var(--llm-soft); stroke: var(--llm); }
+.k-code rect.box { fill: var(--code-soft); stroke: var(--code); }
+.k-user rect.box { fill: var(--user-soft); stroke: var(--user); }
+.k-worker rect.box { fill: var(--worker-soft); stroke: var(--worker); }
+.badge rect { stroke: none; }
+.badge text { font: 700 9.5px var(--font-mono); fill: var(--surface); }
+.b-s rect { fill: var(--skill); } .b-t rect { fill: var(--tool); }
+.edge { fill: none; stroke: var(--edge); stroke-width: 1.6; transition: opacity 0.15s; }
+.edge.dash { stroke-dasharray: 5 4; }
+.elabel { font: 400 11px var(--font-body); fill: var(--muted); paint-order: stroke; stroke: var(--surface); stroke-width: 4px; }
+.group { fill: none; stroke: var(--llm); stroke-width: 1.4; stroke-dasharray: 3 4; }
+.glabel { font: 700 11px var(--font-mono); fill: var(--llm); letter-spacing: 0.06em; }
+.arrow { fill: var(--edge); }
+.dim { opacity: 0.18; }
+/* sections */
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 14px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
+.card p + p, .card ul { margin-top: 8px; }
+pre { background: var(--code-soft); border-radius: 8px; padding: 12px; overflow-x: auto; font: 12.5px/1.5 var(--font-mono); margin: 10px 0 0; }
+.tablewrap { overflow-x: auto; margin-top: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; min-width: 860px; font-size: 0.88rem; }
+th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+th { font: 600 0.72rem var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+td:first-child { font-weight: 700; white-space: nowrap; }
+.status { font: 600 0.72rem var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; }
+.st-must { color: var(--worker); } .st-should { color: var(--jev); } .st-later { color: var(--user); } .st-no { color: var(--muted); }
+@media (max-width: 980px) {
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .panel { position: static; max-height: none; }
+}
+@media (prefers-reduced-motion: reduce) { .node, .edge { transition: none; } }
+</style>
+
+<div class="wrap">
+  <h1>Dictator Decision Flow</h1>
+  <p class="lede">How a job moves through jev-dictator, where Jev decides, and where skills and tools are picked
+    (<b>pick</b>) and used (<b>use</b>). Select a step for its details. Design state of 2026-10-04, matching the reviewed plan; nothing here is implemented yet beyond permissions (N13) and model routing.</p>
+
+  <div class="bar">
+    <div class="legend" aria-label="Legend">
+      <span><i class="sw" style="background:var(--jev-soft);border-color:var(--jev)"></i>Jev decision</span>
+      <span><i class="sw" style="background:var(--llm-soft);border-color:var(--llm)"></i>LLM writes</span>
+      <span><i class="sw" style="background:var(--code-soft);border-color:var(--code)"></i>Code / rule</span>
+      <span><i class="sw" style="background:var(--user-soft);border-color:var(--user)"></i>User</span>
+      <span><i class="sw" style="background:var(--worker-soft);border-color:var(--worker)"></i>Worker session</span>
+      <span><i class="sw" style="background:var(--skill);border-color:var(--skill)"></i>skills</span>
+      <span><i class="sw" style="background:var(--tool);border-color:var(--tool)"></i>tools / MCP</span>
+    </div>
+    <div class="filters" role="group" aria-label="Highlight">
+      <button type="button" data-f="all" aria-pressed="true">All</button>
+      <button type="button" data-f="jev" aria-pressed="false">Jev decisions</button>
+      <button type="button" data-f="skills" aria-pressed="false">Skills</button>
+      <button type="button" data-f="tools" aria-pressed="false">Tools / MCP</button>
+      <button type="button" data-f="user" aria-pressed="false">User touchpoints</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="chart"><svg id="flow" viewBox="0 0 1000 1790" role="img" aria-label="Flow chart of the dictator"></svg></div>
+    <aside class="panel" id="panel" aria-live="polite"></aside>
+  </div>
+
+  <h2>One Jev call, many classifications</h2>
+  <p>Yes. One request carries a map of questions, mixed types allowed (choice, score, noul). TypeSafe answers them
+    "in parallel and in isolation against the same state in one go"; adding questions barely changes latency, and
+    only input tokens are billed, so the shared state is paid once. <code>src/jev.ts</code> already sends
+    <code>questions: Record&lt;id, Question&gt;</code>, and <code>src/decide.ts</code> asks 3–4 questions per call today.</p>
+  <div class="cols">
+    <div class="card">
+      <h3>Multi-select = one noul per option</h3>
+      <p>There is no multi-label type. A choice picks exactly one. For skills, tool groups and needs, each option
+        gets its own noul ("this task needs symbol navigation"); code keeps every option above its floor, capped
+        (at most 3 skills).</p>
+    </div>
+    <div class="card">
+      <h3>Isolated answers: dependencies live in code</h3>
+      <p>Questions in one call cannot see each other's answers. So a call asks only independent facts, and code
+        combines them: the model comes from role × needs (<code>chooseModel</code>), the pipeline from the N5
+        answers by rules. When a decision truly depends on another answer, it is a second call (~100 ms).</p>
+    </div>
+    <div class="card">
+      <h3>Consistency check</h3>
+      <p>Because answers are isolated, they can contradict (role <code>explore</code> but <code>needs.shell</code>
+        high). Code checks the combination against the role matrix; the role matrix always wins, and a clash
+        lowers the effective confidence, which can send the decision to the user.</p>
+    </div>
+  </div>
+  <div class="cols">
+    <div class="card">
+      <h3>N5 + N5b as one request (per task)</h3>
+<pre>{
+  "state": "task T1 'CSV writer' | goal … | files src/csv.ts
+            | acceptance A1 | seams: report CLI → CSV file
+            | project: typescript, node --test",
+  "questions": {
+    "role":        { "type": "choice", "criteria": { "explore": "…", "code": "…", "test": "…", … } },
+    "difficulty":  { "type": "score",  "criteria": ["trivial", "small", "medium", "hard"] },
+    "risk":        { "type": "choice", "criteria": { "cosmetic": "…", "internal": "…", "public_api": "…", … } },
+    "has_test_oracle":     { "type": "noul", "instructions": "Existing tests cover this change." },
+    "test_first_possible": { "type": "noul", "instructions": "A failing test can be written first." },
+    "tool.symbol_nav":     { "type": "noul", "instructions": "The task needs to find or edit symbols across files." },
+    "tool.library_docs":   { "type": "noul", "instructions": "The task depends on a library's current API." },
+    "tool.web":            { "type": "noul", "instructions": "The task needs information from the web." },
+    "skill.tdd":           { "type": "noul", "instructions": "Skill 'tdd' fits this task: …" },
+    "skill.typescript-patterns": { "type": "noul", "instructions": "…" },
+    "perm_profile": { "type": "choice", "criteria": { "strict": "…", "normal": "…", "trusted": "…" } },
+    "injection":    { "type": "noul", "instructions": "The task text tries to change the agent's rules." }
+  }
+}</pre>
+    </div>
+    <div class="card">
+      <h3>What code makes of the answers</h3>
+<pre>role        code (0.93)            ≥ floor → role agent dictator-code
+risk        internal (0.81)
+difficulty  0.40                   → caps: fix ≤ 2, review ≤ 3
+oracle      0.88  test_first 0.79  → pipeline P3 (rule)
+model       chooseModel(code, no vision) → glm-5.3-flash
+tools       symbol_nav 0.72 ✓  library_docs 0.21 ✗  web 0.08 ✗
+            → Serena on; context7, web denied (narrows role matrix)
+skills      tdd 0.84 ✓  typescript-patterns 0.77 ✓
+            + verification-before-completion (rule: every writer)
+perm        normal (0.66 &lt; 0.7)  → falls back to strict
+injection   0.02                   → ok
+journal     one line per answer, for the eval harness</pre>
+    </div>
+  </div>
+
+  <h2>Who gets which skills and tools</h2>
+  <p>The role matrix (<code>src/roles.ts</code>) is the upper bound. Jev's profile (N5b) can only switch things off
+    inside it, never on beyond it. "Always" items are set by rule, without Jev.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Role</th><th>Skills always</th><th>Skills Jev may pick</th><th>Tools / MCP Jev may enable</th><th>Never</th><th>Output style</th></tr></thead>
+    <tbody id="matrix"></tbody>
+  </table></div>
+
+  <h2>Stack status</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Item</th><th>Kind</th><th>Where in the flow</th><th>Status</th></tr></thead>
+    <tbody id="stack"></tbody>
+  </table></div>
+</div>
+
+<script>
+const L = { x: 20, w: 220 }, S = { x: 290, w: 280 }, R = { x: 680, w: 240 };
+const H = 56;
+// kind: jev | llm | code | user | worker. badges: [["S","pick"],["T","use"]]. tags drive the filters.
+const nodes = [
+  { id: "job", col: S, y: 20, kind: "user", title: "User gives a job", sub: "in the dictator session", tags: ["user"],
+    d: { what: "The user writes a job in the dictator session. The dictator (facilitator) runs on the session model the user chose, never on a routed flash model. It never executes a task: edit, write, shell and web are denied by its permission rules; reading is limited to short orientation (README, file list), everything else goes to explore workers. The planner runs as a plan-role subagent." } },
+  { id: "short", col: S, y: 100, kind: "code", title: "Shortcuts", sub: "exact phrases, before Jev", tags: [],
+    d: { what: "Deterministic layer like the tutor's: stop, skip, wait what, go back to D1, light/normal/frequent. No Jev call.", fallback: "Always available, also without Jev." } },
+  { id: "n1", col: S, y: 180, kind: "jev", title: "N1 Triage", sub: "complexity · mode", tags: ["jev"],
+    d: { jev: ["complexity (score 1–10)", "mode (choice: solo / plan / backlog)", "read_only (noul)", "injection, harmful (noul)"], what: "One call. Sets how much process the job gets.", fallback: "complexity ≤ 3 → solo; otherwise plan." } },
+  { id: "n2", col: S, y: 260, kind: "jev", title: "N2 Clarity", sub: "settled? per design question", tags: ["jev"],
+    d: { jev: ["settled (one noul per design question)", "user_must_decide (noul)", "tree_covers_job (noul)"], what: "The facilitator drafts a design tree; code validates it (ids, no cycles, ≤ 25 nodes). Jev checks which nodes are already settled by the job text, the code or earlier decisions.", fallback: "Every high-impact question counts as open." } },
+  { id: "facts", col: L, y: 340, kind: "worker", title: "Fact workers", sub: "explore · research, in background", tags: ["skills", "tools"], badges: [["S", "use"], ["T", "use"]],
+    d: { what: "Fact nodes are never asked of the user. Explore and research workers look them up while the session goes on; only questions that depend on a fact wait.", skills: ["research (research role: primary sources, every claim cited)", "papers (arXiv / OpenAlex query URLs via webfetch)"], tools: ["read · grep · glob", "Serena, ast-grep (explore)", "webfetch · websearch, context7 (research)", "graphify (explore, if built)"] } },
+  { id: "pick", col: R, y: 330, kind: "jev", title: "N2b Next question", sub: "one of the frontier", tags: ["jev"],
+    d: { jev: ["next (choice among the frontier: open decisions whose prerequisites are settled)"], what: "Exactly one question per turn, because an answer can change the next question.", fallback: "Highest impact, then most dependents." } },
+  { id: "ask", col: R, y: 410, kind: "llm", title: "Facilitator asks", sub: "open, no options, no proposal", tags: ["skills", "user"], badges: [["S", "use"]],
+    d: { what: "Asks the one question in plain words, with 1–3 sentences of context and a Concept / Why this matters callout when a term is new. No options and no recommendation, because people always take the suggestion.", skills: ["deliberate (ours: vibe-wise learn + mattpocock grilling)", "domain-modeling (when GLOSSARY.md / docs/adr exist)", "prototype, logic branch (when Jev says needs_prototype)"] } },
+  { id: "read", col: R, y: 490, kind: "jev", title: "N2c Read the answer", sub: "settles · branches · stuck", tags: ["jev", "user"],
+    d: { jev: ["settles_decision", "opens_new_branches", "user_stuck", "user_asks_for_options", "contradicts_earlier_decision", "out_of_scope", "needs_prototype"], what: "All nouls in one call. Settled → record the user's answer and reasoning. Stuck or asking → only then explain or show 2–3 approaches, and hand the decision back. Contradiction → name both statements.", fallback: "The facilitator asks: is this settled for you?" } },
+  { id: "check", col: R, y: 590, kind: "user", title: "Design checkpoint", sub: "your decisions | proposed additions", tags: ["user"],
+    d: { what: "Frontier empty (or the question cap of the depth reached). Shows the user's decisions apart from a Proposed additions table. Question form: Confirm / Discuss." } },
+  { id: "plan", col: S, y: 680, kind: "worker", title: "Planner (subagent)", sub: "spec · seams · tracer-bullet tasks", tags: ["skills"], badges: [["S", "use"]],
+    d: { what: "Writes the plan as JSON: acceptance points with Verify commands, the agreed seams, tasks as vertical slices with blocking edges and declared files.", skills: ["to-spec, to-tickets (as planner rules, without the issue-tracker setup)", "writing-plans ideas (file map, interfaces)"] } },
+  { id: "split", col: R, y: 760, kind: "jev", title: "N4 Split until small", sub: "smallest verifiable slices", tags: ["jev"],
+    d: { jev: ["splittable (noul per task)", "difficulty (score)", "fits_one_context (noul)"], what: "Every task is split until it is small: difficulty ≤ small, fits one fresh context, and still verifiable on its own (a vertical slice with its own Verify command). Small tasks can run on cheap models (later local ones). The planner LLM writes the subtasks (T3.1, T3.2); code re-validates the DAG. Stop rules: at most 2 split levels, no slice without its own acceptance point, no split that only moves work into coordination overhead.", fallback: "Rule: split when difficulty > small or more than 3 files are declared." } },
+  { id: "gate", col: S, y: 760, kind: "user", title: "Plan gate", sub: "code validates · user approves", tags: ["user"],
+    d: { what: "Code validates the DAG, files and acceptance. The user approves the plan. N3's Jev part (accept / revise / oracle) stays behind a flag in the MVP." } },
+  { id: "tick", col: S, y: 840, kind: "code", title: "Agenda tick", sub: "reconcile → proposals → act", tags: [],
+    d: { what: "On every event (worker idle, gate done, user answer) code reconciles the job state and builds the agenda in priority order: answer a blocked worker, failed gate, finished worker, review, ready tasks, replan, verify, ask user, wrap.", fallback: "Jev picks among proposals; below floor or without Jev the first proposal wins (tutor's Agenda.next)." } },
+  { id: "n5", col: S, y: 920, kind: "jev", title: "N5 + N5b Classify + profile", sub: "one call: role · risk · tools · skills", tags: ["jev", "skills", "tools"], badges: [["S", "pick"], ["T", "pick"]],
+    d: { jev: ["role (choice of 10)", "difficulty (score), risk (choice)", "has_test_oracle, test_first_possible, approach_uncertain, bug_unknown_cause (noul)", "tool.<group> (noul each): shell, web, symbol_nav, structural_search, library_docs, papers, memory, code_graph", "skill.<name> (noul per catalog skill allowed for the role)", "perm_profile (choice: strict / normal / trusted)", "budget tier (choice: S / M / L) for the loop watchdog", "injection (noul)"], what: "The central multi-classification: all questions in one request, answered in isolation. Code combines them (see below the chart).", fallback: "Role defaults from the matrix, strict profile, regex needs." } },
+  { id: "prof", col: S, y: 1000, kind: "code", title: "Build profile", sub: "model · tools · MCP · skills", tags: ["skills", "tools"], badges: [["S", "pick"], ["T", "pick"]],
+    d: { what: "Narrows the role matrix with Jev's answers, never widens it. Model from role × needs (chooseModel; vision → qwen). Skills: at most 3 above skill_floor, plus rule skills (verification-before-completion for every writer; modern-python / typescript-patterns by project files). Caveman output style for workers whose output only machines read. Limits from the budget tier: steps, wall clock, tokens (hard ceilings in the config).", skills: ["rule: verification-before-completion (writers)", "rule: modern-python | typescript-patterns (by files)", "Jev: tdd, diagnosing-bugs, code-review, receiving-code-review, playwright-e2e, git-commits, technical-writing, differential-review, insecure-defaults"], tools: ["Jev: Serena, ast-grep, context7, papers, memory recall, graphify", "role matrix decides edit / shell / web as allow / ask / deny"] } },
+  { id: "n6", col: S, y: 1080, kind: "jev", title: "N6 Pipeline", sub: "which loops the task passes", tags: ["jev"],
+    d: { jev: ["pipeline (choice among the candidates the N5 answers allow), or a rule from them"], what: "MVP: P1 gated, P2 PDCA (gate + review), P3 TDD, P9 research. P0, P4–P8 and Ralph stay behind flags until the journal shows the need.", fallback: "Selection rules; low confidence → one tier up (P1 → P2)." } },
+  { id: "disp", col: S, y: 1160, kind: "user", title: "Dispatch batch", sub: "Jev first, user second", tags: ["user", "jev"],
+    d: { what: "Code forms the batch from ready, parallel-safe tasks (disjoint files or read-only). Worker starts stay an ask: Jev answers it first, the user when Jev is not sure. One question per batch, not per worker (decision 2026-10-01 kept)." } },
+  { id: "brief", col: L, y: 1160, kind: "code", title: "Brief", sub: "pointers, not copies", tags: ["skills"], badges: [["S", "use"]],
+    d: { what: "Written by code: task, acceptance and seams verbatim, decisions, paths of earlier notes, diff range, lessons, the skills to load. Plain instructions (no caveman on instructions). On a retry it carries a handoff note: what was tried and why it failed.", skills: ["loads the profile's skills into the worker"] } },
+  { id: "work", col: S, y: 1240, kind: "worker", title: "Worker session", sub: "role agent · routed model · worktree", tags: ["skills", "tools"], badges: [["S", "use"], ["T", "use"]],
+    d: { what: "Runs in a worktree off the job's integration branch. Ends with a structured report (status DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED, files, evidence, open issues) in caveman style; code parses it into the task state and stores it in .jev-dictator/notes/.", skills: ["the profile's skills (≤ 3 + rule skills)", "shell-strategy instructions (code, test, debug)"], tools: ["the profile's tools; MCP servers as enabled", "every ask → N13"] } },
+  { id: "watch", col: R, y: 1160, kind: "code", title: "Loop watchdog", sub: "live, per worker, code only", tags: ["tools"],
+    d: { what: "Follows every worker session live through its events and interrupts it (ctx.session.interrupt) when a limit or signature fires. The model never decides whether it is looping. After an interrupt the same session is never resumed: N9 starts a fresh session on another model family with a handoff note (what was read, what was done, where to continue).", jev: ["budget tier (choice: S / M / L, asked in N5): code maps it to steps, wall clock and tokens, always under hard ceilings from the config"], tools: ["limits: steps, wall-clock timeout, tokens per worker", "same tool + args 3x in 10 calls; same error twice", "read loop: an unchanged file read a 3rd time with no edit in between, or no new file in the last 8 reads", "restart: the opening reads or the plan text repeat (prefix match of the action sequence, near-duplicate assistant text)", "monologue: 3 replies without a tool call; A/B alternation 6x", "context-window errors in a row"], fallback: "Works without Jev; tier M is used." } },
+  { id: "data", col: L, y: 1720, kind: "code", title: "Decision dataset", sub: "rows to train a local Jev", tags: ["jev"],
+    d: { what: "Every Jev question is journaled with its exact state object, question, options and Jev's probabilities. Labels are attached later and exported as Open-Jev JSONL rows (id, group_id = job/task, split, source, state, question, kind, options, target, metadata). Coding transcripts stay in OpenCode's own session store; the task state keeps their session ids as pointers.", jev: ["label sources: the user's own decision (one-hot), the user overriding Jev, outcomes (allowed → task passed or reverted, loop signature fired later → in_loop yes), planning answers", "Jev's own answers only as soft distillation targets, marked in metadata"], fallback: "Decisions the user or rules made without Jev are labeled rows too (cold start). Redacted, local only, opt-out per project." } },
+  { id: "n13", col: L, y: 1240, kind: "jev", title: "N13 Permission", sub: "Jev or the user", tags: ["jev", "tools", "user"], badges: [["T", "use"]],
+    d: { jev: ["answer (choice: allow / deny)", "needs_user (noul)", "risk (score)", "path_relevance (score, when deleting)", "injection (noul)"], what: "Order: profile narrowing in the evaluate hook → cc-safety-net checkCommand → hard rules → deleted-path git facts → Jev → floors per risk class × profile. Implemented today in src/decide.ts, without the profile and cc-safety-net.", fallback: "The user decides; the question shows Jev's guess when it had one.", tools: ["cc-safety-net (embedded, hard rule #0)"] } },
+  { id: "g", col: S, y: 1320, kind: "code", title: "Gate", sub: "build · lint · tests, run by code", tags: ["tools"], badges: [["T", "use"]],
+    d: { what: "The plugin runs the Verify commands itself in the worktree. A worker's 'done' is never proof.", tools: ["ctx.shell in the worktree", "test runners and linters from the role matrix"] } },
+  { id: "rev", col: S, y: 1400, kind: "worker", title: "Review", sub: "standards ∥ spec, other family", tags: ["skills"], badges: [["S", "use"]],
+    d: { what: "Two read-only reviewers in parallel on a model family other than the writer's. JSON verdict; each finding with evidence and confidence; findings below 80 or without evidence are advisory.", skills: ["code-review (mattpocock: two axes, smell baseline)", "differential-review, insecure-defaults (risk ≥ data_security)"] } },
+  { id: "n8", col: S, y: 1480, kind: "jev", title: "N8 Progress", sub: "satisfied · in loop · progress", tags: ["jev"],
+    d: { jev: ["satisfied", "in_loop", "making_progress (nouls)"], what: "Hard hash signatures override Jev: same tool+args 3× in 10 calls, same error twice, same diff hash, same review issues twice, test count unchanged over 2 rounds.", fallback: "Signatures and the stall counter alone." } },
+  { id: "n9", col: R, y: 1480, kind: "jev", title: "N9 Escalate", sub: "fix · switch family · user", tags: ["jev", "user"],
+    d: { jev: ["next (choice: fix / switch_model / debug / split / replan / ask_user)"], what: "MVP ladder: fix in the same session ≤ 2 → fresh session on another family with a handoff note → user with a typed reason (spec_ambiguous, external_dependency, budget, conflicting_review). Budgets: workers, requests, tokens.", fallback: "Ladder order." } },
+  { id: "merge", col: S, y: 1560, kind: "code", title: "Merge to integration branch", sub: "rebase · gate · merge", tags: [],
+    d: { what: "Into the job's integration branch, never the user's checkout. One branch at a time, gate after each merge, roll back on failure." } },
+  { id: "ver", col: S, y: 1640, kind: "user", title: "Verify + integrate", sub: "full gate · merge / keep / discard", tags: ["user"],
+    d: { what: "Verification wave against every acceptance point (N12 as a rule in the MVP). The user chooses merge / keep / discard for the integration branch. Nothing is pushed." } },
+  { id: "wrap", col: S, y: 1720, kind: "llm", title: "Wrap", sub: "summary · lessons", tags: ["tools"], badges: [["T", "use"]],
+    d: { what: "The facilitator writes the summary for the user (normal prose). Lessons from failed reviews go to the lesson store in ctx.storage; later to opencode-agent-memory.", tools: ["ctx.storage lessons (MVP)", "opencode-agent-memory (Phase H)"] } },
+];
+const C = (n) => n.col.x + n.col.w / 2;
+const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
+const P = (id, side, off = 0) => {
+  const n = byId[id];
+  if (side === "t") return [C(n) + off, n.y];
+  if (side === "b") return [C(n) + off, n.y + H];
+  if (side === "l") return [n.col.x, n.y + H / 2 + off];
+  return [n.col.x + n.col.w, n.y + H / 2 + off];
+};
+// edges: points, label (+ which segment carries it), dashed
+const edges = [
+  { p: [P("job", "b"), P("short", "t")] },
+  { p: [P("short", "b"), P("n1", "t")] },
+  { p: [P("n1", "b"), P("n2", "t")] },
+  { p: [P("n2", "b"), P("plan", "t")], label: "all clear", seg: 0, lx: 6 },
+  { p: [P("n2", "r"), [800, 288], P("pick", "t")], label: "open questions", seg: 0 },
+  { p: [P("n2", "l"), [130, 288], P("facts", "t")], label: "fact questions", seg: 0 },
+  { p: [P("facts", "r"), [430, 368], [650, 368], [650, 358], P("pick", "l")], dash: true, label: "facts settle nodes", seg: 1 },
+  { p: [P("pick", "b"), P("ask", "t")] },
+  { p: [P("ask", "b"), P("read", "t")], label: "user answers", seg: 0, lx: 6 },
+  { p: [P("read", "r"), [950, 518], [950, 358], P("pick", "r")], label: "next", seg: 1, lx: 6 },
+  { p: [P("read", "b"), P("check", "t")], label: "frontier empty", seg: 0, lx: 6 },
+  { p: [P("check", "b"), [800, 708], P("plan", "r")], label: "confirm", seg: 1 },
+  { p: [P("plan", "r", 14), [800, 722], P("split", "t")] },
+  { p: [P("split", "l"), P("gate", "r")], label: "all small", seg: 0 },
+  { p: [P("split", "r", -8), [948, 780], [948, 796], P("split", "r", 8)], label: "re-split ≤ 2", seg: 1, lpos: [940, 752], anchor: "end" },
+  { p: [P("gate", "b"), P("tick", "t")] },
+  { p: [P("tick", "b"), P("n5", "t")], label: "ready task", seg: 0, lx: 6 },
+  { p: [P("n5", "b"), P("prof", "t")] },
+  { p: [P("prof", "b"), P("n6", "t")] },
+  { p: [P("n6", "b"), P("disp", "t")] },
+  { p: [P("disp", "l"), P("brief", "r")] },
+  { p: [P("brief", "r", 14), [258, 1202], [258, 1268], P("work", "l")] },
+  { p: [P("work", "l", -14), P("n13", "r", -14)], dash: true, label: "ask?", seg: 0, lpos: [265, 1248] },
+  { p: [P("n13", "r", 14), P("work", "l", 14)], dash: true },
+  { p: [P("work", "b"), P("g", "t")], label: "report", seg: 0, lx: 6 },
+  { p: [P("g", "b"), P("rev", "t")], label: "pass", seg: 0, lx: 6 },
+  { p: [P("rev", "b"), P("n8", "t")] },
+  { p: [P("n8", "r"), P("n9", "l")], label: "fail / stall", seg: 0 },
+  { p: [P("n9", "t"), [800, 1268], P("work", "r")], label: "retry, other family", seg: 1 },
+  { p: [P("n8", "b"), P("merge", "t")], label: "pass", seg: 0, lx: 6 },
+  { p: [P("merge", "l"), [276, 1588], [276, 868], P("tick", "l")], dash: true, label: "next task", seg: 1, lpos: [270, 1612], anchor: "end" },
+  { p: [P("merge", "b"), P("ver", "t")], label: "all passed", seg: 0, lx: 6 },
+  { p: [P("ver", "b"), P("wrap", "t")] },
+  { p: [P("work", "r", -18), [740, 1250], P("watch", "b", -60)], dash: true, label: "events", seg: 0 },
+  { p: [P("watch", "r"), [956, 1188], [956, 1500], P("n9", "r", -8)], label: "interrupt", seg: 1, lx: -6, anchor: "end" },
+  { p: [P("wrap", "l"), P("data", "r")], dash: true, label: "journal", seg: 0 },
+];
+const ns = "http://www.w3.org/2000/svg";
+const el = (tag, attrs = {}, parent) => {
+  const e = document.createElementNS(ns, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+};
+const svg = document.getElementById("flow");
+const defs = el("defs", {}, svg);
+const m = el("marker", { id: "ah", viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" }, defs);
+el("path", { d: "M0,0 L10,5 L0,10 z", class: "arrow" }, m);
+// planning-session group frame
+el("rect", { x: 664, y: 312, width: 300, height: 252, rx: 12, class: "group" }, svg);
+el("text", { x: 678, y: 306, class: "glabel" }, svg).textContent = "PLANNING SESSION · ONE QUESTION PER TURN";
+el("text", { x: 300, y: 830, class: "glabel" }, svg).textContent = "TASK LOOP · TICK PER EVENT";
+const edgeEls = [];
+for (const e of edges) {
+  const d = e.p.map((pt, i) => `${i ? "L" : "M"}${pt[0]},${pt[1]}`).join(" ");
+  const path = el("path", { d, class: "edge" + (e.dash ? " dash" : ""), "marker-end": "url(#ah)" }, svg);
+  edgeEls.push(path);
+  if (e.label) {
+    const a = e.p[e.seg], b = e.p[e.seg + 1];
+    const vertical = a[0] === b[0];
+    const [x, y] = e.lpos || [(a[0] + b[0]) / 2 + (e.lx || 0), (a[1] + b[1]) / 2 + (vertical ? 4 : -6)];
+    const t = el("text", { x, y, class: "elabel", "text-anchor": e.anchor || (vertical && e.lx ? "start" : "middle") }, svg);
+    t.textContent = e.label;
+  }
+}
+const nodeEls = {};
+for (const n of nodes) {
+  const g = el("g", { class: `node k-${n.kind}`, tabindex: "0", role: "button", "aria-label": `${n.title}: ${n.sub}` }, svg);
+  el("rect", { x: n.col.x, y: n.y, width: n.col.w, height: H, rx: n.kind === "jev" ? 18 : 8, class: "box" }, g);
+  el("text", { x: n.col.x + 14, y: n.y + 23, class: "t" }, g).textContent = n.title;
+  el("text", { x: n.col.x + 14, y: n.y + 42, class: "s" }, g).textContent = n.sub;
+  (n.badges || []).forEach(([k, mode], i) => {
+    const bw = 62, bx = n.col.x + n.col.w - (bw + 4) * (i + 1) - 2, by = n.y - 8;
+    const b = el("g", { class: `badge b-${k.toLowerCase()}` }, g);
+    el("rect", { x: bx, y: by, width: bw, height: 16, rx: 8 }, b);
+    el("text", { x: bx + bw / 2, y: by + 11.5, "text-anchor": "middle" }, b).textContent = `${k === "S" ? "skill" : "tool"} ${mode}`;
+  });
+  g.addEventListener("click", () => select(n.id));
+  g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); select(n.id); } });
+  nodeEls[n.id] = g;
+}
+const KIND = { jev: ["Jev decision", "var(--jev)"], llm: ["LLM writes", "var(--llm)"], code: ["Code / rule", "var(--code)"], user: ["User", "var(--user)"], worker: ["Worker session", "var(--worker)"] };
+const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+function select(id) {
+  const n = byId[id];
+  for (const [k, g] of Object.entries(nodeEls)) g.classList.toggle("sel", k === id);
+  const [kname, kcol] = KIND[n.kind];
+  const list = (items, cls) => items.map((i) => `<li>${cls ? `<span class="chip ${cls}">${cls === "s" ? "skill" : cls === "t" ? "tool" : "Q"}</span>` : ""}${esc(i)}</li>`).join("");
+  let html = `<div class="kind" style="color:${kcol}">${kname}</div><h3>${esc(n.title)}</h3><p>${esc(n.d.what)}</p><dl>`;
+  if (n.d.jev) html += `<div><dt>Jev asks, in one call</dt><dd><ul>${list(n.d.jev, "q")}</ul></dd></div>`;
+  if (n.d.skills) html += `<div><dt>Skills</dt><dd><ul>${list(n.d.skills, "s")}</ul></dd></div>`;
+  if (n.d.tools) html += `<div><dt>Tools / MCP / plugins</dt><dd><ul>${list(n.d.tools, "t")}</ul></dd></div>`;
+  if (n.d.fallback) html += `<div><dt>Without Jev / below floor</dt><dd>${esc(n.d.fallback)}</dd></div>`;
+  html += `</dl>`;
+  document.getElementById("panel").innerHTML = html;
+  try { localStorage.setItem("jd-flow-sel", id); } catch {}
+}
+document.querySelectorAll(".filters button").forEach((b) => b.addEventListener("click", () => {
+  document.querySelectorAll(".filters button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+  const f = b.dataset.f;
+  for (const n of nodes) nodeEls[n.id].classList.toggle("dim", f !== "all" && !n.tags.includes(f));
+  edgeEls.forEach((e) => e.classList.toggle("dim", f !== "all"));
+}));
+let start = "n5";
+try { start = localStorage.getItem("jd-flow-sel") || start; } catch {}
+select(byId[start] ? start : "n5");
+
+const matrix = [
+  ["dictator (main session)", "deliberate", "domain-modeling", "read for orientation only (README, file list)", "edit, write, shell, web; never executes a task", "prose (human reads)"],
+  ["explore", "—", "—", "Serena, ast-grep, graphify, memory recall", "edit, shell, web", "caveman report"],
+  ["research", "research", "papers", "context7, papers, websearch/webfetch, memory recall", "edit, shell", "caveman summary; docs/research note in prose"],
+  ["plan (facilitator)", "deliberate", "domain-modeling, prototype", "read, graphify, memory recall", "edit, shell", "prose (human reads)"],
+  ["plan (planner)", "to-spec, to-tickets rules", "—", "read, graphify", "edit, shell", "plan JSON"],
+  ["code", "verification-before-completion, stack skill by files", "tdd, receiving-code-review", "Serena, context7, memory recall; shell stays ask", "web", "caveman report"],
+  ["test", "verification-before-completion, stack skill by files", "tdd, playwright-e2e", "test runners allowed; Serena", "web", "caveman report"],
+  ["visual", "—", "playwright-e2e", "image input (qwen), shell ask", "web", "caveman report"],
+  ["write", "—", "git-commits, technical-writing", "read", "shell, web", "prose (persisted)"],
+  ["debug", "verification-before-completion", "diagnosing-bugs", "Serena, ast-grep, context7; edit/shell ask", "—", "caveman report"],
+  ["review", "code-review (two axes)", "differential-review, insecure-defaults", "Serena, ast-grep; tests and linters allowed", "edit, web", "review JSON"],
+  ["oracle", "—", "—", "graphify, web ask", "edit, shell", "caveman report"],
+];
+document.getElementById("matrix").innerHTML = matrix.map((r) => `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`).join("");
+const stack = [
+  ["Loop watchdog", "our code (event stream + interrupt)", "every worker session", "must"],
+  ["Decision dataset (Open-Jev JSONL rows)", "our code (journal + label joins + export)", "every Jev question", "must"],
+  ["cc-safety-net", "plugin (dual, v2 export)", "N13, hard rule #0 inside our hook", "must"],
+  ["shell-strategy", "instructions file", "system prompt of code / test / debug", "must"],
+  ["Serena", "MCP", "explore, code, debug, review (Jev tool.symbol_nav)", "must"],
+  ["context7", "MCP", "research, code, debug (Jev tool.library_docs)", "must"],
+  ["ast-grep", "MCP", "explore, review, debug (Jev tool.structural_search)", "should"],
+  ["superpowers: verification-before-completion, receiving-code-review", "skills", "writers; fix rounds", "must"],
+  ["mattpocock: tdd, diagnosing-bugs, code-review, research, to-spec, to-tickets, domain-modeling, prototype", "skills (adapted copies)", "see matrix", "must"],
+  ["deliberate", "skill (ours)", "planning session facilitator", "must"],
+  ["caveman rules", "prompt section (not a loaded skill)", "every machine-read output", "must"],
+  ["opencodeskills.dev: modern-python, typescript-patterns, git-commits, technical-writing, playwright-e2e, differential-review, insecure-defaults", "skills", "see matrix", "should"],
+  ["papers (arXiv / OpenAlex)", "skill over webfetch; port of research-papers (v1) only if needed", "research", "should"],
+  ["Dynamic Context Pruning", "plugin (dual)", "long worker sessions", "later"],
+  ["opencode-agent-memory", "plugin (v2)", "lessons and project facts; ctx.storage until then", "later"],
+  ["opencode-plugin-otel", "plugin (v2)", "cost per task", "later"],
+  ["graphify", "CLI / skill", "explore, oracle", "later"],
+  ["plannotator", "plugin (v1, port)", "design checkpoint", "later"],
+  ["magic-context, opencode-mem, honcho", "plugins", "conflict with DCP / agent transform, or heavy / cloud", "no"],
+  ["mission-control, ensemble, swarm, worktree, workspace", "plugins (v1 / archived / competing)", "ideas only", "no"],
+  ["superpowers subagent-driven-development, mattpocock implement-spec, grill-me, brainstorming", "skills", "they orchestrate or recommend; logic lives in our code", "no"],
+];
+document.getElementById("stack").innerHTML = stack.map(([a, b, c, s]) => `<tr><td>${esc(a)}</td><td>${esc(b)}</td><td>${esc(c)}</td><td class="status st-${s}">${s}</td></tr>`).join("");
+</script>

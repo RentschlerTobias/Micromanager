@@ -7,7 +7,8 @@ decisions:
 - how hard and how risky it is,
 - whether a sub-agent's question or permission request is answered by Jev or goes to the user.
 
-Status: planning. See [docs/plan.md](docs/plan.md).
+Status: design agreed, implementation in phases. The design is [docs/design.md](docs/design.md), its flow chart
+[docs/design.html](docs/design.html), the phases and research [docs/plan.md](docs/plan.md).
 
 ## Install
 

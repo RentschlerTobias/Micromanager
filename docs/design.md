@@ -1,0 +1,617 @@
+# jev-dictator design: job state, planning session, Jev's decision tree
+
+Status (2026-10-04): design agreed. Implementation follows in the phases listed in [plan.md](plan.md). The flow
+chart [design.html](design.html) is the interactive version of this document. It shows where Jev decides and
+where skills and tools are picked and used.
+
+What exists today:
+- the role matrix (`src/roles.ts`),
+- model routing on the built-in `subagent` call (`src/routing.ts`, `src/hooks.ts`),
+- the Jev client (`src/jev.ts`),
+- Jev on permission requests (`src/decide.ts`),
+- the decision journal (`src/journal.ts`).
+
+Everything else in this document is design.
+
+## 1. Why the redesign
+The dictator is a system prompt plus two hooks. Its plan lives only inside the LLM's context: there is no goal,
+complexity, task list, dependency graph or progress that code or Jev could see. So Jev can decide permissions,
+but not:
+- whether the job is clear,
+- how it is split,
+- which tasks run in parallel,
+- which tools, skills and loops a task gets.
+
+The redesign follows the jev-tutor engine (`../jev-tutor/src/jev_tutor/engine/state.py`, `agenda.py`,
+`decisions.py`, `decision/rules.py`):
+- a persisted state and explicit FSMs with `ALLOWED` tables, so an illegal jump throws;
+- a deterministic agenda that builds candidate next steps; Jev chooses among them; a rules fallback takes the
+  first candidate;
+- deterministic shortcuts on exact phrases before any Jev call;
+- code owning every threshold. Jev only chooses among candidates code has built.
+
+Decisions (user, 2026-10-03/04):
+1. **The plugin drives the loop.** LLMs write text: questions, plans, code, reviews, summaries.
+2. **The main session never executes a task.** It talks, plans through a subagent, and delegates.
+3. **Planning by discussion.** If the job is unclear, a planning session discusses it with the user:
+   - one question at a time,
+   - no suggested answers.
+4. **Tasks are split as small as possible**, so cheap models can do them.
+5. **No worker can loop forever.** A watchdog in code ends it.
+6. **Every Jev decision is recorded** in a form a local Jev (Open-Jev) can be trained on.
+7. **Caveman-style terse text** is used wherever only machines read it.
+8. **Worker starts stay confirmed:** Jev first, then the user (decision 2026-10-01). Starts are confirmed per
+   batch, not per worker.
+
+## 2. Principles
+1. **Code owns state, transitions and thresholds.** Jev picks among code-built candidates. LLMs only write.
+2. **"Done" is grounded outside the model:** exit codes, frozen tests, diffs. A worker saying "done" is never
+   proof. An LLM review counts only with evidence (file:line, a command and its result).
+3. **Every worker starts with a fresh context**, briefed by code. The job state holds the memory, not chat
+   history.
+4. **Every loop has a hard cap** and separate exits for done, blocked and budget.
+5. **The reviewer comes from another model family** than the writer (`family()` in `src/roles.ts`).
+6. **Effort scales with complexity.** Trivial tasks skip planning and review.
+7. **Without Jev:** rules decide routing and flow; the user decides permissions. Nothing is decided on a guess.
+8. **Start small.** A node, pipeline or plugin outside the MVP (§16) is switched on only when the journal and
+   the eval harness show the need.
+
+## 3. Roles of the sessions
+| Session | Runs on | Does | Never |
+|---|---|---|---|
+| dictator (main) | the session model the user chose (`facilitatorModel` in the config) | talks with the user, runs the planning session, shows checkpoints, writes the final summary | edit, write, patch, shell, web (denied by its rules); reading beyond short orientation (README, file list; a read cap in the evaluate hook) |
+| planner (subagent, role `plan`) | routed | writes spec, seams and tasks as JSON | code |
+| workers (roles explore … oracle) | routed per task | one task each, in a worktree when they write | start sub-agents (`subagent` denied) |
+| plugin code | — | state, agenda, gates (runs Verify commands itself), merges, watchdog, journal | decide anything a Jev floor or the user owns |
+
+## 4. Job state
+`ctx.storage` is the single source of truth. A JSON copy in `.jev-dictator/jobs/<id>.json` is write-only output,
+for humans and the flow pages.
+
+```jsonc
+{
+  "id": "job-2026-10-03-a1",
+  "goal": "Add CSV export to the report CLI, with tests and docs",
+  "phase": "planning_session",
+  "triage": { "complexity": 5, "mode": "plan", "confidence": 0.88 },
+  "designTree": { "...": "see §6.2" },
+  "decisions": [{ "id": "D1", "text": "flag --csv on report", "origin": "user" }],
+  "seams": ["report CLI invocation -> CSV file"],
+  "acceptance": [{ "id": "A1", "text": "`report --csv out.csv` writes all rows", "verify": "npm test -- csv" }],
+  "facts": { "verified": ["CLI entry src/cli.ts"], "toLookup": ["F1"], "guesses": [] },
+  "integrationBranch": "jev/job-2026-10-03-a1",
+  "budget": { "workersMax": 6, "workersUsed": 1, "parallelMax": 3, "turnsMax": 40, "replansMax": 2,
+              "requestsMax": 200, "tokensMax": 2000000, "costCap": null },
+  "counters": { "turns": 4, "stalls": 0, "replans": 0, "questionsAsked": 3 },
+  "tasks": [{
+    "id": "T1", "title": "CSV writer (tracer bullet: flag -> file)", "acceptance": ["A1"],
+    "dependsOn": [], "files": ["src/csv.ts", "test/csv.test.ts"], "wave": 1, "parent": null,
+    "status": "pending",
+    "classification": { "role": "code", "difficulty": 0.4, "risk": "internal", "hasTestOracle": true,
+                        "confidence": { "role": 0.93, "risk": 0.81 } },
+    "profile": { "model": "opencode-go/glm-5.3-flash", "budgetTier": "M",
+                 "tools": { "shell": "ask", "web": "deny", "symbol_nav": true, "papers": false },
+                 "skills": ["tdd", "typescript-patterns", "verification-before-completion"],
+                 "permissions": "normal", "outputStyle": "caveman" },
+    "pipeline": { "id": "P3", "caps": { "fix": 2, "review": 3 } },
+    "stages": [], "notes": ".jev-dictator/notes/job-2026-10-03-a1/T1.md",
+    "session": null, "worktree": null, "baseSha": null, "headSha": null,
+    "attempts": 0, "modelSwitches": 0, "signatures": []
+  }],
+  "lessons": []
+}
+```
+- **ready** (derived by code): pending, and every dependency passed.
+- **parallel-safe** (derived by code): disjoint `files`, read-only, or separate worktrees.
+- **On a hub restart**, `reconcile` maps running sessions back to tasks: wait on them, or mark them stale. A
+  planning session resumes at `designTree.current` and never asks again what is settled.
+
+## 5. State machines
+**Job:**
+```
+intake → triage → clarity ─┬─ clear ───────────────────────────────┐
+                           └─ open → planning_session → design_checkpoint
+design_checkpoint ─ confirm → plan → plan_gate (user) → execute
+execute ⇄ replan        execute → verify → integrate (user) → wrap → done
+any → paused | stopped | failed       ask_user from any state, back to the previous one
+```
+
+**Task:**
+```
+pending → ready → planned → running → gating → reviewing → passed → merged
+                               ▲          │fail        │fail
+                               └── fixing ◄┴───────────┘
+fixing → escalated → running | replan | cancelled
+any → blocked (NEEDS_CONTEXT / BLOCKED, waits for an answer) | cancelled
+```
+`planned` means classified, profiled, and with a pipeline chosen.
+
+## 6. Planning session
+### 6.1 When
+- **N1 triage** scores complexity (1–10) and the mode: solo, plan or backlog.
+- **N2 clarity** asks Jev, per design question, whether it is already settled by the job text, the code or
+  earlier decisions.
+- **Gate:**
+  - skip the session if every question with impact ≥ medium is settled and `user_must_decide` is below its
+    floor;
+  - solo jobs (complexity ≤ 3) skip it unless an open question only the user can answer exists.
+
+### 6.2 The design tree
+The tree is owned by code, after mattpocock `grilling`. The facilitator drafts it. Code validates it:
+- ids are unique,
+- there are no cycles,
+- it has at most 25 nodes,
+- every node has an impact.
+
+Jev checks `tree_covers_job` before the first question.
+
+```jsonc
+"designTree": {
+  "nodes": [
+    { "id": "D1", "question": "Where does the CSV export live: a CLI flag or a separate command?",
+      "kind": "decision", "dependsOn": [], "impact": "high", "status": "settled",
+      "answer": "flag --csv on report", "origin": "user",
+      "reasoning": "one entry point; scripts already call report", "settledAt": "turn 3" },
+    { "id": "F1", "question": "Does the project already have a CSV dependency?", "kind": "fact",
+      "status": "researching", "task": "explore-7" },
+    { "id": "D2", "question": "How are fields with commas quoted?", "kind": "decision",
+      "dependsOn": ["D1"], "impact": "medium", "status": "open" }
+  ],
+  "frontier": ["D2"],
+  "current": "D2",
+  "depth": "normal"
+}
+```
+- `kind`: decision (the user's) | fact (agents look it up) | assumption.
+- `status`: open | discussing | settled | assumed | out_of_scope | researching.
+- `origin`: user | proposed_and_confirmed | fact.
+- **frontier**: the open decisions whose prerequisites are all settled.
+
+### 6.3 One question per turn
+An answer can change the next question, so the session asks exactly one.
+
+1. **Facts are never asked of the user.** They go to explore and research workers in the background. Only the
+   questions that depend on a fact wait for it.
+2. **Jev N2b picks the next question** from the frontier. Fallback: highest impact, then most dependents.
+3. **The facilitator asks it openly:**
+   - context in 1–3 sentences,
+   - a **Concept** / **Why this matters** callout when a term is new,
+   - **no options and no recommendation**, because people take the suggestion.
+4. **The user answers in their own words.**
+5. **Jev N2c reads the answer**, all nouls in one call: settles_decision, opens_new_branches, user_stuck,
+   user_asks_for_options, contradicts_earlier_decision, out_of_scope, needs_prototype.
+   - **settles** → record the answer and the user's reasoning, with origin user.
+   - **new branches** → the facilitator adds nodes, and code re-validates the tree.
+   - **contradiction** → the facilitator names both statements and asks which holds.
+   - **unclear** → one follow-up that challenges assumptions, failure modes or trust boundaries.
+   - **stuck or asks** → only now: explain the concept, or show 2–3 approaches with their trade-offs. Then hand
+     the decision back ("which would you take, and why?"). Never pick one.
+   - **needs_prototype** → a throwaway prototype worker (mattpocock `prototype`, logic branch: a single HTML
+     state-machine demo) answers the question before the user decides.
+6. **The frontier is recomputed.**
+
+Limits:
+- Only nodes with impact ≥ medium are asked. Low-impact ones become `assumed` and show up at the checkpoint.
+- Question cap by depth: light 5, normal 12, frequent unlimited. At the cap: a checkpoint with "continue?".
+
+**Shortcuts** (exact phrases, before Jev):
+- "stop" / "enough"
+- "skip": the node becomes assumed and is shown at the checkpoint
+- "wait what" / "I don't get it": the facilitator re-pitches with the missing context
+- "go back to D1": reopens a node
+- "light" / "normal" / "frequent": sets the depth
+
+**Design checkpoint** (from vibe-wise): the user's decisions, apart from a **Proposed additions** table
+(detail / proposal / why). The question form offers Confirm or Discuss.
+
+**Output to the planner:**
+- the settled tree, as decisions with their origin;
+- the agreed test seams;
+- with GLOSSARY.md / docs/adr in the repo: mattpocock `domain-modeling` updates them as decisions settle.
+
+**Very large jobs** (complexity 9–10, later): a wayfinder map, i.e. a destination plus decision tickets, worked
+one per session across days.
+
+**Where it runs** (assumption, spike A1): the plugin sees each user turn in the dictator chat and steers the next
+one.
+- Fallback: a plugin-driven facilitator session, answered through the question form's free-text field. The
+  dictator chat then shows only the transcript.
+
+## 7. Plan and task split
+- **The planner subagent** writes the plan as JSON:
+  - acceptance points with Verify commands;
+  - tasks as vertical tracer-bullet slices (mattpocock `to-tickets`), each with its declared `files`, its
+    blocking edges and its acceptance points;
+  - wide refactors follow expand–contract.
+- **Code validates** the DAG, the files and the acceptance coverage. The user approves the plan.
+- **N4 splits every task until it is small:**
+  - difficulty ≤ small,
+  - it fits one fresh context,
+  - it stays verifiable on its own.
+
+  Stop rules:
+  - at most 2 split levels,
+  - no slice without its own acceptance point,
+  - no split whose only effect is coordination overhead.
+
+  The planner writes the subtasks (T3.1, T3.2); code re-validates.
+- **Why small:** the model is chosen per role × needs × **difficulty tier** (`tiers` in the config). Today the
+  three tiers are all flash models; local models and any stronger model slot in as tiers later.
+
+## 8. The task loop (tick)
+**When it runs:** on every event (a worker goes idle or fails, a gate finishes, the user answers, a timer fires,
+a `/dictator` command).
+
+**What it does:** reconcile → build the agenda → decide → act → journal.
+
+**Agenda** (deterministic priority order):
+1. answer a blocked worker
+2. handle a failed gate
+3. gate a finished worker
+4. review a gated task
+5. dispatch ready tasks
+6. replan when stalled
+7. verify
+8. ask the user
+9. wrap
+
+Ready tasks are ordered: in-progress parent first, then priority, then fewer dependencies, then id.
+
+**Decision:** Jev picks among the proposals. Below the floor, or without Jev, the first proposal wins.
+
+### 8.1 Classification and profile: one Jev request per task (N5 + N5b)
+Jev answers many questions in one call, "in parallel and in isolation against the same state". Adding questions
+barely changes the latency, and only input tokens are billed.
+
+One request per task asks:
+- role (choice of 10)
+- difficulty (score)
+- risk (choice: cosmetic / internal / public_api / data_security / destructive)
+- has_test_oracle, test_first_possible, approach_uncertain, bug_unknown_cause (one noul each)
+- `tool.<group>`, one noul each: shell, web, symbol_nav, structural_search, library_docs, papers, memory,
+  code_graph
+- `skill.<name>`: one noul per catalog skill allowed for the role
+- perm_profile (choice: strict / normal / trusted)
+- budget_tier (choice: S / M / L)
+- injection (noul)
+
+Rules for these requests:
+- **Multi-select** is one noul per option, because a choice picks exactly one. Code keeps the options above their
+  floor, with at most 3 optional skills.
+- **Isolated answers.** No question sees another's answer, so a request asks only independent things. Code
+  combines them:
+  - model = `chooseModel(role, needs, tier)`;
+  - pipeline = rules over the answers (§9).
+
+  A truly dependent decision is a second call.
+- **Consistency.** The role matrix is the upper bound. A contradicting combination (e.g. role explore with a high
+  `tool.shell`) is cut to the matrix and lowers the effective confidence.
+
+**The profile narrows the role matrix, never widens it:**
+- It is enforced in the permission `evaluate` hook through a session → task map.
+- Tools can be denied this way. MCP tools cannot be hidden from a worker, but they can be denied.
+
+**Rule-based additions** (no Jev):
+- verification-before-completion for every writer;
+- modern-python / typescript-patterns by project files;
+- shell-strategy instructions for code, test and debug;
+- caveman output style for every worker whose output only machines read.
+
+### 8.2 Brief in, report out (the idea of mattpocock `handoff`, done by code)
+- **Brief**, written by code, with pointers rather than copies:
+  - task, acceptance and seams (verbatim),
+  - the decisions that apply,
+  - the paths of earlier notes, the diff range, and lessons,
+  - the skills to load.
+
+  It uses plain instructions, no caveman.
+- **Report**, written by the worker in caveman style. Code parses it into the task state, and the full text goes
+  to `<project>/.jev-dictator/notes/<job>/<task>.md`. Fields:
+  - status: DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED,
+  - changed files, evidence, open issues, pointers.
+- **Where the notes live.** The notes directory sits inside the project, so no `external_directory` ask is
+  triggered, and the plugin adds it to `.git/info/exclude`.
+- **Handoff note.** On a fresh session after a failure, a model switch, an interrupt or a resumed job, code
+  builds a handoff note:
+  - what was read and done,
+  - what failed and why,
+  - where to continue,
+  - suggested skills.
+
+  Secrets are redacted.
+
+## 9. Pipelines: which loops a task passes (N6)
+| ID | Stages | Selected when | MVP |
+|---|---|---|---|
+| P0 direct | implement → gate (lint) | cosmetic, 1 file | flag |
+| P1 gated | implement → gate, fix ≤ 2 | small, clear, a test oracle exists | yes |
+| P2 PDCA | implement → gate → review (standards ∥ spec, other family), ≤ 3 rounds | risk ≥ public_api, or no oracle | yes |
+| P3 TDD | seams → red (frozen) → green → gate → review | test_first_possible and (bug or risk ≥ public_api) | yes |
+| P4 planned | explore → plan review → fan out P1–P3 | approach uncertain or > 5 files | flag |
+| P5 Ralph | a fresh worker per backlog item; the gate is the backpressure; cap items × 1.5; plan regenerated on drift | backlog mode with a test oracle | flag |
+| P6 debug | red-capable feedback loop → hypothesis → fix → regression test; 3 failed fixes → oracle | bug with unknown cause | flag |
+| P7 fan-out | worktrees → a pipeline each → merge train | disjoint files | flag (parallel readers from day one) |
+| P8 best-of-N | N families → tests decide | an escalation step, cheap to verify | flag |
+| P9 research | 1 / 2–4 / 5+ readers → synthesis → citation check | read-only | yes |
+
+- Low confidence on the pipeline means one tier up (P1 → P2).
+- Modifiers:
+  - `+visual` with needs.vision,
+  - `+oracle` with risk ≥ data_security,
+  - `+user_confirm` for destructive or external effects.
+- **The gate is run by the plugin** (`ctx.shell` in the worktree).
+- **Review** returns JSON. Every finding carries evidence and a confidence. Findings under 80, or without
+  evidence, are advisory and do not fail the task.
+
+## 10. Loops, stalls and the watchdog
+### 10.1 The loop watchdog (no worker loops forever)
+Background: Kimi 2.6/2.7 looped without reading its own answers and restarted its task. Gemini is known for
+endless read loops.
+- **Live, in code.** The plugin follows each worker session's events while it runs and interrupts it
+  (`ctx.session.interrupt`). The model never decides whether it loops.
+- **Limits:** steps, wall clock, tokens.
+  - Jev picks the budget tier (S / M / L) in N5.
+  - Code maps the tier to numbers under hard ceilings from the config.
+  - The eval harness calibrates the tiers from real durations.
+- **Signatures:**
+  - the same tool + args 3× in 10 calls;
+  - the same error twice;
+  - a read loop: an unchanged file (content hash) read a 3rd time with no edit in between, or no new file in
+    the last 8 reads;
+  - a restart: the opening action sequence repeats (prefix match), or near-duplicate assistant text appears;
+  - monologue: 3 replies without a tool call;
+  - A/B alternation 6×;
+  - repeated context-window errors.
+- **After an interrupt** the session is never resumed. N9 starts a fresh one on another family with a handoff
+  note.
+- **Assumption to check (spike A7):** glm, qwen and deepseek see their own tool output and reasoning through
+  OpenCode Go. Losing it is the usual cause of the restart pattern.
+
+### 10.2 Improvement loop and escalation (N8, N9)
+- **After each stage, N8 asks:** satisfied, in_loop, making_progress. Hash signatures override Jev:
+  - the same diff hash,
+  - the same review issues twice,
+  - the test count unchanged over 2 rounds.
+- **N9 ladder (MVP):**
+  1. fix in the same session, ≤ 2 rounds;
+  2. a fresh session on another family, with a handoff note;
+  3. the user, with a typed reason: spec_ambiguous / external_dependency / budget / conflicting_review.
+
+  Later: best-of-2, split, replan.
+- **Job level** (Magentic-One): the stall counter goes +1 on a stall and −1 on progress. At 3: replan (facts →
+  root cause → new plan), at most 2 times, then the user.
+- **Budgets:** workers, requests, tokens, and an optional cost cap. They are checked before every start.
+
+## 11. Parallelism and merging
+- **Waves** come from the DAG. A batch takes only parallel-safe ready tasks: at most 3 per job and 2 per model.
+- **Worker starts are confirmed per batch** ("start T1 and T3 in parallel?"): Jev first, the user when Jev is not
+  sure.
+- **The integration branch:**
+  - The job works on `jev/<job>` in its own worktree. The user's checkout is never touched.
+  - Writers get worktrees off the integration branch.
+  - The baseline gate runs once per job.
+- **Merge train:** one branch at a time; rebase → gate → merge; roll back on failure; a conflict goes back to its
+  owner once, then to the user.
+- **Integrate:** the user chooses merge / keep / discard. Nothing is ever pushed.
+
+## 12. Permissions (N13)
+- **Path of an ask:**
+  1. The profile narrows the request in the `evaluate` hook.
+  2. cc-safety-net `checkCommand` (hard rule #0).
+  3. The hard rules (external directory, `.env`, push, sudo, system installs).
+  4. Deleted-path facts from git.
+  5. Guards.
+  6. Jev: answer, needs_user, risk, path_relevance.
+  7. The floors per risk class × profile.
+- **Outcome:** allow / deny / the user, with Jev's guess shown in the question.
+- **Implemented today** in `src/decide.ts`, without the profile and without cc-safety-net.
+
+## 13. Stack
+Checked against OpenCode v2.0.18 on 2026-10-03. v2 does not load v1 plugins. v2-native plugins import
+`@opencode/plugin` and default-export `{ id, setup }`.
+
+| Item | Kind | Where | Status |
+|---|---|---|---|
+| loop watchdog, decision dataset | our code | every worker, every Jev question | must |
+| cc-safety-net | plugin (dual, `./opencode/v2`) | N13 hard rule #0 inside our hook (assumption: the import resolves from the symlinked plugin, spike A6; else its own plugin) | must |
+| shell-strategy | instructions file | system prompt of code, test, debug | must |
+| Serena | MCP | explore, code, debug, review (`tool.symbol_nav`) | must |
+| context7 | MCP | research, code, debug (`tool.library_docs`) | must |
+| ast-grep | MCP | explore, review, debug (`tool.structural_search`) | should |
+| papers | skill: arXiv / OpenAlex query URLs via webfetch | research | should; port `opencode-research-papers` (v1) only if needed |
+| Dynamic Context Pruning | plugin (dual) | long worker sessions | later |
+| opencode-agent-memory | plugin (v2) | project facts, lessons; until then our `ctx.storage` lessons | later |
+| opencode-plugin-otel | plugin (v2) | cost per task | later |
+| graphify | CLI / skill | explore, oracle | later |
+| plannotator | plugin (v1, port) | design checkpoint | later |
+| magic-context, opencode-mem, honcho | plugins | conflict with DCP or our agent transform; heavy or cloud | no |
+| mission-control, ensemble, swarm, worktree, workspace | plugins | v1, archived or competing orchestrators; ideas only | no |
+| phall1/opencode-workflows | plugin (v2) | reference for our v2 code | reference |
+
+### 13.1 Skills
+Workflow logic lives in the plugin. Workers only get leaf skills: how to do the work, never how to orchestrate.
+
+| Skill | Source | Role / stage | Loaded |
+|---|---|---|---|
+| deliberate | ours (vibe-wise `learn` + mattpocock `grilling`) | dictator, planning session | N2 finds open questions |
+| domain-modeling | mattpocock | dictator | the repo has GLOSSARY / ADR |
+| prototype (logic) | mattpocock | a plan worker | N2c `needs_prototype` |
+| to-spec, to-tickets | mattpocock, as planner rules | planner | plan mode |
+| research | mattpocock | research | research tasks |
+| tdd | mattpocock | code, test | P3 |
+| diagnosing-bugs | mattpocock | debug | P6 |
+| code-review (two axes) | mattpocock | review | P2–P4 |
+| verification-before-completion | obra/superpowers | every writer | rule |
+| receiving-code-review | obra/superpowers | code | fix rounds |
+| modern-python, typescript-patterns | opencodeskills.dev | code, test | rule, by project files |
+| git-commits, technical-writing | opencodeskills.dev | write | Jev |
+| playwright-e2e | opencodeskills.dev | visual, test | Jev |
+| differential-review, insecure-defaults | opencodeskills.dev | review | risk ≥ data_security |
+| writing-for-agents | mattpocock | us, while writing prompts and skills | dev time |
+
+- **Not used:**
+  - superpowers subagent-driven-development / executing-plans / dispatching-parallel-agents, and mattpocock
+    implement-spec: they make a worker orchestrate.
+  - brainstorming and grill-me: they recommend answers.
+  - handoff as is: code builds our handoff notes (§8.2).
+- **Vendoring:**
+  - Adapted copies go into `skills/`, with the source commit in their frontmatter and the licence checked per
+    source.
+  - The parts of mattpocock's skills that point to his issue-tracker setup are removed.
+  - `install.sh --skills` links them.
+- **Catalog:** from `ctx.skill`.
+
+### 13.2 Caveman: terse text where no human reads it
+| Channel | Style |
+|---|---|
+| worker reports, explore / research notes, review JSON, handoff notes | caveman: answer first, no ceremony, negations kept, payload verbatim |
+| briefs (instructions to a flash model) | plain and short; acceptance and seams verbatim |
+| Jev state | terse facts; caveman only after the eval harness shows no calibration loss |
+| planning session, checkpoints, permission questions, final summary | normal prose |
+| code, comments, docs, commits, `docs/research/` notes | normal (caveman's own exception) |
+
+It is applied as a short section in the worker's system prompt, by audience, not as a loaded skill.
+
+### 13.3 Research
+- **Tools:** the research role uses webfetch / websearch, the papers skill and context7. The `research` skill
+  makes it work against primary sources and cite every claim.
+- **P9:** 1, 2–4 or 5+ parallel readers by complexity, then a synthesis worker, then a citation check by code.
+- **Output:** `docs/research/<slug>.md` in prose, and a caveman summary in the job state.
+
+## 14. All Jev nodes
+| # | Node | Jev answers | Fallback |
+|---|---|---|---|
+| N1 | triage | complexity, mode, read_only | complexity ≤ 3 → solo |
+| N2 | clarity | settled per design question, user_must_decide, tree_covers_job | high-impact questions count as open |
+| N2b | next question | choice among the frontier | impact, then dependents |
+| N2c | answer reading | settles, new_branches, stuck, asks_options, contradicts, out_of_scope, needs_prototype | the facilitator asks whether it is settled |
+| N3 | plan gate | accept / revise / oracle | the user approves (flag) |
+| N4 | split | splittable, difficulty, fits_one_context | split when difficulty > small or > 3 files |
+| N5+N5b | classify + profile | §8.1 | role defaults, strict, tier M |
+| N6 | pipeline | choice among allowed pipelines | rules (§9) |
+| N7 | dispatch | choice among conflict-free batches | rule (flag) |
+| N8 | progress | satisfied, in_loop, making_progress | signatures, stall counter |
+| N9 | escalate | fix / switch_model / debug / split / replan / ask_user | ladder order |
+| N10 | review filter | blocking per finding | without evidence → advisory (flag) |
+| N11 | merge | merge_now | gate after each merge (flag) |
+| N12 | done | job_satisfied | the verification wave must pass (flag) |
+| N13 | permission | answer, needs_user, risk, path_relevance | the user |
+| G | guards | injection, harmful | the user |
+
+Floors live next to the question wordings in `src/catalog.ts`, and change only together with an eval run.
+
+## 15. Decision journal, eval harness, dataset for a local Jev
+- **Journal:**
+  - every Jev question, with its exact **state object** (structured JSON, stringified only for the API), the
+    question, the options and Jev's probabilities;
+  - every decision the user or a rule made without Jev.
+
+  Today's `decisions.jsonl` (`permission` and `routing` entries) grows into this.
+- **Labels**, joined later by job and task id:
+  - the user's own decisions (one-hot);
+  - the user overriding Jev;
+  - outcomes: allowed → task passed or reverted; a watchdog signature fired later → `in_loop` yes;
+  - planning-session answers.
+
+  Jev's own answers are soft distillation targets only, marked in `metadata.label_source`.
+- **Eval harness:** `npm run eval` replays the journal against changed floors or wordings and reports, per node:
+  - the automatic rate,
+  - the wrong rate,
+  - the calibration.
+- **Dataset:**
+  - `npm run export-dataset` writes Open-Jev JSONL (`../Open-Jev/docs/data.md`): `id, group_id, split, source,
+    state, question, kind, options, target, metadata`.
+  - Noul options are `["no", "yes"]`.
+  - `group_id` is the job or task, so no task leaks across splits.
+- **Transcripts** stay in OpenCode's session store. Tasks keep the session ids.
+- **Privacy:** redacted, local only, opt-out per project.
+
+## 16. MVP cut
+- **In:**
+  - state, FSMs, agenda and rules fallback; the integration branch;
+  - the planning session (N1, N2, N2b, N2c, shortcuts, question caps, checkpoint);
+  - the planner subagent and N4 split;
+  - N5+N5b as one request;
+  - N6 with P1 / P2 / P3 / P9;
+  - gates, two-axis review, N8 with signatures, the N9 ladder with 3 rungs;
+  - the loop watchdog;
+  - N13 with profile narrowing;
+  - batch-confirmed worker starts;
+  - the dictator read cap;
+  - journal, eval harness, dataset export.
+- **Behind flags until the journal shows the need:**
+  - P0, P4–P8 and best-of-N;
+  - parallel writers and the merge train (parallel readers from day one);
+  - N3's Jev part, N7, N10–N12 as Jev nodes;
+  - wayfinder maps, DCP, the memory plugin, otel, plannotator.
+
+## 17. Assumptions and spikes (Phase A)
+| # | Assumption | Fallback if it fails |
+|---|---|---|
+| A1 | The plugin sees each user turn in the dictator chat and can steer the next turn (chat hook, `session.synthetic` / system transform) | a plugin-driven facilitator session, answered through the question form |
+| A2 | `ctx.session.create/prompt/wait` starts a worker with agent, model and background | keep the built-in `subagent` tool; `tool.hook` rewrites agent, model and prompt to the agenda's choice (today's path) |
+| A3 | A custom tool can return output (the open Phase 0 schema question) | the planner's final message carries JSON that the plugin parses |
+| A4 | Event names for idle, error and question; `ctx.shell` runs inside a worktree; `ctx.session.interrupt` stops a worker | poll `session.get`; run gates through a worker of role test |
+| A5 | The `evaluate` hook fires for allow too, so the profile can tighten every effect | one variant agent per profile |
+| A6 | cc-safety-net imports from the symlinked plugin file | its own plugin, order of the hooks checked |
+| A7 | glm, qwen and deepseek see their own tool output and reasoning through OpenCode Go | that model is dropped from the routing table |
+
+## 18. Code layout (target)
+- **New:**
+  - `src/state.ts` (types, FSMs, reconcile)
+  - `src/agenda.ts`
+  - `src/catalog.ts` (wordings and floors)
+  - `src/nodes.ts`
+  - `src/session.ts` (planning session)
+  - `src/profile.ts`
+  - `src/pipelines.ts`
+  - `src/scheduler.ts`
+  - `src/gates.ts`
+  - `src/watchdog.ts`
+  - `src/brief.ts` (brief, report parser, handoff notes)
+  - `src/merge.ts`
+  - `src/eval.ts`
+  - `src/dataset.ts`
+  - `skills/`
+- **Reused:**
+  - `src/jev.ts`
+  - `src/decide.ts` (becomes N13)
+  - `src/journal.ts`
+  - `src/roles.ts` (the upper bound)
+  - `src/routing.ts` (`chooseModel` gets needs and tier)
+
+## Sources
+- **Orchestration:**
+  - Magentic-One ledgers (github.com/microsoft/autogen, `_magentic_one`)
+  - Task Master (github.com/eyaltoledano/claude-task-master)
+  - LLMCompiler (arxiv.org/abs/2312.04511)
+  - spec-kit (github.com/github/spec-kit)
+  - Kiro specs (kiro.dev/docs/specs)
+  - oh-my-openagent (github.com/code-yeongyu/oh-my-openagent)
+  - OpenHands stuck detector (github.com/OpenHands/software-agent-sdk)
+- **Loops:**
+  - Ralph (ghuntley.com/ralph)
+  - ralph-wiggum plugin (github.com/anthropics/claude-code/tree/main/plugins)
+  - opencode-squad (github.com/GFN-CIS/opencode-squad)
+  - anthropic.com/engineering: building-effective-agents, multi-agent-research-system,
+    effective-harnesses-for-long-running-agents
+  - Reflexion (arxiv.org/abs/2303.11366)
+  - AlphaCodium (qodo.ai)
+- **Planning and skills:**
+  - vibe-wise learn (github.com/nykooi1/vibe-wise)
+  - mattpocock skills (github.com/mattpocock/skills)
+  - obra/superpowers (github.com/obra/superpowers)
+  - caveman (github.com/JuliusBrussee/caveman)
+  - opencodeskills.dev
+- **Ecosystem:**
+  - awesome-opencode (github.com/awesome-opencode/awesome-opencode)
+  - cc-safety-net (github.com/kenryu42/claude-code-safety-net)
+  - DCP (github.com/Tarquinen/opencode-dynamic-context-pruning)
+  - opencode-agent-memory (github.com/joshuadavidthomas/opencode-agent-memory)
+  - opencode-workflows (github.com/phall1/opencode-plugins)
+  - Serena (github.com/oraios/serena), context7 (github.com/upstash/context7), ast-grep-mcp
+    (github.com/ast-grep/ast-grep-mcp)
+  - opencode-research-papers (github.com/saim-x/opencode-research-papers)
+- **Jev:**
+  - docs.typesafe.ai (several questions per request, answered in parallel and in isolation)
+  - Open-Jev data format (`../Open-Jev/docs/data.md`)

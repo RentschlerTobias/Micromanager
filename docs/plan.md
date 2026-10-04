@@ -1,6 +1,8 @@
 # jev-dictator: an OpenCode orchestrator driven by Jev
 
-Status (2026-10-01): Phase 0 (spike) and Phase 1 done; Phase 2 next.
+Status (2026-10-04): Phase 0 (spike) and Phase 1 done, and Jev on permission requests works (part of the old
+Phases 2 and 3). The design was reworked on 2026-10-03/04: [design.md](design.md) is now the design and
+[design.html](design.html) its flow chart. The next step is Phase A (spikes) below.
 
 ## Context
 An OpenCode plugin that orchestrates sub-agents the way oh-my-openagent (OmO) does: it splits a job into
@@ -109,6 +111,36 @@ github.com/GFN-CIS/opencode-squad · github.com/nigel-dev/opencode-mission-contr
 github.com/awesome-opencode/awesome-opencode · github.com/javargasm/opencode-graphify · openappa.com ·
 typesafe.ai/blog/introducing-system-one-models-and-jev · opencode.ai/docs/plugins · opencode.ai/docs/agents
 
+**Research 2026-10-03 (orchestration, loops, ecosystem).** It shaped design.md:
+- **State models:**
+  - Magentic-One: a task ledger with a fact sheet, and a progress ledger asking satisfied / in loop / progress.
+    A stall counter triggers a replan.
+  - Task Master: task fields, a complexity score with an expansion threshold, next-task order.
+  - LLMCompiler: greedy DAG dispatch.
+  - spec-kit / Kiro: `[P]` markers and dependency waves.
+  - OpenHands: stuck patterns.
+- **Loops:**
+  - Ralph: a fresh context per item, tests as backpressure, a hard cap.
+  - superpowers subagent-driven development: status codes, fix rounds, model escalation.
+  - opencode-squad PDCA: max 3 rounds.
+  - "Progress mirage": self-judged progress is unreliable, so ground "done" outside the model.
+  - Reviews from another model family.
+- **Ecosystem** (v2-checked, see design.md §13):
+  - Many awesome-opencode plugins are v1 and do not load in OpenCode v2.
+  - Usable as is: cc-safety-net, DCP, opencode-agent-memory, otel, shell-strategy, and MCP servers (Serena,
+    context7, ast-grep).
+  - opencode-research-papers is v1.
+- **Planning:**
+  - vibe-wise `learn`: the user reasons, the agent gives feedback.
+  - mattpocock `grilling`: a design tree with a frontier; facts are looked up by agents.
+  - mattpocock engineering skills: tdd, diagnosing-bugs, two-axis code-review, to-tickets.
+- **Jev:**
+  - Several questions per request, answered in parallel and in isolation; no multi-select type.
+  - Open-Jev's JSONL row format fits our journal, for training a local Jev.
+
+Sources are listed at the end of design.md.
+
+
 ## Phase 0 results (spike against a separate hub on :4097, opencode 2.0.18, 2026-10-01)
 - **v1 plugins (`export const X = async ({client}) => ({tool, event, …})`) are not loaded by v2.** v2 plugins
   are: `export default define({ id, setup: async (ctx) => … })` from `@opencode-ai/plugin/v2/promise`, placed in
@@ -139,97 +171,23 @@ typesafe.ai/blog/introducing-system-one-models-and-jev · opencode.ai/docs/plugi
 - Sessions on a second server share `~/.local/share/opencode/opencode.db` (the spike's sessions were deleted
   afterwards).
 
+## Design
+The architecture, the job state, the planning session, Jev's decision nodes, the pipelines, the loop watchdog,
+parallelism, the stack and the decision dataset are in [design.md](design.md). It replaces this file's earlier
+sections "Architecture", "Jev's decisions", "Loops and parallelism", "Guardrails", "Memory and code knowledge"
+and "Layout".
 
-## Architecture
-```
-user (OpenCode TUI) ──► dictator session (agent "dictator")
-                            │  tools: plan · spawn_worker · worker_status · worker_output · worker_cancel · review · recall
-                            ▼
-                     plugin "jev-dictator" (v2 plugin in the hub) ◄──► TypeSafe Jev (typed decisions)
-                            │  ctx.session.create / prompt / wait · ctx.worktree · ctx.event · ctx.storage · ctx.skill
-                            ▼
-                     worker sessions (agent per role, model per routing) ──► reviewer sessions (another family)
-                            │  questions / permission requests
-                            ▼
-                     Jev answers (confident, low risk) ── or ──► the user, as a question form in the TUI
-```
-- **Plugin** (`plugin/` in this repo, installed into `~/.config/opencode/plugins/` by `install.sh`):
-  - Holds the job and worker state in `ctx.storage`, so a restarted hub picks the job up again.
-  - A queue enforces concurrency.
-  - Routing reads `~/.config/opencode/jev-dictator.jsonc`.
-  - It listens to `ctx.event` for workers going idle, failing, asking questions or asking for permissions.
-- **Jev client** in the plugin (TypeScript):
-  - The request shape is the same as in oc-voice's `decision/systemone.py`: state + typed questions → typed
-    answers with probabilities.
-  - The API key comes from the keyring (`secret-tool lookup service typesafe key jev`) or
-    `JEV_API_KEY`; never in a config file.
-  - The state sent to Jev is redacted: no secrets, paths shortened, file contents cut.
-  - **Fallback without Jev** (no key, timeout, error): a cheap OpenCode model via `ctx.generate.text`
-    (deepseek-v4.1-flash) answers the same questions as JSON. Its answers carry no calibrated confidence, so
-    everything it decides goes to the user.
-
-## Jev's decisions
-
-### 1. Classification per sub-task (role → model → skills)
-The dictator agent writes the plan (1–6 sub-tasks with acceptance points and "depends on"). For each sub-task
-the plugin asks Jev in **one** request:
-- `role` (choice): explore, research, plan, code, test, visual, write, debug, review, oracle.
-- `difficulty` (score 0–1).
-- `needs` (yes/no each): web, vision, code_graph, memory, long_context, run_tests.
-- `risk` (yes/no): destructive or external effects.
-- `self_or_delegate`: does the dictator do a trivial step itself?
-- `skills`: one score per catalog skill.
-
-Below `confidence_floor` for the role, the sub-task gets the next safer role (code → plan, research → explore)
-or the dictator asks the user.
-
-**The model** comes from role × needs (× time of day):
-- Each role has a first model and one fallback.
-- vision → qwen3.8-flash (the only one with image input).
-- Mass and search work prefers deepseek-v4.1-flash at night (half price).
-- Difficulty does not pick a stronger model (there is none among the three). It raises the step limit and the
-  review depth: hard sub-tasks always get a reviewer and run tests.
-- After 2 failed reviews the worker switches to its fallback model, once.
-
-**The skills:**
-- The plugin keeps a catalog from `ctx.skill` (name, description, path): `~/.config/opencode/skills/` and the
-  project's `.opencode/skills/`.
-- A worker loads at most 3 skills above `skill_floor` at its start. A skill can be tied to roles (e.g.
-  `omarchy` only for code/debug, never for review).
-- The worker's own `skill` tool stays allowed; what it loads itself is logged.
-- With an empty catalog this step is skipped. When the dictator misses a skill for a recurring kind of task,
-  it suggests writing one.
-
-### 2. Questions and permissions (Jev answers or the user does)
-OpenCode's `question` form has fixed options, and permission requests are allow/deny. Both are typed choices,
-so they fit Jev exactly. When a worker asks:
-1. The plugin catches it (`ctx.event`: question / permission asked) before the user sees it.
-2. Jev gets the worker's sub-task, its acceptance points, the question with its options (or the permission
-   with tool, command, path) and the job's rules. It answers:
-   - `answer` (choice among the options)
-   - `risk` (score)
-   - `needs_user` (yes/no, e.g. matters of taste, money, anything outside the project)
-3. **Jev answers itself** only if all of these hold:
-   - its confidence is at or above the floor for the risk class,
-   - `needs_user` is below its floor,
-   - no hard rule applies.
-
-   The floors per risk class:
-
-   | risk class | examples | floor |
-   |---|---|---|
-   | read | read/grep outside the worktree, webfetch of docs | 0.80 |
-   | write | edit inside the worktree, run tests, install a dev dependency | 0.92 |
-   | always the user | delete outside the worktree, git push/merge, network writes, secrets, money, anything denied by the role | never automatic |
-
-4. Otherwise the plugin passes the question on unchanged; it shows in the TUI as usual. When it has a guess, it
-   adds Jev's suggestion and confidence to the question text ("Jev suggests 'yes' (0.71)").
-5. Every automatic answer is logged: job, worker, question, chosen option, confidence. `/dictator log` shows
-   them, so the user can see what Jev decided. A setting per job: "Jev answers nothing" (everything to the user).
-
-Worker starts use the same path: for now the user confirms each one (decision). The confirmation shows role,
-model, difficulty and skills ("Start worker 'write tests' as tester with glm-5.3-flash (medium), skills:
-pytest? yes/no"). Later the read-only roles can be confirmed by Jev.
+What is implemented (2026-10-04):
+- **The role matrix** as OpenCode agents via `ctx.agent.transform` (`src/roles.ts`, `src/agents.ts`).
+- **Model routing** on the dictator's `subagent` call (`src/routing.ts`, `src/hooks.ts`).
+- **The Jev client** (`src/jev.ts`):
+  - the key from `JEV_API_KEY` or the keyring,
+  - redaction,
+  - retries on 429/529.
+- **Permission decisions** (`src/decide.ts`): hard rules → deleted-path facts from git → Jev → floors per risk
+  class. Without Jev, everything goes to the user.
+- **The decision journal** (`src/journal.ts`, `permission` and `routing` entries) and the flow page
+  `docs/flow.html`.
 
 ## Role matrix
 Defined in the plugin via `ctx.agent.transform`, because v2 does not load agent markdown files. Rights are the
@@ -254,79 +212,63 @@ OpenCode permission per tool: allow / ask / deny. Write rights apply only inside
 - The reviewer answers in strict JSON `{verdict: PASS|FAIL, checks: [...], fixes: [...]}`.
 - Prompts come in two variants per model family (lesson from OmO).
 
-## Loops and parallelism
-- **Improvement loop** per worker:
-  1. The worker finishes.
-  2. The reviewer checks against the acceptance points and runs tests when there are any.
-  3. FAIL → the fixes go back into the same worker session.
-  4. At most 2 rounds, then the fallback model, then the user ("worker 'tests' failed 3 times: continue or
-     cancel?").
-  5. Results are merged only after PASS.
-- **Parallelism**:
-  - At most 3 workers at a time per job, at most 2 per model. Each worker times out after 30 min.
-  - Each job has a budget of worker starts (default 6).
-  - Independent sub-tasks of the DAG run in parallel.
-  - Workers that write run in their own git worktree (`ctx.worktree.create`). A merge needs PASS and the
-    user's yes; nothing is pushed.
-
-## Guardrails
-- Hard rules in `tool.hook` that Jev cannot override:
-  - Denied commands: `git push --force`, `rm -rf` outside the worktree, `curl | sh`, `sudo`.
-  - Writes only inside the worker's worktree. `.env*` and keyring files are never readable.
-- Jev's `risk` above its floor: the sub-task runs read-only (plan role) first, or the user is asked.
-- Untrusted content (web pages, tool output) is never followed as instructions. Jev screens a worker's question
-  for injection ("ignore your rules …") before it answers it; a hit goes to the user.
-- Kill switch: `/dictator stop` cancels every worker and empties the queue.
-- Later stage: OpenAPPA-like data-flow labels (content from a webfetch may not flow into bash arguments without
-  a check).
-
-## Memory and code knowledge (Jev decides when)
-- **graphify** (`opencode-graphify`): dictator, explorer and oracle may query it. It is built per repo on
-  request and rebuilt when stale.
-- **Memory**: a small store in the plugin (`ctx.storage`, per project): facts the user confirms and lessons from
-  failed reviews (the OmO "Kibitzer" idea), exposed as `recall` / `remember`. Opencode Mem or Honcho are tried
-  later, if this is not enough.
-- **When**: Jev's `needs` answers. With `code_graph` the worker gets "query graphify first", with `memory` a
-  `recall` runs before the sub-task, so the context stays small.
-- **Context**: Dynamic Context Pruning for long worker sessions, tried in Phase 4.
-
-## Layout
-- In the OpenCode TUI: the dictator session; workers are child sessions (OpenCode's child-session navigation).
-- `/dictator` command:
-  - `status`: job → workers with role, model, status (queued / working / review / PASS / FAIL)
-  - `log`: Jev's automatic answers
-  - `stop`
-- With herdr (optional): one tab per job, the dictator on the left, worker TUIs split on the right. Nothing in
-  the plugin depends on it.
-
 ## Phases (each its own small commits, English)
 0. **Spike**: done (results above).
-   - Open: the output schema for custom tools.
-   - Open: catching a worker's question/permission event before the user sees it (`ctx.permission.hook`,
-     question events).
-   - A small model bench (5 tasks × the three models) for the routing table.
-1. Repo skeleton (plugin, `install.sh`, bun tests) + role matrix via `ctx.agent.transform` + routing config +
-   the dictator with `spawn_worker` (sequential), worker starts confirmed by the user in the TUI.
-2. Jev client (keyring key, redaction, model fallback) + classification (role, difficulty, needs, risk,
-   skills) + skill catalog.
-3. Questions and permissions through Jev (floors per risk class, hard rules, log, suggestion text).
-4. Queue + concurrency + worktrees + status/output/cancel + timeouts + the `/dictator` command; Dynamic
-   Context Pruning.
-5. Reviewer + improvement loop + fallback model + the question to the user after 3 failures.
-6. graphify + memory store (`recall` / `remember`) + the hints Jev chooses.
-7. Guardrail hardening: path allowlist, command denylist, budgets, injection screening, kill switch.
+1. Repo skeleton, role matrix, routing config, the dictator agent, install script: done. Jev client and
+   permission decisions: done.
+
+From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
+- **A. Spikes A1–A7.** A1 (chat-turn hook + steering) first; then A2, A3, A4, A7, A6, A5. Each result picks the
+  design or its named fallback.
+- **B. Core:**
+  - state, FSMs, agenda and rules fallback;
+  - the integration branch;
+  - the planner subagent writing plan JSON, with the DAG validated;
+  - one task at a time on P1;
+  - journal with state objects, eval harness, dataset export.
+- **C. Planning session:**
+  - the `deliberate` skill;
+  - design tree validation, frontier, N2 / N2b / N2c, shortcuts, question caps, design checkpoint;
+  - the facilitator on the session model;
+  - the dictator read cap; the "answer yourself" line removed from the dictator prompt.
+- **D. Classification and profile:**
+  - N4 split until small;
+  - N5+N5b in one request;
+  - N6 with P1–P3 and P9;
+  - profile narrowing in the evaluate hook;
+  - skill vendoring + `install.sh --skills`;
+  - brief and report;
+  - caveman on outputs;
+  - difficulty tiers in the routing.
+- **E. Quality loop:**
+  - gates run by the plugin;
+  - two-axis review;
+  - improvement loop;
+  - **the loop watchdog**;
+  - N8 signatures;
+  - the N9 ladder with handoff notes;
+  - budgets including requests and tokens.
+- **F. Parallelism:** parallel readers; then parallel writers in worktrees, the merge train into the integration
+  branch, batch confirmation.
+- **G. Flagged pipelines:** P0, P4–P8, Ralph; DCP. Each is switched on only with eval evidence.
+- **H. Extras:** memory plugin, research extras (papers skill, context7, Serena, graphify).
+- **I. Visibility:** design.html / flow.html lanes from the journal, `/dictator status|log|stop`, otel, later
+  wayfinder maps.
 
 ## Verification
-- Phase 0: a spike against a separate hub. The dictator agent calls `spawn_worker`, and the worker session runs
-  on the routed model.
-- bun tests:
-  - routing (classification → role, model, skills)
-  - queue and concurrency
-  - Jev answering or passing on per risk class, with a fake Jev
-  - hard rules never overridden
-- Live per phase: a test job in a throwaway repo ("write a README and a test"). Check:
-  - two workers confirmed in the TUI,
-  - a worker question answered by Jev and one passed to the user,
-  - a review FAIL → fix → PASS,
-  - `/dictator stop`,
+- **Per phase: tests** with a fake Jev:
+  - the FSMs refuse illegal jumps;
+  - the agenda order;
+  - the rules fallback without Jev;
+  - the N5 combination and the role-matrix upper bound;
+  - the watchdog signatures on recorded event streams (including a read loop and a restart);
+  - hard rules never overridden;
+  - dataset rows validate against the Open-Jev schema.
+- **Live per phase:** a test job in a throwaway repo ("write a README and a test"). Check:
+  - a planning session that asks one question per turn and recommends nothing;
+  - a split into small tasks;
+  - a worker question answered by Jev and one passed to the user;
+  - a review FAIL → fix → PASS;
+  - a forced loop that the watchdog interrupts;
+  - `/dictator stop`;
   - no push, worktrees cleaned up.
