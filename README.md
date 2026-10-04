@@ -21,20 +21,38 @@ Restart the OpenCode server afterwards (plugins load at start). Requires opencod
 
 ## Use
 
-Pick the agent **dictator** in OpenCode and give it a job. It splits the job into sub-tasks and delegates each
-one to a role sub-agent (`dictator-explore`, `-research`, `-plan`, `-code`, `-test`, `-visual`, `-write`,
-`-debug`, `-review`, `-oracle`). Each role has its own rights (see `src/roles.ts`). OpenCode asks you before
-every delegation. The plugin sets the model per role (OpenCode Go: glm-5.3-flash, qwen3.8-flash,
-deepseek-v4.1-flash).
+Pick the agent **dictator** in OpenCode and give it a job. The dictator never works on the code itself:
+1. `dictator_plan`: a planner sub-agent reads the project and splits the job into small tasks with acceptance
+   points and checks; the plugin validates the plan, and the dictator shows it to you.
+2. `dictator_run`, after your go: the plugin runs one task at a time in a role sub-agent (`dictator-code`,
+   `-test`, `-write`, …, rights per role in `src/roles.ts`) on the job's own branch `jev/<job>`, in a worktree
+   under `.jev-dictator/worktrees/`. It runs the checks itself, gives a worker up to two fix rounds, and commits
+   each passed task. Your checkout is never touched; you merge or discard the branch.
+3. `dictator_status` shows a job at any time. Jobs and task notes live in `.jev-dictator/` (kept out of git
+   through `.git/info/exclude`).
 
-Optional overrides in `~/.config/opencode/jev-dictator.jsonc`:
+Models come from a registry of the OpenCode Go models and your local ones (llama-swap, iGPU, NPU), local
+first when they can do the task (`src/registry.ts`). Permission requests go to Jev first and to you when Jev is
+not sure (`src/decide.ts`). Some phases of the design are still to come: see docs/plan.md.
+
+Optional settings in `~/.config/opencode/jev-dictator.jsonc`:
 
 ```jsonc
 {
-  "models": { "code": ["opencode-go/deepseek-v4.1-flash", "opencode-go/glm-5.3-flash"] },
-  "vision": "opencode-go/qwen3.8-flash"
+  // presets per decision: "auto" (the decision model), "ask" (always you), "rule", or "fixed:<value>"
+  "decisions": {
+    "N5.model": "fixed:opencode-go/deepseek-v4.1-flash", // every worker on one model
+    "N13.shell": "fixed:allow"                            // shell commands of workers without asking
+  },
+  // models to add or change by id
+  "registry": [{ "id": "llamaswap/mimo", "disabled": true }]
 }
 ```
+
+Hard rules (pushes, `sudo`, system installs, deleting tracked files, …) always go to you, whatever a preset says.
+
+The local GLiNER decision server (`decider/`, see its README) answers guard questions on the CPU; the journal
+`~/.local/state/jev-dictator/decisions.jsonl` feeds `npm run eval` and `npm run export-dataset`.
 
 ## Flow chart
 

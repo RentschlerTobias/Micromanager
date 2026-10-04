@@ -172,3 +172,13 @@ test("reading shell commands use the read floor; anything that writes stays at t
   assert.equal(riskClass(req("shell", ["ls -la"])), "read")
   assert.equal(judge(decision("allow", 0.81, 0.1, 0.1), req("shell", ["ls -la", "cat calc.py"])).verdict, "allow")
 })
+
+test("a user's preset replaces Jev but never the hard rules or the deleted-path check", async () => {
+  const jev = fakeJev(decision("deny", 0.99, 0.0, 0.1))
+  assert.equal((await decide(jev, req("shell", ["npm test"]), undefined, undefined, "allow")).verdict, "allow")
+  assert.equal(jev.calls.length, 0, "Jev is not asked")
+  assert.equal((await decide(jev, req("shell", ["git push origin main"]), undefined, undefined, "allow")).verdict, "user")
+  const tracked = () => [{ path: "src/a.ts", exists: true, tracked: true, ignored: false }]
+  assert.equal((await decide(jev, req("shell", ["rm -rf src/a.ts"]), undefined, tracked, "allow")).verdict, "user")
+  assert.equal((await decide(jev, req("edit", ["src/a.ts"]), undefined, undefined, "user")).verdict, "user")
+})

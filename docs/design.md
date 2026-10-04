@@ -73,8 +73,10 @@ Decisions (user, 2026-10-03/04):
 | plugin code | — | state, agenda, gates (runs Verify commands itself), merges, watchdog, journal | decide anything a Jev floor or the user owns |
 
 ## 4. Job state
-`ctx.storage` is the single source of truth. A JSON copy in `.jev-dictator/jobs/<id>.json` is write-only output,
-for humans and the flow pages.
+The job file `<project>/.jev-dictator/jobs/<id>.json` is the single source of truth (Phase B, `src/store.ts`).
+It is written atomically, readable by the user and the flow pages, and kept out of git through
+`.git/info/exclude`. `ctx.storage` was not used: its API was not verified in Phase A, and a file needs no
+second copy.
 
 ```jsonc
 {
@@ -404,7 +406,9 @@ endless read loops.
 - **Worker starts are confirmed per batch** ("start T1 and T3 in parallel?"): Jev first, the user when Jev is not
   sure.
 - **The integration branch:**
-  - The job works on `jev/<job>` in its own worktree. The user's checkout is never touched.
+  - The job works on the branch `jev/<job>` in its own worktree at `<project>/.jev-dictator/worktrees/<job>`
+    (inside the project, so workers trigger no external_directory ask). The user's checkout is never touched;
+    the worktree starts from the last commit, so uncommitted changes of the user are not part of the job.
   - Writers get worktrees off the integration branch.
   - The baseline gate runs once per job.
 - **Merge train:** one branch at a time; rebase → gate → merge; roll back on failure; a conflict goes back to its
@@ -440,7 +444,7 @@ Checked against OpenCode v2.0.18 on 2026-10-03. v2 does not load v1 plugins. v2-
 | ast-grep | MCP | explore, review, debug (`tool.structural_search`) | should |
 | papers | skill: arXiv / OpenAlex query URLs via webfetch | research | should; port `opencode-research-papers` (v1) only if needed |
 | Dynamic Context Pruning | plugin (dual) | long worker sessions | later |
-| opencode-agent-memory | plugin (v2) | project facts, lessons; until then our `ctx.storage` lessons | later |
+| opencode-agent-memory | plugin (v2) | project facts, lessons; until then the lessons in the job files | later |
 | opencode-plugin-otel | plugin (v2) | cost per task | later |
 | graphify | CLI / skill | explore, oracle | later |
 | plannotator | plugin (v1, port) | design checkpoint | later |

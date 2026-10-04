@@ -3,7 +3,7 @@
 Status (2026-10-04): Phase 0 (spike) and Phase 1 done, and Jev on permission requests works (part of the old
 Phases 2 and 3). The design was reworked on 2026-10-03/04: [design.md](design.md) is now the design and
 [design.html](design.html) its flow chart. Extended the same day by local vs cloud routing, censorship guards, decision backends (cloud Jev or
-local GLiNER) and user overrides (design.md §19–§22). Phase A (spikes) is done (results below); the next step is Phase B.
+local GLiNER) and user overrides (design.md §19–§22). Phase A (spikes) and Phase B (core) are done (results below); the next step is Phase C.
 
 ## Context
 An OpenCode plugin that orchestrates sub-agents the way oh-my-openagent (OmO) does: it splits a job into
@@ -338,7 +338,7 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   (chat-turn hook + steering) first; then A2, A3, A4, A7, A8 (local availability),
   A9 (GLiNER decision server), A10 (refusal detection), A6, A5. Each result picks the
   design or its named fallback.
-- **B. Core:**
+- **B. Core: done 2026-10-04** (results below the phase list):
   - state, FSMs, agenda and rules fallback;
   - the integration branch;
   - the planner subagent writing plan JSON, with the DAG validated;
@@ -380,6 +380,40 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   promotion gate per node, with demotion on rising overrides.
 - **I. Visibility:** design.html / flow.html lanes from the journal, `/dictator status|log|stop`, otel, later
   wayfinder maps.
+
+### Phase B results (2026-10-04)
+**What exists now:**
+- `src/state.ts`, `plan.ts`, `agenda.ts`: job and task FSMs, plan parsing and validation, agenda.
+- `src/store.ts`: job files.
+- `src/policy.ts`: overrides and chat shortcuts.
+- `src/registry.ts`: models, availability, router.
+- `src/backends.ts`: decision backends, shadow mode.
+- `src/dataset.ts`, `eval.ts`, `cli.ts`: the training rows and the eval harness.
+- `src/integration.ts`, `brief.ts`, `runner.ts`, `tools.ts`: the job branch, briefs and reports, the P1 runner,
+  the dictator tools.
+- `decider/`: the GLiNER server.
+- Tests: 63 TypeScript tests, 5 Python tests.
+
+**Live, in a throwaway project** (private standalone server with the real plugin, cloud model by preset):
+- The dictator called `dictator_plan`. The planner made 2 tasks with 3 checks.
+- `dictator_run` ran both on `jev/<job>` in `.jev-dictator/worktrees/<job>`. Both checks passed on the first
+  try, and each task became a commit.
+- The user's checkout stayed untouched, and `npm test` in the worktree passed.
+
+**Findings:**
+- **Permission prompts of plugin-started workers are not answered in headless `opencode run`.** `--auto` only
+  covers the run's own session. A worker whose shell command Jev was unsure about (0.17) waited until it was
+  stopped.
+  - The fix used: permission presets per action (`"N13.shell": "fixed:allow"`). A preset applies after the hard
+    rules and the deleted-path check and replaces Jev.
+  - Still to check in Phase C: how these prompts reach the user in the TUI.
+- **Job state lives in files, not in `ctx.storage`.** `ctx.storage` was not verified; the file is readable and
+  needs no copy.
+- **The integration worktree lives inside the project** (`.jev-dictator/worktrees/`), so workers trigger no
+  `external_directory` ask. It starts from the last commit, so the user's uncommitted changes are not part of a
+  job.
+- **Planners write verify commands** that the plugin runs with `sh -c` at low priority. The planner chose sound
+  checks (an import check, `npm test`).
 
 ## Verification
 - **Per phase: tests** with a fake Jev:

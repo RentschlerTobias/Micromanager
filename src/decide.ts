@@ -221,11 +221,14 @@ export function judge(decision: Decision, request: PermissionRequest, floors: Fl
   return { ...base, verdict: answer.choice === "allow" ? "allow" : "deny", reason: `Jev: ${answer.choice} (${cls})` }
 }
 
+// preset: the user's policy for this kind of request ("N13.shell": "fixed:allow", design.md §22). It applies after
+// the hard rules and the deleted-path check, which it can never switch off, and replaces Jev.
 export async function decide(
   jev: Jev | undefined,
   request: PermissionRequest,
   floors: Floors = DEFAULT_FLOORS,
   inspect: Inspect = inspectPaths,
+  preset?: "allow" | "deny" | "user",
 ): Promise<Outcome> {
   const rule = hardRule(request)
   if (rule) return { verdict: "user", reason: `always the user: ${rule}` }
@@ -241,6 +244,7 @@ export async function decide(
       return { verdict: "user", reason: `deletes ${kept.path} (${why})` }
     }
   }
+  if (preset) return { verdict: preset, reason: `preset by the user's policy (${preset})` }
   if (!jev) return { verdict: "user", reason: "no Jev key" }
   try {
     const state = facts.length > 0 ? `${describe(request)}\n${relevanceFacts(facts)}` : describe(request)

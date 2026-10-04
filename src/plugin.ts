@@ -10,7 +10,12 @@ import { decide, type PermissionRequest } from "./decide.ts"
 import { routeSubagentCall, type ToolCall } from "./hooks.ts"
 import { Jev, apiKey } from "./jev.ts"
 import { record } from "./journal.ts"
+import { resolvePolicy } from "./policy.ts"
+import { probe } from "./registry.ts"
 import { DICTATOR, ROLES } from "./roles.ts"
+import { Runner, summary, type SessionApi } from "./runner.ts"
+import { listJobs, loadJob } from "./store.ts"
+import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 
 // What the permission hook "evaluate" gets (opencode 2.0.18): the planned effect can be changed in place.
 interface Evaluation {
@@ -23,7 +28,11 @@ interface Evaluation {
 
 interface Context {
   agent: { transform(callback: (draft: AgentDraft) => void): Promise<unknown> }
-  tool: { hook(name: string, callback: (call: ToolCall) => void): Promise<unknown> }
+  tool: {
+    hook(name: string, callback: (call: ToolCall) => void): Promise<unknown>
+    transform(callback: (draft: ToolDraft) => void): Promise<unknown>
+  }
+  session: SessionApi & { hook(name: string, callback: (input: { agent?: string; tools?: Record<string, unknown> }) => void): Promise<unknown> }
   permission: { hook(name: string, callback: (evaluation: Evaluation) => Promise<void> | void): Promise<unknown> }
   location?: { directory?: string }
   app?: { log?(entry: { level: string; message: string }): unknown }
@@ -44,7 +53,7 @@ export default {
   id: "jev-dictator",
   setup: async (ctx: Context): Promise<void> => {
     const log = logger(ctx)
-    const { routing, floors, error } = loadSettings()
+    const { routing, floors, decisions, registry, error } = loadSettings()
     if (error) log("warn", `config ignored, defaults used: ${error}`)
 
     await ctx.agent.transform((draft) => {
@@ -59,8 +68,10 @@ export default {
     const jev = key ? new Jev(key) : undefined
     if (!jev) log("warn", "no Jev key (JEV_API_KEY or the keyring entry service=typesafe key=jev): every question goes to the user")
 
-    // The sub-task each agent works on, for Jev's context: the dictator's last delegation per role agent.
+    // The sub-task each agent works on, for Jev's context: the dictator's last delegation per role agent, and
+    // the task of each worker session the runner started.
     const tasks = new Map<string, string>()
+    const workerTasks = new Map<string, string>()
 
     await ctx.tool.hook("execute.before", (call) => {
       const routed = routeSubagentCall(call, routing)
@@ -95,12 +106,56 @@ export default {
         directory: ctx.location?.directory,
         task: evaluation.agent === DICTATOR.agent && evaluation.action === "subagent"
           ? tasks.get(evaluation.resources[0] ?? "")
-          : tasks.get(evaluation.agent),
+          : workerTasks.get(evaluation.sessionID) ?? tasks.get(evaluation.agent),
       }
-      const outcome = await decide(jev, request, floors)
+      // "N13.<action>" or "N13" in the config: fixed:allow / fixed:deny, or ask for "always the user".
+      const policy = resolvePolicy(`N13.${evaluation.action}`, { global: decisions }).policy
+      const preset = policy.kind === "ask" ? "user" : policy.kind === "fixed" && (policy.value === "allow" || policy.value === "deny") ? policy.value : undefined
+      const outcome = await decide(jev, request, floors, undefined, preset)
       if (outcome.verdict !== "user") evaluation.effect = outcome.verdict
       record({ kind: "permission", ...request, task: request.task?.slice(0, 500), ...outcome })
       log("info", `${evaluation.action} ${evaluation.resources.join(" | ").slice(0, 120)}: ${outcome.verdict} (${outcome.reason})`)
+    })
+
+    // Jobs: the dictator plans and runs them through its tools; the plugin drives the loop (Phase B).
+    const project = ctx.location?.directory
+    if (!project) {
+      log("warn", "no project directory: the dictator tools are not installed")
+      return
+    }
+    const runner = (parentID?: string) =>
+      new Runner({
+        session: ctx.session,
+        project,
+        registry,
+        policies: { global: decisions },
+        availability: () => probe(registry),
+        progress: (text) => log("info", text),
+        parentID,
+        onWorker: (sessionID, task) => workerTasks.set(sessionID, task),
+      })
+    await ctx.tool.transform((draft) => {
+      try {
+        installTools(draft, {
+          plan: async (goal, tctx) => {
+            if (!goal.trim()) return "dictator_plan needs the goal in the user's words."
+            const { job, errors } = await runner(tctx.sessionID).plan(goal)
+            return errors ? `The planner could not produce a valid plan (job ${job.id}):\n- ${errors.join("\n- ")}` : planText(job)
+          },
+          run: async (id, tctx) => summary(await runner(tctx.sessionID).run(id.trim())),
+          status: async (id) => {
+            const job = id.trim() ? loadJob(project, id.trim()) : listJobs(project)[0]
+            return job ? `${summary(job)}\n\n${planText(job)}` : "no job yet"
+          },
+        })
+      } catch (err) {
+        log("error", `dictator tools not installed: ${String(err)}`)
+      }
+    })
+    // The tools exist for every agent; only the dictator sees them.
+    await ctx.session.hook("context", (input) => {
+      if (input.agent === DICTATOR.agent || !input.tools) return
+      for (const id of TOOL_IDS) delete input.tools[id]
     })
   },
 }

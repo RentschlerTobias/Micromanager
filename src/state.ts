@@ -69,7 +69,7 @@ const TASK_ALLOWED: Record<TaskStatus, readonly TaskStatus[]> = {
   ready: ["planned", "pending"],
   planned: ["running"],
   running: ["gating", "escalated"],
-  gating: ["reviewing", "passed", "fixing"],
+  gating: ["reviewing", "passed", "fixing", "escalated"],
   reviewing: ["passed", "fixing"],
   fixing: ["running", "escalated"],
   escalated: ["running", "pending"],
