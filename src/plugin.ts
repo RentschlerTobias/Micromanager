@@ -17,6 +17,7 @@ import { DICTATOR, ROLES } from "./roles.ts"
 import { recentFailure, Runner, summary, type SessionApi } from "./runner.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
 import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
+import { Watchdog, type Signal } from "./watchdog.ts"
 
 // What the permission hook "evaluate" gets (opencode 2.0.18): the planned effect can be changed in place.
 interface Evaluation {
@@ -37,6 +38,7 @@ const READS = new Set(["read", "glob", "grep", "list"])
 interface SessionHookInput {
   sessionID?: string
   agent?: string
+  messages?: unknown
   prompt?: { text?: string }
   system?: { type: string; text: string }[]
   tools?: Record<string, unknown>
@@ -151,6 +153,18 @@ export default {
       return
     }
     const decider = new Decider(DEFAULT_BACKENDS, makeAskers(DEFAULT_BACKENDS, key))
+    // The loop watchdog judges the planner and worker sessions the runner starts; a signal interrupts the session
+    // and the runner reads why (design.md §10.1).
+    const watchdog = new Watchdog()
+    const stops = new Map<string, Signal>()
+    const stop = (sessionID: string, signal: Signal) => {
+      if (stops.has(sessionID)) return
+      stops.set(sessionID, signal)
+      watchdog.unwatch(sessionID)
+      record({ kind: "watchdog", sessionID, signal: signal.kind, detail: signal.detail })
+      log("warn", `watchdog stopped ${sessionID}: ${signal.detail}`)
+      ctx.session.interrupt({ sessionID }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
+    }
     const runner = (parentID?: string) =>
       new Runner({
         session: ctx.session,
@@ -162,7 +176,14 @@ export default {
         progress: (text) => log("info", text),
         parentID,
         onWorker: (sessionID, task) => workerTasks.set(sessionID, task),
+        watch: (sessionID, maxSteps) => watchdog.watch(sessionID, { maxSteps }),
+        stopped: (sessionID) => stops.get(sessionID),
       })
+    await ctx.tool.hook("execute.after", (call) => {
+      if (!call.sessionID || !watchdog.watching(call.sessionID)) return
+      const signal = watchdog.onTool(call.sessionID, call.tool, call.input)
+      if (signal) stop(call.sessionID, signal)
+    })
     // The dictator's newest job in a session, for the user's turns (planning session, gate answer, pins).
     const sessionJob = (sessionID: string) => listJobs(project).find((j) => j.facilitator === sessionID)
     const JOB_ID = /^job-\d{8}-\d{6}-[0-9a-f]{1,4}$/
@@ -231,6 +252,10 @@ export default {
       // The tools exist for every agent; only the dictator sees them.
       if (input.agent !== DICTATOR.agent) {
         if (input.tools) for (const id of TOOL_IDS) delete input.tools[id]
+        if (input.sessionID && watchdog.watching(input.sessionID)) {
+          const signal = watchdog.onTurn(input.sessionID, input.messages)
+          if (signal) stop(input.sessionID, signal)
+        }
         return
       }
       const note = input.sessionID ? steering.get(input.sessionID) : undefined

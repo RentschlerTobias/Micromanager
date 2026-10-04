@@ -12,16 +12,17 @@ import { brief, fixPrompt, lastAssistantText, parseReport, taskAcceptance, usage
 import { changedFiles, commitTask, exec as defaultExec, prepareIntegration, runGate, type Exec } from "./integration.ts"
 import { record } from "./journal.ts"
 import { HEADER } from "./hooks.ts"
-import { applyPlan, parsePlan, PLAN_FORMAT } from "./plan.ts"
+import { applyPlan, parsePlan, PLAN_FORMAT, type Parsed } from "./plan.ts"
 import { resolvePolicy, type Policies } from "./policy.ts"
 import { route, type Availability, type ModelEntry } from "./registry.ts"
-import { roleById } from "./roles.ts"
+import { family, roleById } from "./roles.ts"
 import {
   addNodes, applyAnswer, applyShortcut, decisionsText, frontier, instruction, matchSessionShortcut, nextStep, parseTree, settle,
   type AnswerReading, type DesignTree, type Step,
 } from "./session.ts"
 import { moveJob, moveTask, newJob, promoteReady, stage, type Job, type Task } from "./state.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
+import { handoffNote, TIER_STEPS, type Signal } from "./watchdog.ts"
 
 // The part of ctx.session the runner needs (argument shapes as seen in Phase A).
 export interface SessionApi {
@@ -47,6 +48,8 @@ export interface RunnerDeps {
   readonly fixRounds?: number
   readonly planRetries?: number
   readonly decider?: Decider // the decision model per node; without one, the rules decide
+  readonly watch?: (sessionID: string, maxSteps: number) => void // the loop watchdog starts judging a session
+  readonly stopped?: (sessionID: string) => Signal | undefined // why the watchdog stopped a session, if it did
   readonly unchecked?: Unchecked // what G0 does when nothing local could check a job
 }
 
@@ -85,7 +88,7 @@ export class Runner {
   }
 
   // The model for a role: the user's preset if any, else the router over the registry, else the role's cloud model.
-  async #model(job: Job, role: string, difficulty: number, task?: string): Promise<{ id: string; reason: string }> {
+  async #model(job: Job, role: string, difficulty: number, task?: string, avoidFamilies?: string[]): Promise<{ id: string; reason: string }> {
     const preset = resolvePolicy("N5.model", this.#policies(job, task))
     const presetModel = preset.policy.kind === "fixed" ? this.#d.registry.find((m) => m.id === (preset.policy as { value: string }).value) : undefined
     const presetBreaksGate = job.flags?.localOnly && (presetModel?.location === "cloud" || (job.flags.uncensored && presetModel?.censored))
@@ -95,13 +98,13 @@ export class Runner {
     }
     if (presetBreaksGate) this.#say(`preset ${(preset.policy as { value: string }).value} ignored: the job must stay local${job.flags?.uncensored ? " and uncensored" : ""}`)
     const availability = await this.#d.availability?.().catch(() => undefined)
-    const r = route(this.#d.registry, { role, difficulty, sensitive: job.flags?.localOnly, refusalLikely: job.flags?.uncensored }, availability)
+    const r = route(this.#d.registry, { role, difficulty, sensitive: job.flags?.localOnly, refusalLikely: job.flags?.uncensored, avoidFamilies }, availability)
     const id = r.model ?? roleById(role)?.models[0] ?? this.#d.registry[0]!.id
     this.#journal({ kind: "routing", job: job.id, task, role, model: id, reason: r.model ? r.reason : `fallback: ${r.reason}`, ranked: r.ranked.slice(0, 5) })
     return { id, reason: r.model ? r.reason : "fallback" }
   }
 
-  async #ask(sessionID: string, text: string): Promise<{ text: string; timedOut: boolean }> {
+  async #ask(sessionID: string, text: string): Promise<{ text: string; timedOut: boolean; stopped?: Signal }> {
     await this.#d.session.prompt({ sessionID, text })
     const timeoutMs = this.#d.workerTimeoutMs ?? 20 * 60_000
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -111,7 +114,7 @@ export class Runner {
     ])
     clearTimeout(timer)
     if (timedOut) await this.#d.session.interrupt({ sessionID }).catch(() => undefined)
-    return { text: lastAssistantText(await this.#d.session.context({ sessionID })), timedOut }
+    return { text: lastAssistantText(await this.#d.session.context({ sessionID })), timedOut, stopped: this.#d.stopped?.(sessionID) }
   }
 
   // Goal -> validated plan, waiting at the plan gate for the user's go.
@@ -128,19 +131,19 @@ export class Runner {
     saveJob(this.#d.project, job)
     const model = await this.#model(job, "plan", 0.7)
     this.#say(`planning with ${model.id} (${model.reason})`)
-    const s = await this.#d.session.create({
-      ...(this.#d.parentID ? { parentID: this.#d.parentID } : {}),
-      title: `plan ${job.id}`,
-      agent: roleById("plan")!.agent,
-      model: toModel(model.id),
-      location: { directory: this.#d.project },
-    })
+    let s = await this.#plannerSession(job, model.id)
     let answer = await this.#ask(s.id, plannerPrompt(job))
-    let parsed = parsePlan(answer.text)
-    for (let retry = 0; parsed.errors && !answer.timedOut && retry < (this.#d.planRetries ?? 2); retry++) {
+    if (answer.stopped) {
+      // never resume a stopped session: one fresh planner with a handoff note
+      this.#say(`the planner was stopped by the loop watchdog (${answer.stopped.detail}); one fresh try`)
+      s = await this.#plannerSession(job, model.id)
+      answer = await this.#ask(s.id, `${plannerPrompt(job)}\n\n${handoffNote(answer.stopped, [])}`)
+    }
+    let parsed: Parsed = answer.stopped ? { errors: [`the planner was stopped by the loop watchdog: ${answer.stopped.detail}`] } : parsePlan(answer.text)
+    for (let retry = 0; parsed.errors && !answer.timedOut && !answer.stopped && retry < (this.#d.planRetries ?? 2); retry++) {
       this.#say(`the plan has ${parsed.errors.length} problem(s), asking again`)
       answer = await this.#ask(s.id, `${HEADER} The plan has these problems:\n- ${parsed.errors.join("\n- ")}\n\nAnswer again with the corrected JSON only.`)
-      parsed = parsePlan(answer.text)
+      parsed = answer.stopped ? { errors: [`the planner was stopped by the loop watchdog: ${answer.stopped.detail}`] } : parsePlan(answer.text)
     }
     if (!parsed.plan) {
       job.lessons.push(`planning failed: ${answer.timedOut ? "the planner timed out" : (parsed.errors ?? []).join("; ")}`)
@@ -371,24 +374,29 @@ export class Runner {
     if (job.budget.workersUsed >= job.budget.workersMax) return this.#stop(job, `worker budget of ${job.budget.workersMax} used up`)
     const worktree = job.integrationWorktree!
     moveTask(task, "planned")
-    const model = await this.#model(job, task.role, 0.5, task.id)
+    let model = await this.#model(job, task.role, 0.5, task.id)
     task.model = model.id
     moveTask(task, "running")
     job.budget.workersUsed++
     this.#say(`${task.id} ${task.title}: ${task.role} on ${model.id} (${model.reason})`)
-    const s = await this.#d.session.create({
-      ...(this.#d.parentID ? { parentID: this.#d.parentID } : {}),
-      title: `${task.id} ${task.title}`,
-      agent: roleById(task.role)?.agent ?? "dictator-code",
-      model: toModel(model.id),
-      location: { directory: worktree },
-    })
-    task.session = s.id
-    this.#d.onWorker?.(s.id, `${task.id} ${task.title}: ${task.description}`)
-    saveJob(this.#d.project, job)
+    let s = await this.#workerSession(job, task, model.id)
     let answer = await this.#ask(s.id, brief(job, task, model.id, worktree))
     const checks = [...new Set(taskAcceptance(job, task).map((a) => a.verify).filter((v): v is string => Boolean(v)))]
+    let fresh = false
     for (;;) {
+      if (answer.stopped) {
+        // The watchdog stopped it: never resume that session. One fresh session, on another model family when no
+        // preset pins the model, told what was already done; a second stop goes to the user.
+        stage(task, "implement", "fail", `loop watchdog: ${answer.stopped.detail}`)
+        if (fresh) return this.#escalate(job, task, `stopped twice by the loop watchdog: ${answer.stopped.detail}`)
+        fresh = true
+        model = await this.#model(job, task.role, 0.5, task.id, [family(model.id)])
+        task.model = model.id
+        this.#say(`${task.id}: stopped by the loop watchdog (${answer.stopped.detail}), fresh session on ${model.id}`)
+        s = await this.#workerSession(job, task, model.id)
+        answer = await this.#ask(s.id, `${brief(job, task, model.id, worktree)}\n\n${handoffNote(answer.stopped, await changedFiles(worktree, this.#exec))}`)
+        continue
+      }
       const report = parseReport(answer.text)
       stage(task, "implement", answer.timedOut ? "fail" : "pass", answer.timedOut ? "timed out" : `status ${report.status ?? "missing"}`)
       if (answer.timedOut) return this.#escalate(job, task, "the worker timed out")
@@ -419,6 +427,33 @@ export class Runner {
       moveTask(task, "running")
       answer = await this.#ask(s.id, fixPrompt(failed))
     }
+  }
+
+  async #plannerSession(job: Job, model: string): Promise<{ id: string }> {
+    const s = await this.#d.session.create({
+      ...(this.#d.parentID ? { parentID: this.#d.parentID } : {}),
+      title: `plan ${job.id}`,
+      agent: roleById("plan")!.agent,
+      model: toModel(model),
+      location: { directory: this.#d.project },
+    })
+    this.#d.watch?.(s.id, 40)
+    return s
+  }
+
+  async #workerSession(job: Job, task: Task, model: string): Promise<{ id: string }> {
+    const s = await this.#d.session.create({
+      ...(this.#d.parentID ? { parentID: this.#d.parentID } : {}),
+      title: `${task.id} ${task.title}`,
+      agent: roleById(task.role)?.agent ?? "dictator-code",
+      model: toModel(model),
+      location: { directory: job.integrationWorktree! },
+    })
+    task.session = s.id
+    this.#d.onWorker?.(s.id, `${task.id} ${task.title}: ${task.description}`)
+    this.#d.watch?.(s.id, TIER_STEPS.M)
+    saveJob(this.#d.project, job)
+    return s
   }
 
   // Phase B's escalation ladder ends at the user; other families and best-of-N come in Phase E.

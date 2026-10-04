@@ -231,3 +231,38 @@ test("a goal that failed to plan a short while ago is reported, not started agai
   assert.equal(recentFailure(job, "something else", now), undefined)
   assert.equal(recentFailure(job, "add an add function", now + 60 * 60_000), undefined)
 })
+
+// --- the loop watchdog --------------------------------------------------------------------------------------
+
+test("a worker stopped by the watchdog gets one fresh session with a handoff note, a second stop escalates", async () => {
+  const project = repo()
+  const prompts: string[] = []
+  const fake = fakeSession({ worker: (dir, prompt) => { prompts.push(prompt); return writeFiles(dir, prompt) } })
+  const watched: string[] = []
+  const stoppedOnce = new Set(["ses_2"]) // ses_1 is the planner, ses_2 the first worker of T1
+  const r = runner(project, fake.api, {
+    watch: (id: string) => watched.push(id),
+    stopped: (id: string) => (stoppedOnce.has(id) ? { kind: "read_loop", detail: "read add.js 3x with no write in between" } : undefined),
+  })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.deepEqual(watched.slice(0, 3), ["ses_1", "ses_2", "ses_3"], "planner and every worker session are watched")
+  assert.match(prompts[1]!, /stopped by the loop watchdog: read add.js 3x/)
+  assert.ok(done.tasks[0]!.stages.some((s) => s.result === "fail" && s.evidence?.includes("loop watchdog")))
+
+  const always = runner(repo(), fakeSession({ worker: writeFiles }).api, { stopped: (id: string) => (id === "ses_1" ? undefined : { kind: "steps", detail: "more than 60 steps" }) })
+  const stuck = await always.run((await always.plan("goal")).job.id)
+  assert.equal(stuck.tasks[0]!.status, "escalated")
+  assert.match(stuck.lessons.at(-1)!, /stopped twice by the loop watchdog/)
+})
+
+test("a planner stopped by the watchdog gets one fresh try, then the job fails with the reason", async () => {
+  const project = repo()
+  const fake = fakeSession({})
+  const ok = runner(project, fake.api, { stopped: (id: string) => (id === "ses_1" ? { kind: "same_call", detail: "read .jev-dictator 3x" } : undefined) })
+  assert.equal((await ok.plan("goal")).job.phase, "plan_gate")
+  const bad = runner(repo(), fakeSession({}).api, { stopped: () => ({ kind: "read_loop", detail: "read .jev-dictator 3x" }) })
+  const failed = await bad.plan("goal")
+  assert.equal(failed.job.phase, "failed")
+  assert.deepEqual(failed.errors, ["the planner was stopped by the loop watchdog: read .jev-dictator 3x"])
+})
