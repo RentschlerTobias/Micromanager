@@ -2,7 +2,8 @@
 
 Status (2026-10-04): Phase 0 (spike) and Phase 1 done, and Jev on permission requests works (part of the old
 Phases 2 and 3). The design was reworked on 2026-10-03/04: [design.md](design.md) is now the design and
-[design.html](design.html) its flow chart. The next step is Phase A (spikes) below.
+[design.html](design.html) its flow chart. Extended the same day by local vs cloud routing, censorship guards, decision backends (cloud Jev or
+local GLiNER) and user overrides (design.md §19–§22). The next step is Phase A (spikes) below.
 
 ## Context
 An OpenCode plugin that orchestrates sub-agents the way oh-my-openagent (OmO) does: it splits a job into
@@ -138,6 +139,18 @@ typesafe.ai/blog/introducing-system-one-models-and-jev · opencode.ai/docs/plugi
   - Several questions per request, answered in parallel and in isolation; no multi-select type.
   - Open-Jev's JSONL row format fits our journal, for training a local Jev.
 
+**Local models and GLiNER, 2026-10-04:**
+- **The local fleet**, from `~/Models/bench/ROSTER.md`:
+  - llama-swap `:8000` on the RTX 4060: gpt-oss-20b unc, Ornith-1.5 unc / stock, MiMo, Qwen3.5-4B unc. One
+    model at a time; a swap takes 1–2 min.
+  - `qwen3.8-u` 27B unc, resident on the iGPU (`:8092`).
+  - FLM on the NPU (`:52625`): qwen3 4B models and gpt-oss-20b.
+  - Every local model runs with 16k context.
+- **oc-voice's GLiNER verdict:** LoRA fine-tunes of GLiNER2.5-Decide match or beat cloud Jev on guards
+  (injection and harmful at recall 1.0 / fpr 0.0) but reach 0.85 against 0.98 on intent. So the backend is chosen
+  per question family.
+- **GLiNER does not run on the NPU.**
+
 Sources are listed at the end of design.md.
 
 
@@ -218,15 +231,20 @@ OpenCode permission per tool: allow / ask / deny. Write rights apply only inside
    permission decisions: done.
 
 From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
-- **A. Spikes A1–A7.** A1 (chat-turn hook + steering) first; then A2, A3, A4, A7, A6, A5. Each result picks the
+- **A. Spikes A1–A10.** A1 (chat-turn hook + steering) first; then A2, A3, A4, A7, A8 (local availability),
+  A9 (GLiNER decision server), A10 (refusal detection), A6, A5. Each result picks the
   design or its named fallback.
 - **B. Core:**
   - state, FSMs, agenda and rules fallback;
   - the integration branch;
   - the planner subagent writing plan JSON, with the DAG validated;
   - one task at a time on P1;
-  - journal with state objects, eval harness, dataset export.
-- **C. Planning session:**
+  - journal with state objects, eval harness, dataset export;
+  - the model registry, decision backends per node (typesafe, gliner, rules), the policy / override layer;
+  - the GLiNER decision server.
+- **C. Planning session and gate:**
+  - G0 local-first gate with the four guards (sensitive, refusal_likely, injection, harmful) and the guard
+    bench;
   - the `deliberate` skill;
   - design tree validation, frontier, N2 / N2b / N2c, shortcuts, question caps, design checkpoint;
   - the facilitator on the session model;
@@ -239,7 +257,8 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - skill vendoring + `install.sh --skills`;
   - brief and report;
   - caveman on outputs;
-  - difficulty tiers in the routing.
+  - routing over the registry: locality, censorship, difficulty tier, live availability, per-device
+    concurrency.
 - **E. Quality loop:**
   - gates run by the plugin;
   - two-axis review;
@@ -247,11 +266,14 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - **the loop watchdog**;
   - N8 signatures;
   - the N9 ladder with handoff notes;
-  - budgets including requests and tokens.
+  - budgets including requests and tokens;
+  - the `worker_refused` signature and the locality-aware ladder.
 - **F. Parallelism:** parallel readers; then parallel writers in worktrees, the merge train into the integration
   branch, batch confirmation.
 - **G. Flagged pipelines:** P0, P4–P8, Ralph; DCP. Each is switched on only with eval evidence.
 - **H. Extras:** memory plugin, research extras (papers skill, context7, Serena, graphify).
+- **J. Local decision model:** GLiNER shadow mode → retraining on Jev's answers, overrides and outcomes → a
+  promotion gate per node, with demotion on rising overrides.
 - **I. Visibility:** design.html / flow.html lanes from the journal, `/dictator status|log|stop`, otel, later
   wayfinder maps.
 
@@ -270,5 +292,8 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - a worker question answered by Jev and one passed to the user;
   - a review FAIL → fix → PASS;
   - a forced loop that the watchdog interrupts;
+  - a sensitive task that never reaches the cloud;
+  - a refusal_likely task routed to a local uncensored model, while a harmful one goes to the user;
+  - a user override that skips a node and shows up as a label in the journal;
   - `/dictator stop`;
   - no push, worktrees cleaned up.
