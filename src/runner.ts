@@ -143,6 +143,7 @@ export class Runner {
       parsed = parsePlan(answer.text)
     }
     if (!parsed.plan) {
+      job.lessons.push(`planning failed: ${answer.timedOut ? "the planner timed out" : (parsed.errors ?? []).join("; ")}`)
       moveJob(job, "failed")
       saveJob(this.#d.project, job)
       return { job, errors: answer.timedOut ? ["the planner timed out"] : parsed.errors }
@@ -498,4 +499,14 @@ function topLevel(project: string): string[] {
   } catch {
     return []
   }
+}
+
+// A goal the same session failed to plan a short while ago: the dictator reports that instead of starting the
+// same job again (live test: a looping local planner made it restart three times). "retry: <goal>" overrides.
+export function recentFailure(job: Job | undefined, goal: string, now = Date.now(), windowMs = 30 * 60_000): string | undefined {
+  if (!job || job.phase !== "failed" || /^retry:/i.test(goal.trim())) return undefined
+  const same = job.goal.trim().toLowerCase() === goal.trim().toLowerCase()
+  if (!same || now - Date.parse(job.updated) > windowMs) return undefined
+  const why = job.lessons.at(-1) ?? "unknown reason"
+  return `Job ${job.id} with this goal failed ${Math.round((now - Date.parse(job.updated)) / 60_000)} min ago (${why}). Tell the user and do not start it again by yourself; if the user wants another try, call dictator_plan with goal "retry: <goal>".`
 }

@@ -217,3 +217,17 @@ test("a cloud model preset never takes a local-only job to the cloud", async () 
   const planner = fake.created.find((c) => c.agent === "dictator-plan")!
   assert.equal((planner.model as { providerID: string }).providerID === "opencode-go", false)
 })
+
+test("a goal that failed to plan a short while ago is reported, not started again", async () => {
+  const { recentFailure } = await import("../src/runner.ts")
+  const project = repo()
+  const fake = fakeSession({ plan: ["no", "no", "no"] })
+  const { job } = await runner(project, fake.api).plan("add an add function")
+  assert.equal(job.phase, "failed")
+  assert.match(job.lessons.at(-1)!, /planning failed: no JSON object found/)
+  const now = Date.parse(job.updated) + 5 * 60_000
+  assert.match(recentFailure(job, "Add an add function", now) ?? "", /failed 5 min ago.*retry: <goal>/s)
+  assert.equal(recentFailure(job, "retry: add an add function", now), undefined)
+  assert.equal(recentFailure(job, "something else", now), undefined)
+  assert.equal(recentFailure(job, "add an add function", now + 60 * 60_000), undefined)
+})

@@ -14,7 +14,7 @@ import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe } from "./registry.ts"
 import { DICTATOR, ROLES } from "./roles.ts"
-import { Runner, summary, type SessionApi } from "./runner.ts"
+import { recentFailure, Runner, summary, type SessionApi } from "./runner.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
 import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 
@@ -176,9 +176,12 @@ export default {
             // instead of starting another (live test: the dictator re-sent the goal mid-session and after confirm).
             const active = tctx.sessionID ? sessionJob(tctx.sessionID) : undefined
             const planning = active && !["done", "stopped", "failed", "integrate", "wrap"].includes(active.phase)
+            const failed = !JOB_ID.test(text) && !planning ? recentFailure(active, text) : undefined
+            if (failed) return failed
+            const fresh = text.replace(/^retry:\s*/i, "")
             const out = JOB_ID.test(text) ? await runner(tctx.sessionID).continueJob(text)
               : planning ? await runner(tctx.sessionID).continueJob(active.id)
-              : await runner(tctx.sessionID).start(text, tctx.sessionID)
+              : await runner(tctx.sessionID).start(fresh, tctx.sessionID)
             if (out.job.facilitator === undefined && tctx.sessionID) {
               out.job.facilitator = tctx.sessionID
               saveJob(project, out.job)

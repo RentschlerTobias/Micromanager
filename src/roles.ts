@@ -55,6 +55,10 @@ const noShell = [rule("shell", "deny")]
 const askShell = [rule("shell", "ask")]
 // Sub-agents never start sub-agents of their own: only the dictator delegates, so it can count them.
 const noDelegation = [rule("subagent", "deny")]
+// The plugin's state (job files, notes) is not for agents: a local planner looped on it in a live test. Paths are
+// relative to the session's directory; a worker inside its worktree never needs to climb up into jobs or notes.
+const STATE_PATHS = [".jev-dictator*", "*/.jev-dictator/jobs*", "*/.jev-dictator/notes*"]
+const noStateDir = ["read", "glob", "grep", "list", "edit", "write", "patch"].flatMap((tool) => STATE_PATHS.map((path) => rule(tool, "deny", path)))
 
 const TEST_RUNNERS = [
   "pytest*", "python -m pytest*", "python3 -m pytest*", "uv run pytest*", "uv run python -m pytest*",
@@ -72,7 +76,7 @@ const role = (
   system: string,
   rules: readonly Rule[],
   models: readonly string[],
-): Role => ({ id, agent: `dictator-${id}`, description, system: `${SHARED}\n\n${system}`, rules, models })
+): Role => ({ id, agent: `dictator-${id}`, description, system: `${SHARED}\n\n${system}`, rules: [...rules, ...noStateDir], models })
 
 export const ROLES: readonly Role[] = [
   role(
@@ -162,7 +166,7 @@ export function roleById(id: string): Role | undefined {
 export const DICTATOR = {
   agent: "dictator",
   description: "Orchestrator: splits a job into sub-tasks and delegates each to a role sub-agent.",
-  rules: [...noWrite, ...noShell, ...noWeb, rule("subagent", "ask")] as readonly Rule[],
+  rules: [...noWrite, ...noShell, ...noWeb, rule("subagent", "ask"), ...noStateDir] as readonly Rule[],
 } as const
 
 export function dictatorSystem(roles: readonly Role[] = ROLES): string {
@@ -185,7 +189,8 @@ For a job:
    git branch, runs the checks and commits; the user's checkout is never touched.
 5. Report what dictator_run returns: each task's status, the branch, and how to merge or discard it. If it
    stopped, say why and what the user can decide.
-Notes that start with "[job …]" are the plugin's instructions for this turn; follow them. dictator_status shows a
+If planning or a run fails, tell the user why and what they can decide; never start the same job again on your
+own. Notes that start with "[job …]" are the plugin's instructions for this turn; follow them. dictator_status shows a
 job's state at any time.
 
 The role sub-agents, for your understanding (the plugin picks role and model per task):

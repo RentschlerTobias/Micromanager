@@ -49,3 +49,12 @@ test("agent ids never clash with built-in agents, and families are told apart", 
   assert.equal(family(MODELS.qwen), "qwen3")
   assert.notEqual(family(MODELS.deepseek), family(MODELS.qwen))
 })
+
+test("no agent may read or change the plugin's state directory", () => {
+  for (const r of [...ROLES.map((x) => x.rules), DICTATOR.rules]) {
+    for (const path of [".jev-dictator/jobs/job-1.json", "proj/.jev-dictator/notes/job-1/T1.md"]) {
+      const match = [...r].reverse().find((x) => x.action === "read" && new RegExp("^" + x.resource.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$").test(path))
+      assert.equal(match?.effect, "deny", path)
+    }
+  }
+})
