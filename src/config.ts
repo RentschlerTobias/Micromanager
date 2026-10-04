@@ -5,6 +5,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 
 import { DEFAULT_FLOORS, type Floors } from "./decide.ts"
+import { validatePolicies, type PolicySet } from "./policy.ts"
 import { DEFAULT_ROUTING, type Routing } from "./routing.ts"
 import { roleById, type RoleId } from "./roles.ts"
 
@@ -63,9 +64,19 @@ export function parseFloors(text: string): Floors {
   return floors as unknown as Floors
 }
 
+// "decisions": the global policy per decision key, e.g. { "N6.pipeline": "fixed:P1", "N5": "ask" } (design.md §22).
+export function parseDecisions(text: string): PolicySet {
+  const raw = (JSON.parse(stripComments(text)) as { decisions?: unknown }).decisions ?? {}
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("decisions must be an object")
+  const errors = validatePolicies(raw as Record<string, unknown>)
+  if (errors.length > 0) throw new Error(errors.join("; "))
+  return raw as PolicySet
+}
+
 export interface Settings {
   readonly routing: Routing
   readonly floors: Floors
+  readonly decisions: PolicySet
 }
 
 export function loadSettings(path = configPath()): Settings & { error?: string } {
@@ -73,11 +84,11 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS } // no file: the defaults
+    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {} } // no file: the defaults
   }
   try {
-    return { routing: parseRouting(text), floors: parseFloors(text) }
+    return { routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text) }
   } catch (err) {
-    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, error: `${path}: ${String(err)}` }
+    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, error: `${path}: ${String(err)}` }
   }
 }
