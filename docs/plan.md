@@ -3,8 +3,8 @@
 Status (2026-10-04): Phase 0 (spike) and Phase 1 done, and Jev on permission requests works (part of the old
 Phases 2 and 3). The design was reworked on 2026-10-03/04: [design.md](design.md) is now the design and
 [design.html](design.html) its flow chart. Extended the same day by local vs cloud routing, censorship guards, decision backends (cloud Jev or
-local GLiNER) and user overrides (design.md §19–§22). Phases A (spikes), B (core) and C (planning session and gate) are done (results below); the next step is
-Phase D.
+local GLiNER) and user overrides (design.md §19–§22). Phases A (spikes), B (core), C (planning session and gate) and D (classification and profile) are done (results
+below); the next step is Phase E.
 
 ## Context
 An OpenCode plugin that orchestrates sub-agents the way oh-my-openagent (OmO) does: it splits a job into
@@ -354,7 +354,7 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - design tree validation, frontier, N2 / N2b / N2c, shortcuts, question caps, design checkpoint;
   - the facilitator on the session model;
   - the dictator read cap; the "answer yourself" line removed from the dictator prompt.
-- **D. Classification and profile:**
+- **D. Classification and profile: done 2026-10-04** (results below the phase list):
   - N4 split until small;
   - N5+N5b in one request;
   - N6 with P1–P3 and P9;
@@ -362,13 +362,13 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - skill vendoring + `install.sh --skills`;
   - brief and report;
   - caveman on outputs;
-  - routing over the registry: locality, censorship, difficulty tier, live availability, per-device
-    concurrency.
+  - routing over the registry: locality, censorship, difficulty tier, live availability. Per-device concurrency
+    is only "local readers take turns" so far; batching tasks by model belongs to Phase F.
 - **E. Quality loop:**
   - gates run by the plugin;
   - two-axis review;
   - improvement loop;
-  - **the loop watchdog**;
+  - **the loop watchdog** (done early, 2026-10-04);
   - N8 signatures;
   - the N9 ladder with handoff notes;
   - budgets including requests and tokens;
@@ -467,6 +467,61 @@ So our own fine-tune is needed before a guard may decide alone (Phase J).
   that is an ask.
 - **Transliteration:** "Straße" became "strae" (ß dropped). It is consistent with "drop what has no ASCII
   equivalent", but a review stage (Phase E) should question such details.
+
+### Phase D results (2026-10-04)
+**What exists now:**
+- `src/profile.ts`: N5 + N5b in one request per task. The role matrix is the upper bound; a task that needs shell or
+  web never keeps a role without it; contradictions cost confidence. The profile narrows rights per tool group,
+  as the worker session's own permission rules and again in the evaluate hook.
+- `src/pipelines.ts`: N6 by rules over the N5 answers (§8.1), "pipeline P2" pins it.
+  - P1: implement, gate, fix rounds.
+  - P2: plus a review by another model family, at most 3 rounds; findings block only with evidence.
+  - P3: a test session writes the tests first; anything else it writes is undone; the tests must fail, are
+    frozen (content hashes), then the implementation and a review. No red, or tests that already pass: P2.
+  - P9: 1, 3 or 5 readers with their own angles, in parallel in the cloud and one after another on a local
+    model; a synthesis in `docs/research/`; a citation check by code.
+  - Destructive risk and "ask me about everything" wait for the user's go; an injection-flagged task is blocked.
+- N4 in `src/plan.ts` and the runner: too big and splittable → the planner writes the parts, code re-validates
+  (parent's files only, every point covered, no split that only adds coordination); two levels at most.
+- `skills/`: six leaf skills adapted from mattpocock/skills and obra/superpowers (MIT, `skills/THIRD_PARTY.md`);
+  `src/skills.ts` names them by rule or by N5, and only when the OpenCode link is ours.
+- Briefs carry skills, lessons and shared-point notes; reports and reader notes are caveman.
+- `run()` reconciles a run that ended mid-task.
+- Tests: 116 TypeScript tests.
+
+**Live, cloud workers by preset (deepseek-v4.1-flash), cloud Jev, GLiNER for G0:**
+- **Run 1** (a stats module, tests, README; before Phase D): 3 of 4 tasks committed, 8 tests green, no watchdog
+  signal. The planner gave "run the test suite" to oracle, which has no shell; that worker then asked for a path
+  outside its worktree and waited for an answer nobody could give.
+- **Run 2** (a median bug and a new `percentile`, the same goal twice):
+  - N4 split nothing.
+  - N5 made the bug fix and the new function P3. Both red stages failed before the change, both reviews passed.
+    The README task ran as P1. Jev itself moved the verification task from oracle to review (0.79).
+  - The run was cut off once inside T4 (a harness timeout); `dictator_run` resumed it with T4 started again.
+  - Result: 4 commits, 13 tests green, `median` no longer mutates the caller's array, `percentile` throws
+    `RangeError` in all three cases.
+
+**Fixed during the live tests:**
+- **Sessions the runner starts never wait on the user.** A worker or reviewer asking for anything outside its
+  directory is denied with a note; any request that would go to the user is denied with "report NEEDS_CONTEXT",
+  so the job stops and the dictator asks in its own session. This answers Phase C's open point for the TUI too.
+- **The dictator tried to get past the gate.** G0 flagged the goal as injection (0.59). The dictator called
+  `dictator_plan` with "continue", then `dictator_run`, then read the plugin's own source outside the project,
+  before it asked. The gate's result now says only the user can answer; the dictator is denied
+  `external_directory`.
+- **Shared acceptance points** are marked per task in the brief and the review prompt. A reviewer of the median
+  fix had asked for the percentile tests of the next task.
+- **"Another family" compared different names** (`qwen3` from the model id, `qwen` in the registry).
+- **A failing `session.wait()` leaked the 20-minute timer.**
+
+**Open:**
+- **G0 is not stable on the same text:** the identical goal scored injection 0.59 in one run and 2e-8 in the
+  next. Phase J's fine-tune and the guard bench need a repeat-run check.
+- **N5 sees the whole job text,** so a new-function task in a job that also fixes a bug was classified as a bug fix
+  too. Harmless here (P3 either way); the state could carry the job goal more weakly.
+- **The code-mode `execute` tool** lists every tool, `dictator_run` included, to role agents. Whether its nested
+  calls pass the evaluate hook is not verified; the narrowed-rights deny in the hook is the safety net.
+- **`glob` with `hidden: true`** shows file names under `.jev-dictator/`; reads are denied.
 
 ## Verification
 - **Per phase: tests** with a fake Jev:

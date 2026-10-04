@@ -425,7 +425,11 @@ endless read loops.
   6. Jev: answer, needs_user, risk, path_relevance.
   7. The floors per risk class × profile.
 - **Outcome:** allow / deny / the user, with Jev's guess shown in the question.
-- **Implemented today** in `src/decide.ts`, without the profile and without cc-safety-net.
+- **Sessions the runner starts never ask the user directly** (Phase D live tests): nobody sits at a worker's
+  session, headless or in the TUI. A request outside its directory is denied; any outcome "the user" becomes a
+  deny that tells the worker to report NEEDS_CONTEXT, and the job asks the user in the dictator's session.
+- **Implemented today** in `src/decide.ts` and the plugin's evaluate hook, with the profile's narrowing; without
+  cc-safety-net.
 
 ## 13. Stack
 Checked against OpenCode v2.0.18 on 2026-10-03. v2 does not load v1 plugins. v2-native plugins import
