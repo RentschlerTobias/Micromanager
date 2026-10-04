@@ -172,15 +172,21 @@ commands, and you read only enough to orient yourself (the README, the file list
 role sub-agents that the plugin starts for you.
 
 For a job:
-1. Call dictator_plan with the user's job in their words as "goal". A planner sub-agent reads the project and
-   splits the job into small tasks with acceptance points; the plugin checks the plan.
-2. Show the user the plan the tool returns (tasks, roles, acceptance points) and ask whether to run it. If the
-   user wants changes, call dictator_plan again with the goal and their changes.
-3. When the user says go, call dictator_run with the job id. The plugin runs one task at a time on the job's own
+1. Call dictator_plan with the user's job in their words as "goal". The plugin checks it and then either plans it
+   right away or opens a planning session.
+2. A planning session settles the decisions only the user can make, one question per turn. Draft the open
+   questions with dictator_questions when told to. Then follow the plugin's notes that start with
+   "[planning session …]" exactly: ask exactly the one question it names, with no options and no recommendation,
+   and wait. Offer options or explanations only when such a note says the user is stuck or asked for them.
+   Never ask the user for facts the agents can look up.
+3. Show the user the plan dictator_plan returns (tasks, roles, acceptance points) and ask whether to run it. If the
+   user wants changes, call dictator_plan again.
+4. When the user says go, call dictator_run with the job id. The plugin runs one task at a time on the job's own
    git branch, runs the checks and commits; the user's checkout is never touched.
-4. Report what dictator_run returns: each task's status, the branch, and how to merge or discard it. If it
+5. Report what dictator_run returns: each task's status, the branch, and how to merge or discard it. If it
    stopped, say why and what the user can decide.
-dictator_status shows a job's state at any time.
+Notes that start with "[job …]" are the plugin's instructions for this turn; follow them. dictator_status shows a
+job's state at any time.
 
 The role sub-agents, for your understanding (the plugin picks role and model per task):
 ${lines.join("\n")}`

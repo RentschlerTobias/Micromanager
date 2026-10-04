@@ -19,6 +19,7 @@ test("the three tools are built from the read tool's schema and refuse other age
   const calls: string[] = []
   const ids = installTools(draft, {
     plan: async (goal) => { calls.push(`plan:${goal}`); return "planned" },
+    questions: async (job, tree) => { calls.push(`questions:${job}:${tree}`); return "asked" },
     run: async (job) => { calls.push(`run:${job}`); return "ran" },
     status: async () => { throw new Error("boom") },
   })
@@ -26,10 +27,12 @@ test("the three tools are built from the read tool's schema and refuse other age
   assert.deepEqual(added[0]!.input, { mapped: { goal: str } })
   const exec = (i: number) => added[i]!.execute as (a: Record<string, unknown>, c: object) => Promise<{ content: string }>
   assert.deepEqual(await exec(0)({ goal: "add a flag" }, { agent: "dictator" }), { content: "planned" })
-  assert.deepEqual(await exec(1)({ job: "job-1" }, { agent: "build" }), { content: "Only the dictator agent may use this tool." })
-  assert.deepEqual(await exec(2)({ job: "" }, { agent: "dictator" }), { content: "failed: boom" })
-  assert.deepEqual(calls, ["plan:add a flag"])
-  assert.throws(() => installTools({ get: () => undefined, add: () => {} }, { plan: async () => "", run: async () => "", status: async () => "" }))
+  assert.deepEqual(added[1]!.input, { mapped: { job: str, tree: str } })
+  assert.deepEqual(await exec(1)({ job: "job-1", tree: "[]" }, { agent: "dictator" }), { content: "asked" })
+  assert.deepEqual(await exec(2)({ job: "job-1" }, { agent: "build" }), { content: "Only the dictator agent may use this tool." })
+  assert.deepEqual(await exec(3)({ job: "" }, { agent: "dictator" }), { content: "failed: boom" })
+  assert.deepEqual(calls, ["plan:add a flag", "questions:job-1:[]"])
+  assert.throws(() => installTools({ get: () => undefined, add: () => {} }, { plan: async () => "", questions: async () => "", run: async () => "", status: async () => "" }))
 })
 
 test("the plan text lists acceptance points and tasks", () => {

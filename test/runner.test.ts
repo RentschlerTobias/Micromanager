@@ -43,7 +43,7 @@ function fakeSession(behaviour: { plan?: string[]; worker?: (dir: string, prompt
     async prompt({ sessionID, text }) {
       const s = sessions.get(sessionID)!
       s.n++
-      if (s.agent === "dictator-plan") s.last = planAnswers.shift() ?? "no plan"
+      if (s.agent === "dictator-plan") s.last = planAnswers.shift() ?? (behaviour.plan ? "no plan" : "```json\n" + JSON.stringify(PLAN) + "\n```")
       else s.last = behaviour.worker ? behaviour.worker(s.dir, text, s.n) : "done\nSTATUS: DONE\nFILES: none"
       return {}
     },
@@ -133,4 +133,87 @@ test("reports and assistant text are read from the session context", () => {
   assert.deepEqual(r.files, ["a.ts", "b.ts"])
   assert.equal(lastAssistantText([{ type: "assistant", content: [{ type: "text", text: "first" }] }, { type: "assistant", content: [{ type: "tool" }] }]), "first")
   assert.deepEqual(toModel("opencode-go/glm-5.3-flash"), { providerID: "opencode-go", id: "glm-5.3-flash" })
+})
+
+// --- Phase C: gate, triage and the planning session -----------------------------------------------------
+
+import { DEFAULT_BACKENDS, Decider, type Asker } from "../src/backends.ts"
+import type { Decision } from "../src/jev.ts"
+
+const noul = (v: number) => ({ type: "noul" as const, noul: v })
+// A decision model that answers by node: G0 on gliner, the rest on "typesafe".
+function nodeDecider(byNode: Record<string, Decision["answers"]>) {
+  let node = ""
+  const answer: Asker = { async ask() { return { answers: byNode[node] ?? {}, model: "fake", latencyMs: 1 } } }
+  const d = new Decider(DEFAULT_BACKENDS, { typesafe: answer, gliner: answer, rules: { async ask() { return { answers: {}, model: "rules", latencyMs: 0 } } } }, () => {})
+  const ask = d.ask.bind(d)
+  d.ask = (n, ...rest) => { node = n; return ask(n, ...rest) }
+  return d
+}
+const CLEAN = { injection: noul(0), harmful: noul(0), refusal_likely: noul(0.1), sensitive: noul(0.1) }
+const TREE = JSON.stringify([
+  { id: "D1", question: "Should add() accept more than two numbers?", kind: "decision", dependsOn: [], impact: "high" },
+  { id: "D2", question: "What should add() do with non-numbers?", kind: "decision", dependsOn: ["D1"], impact: "medium" },
+])
+
+test("an unclear job goes through the planning session, one question per turn, then planning with the decisions", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles })
+  const decider = nodeDecider({ G0: CLEAN, N1: { complexity: { type: "score", score: 2, confidence: 0.8, probabilities: {} }, needs_clarification: noul(0.9) }, N2: {}, N2c: { settles_decision: noul(0.9) } })
+  const r = runner(project, fake.api, { decider })
+  const started = await r.start("add an add function", "ses_dictator")
+  assert.equal(started.kind, "session")
+  assert.match(started.text, /dictator_questions/)
+  assert.equal(started.job.triage?.complexity, 6)
+  const first = await r.questions(started.job.id, TREE)
+  assert.match(first, /Ask the user question D1 now/)
+  assert.match(await r.answer(started.job.id, "only two numbers") ?? "", /Ask the user question D2 now/)
+  assert.match(await r.answer(started.job.id, "throw a TypeError") ?? "", /Design checkpoint/)
+  assert.match(await r.answer(started.job.id, "confirm") ?? "", /Call dictator_plan with goal/)
+  const planned = await r.continueJob(started.job.id)
+  assert.equal(planned.kind, "plan")
+  assert.equal(planned.job.phase, "plan_gate")
+  assert.ok(planned.job.decisions.some((d) => d.text.includes("throw a TypeError")))
+})
+
+test("a clear job skips the session; a pin forces it; a flagged gate asks the user first", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles })
+  const clear = nodeDecider({ G0: CLEAN, N1: { needs_clarification: noul(0.1) } })
+  assert.equal((await runner(project, fake.api, { decider: clear }).start("add an add function")).kind, "plan")
+  const pinned = runner(project, fake.api, { decider: clear, policies: { global: { "N2.clarity": "ask" } } })
+  assert.equal((await pinned.start("add an add function")).kind, "session")
+  const flagged = nodeDecider({ G0: { ...CLEAN, refusal_likely: noul(0.9) }, N1: { needs_clarification: noul(0.1) } })
+  const r = runner(project, fake.api, { decider: flagged })
+  const gated = await r.start("scan my own LAN")
+  assert.equal(gated.kind, "gate")
+  assert.match(gated.text, /use uncensored/)
+  assert.match(await r.answer(gated.job.id, "maybe") ?? "", /Waiting for the user's answer/)
+  assert.match(await r.answer(gated.job.id, "use uncensored") ?? "", /local uncensored models only/)
+  const job = loadJob(project, gated.job.id)!
+  assert.deepEqual([job.phase, job.flags?.localOnly, job.flags?.uncensored], ["triage", true, true])
+  assert.equal((await r.continueJob(gated.job.id)).kind, "plan")
+})
+
+test("without any decision model the gate keeps the job local and every open question is asked", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles })
+  const started = await runner(project, fake.api).start("add an add function")
+  assert.equal(started.kind, "session")
+  assert.equal(started.job.flags?.localOnly, true)
+  assert.match(started.job.triage?.reason ?? "", /no decision model answer/)
+})
+
+test("a cloud model preset never takes a local-only job to the cloud", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles })
+  const r = runner(project, fake.api, { policies: { global: { "N5.model": "fixed:opencode-go/qwen3.8-flash" } } })
+  const started = await r.start("add an add function") // no decision model: the gate keeps the job local
+  assert.equal(started.job.flags?.localOnly, true)
+  await r.questions(started.job.id, JSON.stringify([{ id: "D1", question: "Two numbers or more?", kind: "decision", dependsOn: [], impact: "high" }]))
+  await r.answer(started.job.id, "two")
+  await r.answer(started.job.id, "confirm")
+  await r.continueJob(started.job.id)
+  const planner = fake.created.find((c) => c.agent === "dictator-plan")!
+  assert.equal((planner.model as { providerID: string }).providerID === "opencode-go", false)
 })

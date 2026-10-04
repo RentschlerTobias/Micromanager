@@ -2,7 +2,12 @@
 // fix at most twice). The planner and the workers are plugin-started sessions (Phase A, A2); code moves the
 // state, runs the checks and commits. The decision model joins in later phases; here the rules decide.
 
+import { readdirSync } from "node:fs"
+
 import { buildAgenda, nextProposal } from "./agenda.ts"
+import { Decider, RulesBackend } from "./backends.ts"
+import { ANSWER, CHOICE_FLOOR, complexityOf, NOUL_FLOOR, nextQuestionChoice, TRIAGE } from "./catalog.ts"
+import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, type Unchecked } from "./gate.ts"
 import { brief, fixPrompt, lastAssistantText, parseReport, taskAcceptance, usage } from "./brief.ts"
 import { changedFiles, commitTask, exec as defaultExec, prepareIntegration, runGate, type Exec } from "./integration.ts"
 import { record } from "./journal.ts"
@@ -11,6 +16,10 @@ import { applyPlan, parsePlan, PLAN_FORMAT } from "./plan.ts"
 import { resolvePolicy, type Policies } from "./policy.ts"
 import { route, type Availability, type ModelEntry } from "./registry.ts"
 import { roleById } from "./roles.ts"
+import {
+  addNodes, applyAnswer, applyShortcut, decisionsText, frontier, instruction, matchSessionShortcut, nextStep, parseTree, settle,
+  type AnswerReading, type DesignTree, type Step,
+} from "./session.ts"
 import { moveJob, moveTask, newJob, promoteReady, stage, type Job, type Task } from "./state.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
 
@@ -37,6 +46,15 @@ export interface RunnerDeps {
   readonly workerTimeoutMs?: number
   readonly fixRounds?: number
   readonly planRetries?: number
+  readonly decider?: Decider // the decision model per node; without one, the rules decide
+  readonly unchecked?: Unchecked // what G0 does when nothing local could check a job
+}
+
+// What a step of the dictator's tools ends with: text for the dictator to act on.
+export interface Outcome {
+  readonly kind: "gate" | "session" | "plan" | "failed" | "info"
+  readonly job: Job
+  readonly text: string
 }
 
 export function toModel(id: string): { providerID: string; id: string } {
@@ -49,10 +67,17 @@ export class Runner {
   readonly #exec: Exec
   readonly #journal: (entry: Record<string, unknown>) => void
 
+  readonly #decider: Decider
+
   constructor(deps: RunnerDeps) {
     this.#d = deps
     this.#exec = deps.exec ?? defaultExec
     this.#journal = deps.journal ?? record
+    this.#decider = deps.decider ?? new Decider({ default: "rules", nodes: {}, urls: {} }, { rules: new RulesBackend() }, this.#journal)
+  }
+
+  #policies(job: Job, task?: string): Policies {
+    return { ...(this.#d.policies ?? {}), job: job.pins, ...(task && job.taskPins?.[task] ? { task: job.taskPins[task] } : {}) }
   }
 
   #say(text: string): void {
@@ -61,13 +86,16 @@ export class Runner {
 
   // The model for a role: the user's preset if any, else the router over the registry, else the role's cloud model.
   async #model(job: Job, role: string, difficulty: number, task?: string): Promise<{ id: string; reason: string }> {
-    const preset = resolvePolicy("N5.model", this.#d.policies ?? {})
-    if (preset.policy.kind === "fixed") {
+    const preset = resolvePolicy("N5.model", this.#policies(job, task))
+    const presetModel = preset.policy.kind === "fixed" ? this.#d.registry.find((m) => m.id === (preset.policy as { value: string }).value) : undefined
+    const presetBreaksGate = job.flags?.localOnly && (presetModel?.location === "cloud" || (job.flags.uncensored && presetModel?.censored))
+    if (preset.policy.kind === "fixed" && !presetBreaksGate) {
       this.#journal({ kind: "routing", job: job.id, task, role, model: preset.policy.value, reason: `preset (${preset.level})` })
       return { id: preset.policy.value, reason: `preset (${preset.level})` }
     }
+    if (presetBreaksGate) this.#say(`preset ${(preset.policy as { value: string }).value} ignored: the job must stay local${job.flags?.uncensored ? " and uncensored" : ""}`)
     const availability = await this.#d.availability?.().catch(() => undefined)
-    const r = route(this.#d.registry, { role, difficulty }, availability)
+    const r = route(this.#d.registry, { role, difficulty, sensitive: job.flags?.localOnly, refusalLikely: job.flags?.uncensored }, availability)
     const id = r.model ?? roleById(role)?.models[0] ?? this.#d.registry[0]!.id
     this.#journal({ kind: "routing", job: job.id, task, role, model: id, reason: r.model ? r.reason : `fallback: ${r.reason}`, ranked: r.ranked.slice(0, 5) })
     return { id, reason: r.model ? r.reason : "fallback" }
@@ -91,7 +119,12 @@ export class Runner {
     const job = newJob(jobId(), goal)
     excludeFromGit(this.#d.project)
     moveJob(job, "triage")
-    moveJob(job, "plan")
+    return this.planJob(job)
+  }
+
+  // A job from triage or a confirmed checkpoint to a validated plan at the plan gate.
+  async planJob(job: Job): Promise<{ job: Job; errors?: string[] }> {
+    if (job.phase !== "plan") moveJob(job, "plan")
     saveJob(this.#d.project, job)
     const model = await this.#model(job, "plan", 0.7)
     this.#say(`planning with ${model.id} (${model.reason})`)
@@ -118,6 +151,182 @@ export class Runner {
     moveJob(job, "plan_gate")
     saveJob(this.#d.project, job)
     return { job }
+  }
+
+  // A new job from the dictator: the local gate, triage, then a planning session or the planner (design.md §6).
+  async start(goal: string, facilitator?: string): Promise<Outcome> {
+    const job = newJob(jobId(), goal)
+    job.facilitator = facilitator
+    excludeFromGit(this.#d.project)
+    moveJob(job, "triage")
+    const gate = await checkGuards(this.#decider, goal, job.id)
+    const flags = flagsWithoutUser(gate, this.#d.unchecked ?? "local")
+    if (flags === "ask_user") {
+      job.flags = { gate }
+      moveJob(job, "ask_user")
+      saveJob(this.#d.project, job)
+      return { kind: "gate", job, text: `job ${job.id}\n${gateQuestion(gate)}` }
+    }
+    job.flags = flags
+    return this.#triage(job)
+  }
+
+  // dictator_plan with a job id: go on from wherever the job stands.
+  async continueJob(id: string): Promise<Outcome> {
+    const job = loadJob(this.#d.project, id)
+    if (!job) return { kind: "failed", job: newJob(id, ""), text: `no job ${id}` }
+    if (job.phase === "triage") return this.#triage(job)
+    if (job.phase === "plan") return this.#planned(await this.planJob(job))
+    if (job.phase === "planning_session" && job.designTree) {
+      const node = job.designTree.nodes.find((n) => n.id === job.designTree!.current)
+      return { kind: "session", job, text: node ? instruction({ kind: "ask", node, reason: "continued" }, job.id, job.designTree) : draftInstruction(job) }
+    }
+    if (job.phase === "planning_session") return { kind: "session", job, text: draftInstruction(job) }
+    if (job.phase === "paused" && job.resumePhase === "planning_session") {
+      moveJob(job, "planning_session")
+      saveJob(this.#d.project, job)
+      return this.continueJob(id)
+    }
+    return { kind: "info", job, text: `job ${job.id} is in phase ${job.phase}` }
+  }
+
+  #planned(r: { job: Job; errors?: string[] }): Outcome {
+    return r.errors
+      ? { kind: "failed", job: r.job, text: `The planner could not produce a valid plan (job ${r.job.id}):\n- ${r.errors.join("\n- ")}` }
+      : { kind: "plan", job: r.job, text: "" }
+  }
+
+  // N1: how complex, and does it need the user's decisions first? A pin ("no planning session") skips the session.
+  async #triage(job: Job): Promise<Outcome> {
+    const pin = resolvePolicy("N2.clarity", this.#policies(job)).policy
+    const asked = await this.#decider.ask("N1", { goal: job.goal, files: topLevel(this.#d.project) }, TRIAGE, { localOnly: job.flags?.localOnly, job: job.id })
+    const c = asked.decision.answers.complexity
+    const n = asked.decision.answers.needs_clarification
+    const complexity = c?.type === "score" ? complexityOf(c.score) : undefined
+    const clarification = n?.type === "noul" ? n.noul : undefined
+    let session: boolean
+    let reason: string
+    if (pin.kind === "fixed") [session, reason] = [pin.value !== "clear", `preset ${pin.value}`]
+    else if (pin.kind === "ask") [session, reason] = [true, "the user wants to be asked"]
+    else if (clarification === undefined) [session, reason] = [true, "no decision model answer: open questions count as open"]
+    else if (clarification >= NOUL_FLOOR) [session, reason] = [true, `open decisions (${clarification.toFixed(2)})`]
+    else [session, reason] = [false, `clear enough (${clarification.toFixed(2)})`]
+    job.triage = { complexity, clarification, session, reason }
+    if (!session) return this.#planned(await this.planJob(job))
+    moveJob(job, "clarity")
+    moveJob(job, "planning_session")
+    saveJob(this.#d.project, job)
+    return { kind: "session", job, text: draftInstruction(job) }
+  }
+
+  // The facilitator's draft of the design tree, or new branches for an existing one.
+  async questions(id: string, json: string): Promise<string> {
+    const job = loadJob(this.#d.project, id)
+    if (!job || (job.phase !== "planning_session" && job.phase !== "design_checkpoint")) return `no planning session for job ${id}`
+    let raw: unknown
+    try {
+      raw = JSON.parse(json)
+    } catch (err) {
+      return `invalid JSON: ${err instanceof Error ? err.message : String(err)}. Send the list of questions again.`
+    }
+    if (!job.designTree) {
+      const parsed = parseTree(raw)
+      if (parsed.errors) return `The questions have problems:\n- ${parsed.errors.join("\n- ")}\nSend them again.`
+      job.designTree = parsed.tree
+    } else {
+      const errors = addNodes(job.designTree, raw)
+      if (errors.length) return `The new questions have problems:\n- ${errors.join("\n- ")}\nSend them again.`
+    }
+    if (job.phase === "design_checkpoint") moveJob(job, "planning_session")
+    await this.#settledByJob(job)
+    return this.#advance(job, nextStep(job.designTree, await this.#pick(job)))
+  }
+
+  // N2: questions the job text already answers are settled without asking (one request, one noul per question).
+  async #settledByJob(job: Job): Promise<void> {
+    const tree = job.designTree!
+    const open = tree.nodes.filter((n) => n.status === "open" && n.kind === "decision")
+    if (open.length === 0) return
+    const questions = Object.fromEntries(open.map((n) => [`settled_${n.id}`, {
+      type: "noul" as const,
+      instructions: `The question "${n.question}" is already answered by the job text, so the user does not need to be asked.`,
+    }]))
+    const asked = await this.#decider.ask("N2", { goal: job.goal }, questions, { localOnly: job.flags?.localOnly, job: job.id })
+    for (const n of open) {
+      const a = asked.decision.answers[`settled_${n.id}`]
+      if (a?.type === "noul" && a.noul >= 0.8) settle(tree, n.id, "answered by the job text", "fact")
+    }
+  }
+
+  // N2b: which frontier question next; below the floor the rules pick.
+  async #pick(job: Job): Promise<string | undefined> {
+    const options = frontier(job.designTree!)
+    if (options.length < 2) return undefined
+    const asked = await this.#decider.ask("N2b", { goal: job.goal, decided: decisionsText(job.designTree!) },
+      { next: nextQuestionChoice(Object.fromEntries(options.map((n) => [n.id, n.question]))) }, { localOnly: job.flags?.localOnly, job: job.id })
+    const a = asked.decision.answers.next
+    return a?.type === "choice" && a.confidence >= CHOICE_FLOOR ? a.choice : undefined
+  }
+
+  #advance(job: Job, step: Step): string {
+    if (step.kind === "checkpoint" && job.phase === "planning_session") moveJob(job, "design_checkpoint")
+    if (step.kind === "stopped") moveJob(job, "paused")
+    saveJob(this.#d.project, job)
+    return instruction(step, job.id, job.designTree!)
+  }
+
+  // One user turn in the dictator session: the gate answer, a planning-session answer, or the checkpoint reply.
+  // Returns the instruction for the dictator's next turn, or undefined when the turn is not about this job.
+  async answer(id: string, text: string): Promise<string | undefined> {
+    const job = loadJob(this.#d.project, id)
+    if (!job) return undefined
+    if (job.phase === "ask_user" && job.resumePhase === "triage" && job.flags?.gate) {
+      const reply = gateAnswer(text)
+      if (reply === undefined) return `[job ${id}] Waiting for the user's answer to the local check: "always local", "use uncensored", "continue" or "stop".`
+      if (reply === "stop") {
+        moveJob(job, "stopped")
+        saveJob(this.#d.project, job)
+        return `[job ${id}] The user stopped the job. Confirm briefly.`
+      }
+      job.flags = { ...job.flags, ...reply }
+      moveJob(job, "triage")
+      saveJob(this.#d.project, job)
+      return `[job ${id}] The user answered the local check${reply.uncensored ? ": local uncensored models only" : reply.localOnly ? ": everything stays local" : ""}. Call dictator_plan with goal "${id}" to continue.`
+    }
+    const tree = job.designTree
+    if (job.phase === "design_checkpoint" && tree) {
+      const s = matchSessionShortcut(text)
+      if (s?.kind === "confirm") {
+        job.decisions = tree.nodes.filter((n) => n.status === "settled").map((n) => ({ id: n.id, text: `${n.question} -> ${n.answer}`, origin: n.origin === "fact" ? "fact" : "user" }))
+        moveJob(job, "plan")
+        saveJob(this.#d.project, job)
+        return `[job ${id}] The user confirmed the design. Call dictator_plan with goal "${id}" to plan it now.`
+      }
+      moveJob(job, "planning_session")
+      saveJob(this.#d.project, job)
+      return `[planning session ${id}] The user wants to change something ("${text.slice(0, 200)}"). Ask which decision they mean, one question, no suggestions. Reopen it with their words in mind; "back to <id>" reopens a question.`
+    }
+    if (job.phase !== "planning_session" || !tree) return undefined
+    const shortcut = matchSessionShortcut(text)
+    if (shortcut) {
+      const step = applyShortcut(tree, shortcut)
+      return this.#advance(job, step ?? nextStep(tree, await this.#pick(job)))
+    }
+    const reading = await this.#read(job, tree, text)
+    const step = applyAnswer(tree, text, reading)
+    return this.#advance(job, step ?? nextStep(tree, await this.#pick(job)))
+  }
+
+  // N2c: what the answer does; without the decision model an answer counts as settling the question.
+  async #read(job: Job, tree: DesignTree, text: string): Promise<AnswerReading> {
+    const node = tree.nodes.find((n) => n.id === tree.current)
+    const asked = await this.#decider.ask("N2c", { question: node?.question, answer: text, decided: decisionsText(tree) }, ANSWER, { localOnly: job.flags?.localOnly, job: job.id })
+    const yes = (q: string) => {
+      const a = asked.decision.answers[q]
+      return a?.type === "noul" ? a.noul >= NOUL_FLOOR : undefined
+    }
+    if (Object.keys(asked.decision.answers).length === 0) return { settles: true }
+    return { settles: yes("settles_decision"), newBranches: yes("opens_new_branches"), stuck: yes("user_stuck"), asksOptions: yes("user_asks_for_options"), contradicts: yes("contradicts_earlier_decision"), outOfScope: yes("out_of_scope") }
   }
 
   // The user said go: work the plan on the job's branch until it is done or needs the user.
@@ -236,10 +445,11 @@ export class Runner {
 }
 
 export function plannerPrompt(job: Job): string {
+  const decided = job.designTree ? decisionsText(job.designTree) : job.decisions.map((d) => d.text)
   return `${HEADER} planning job ${job.id}
 
 The user's job: ${job.goal}
-
+${decided.length ? `\nDecided with the user (follow these; for assumed points, decide and say what you chose):\n- ${decided.join("\n- ")}\n` : ""}
 Read as much of the project as you need (read, glob, grep); change nothing.
 Verify commands run from the project root in a fresh checkout of the current commit; use only commands that
 work there, such as the project's own test script.
@@ -269,4 +479,22 @@ export function summary(job: Job): string {
     : ""
   const why = job.phase === "ask_user" && job.lessons.length ? `\nwhy: ${job.lessons[job.lessons.length - 1]}` : ""
   return `${head}\n${lines.join("\n")}${branch}${why}`
+}
+
+// The instruction to draft the design tree; the format is the one parseTree reads.
+export function draftInstruction(job: Job): string {
+  return `[planning session ${job.id}] Before planning, the user's open decisions are settled in a planning session.
+Draft the design questions this job leaves open and send them with dictator_questions (job "${job.id}", tree as a
+JSON list): [{ "id": "D1", "question": "...", "kind": "decision" | "fact" | "assumption", "dependsOn": [], "impact":
+"low" | "medium" | "high" }]. Decisions are what only the user can decide (behaviour, scope, interfaces, trade-offs);
+facts are what agents can look up; at most 25. Do not ask the user anything in this turn.`
+}
+
+// The project's top-level entries, as cheap context for triage.
+function topLevel(project: string): string[] {
+  try {
+    return readdirSync(project).filter((f) => !f.startsWith(".")).slice(0, 40)
+  } catch {
+    return []
+  }
 }

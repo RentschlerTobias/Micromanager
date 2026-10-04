@@ -126,3 +126,13 @@ test("the gate flags guards at the floor and asks the user; unchecked jobs stay 
   assert.deepEqual(gateAnswer("continue."), {})
   assert.equal(gateAnswer("maybe"), undefined)
 })
+
+test("the guard bench sweeps recall and false positives per guard", async () => {
+  const { sweep } = await import("../src/bench.ts")
+  const rows = [
+    { yes: ["harmful"], p: { harmful: 0.9, injection: 0.1, refusal_likely: 0.2, sensitive: 0.1 } },
+    { yes: [], p: { harmful: 0.6, injection: 0.1, refusal_likely: 0.2, sensitive: 0.1 } },
+  ]
+  const h = sweep(rows, [0.5, 0.7]).filter((s) => s.guard === "harmful")
+  assert.deepEqual(h.map((s) => [s.floor, s.recall, s.fpr]), [[0.5, 1, 1], [0.7, 1, 0]])
+})

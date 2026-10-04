@@ -10,11 +10,12 @@ import { decide, type PermissionRequest } from "./decide.ts"
 import { routeSubagentCall, type ToolCall } from "./hooks.ts"
 import { Jev, apiKey } from "./jev.ts"
 import { record } from "./journal.ts"
-import { resolvePolicy } from "./policy.ts"
+import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
+import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe } from "./registry.ts"
 import { DICTATOR, ROLES } from "./roles.ts"
 import { Runner, summary, type SessionApi } from "./runner.ts"
-import { listJobs, loadJob } from "./store.ts"
+import { listJobs, loadJob, saveJob } from "./store.ts"
 import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 
 // What the permission hook "evaluate" gets (opencode 2.0.18): the planned effect can be changed in place.
@@ -24,6 +25,21 @@ interface Evaluation {
   action: string
   resources: string[]
   effect: "allow" | "ask" | "deny"
+  message?: string
+}
+
+// The dictator reads only to orient itself (README, file list); past this many reads per session it is refused
+// and told to let the agents explore (design.md §3).
+const DICTATOR_READ_CAP = 12
+const READS = new Set(["read", "glob", "grep", "list"])
+
+// What the session hooks "prompt" and "context" get (opencode 2.0.18, Phase A1).
+interface SessionHookInput {
+  sessionID?: string
+  agent?: string
+  prompt?: { text?: string }
+  system?: { type: string; text: string }[]
+  tools?: Record<string, unknown>
 }
 
 interface Context {
@@ -32,7 +48,7 @@ interface Context {
     hook(name: string, callback: (call: ToolCall) => void): Promise<unknown>
     transform(callback: (draft: ToolDraft) => void): Promise<unknown>
   }
-  session: SessionApi & { hook(name: string, callback: (input: { agent?: string; tools?: Record<string, unknown> }) => void): Promise<unknown> }
+  session: SessionApi & { hook(name: string, callback: (input: SessionHookInput) => Promise<void> | void): Promise<unknown> }
   permission: { hook(name: string, callback: (evaluation: Evaluation) => Promise<void> | void): Promise<unknown> }
   location?: { directory?: string }
   app?: { log?(entry: { level: string; message: string }): unknown }
@@ -96,7 +112,18 @@ export default {
 
     // Every question of the dictator and its sub-agents goes to Jev first: it answers itself when sure enough,
     // else the user is asked as usual.
+    const dictatorReads = new Map<string, number>()
     await ctx.permission.hook("evaluate", async (evaluation) => {
+      if (evaluation.agent === DICTATOR.agent && READS.has(evaluation.action) && evaluation.effect !== "deny") {
+        const reads = (dictatorReads.get(evaluation.sessionID) ?? 0) + 1
+        dictatorReads.set(evaluation.sessionID, reads)
+        if (reads > DICTATOR_READ_CAP) {
+          evaluation.effect = "deny"
+          evaluation.message = "The dictator only orients itself; let the agents explore (dictator_plan starts a planner that reads the project)."
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: `dictator read cap (${DICTATOR_READ_CAP})` })
+          return
+        }
+      }
       if (evaluation.effect !== "ask" || !ours.has(evaluation.agent)) return
       const request: PermissionRequest = {
         sessionID: evaluation.sessionID,
@@ -117,31 +144,40 @@ export default {
       log("info", `${evaluation.action} ${evaluation.resources.join(" | ").slice(0, 120)}: ${outcome.verdict} (${outcome.reason})`)
     })
 
-    // Jobs: the dictator plans and runs them through its tools; the plugin drives the loop (Phase B).
+    // Jobs: the dictator plans and runs them through its tools; the plugin drives the loop (Phase B, C).
     const project = ctx.location?.directory
     if (!project) {
       log("warn", "no project directory: the dictator tools are not installed")
       return
     }
+    const decider = new Decider(DEFAULT_BACKENDS, makeAskers(DEFAULT_BACKENDS, key))
     const runner = (parentID?: string) =>
       new Runner({
         session: ctx.session,
         project,
         registry,
+        decider,
         policies: { global: decisions },
         availability: () => probe(registry),
         progress: (text) => log("info", text),
         parentID,
         onWorker: (sessionID, task) => workerTasks.set(sessionID, task),
       })
+    const JOB_ID = /^job-\d{8}-\d{6}-[0-9a-f]{1,4}$/
     await ctx.tool.transform((draft) => {
       try {
         installTools(draft, {
           plan: async (goal, tctx) => {
-            if (!goal.trim()) return "dictator_plan needs the goal in the user's words."
-            const { job, errors } = await runner(tctx.sessionID).plan(goal)
-            return errors ? `The planner could not produce a valid plan (job ${job.id}):\n- ${errors.join("\n- ")}` : planText(job)
+            const text = goal.trim()
+            if (!text) return "dictator_plan needs the goal in the user's words, or a job id to continue."
+            const out = JOB_ID.test(text) ? await runner(tctx.sessionID).continueJob(text) : await runner(tctx.sessionID).start(text, tctx.sessionID)
+            if (out.job.facilitator === undefined && tctx.sessionID) {
+              out.job.facilitator = tctx.sessionID
+              saveJob(project, out.job)
+            }
+            return out.kind === "plan" ? planText(out.job) : out.text
           },
+          questions: async (job, tree, tctx) => runner(tctx.sessionID).questions(job.trim(), tree),
           run: async (id, tctx) => summary(await runner(tctx.sessionID).run(id.trim())),
           status: async (id) => {
             const job = id.trim() ? loadJob(project, id.trim()) : listJobs(project)[0]
@@ -152,10 +188,44 @@ export default {
         log("error", `dictator tools not installed: ${String(err)}`)
       }
     })
-    // The tools exist for every agent; only the dictator sees them.
+
+    // The dictator's newest job in a session, for the user's turns (planning session, gate answer, pins).
+    const sessionJob = (sessionID: string) => listJobs(project).find((j) => j.facilitator === sessionID)
+    // What the dictator must do in its next turn, per session; set from the user's turn, used by every provider
+    // turn of that answer (steering through a system block, Phase A1), replaced at the user's next turn.
+    const steering = new Map<string, string>()
+
+    await ctx.session.hook("prompt", async (input) => {
+      const sessionID = input.sessionID
+      const text = String(input.prompt?.text ?? "")
+      if (!sessionID || !text) return
+      steering.delete(sessionID)
+      const job = sessionJob(sessionID)
+      if (!job) return
+      try {
+        const pin = matchShortcut(text)
+        if (pin) {
+          if (pin.level === "job") job.pins = { ...job.pins, [pin.key]: pin.value }
+          else if (pin.taskId) job.taskPins = { ...job.taskPins, [pin.taskId]: { ...job.taskPins?.[pin.taskId], [pin.key]: pin.value } }
+          saveJob(project, job)
+          steering.set(sessionID, `[job ${job.id}] Noted the user's preset: ${pin.key} = ${pin.value}${pin.taskId ? ` for ${pin.taskId}` : ""}. Confirm it in one sentence.`)
+          return
+        }
+        const next = await runner(sessionID).answer(job.id, text)
+        if (next) steering.set(sessionID, next)
+      } catch (err) {
+        log("warn", `planning turn failed: ${String(err)}`)
+      }
+    })
+
     await ctx.session.hook("context", (input) => {
-      if (input.agent === DICTATOR.agent || !input.tools) return
-      for (const id of TOOL_IDS) delete input.tools[id]
+      // The tools exist for every agent; only the dictator sees them.
+      if (input.agent !== DICTATOR.agent) {
+        if (input.tools) for (const id of TOOL_IDS) delete input.tools[id]
+        return
+      }
+      const note = input.sessionID ? steering.get(input.sessionID) : undefined
+      if (note && Array.isArray(input.system)) input.system.push({ type: "text", text: note })
     })
   },
 }

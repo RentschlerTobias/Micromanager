@@ -8,7 +8,8 @@
     "test": "node --test 'test/**/*.test.ts'",
     "typecheck": "tsc -p tsconfig.json",
     "eval": "node src/cli.ts eval",
-    "export-dataset": "node src/cli.ts export-dataset"
+    "export-dataset": "node src/cli.ts export-dataset",
+    "bench-guards": "node src/cli.ts bench-guards"
   },
   "devDependencies": {
     "@types/node": "^24.19.0",

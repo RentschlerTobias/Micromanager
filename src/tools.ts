@@ -3,7 +3,7 @@
 
 import type { Job } from "./state.ts"
 
-export const TOOL_IDS = ["dictator_plan", "dictator_run", "dictator_status"] as const
+export const TOOL_IDS = ["dictator_plan", "dictator_questions", "dictator_run", "dictator_status"] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
 export interface ToolDraft {
@@ -18,6 +18,7 @@ export interface ToolContext {
 
 export interface Handlers {
   plan(goal: string, ctx: ToolContext): Promise<string>
+  questions(job: string, tree: string, ctx: ToolContext): Promise<string>
   run(job: string, ctx: ToolContext): Promise<string>
   status(job: string, ctx: ToolContext): Promise<string>
 }
@@ -27,12 +28,12 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dict
   const read = draft.get("read")
   const str = read?.input?.fields?.path
   if (!read?.input?.mapFields || !str) throw new Error("the built-in read tool has no input schema to build from")
-  const input = (name: string) => read.input!.mapFields!(() => ({ [name]: str }))
-  const guarded = (fn: (value: string, ctx: ToolContext) => Promise<string>, name: string) =>
+  const input = (...names: string[]) => read.input!.mapFields!(() => Object.fromEntries(names.map((n) => [n, str])))
+  const guarded = (fn: (values: string[], ctx: ToolContext) => Promise<string>, ...names: string[]) =>
     async (args: Record<string, unknown>, ctx: ToolContext) => {
       if (ctx?.agent && ctx.agent !== agent) return { content: `Only the ${agent} agent may use this tool.` }
       try {
-        return { content: await fn(String(args?.[name] ?? ""), ctx ?? {}) }
+        return { content: await fn(names.map((n) => String(args?.[n] ?? "")), ctx ?? {}) }
       } catch (err) {
         return { content: `failed: ${err instanceof Error ? err.message : String(err)}` }
       }
@@ -40,23 +41,30 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dict
   draft.add({
     id: "dictator_plan",
     name: "dictator_plan",
-    description: "Plan a job: a planner sub-agent splits the user's goal into small tasks with acceptance points. Returns the job id and the plan to show the user. Changes nothing.",
+    description: "Start or continue a job. With the user's goal: checks it, and either opens a planning session (follow the instruction it returns) or plans it right away. With a job id as goal: continues that job. Returns the plan to show the user, or what to do next. Changes nothing.",
     input: input("goal"),
-    execute: guarded(handlers.plan, "goal"),
+    execute: guarded(([goal], ctx) => handlers.plan(goal!, ctx), "goal"),
+  })
+  draft.add({
+    id: "dictator_questions",
+    name: "dictator_questions",
+    description: "Send the design questions of a planning session (or new ones found later) for a job: tree is a JSON list of { id, question, kind, dependsOn, impact }. Returns the one question to ask the user next.",
+    input: input("job", "tree"),
+    execute: guarded(([job, tree], ctx) => handlers.questions(job!, tree!, ctx), "job", "tree"),
   })
   draft.add({
     id: "dictator_run",
     name: "dictator_run",
     description: "Run a planned job after the user said go: one task at a time on the job's own git branch, with checks. Takes the job id from dictator_plan. Returns each task's status and the branch.",
     input: input("job"),
-    execute: guarded(handlers.run, "job"),
+    execute: guarded(([job], ctx) => handlers.run(job!, ctx), "job"),
   })
   draft.add({
     id: "dictator_status",
     name: "dictator_status",
     description: "Show a job's state: phase, tasks, branch. An empty job id shows the newest job.",
     input: input("job"),
-    execute: guarded(handlers.status, "job"),
+    execute: guarded(([job], ctx) => handlers.status(job!, ctx), "job"),
   })
   return [...TOOL_IDS]
 }

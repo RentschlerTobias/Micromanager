@@ -3,6 +3,10 @@
 // Code owns every transition. An illegal jump throws, so a bug shows up at once instead of as a stuck job.
 // The tables follow the jev-tutor engine's ALLOWED pattern.
 
+import type { JobFlags } from "./gate.ts"
+import type { PolicySet } from "./policy.ts"
+import type { DesignTree } from "./session.ts"
+
 export type JobPhase =
   | "intake"
   | "triage"
@@ -123,6 +127,12 @@ export interface Job {
   tasks: Task[]
   integrationBranch?: string
   integrationWorktree?: string
+  flags?: JobFlags // set by the G0 gate and the user's answer to it
+  triage?: { complexity?: number; clarification?: number; session: boolean; reason: string }
+  designTree?: DesignTree // the planning session
+  facilitator?: string // the dictator session that runs this job's planning session
+  pins?: PolicySet // job-level policies from the user's shortcuts ("always local", "pipeline P1", …)
+  taskPins?: Record<string, PolicySet> // task-level ones ("T3 use llamaswap/oss-u")
   budget: { workersMax: number; workersUsed: number; turnsMax: number; replansMax: number }
   counters: { turns: number; stalls: number; replans: number }
   lessons: string[]
