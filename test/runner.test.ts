@@ -485,3 +485,20 @@ test("a task that needs images goes to a vision model; local research readers ta
   assert.equal(fake2.created.filter((c) => c.agent === "dictator-research").length, 5)
   assert.equal(most, 1, "one reader at a time on the local GPU")
 })
+
+test("a run that ended mid-task starts that task again on a clean worktree", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles })
+  const r = runner(project, fake.api)
+  const { job } = await r.plan("goal")
+  // the first run dies inside T1: simulate its state on disk
+  const dying = runner(project, { ...fake.api, async wait() { throw new Error("server stopped") } })
+  await assert.rejects(dying.run(job.id))
+  const cut = loadJob(project, job.id)!
+  assert.equal(cut.tasks[0]!.status, "running")
+  writeFileSync(join(cut.integrationWorktree!, "half.js"), "half a change\n")
+  const done = await r.run(job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.match(done.lessons.join("\n"), /interrupted run: T1 started again, unfinished changes undone \(add\.js, half\.js\)/)
+  assert.equal(existsSync(join(done.integrationWorktree!, "half.js")), false)
+})

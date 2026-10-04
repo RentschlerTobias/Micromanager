@@ -133,11 +133,15 @@ export class Runner {
     await this.#d.session.prompt({ sessionID, text })
     const timeoutMs = this.#d.workerTimeoutMs ?? 20 * 60_000
     let timer: ReturnType<typeof setTimeout> | undefined
-    const timedOut = await Promise.race([
-      this.#d.session.wait({ sessionID }).then(() => false),
-      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), timeoutMs) }),
-    ])
-    clearTimeout(timer)
+    let timedOut: boolean
+    try {
+      timedOut = await Promise.race([
+        this.#d.session.wait({ sessionID }).then(() => false),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), timeoutMs) }),
+      ])
+    } finally {
+      clearTimeout(timer) // also when wait() fails, or the timer keeps the process alive for the whole timeout
+    }
     if (timedOut) await this.#d.session.interrupt({ sessionID }).catch(() => undefined)
     return { text: lastAssistantText(await this.#d.session.context({ sessionID })), timedOut, stopped: this.#d.stopped?.(sessionID) }
   }
@@ -413,7 +417,7 @@ export class Runner {
       job.integrationBranch = integration.branch
       job.integrationWorktree = integration.worktree
       this.#say(`working on branch ${integration.branch}`)
-    }
+    } else await this.#reconcile(job)
     saveJob(this.#d.project, job)
     while (job.phase === "execute") {
       if (++job.counters.turns > job.budget.turnsMax) {
@@ -430,6 +434,29 @@ export class Runner {
     }
     saveJob(this.#d.project, job)
     return job
+  }
+
+  // A run that ended in the middle of a task (the server stopped, a crash) leaves it running with half a change in
+  // the worktree. Nothing of this process works on it, so it goes back to pending and the worktree back to the last
+  // commit; the passed tasks are commits and stay.
+  async #reconcile(job: Job): Promise<void> {
+    const PATH: Partial<Record<Task["status"], Task["status"][]>> = {
+      planned: ["running", "escalated", "pending"],
+      running: ["escalated", "pending"],
+      gating: ["escalated", "pending"],
+      reviewing: ["fixing", "escalated", "pending"],
+      fixing: ["escalated", "pending"],
+    }
+    const cut = job.tasks.filter((t) => PATH[t.status])
+    if (cut.length === 0) return
+    for (const t of cut) {
+      for (const to of PATH[t.status]!) moveTask(t, to)
+      stage(t, "reconcile", "skip", "the run ended in the middle of this task; it starts again")
+    }
+    const dirty = await changedFiles(job.integrationWorktree!, this.#exec)
+    await revertFiles(job.integrationWorktree!, dirty, this.#exec)
+    job.lessons.push(`interrupted run: ${cut.map((t) => t.id).join(", ")} started again${dirty.length ? `, unfinished changes undone (${dirty.join(", ")})` : ""}`)
+    this.#say(`resuming: ${cut.map((t) => t.id).join(", ")} start again`)
   }
 
   #stop(job: Job, reason: string): void {
