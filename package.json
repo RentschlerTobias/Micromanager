@@ -6,7 +6,9 @@
   "description": "An OpenCode v2 plugin that orchestrates sub-agents, with TypeSafe Jev making the decisions",
   "scripts": {
     "test": "node --test 'test/**/*.test.ts'",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "eval": "node src/cli.ts eval",
+    "export-dataset": "node src/cli.ts export-dataset"
   },
   "devDependencies": {
     "@types/node": "^24.19.0",
