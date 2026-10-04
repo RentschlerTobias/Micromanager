@@ -15,6 +15,7 @@ import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe } from "./registry.ts"
 import { DICTATOR, ROLES, type Rule } from "./roles.ts"
 import { recentFailure, Runner, summary, type SessionApi } from "./runner.ts"
+import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
 import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 import { Watchdog, type Signal } from "./watchdog.ts"
@@ -175,6 +176,9 @@ export default {
       log("warn", `watchdog stopped ${sessionID}: ${signal.detail}`)
       ctx.session.interrupt({ sessionID }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
     }
+    // Skills are read once per start, like the agents: install.sh --skills and a restart make new ones known.
+    const installed = installedSkills()
+    log("info", `skills for workers: ${[...installed].join(", ") || "none (./install.sh --skills)"}`)
     const runner = (parentID?: string) =>
       new Runner({
         session: ctx.session,
@@ -191,6 +195,8 @@ export default {
         },
         watch: (sessionID, maxSteps) => watchdog.watch(sessionID, { maxSteps }),
         stopped: (sessionID) => stops.get(sessionID),
+        skills: SKILLS.filter((s) => s.asked && installed.has(s.name)),
+        installedSkills: installed,
       })
     await ctx.tool.hook("execute.after", (call) => {
       if (!call.sessionID || !watchdog.watching(call.sessionID)) return

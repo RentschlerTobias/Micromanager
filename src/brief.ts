@@ -50,10 +50,14 @@ export function brief(job: Job, task: Task, model: string, directory: string, sk
     done.length ? `Already done: ${done.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
     job.decisions.length ? `Decisions that apply: ${job.decisions.map((d) => d.text).join("; ")}` : "",
     job.lessons.length ? `Learned earlier in this job: ${job.lessons.slice(-3).join("; ")}` : "",
-    skills.length ? `Load these skills before you start: ${skills.join(", ")}.` : "",
+    skillLine(skills),
     "",
     REPORT_FORMAT,
   ].filter((line, i, all) => line !== "" || all[i - 1] !== "").join("\n").trim()
+}
+
+export function skillLine(skills: readonly string[]): string {
+  return skills.length ? `Load these skills before you start: ${skills.join(", ")}.` : ""
 }
 
 export function fixPrompt(failures: readonly { command: string; code: number; output: string }[]): string {

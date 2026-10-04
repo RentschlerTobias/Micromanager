@@ -9,7 +9,7 @@ import { buildAgenda, nextProposal } from "./agenda.ts"
 import { Decider, RulesBackend } from "./backends.ts"
 import { ANSWER, CHOICE_FLOOR, complexityOf, NOUL_FLOOR, nextQuestionChoice, splitQuestions, TRIAGE } from "./catalog.ts"
 import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, type Unchecked } from "./gate.ts"
-import { brief, fixPrompt, lastAssistantText, parseReport, taskAcceptance, usage } from "./brief.ts"
+import { brief, fixPrompt, lastAssistantText, parseReport, skillLine, taskAcceptance, usage } from "./brief.ts"
 import { changedFiles, commitTask, exec as defaultExec, hashFiles, prepareIntegration, revertFiles, runGate, workingDiff, type Exec, type GateResult } from "./integration.ts"
 import { record } from "./journal.ts"
 import { HEADER } from "./hooks.ts"
@@ -27,6 +27,7 @@ import {
   type AnswerReading, type DesignTree, type Step,
 } from "./session.ts"
 import { moveJob, moveTask, newJob, promoteReady, stage, type Job, type Task } from "./state.ts"
+import { skillsFor, type Stage } from "./skills.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
 import { handoffNote, TIER_STEPS, type Signal } from "./watchdog.ts"
 
@@ -57,7 +58,8 @@ export interface RunnerDeps {
   readonly watch?: (sessionID: string, maxSteps: number) => void // the loop watchdog starts judging a session
   readonly stopped?: (sessionID: string) => Signal | undefined // why the watchdog stopped a session, if it did
   readonly unchecked?: Unchecked // what G0 does when nothing local could check a job
-  readonly skills?: readonly Skill[] // the leaf skills workers may load (design.md §13.1)
+  readonly skills?: readonly Skill[] // the skills the decision model may pick per task (design.md §13.1)
+  readonly installedSkills?: ReadonlySet<string> // the skills a brief may name: linked into OpenCode by install.sh
 }
 
 // A worker session in progress: its model, its last answer, and whether it is already the fresh retry.
@@ -467,7 +469,7 @@ export class Runner {
       frozen = red
     }
     const s = await this.#workerSession(job, task, model.id)
-    const first = [brief(job, task, model.id, worktree, this.#skillNotes(profile)), frozen.size ? greenNote([...frozen.keys()]) : ""].filter(Boolean).join("\n\n")
+    const first = [brief(job, task, model.id, worktree, this.#skills("implement", task)), frozen.size ? greenNote([...frozen.keys()]) : ""].filter(Boolean).join("\n\n")
     let work: Work | undefined = { s, model, answer: await this.#ask(s.id, first), fresh: false }
     work = await this.#untilGreen(job, task, work, checks, frozen)
     if (!work) return
@@ -481,7 +483,7 @@ export class Runner {
       moveTask(task, "fixing")
       moveTask(task, "running")
       this.#say(`${task.id}: the review found ${r.blocking.length} unmet point(s), round ${round + 1}`)
-      work.answer = await this.#ask(work.s.id, reviewFixPrompt(r))
+      work.answer = await this.#ask(work.s.id, [reviewFixPrompt(r), skillLine(this.#skills("review_fix", task))].filter(Boolean).join("\n\n"))
       work = await this.#untilGreen(job, task, work, checks, frozen)
       if (!work) return
     }
@@ -526,7 +528,7 @@ export class Runner {
         task.model = model.id
         this.#say(`${task.id}: stopped by the loop watchdog (${answer.stopped.detail}), fresh session on ${model.id}`)
         const s = await this.#workerSession(job, task, model.id)
-        const text = `${brief(job, task, model.id, worktree, this.#skillNotes(task.profile))}\n\n${frozen.size ? `${greenNote([...frozen.keys()])}\n\n` : ""}${handoffNote(answer.stopped, await changedFiles(worktree, this.#exec))}`
+        const text = `${brief(job, task, model.id, worktree, this.#skills("implement", task))}\n\n${frozen.size ? `${greenNote([...frozen.keys()])}\n\n` : ""}${handoffNote(answer.stopped, await changedFiles(worktree, this.#exec))}`
         work = { s, model, answer: await this.#ask(s.id, text), fresh: true }
         continue
       }
@@ -570,7 +572,7 @@ export class Runner {
     const model = await this.#model(job, "test", task.profile?.difficulty ?? 0.5, task.id)
     const s = await this.#workerSession(job, task, model.id, "test")
     const testFiles = task.files.filter((f) => TEST_FILE.test(f))
-    const answer = await this.#ask(s.id, `${brief(job, task, model.id, worktree)}\n\n${redPrompt(task, testFiles)}`)
+    const answer = await this.#ask(s.id, `${brief(job, task, model.id, worktree, this.#skills("red", task))}\n\n${redPrompt(task, testFiles)}`)
     if (answer.stopped || answer.timedOut) {
       stage(task, "red", "fail", answer.stopped ? `loop watchdog: ${answer.stopped.detail}` : "timed out")
       this.#escalate(job, task, `the tests-first worker ${answer.stopped ? "was stopped by the loop watchdog" : "timed out"}`)
@@ -603,7 +605,7 @@ export class Runner {
     const model = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [this.#family(workerModel)])
     const s = await this.#workerSession(job, task, model.id, "review", TIER_STEPS.S)
     const diff = await workingDiff(worktree, this.#exec)
-    let answer = await this.#ask(s.id, reviewPrompt(job, task, taskAcceptance(job, task), diff))
+    let answer = await this.#ask(s.id, [reviewPrompt(job, task, taskAcceptance(job, task), diff), skillLine(this.#skills("review", task))].filter(Boolean).join("\n\n"))
     let review = answer.stopped || answer.timedOut ? { checks: [], fixes: [], blocking: [], error: answer.stopped ? `reviewer stopped: ${answer.stopped.detail}` : "reviewer timed out" } : parseReview(answer.text)
     if (review.error && !answer.stopped && !answer.timedOut) {
       answer = await this.#ask(s.id, `${HEADER} Answer again with the JSON only.`)
@@ -619,7 +621,7 @@ export class Runner {
     const n = readerCount(task.profile?.difficulty ?? 0.5)
     const readers = await Promise.all(Array.from({ length: n }, async (_, i) => {
       const s = await this.#workerSession(job, task, model, "research")
-      return this.#ask(s.id, readerPrompt(job, task, i, n))
+      return this.#ask(s.id, [readerPrompt(job, task, i, n), skillLine(this.#skills("reader", task))].filter(Boolean).join("\n\n"))
     }))
     const notes = readers.filter((r) => !r.stopped && !r.timedOut && r.text).map((r) => r.text)
     readers.forEach((r, i) => saveNote(this.#d.project, job.id, `${task.id}.reader${i + 1}`, r.text || "(no answer)"))
@@ -654,8 +656,8 @@ export class Runner {
     this.#say(`${task.id} researched${commit ? ` (${commit})` : ""}: ${path}`)
   }
 
-  #skillNotes(profile?: Profile): readonly string[] {
-    return profile?.skills ?? []
+  #skills(stage: Stage, task: Task): string[] {
+    return skillsFor(stage, task.profile, task.pipeline, this.#d.installedSkills ?? new Set())
   }
 
   async #plannerSession(job: Job, model: string): Promise<{ id: string }> {
