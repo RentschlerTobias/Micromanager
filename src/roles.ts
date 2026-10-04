@@ -166,7 +166,9 @@ export function roleById(id: string): Role | undefined {
 export const DICTATOR = {
   agent: "dictator",
   description: "Orchestrator: splits a job into sub-tasks and delegates each to a role sub-agent.",
-  rules: [...noWrite, ...noShell, ...noWeb, rule("subagent", "ask"), ...noStateDir] as readonly Rule[],
+  // No reads outside the project: in a live test the dictator went into the plugin's own source to find a way past
+  // the local check, instead of asking the user.
+  rules: [...noWrite, ...noShell, ...noWeb, rule("subagent", "ask"), rule("external_directory", "deny"), ...noStateDir] as readonly Rule[],
 } as const
 
 export function dictatorSystem(roles: readonly Role[] = ROLES): string {

@@ -233,7 +233,7 @@ export class Runner {
       job.flags = { gate }
       moveJob(job, "ask_user")
       saveJob(this.#d.project, job)
-      return { kind: "gate", job, text: `job ${job.id}\n${gateQuestion(gate)}` }
+      return { kind: "gate", job, text: `[job ${job.id}] Only the user can answer the local check, so ask them now: show the question below word for word, call no tool, and end your turn. Their reply reaches the plugin by itself.\n\n${gateQuestion(gate)}` }
     }
     job.flags = flags
     return this.#triage(job)

@@ -58,3 +58,7 @@ test("no agent may read or change the plugin's state directory", () => {
     }
   }
 })
+
+test("the dictator never reads outside the project (live test: it searched the plugin's source for a way past the gate)", () => {
+  assert.ok(DICTATOR.rules.some((r) => r.action === "external_directory" && r.effect === "deny" && r.resource === "*"))
+})
