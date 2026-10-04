@@ -6,6 +6,7 @@ import { join } from "node:path"
 
 import { DEFAULT_FLOORS, type Floors } from "./decide.ts"
 import { validatePolicies, type PolicySet } from "./policy.ts"
+import { DEFAULT_REGISTRY, mergeRegistry, type ModelEntry } from "./registry.ts"
 import { DEFAULT_ROUTING, type Routing } from "./routing.ts"
 import { roleById, type RoleId } from "./roles.ts"
 
@@ -73,10 +74,20 @@ export function parseDecisions(text: string): PolicySet {
   return raw as PolicySet
 }
 
+// "registry": models to add or change by id, e.g. [{ "id": "llamaswap/mimo", "disabled": true }] (design.md §19).
+export function parseRegistry(text: string): ModelEntry[] {
+  const raw = (JSON.parse(stripComments(text)) as { registry?: unknown }).registry ?? []
+  if (!Array.isArray(raw) || !raw.every((e) => typeof e === "object" && e !== null && typeof (e as { id?: unknown }).id === "string" && (e as { id: string }).id.includes("/"))) {
+    throw new Error('registry must be a list of objects with an "id" like "provider/model"')
+  }
+  return mergeRegistry(DEFAULT_REGISTRY, raw as Partial<ModelEntry>[])
+}
+
 export interface Settings {
   readonly routing: Routing
   readonly floors: Floors
   readonly decisions: PolicySet
+  readonly registry: readonly ModelEntry[]
 }
 
 export function loadSettings(path = configPath()): Settings & { error?: string } {
@@ -84,11 +95,11 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {} } // no file: the defaults
+    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text) }
+    return { routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
   } catch (err) {
-    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, error: `${path}: ${String(err)}` }
+    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }
 }
