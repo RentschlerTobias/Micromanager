@@ -1,6 +1,6 @@
 # jev-dictator design: job state, planning session, Jev's decision tree
 
-Status (2026-10-04): design agreed, extended the same day by local vs cloud routing, censored vs uncensored
+Status (2026-10-04): design agreed, Phase A spikes done (§17), extended the same day by local vs cloud routing, censored vs uncensored
 guards, decision backends (cloud Jev or local GLiNER) and user overrides (§19–§22). Implementation follows in the phases listed in [plan.md](plan.md). The flow
 chart [design.html](design.html) is the interactive version of this document. It shows where Jev decides and
 where skills and tools are picked and used.
@@ -43,7 +43,7 @@ Decisions (user, 2026-10-03/04):
 7. **Caveman-style terse text** is used wherever only machines read it.
 8. **Worker starts stay confirmed:** Jev first, then the user (decision 2026-10-01). Starts are confirmed per
    batch, not per worker.
-9. **Models: local when capable** (GPU, iGPU, NPU). Cloud (OpenCode Go) is used for hard tasks, long contexts,
+9. **Models: local when capable** (4060 GPU, iGPU; the NPU is reserved for Whisper and one small quick model). Cloud (OpenCode Go) is used for hard tasks, long contexts,
    or when the local hardware is busy (§19).
 10. **A legitimate task a censored model would refuse** goes automatically to a local uncensored model. Only a
     narrowly defined `harmful` and `injection` go to the user (§21).
@@ -220,10 +220,11 @@ Limits:
 **Very large jobs** (complexity 9–10, later): a wayfinder map, i.e. a destination plus decision tickets, worked
 one per session across days.
 
-**Where it runs** (assumption, spike A1): the plugin sees each user turn in the dictator chat and steers the next
-one.
-- Fallback: a plugin-driven facilitator session, answered through the question form's free-text field. The
-  dictator chat then shows only the transcript.
+**Where it runs** (verified, A1): the `session` hook `prompt` sees every user turn (text, files, agents, skills)
+before it is processed, and the `context` hook sees every provider turn (system blocks, messages, tools).
+- **Steering goes through the system prompt** (the `context` hook appends a system block, e.g. "ask exactly D2
+  now") or through `ctx.session.synthetic`. It never goes through the user's text: a note appended to the user
+  message was recognised as an injection and ignored (A1).
 
 ## 7. Plan and task split
 - **The planner subagent** writes the plan as JSON:
@@ -298,8 +299,12 @@ Rules for these requests:
   `tool.shell`) is cut to the matrix and lowers the effective confidence.
 
 **The profile narrows the role matrix, never widens it:**
-- It is enforced in the permission `evaluate` hook through a session → task map.
-- Tools can be denied this way. MCP tools cannot be hidden from a worker, but they can be denied.
+- It is set as the worker session's own permission rules at `ctx.session.create({ permissions })` (A5). A tool
+  denied there disappears from the worker's toolset.
+- The `evaluate` hook (it fires for allow and ask, not for deny) tightens single requests on top, through a
+  session → task map.
+- **Profiles deny tool groups, never single tools.** A2 showed a worker without `read` reading the file through
+  `grep`. Reading = read, grep, glob, list, lsp; writing = edit, write, patch; and so on.
 
 **Rule-based additions** (no Jev):
 - verification-before-completion for every writer;
@@ -357,7 +362,8 @@ Rules for these requests:
 ### 10.1 The loop watchdog (no worker loops forever)
 Background: Kimi 2.6/2.7 looped without reading its own answers and restarted its task. Gemini is known for
 endless read loops.
-- **Live, in code.** The plugin follows each worker session's events while it runs and interrupts it
+- **Live, in code.** The plugin follows each worker session through the `tool.execute.before/after` hooks and the
+  `context` hook (A4: the event stream delivered nothing) and interrupts it
   (`ctx.session.interrupt`). The model never decides whether it loops.
 - **Limits:** steps, wall clock, tokens.
   - Jev picks the budget tier (S / M / L) in N5.
@@ -425,7 +431,7 @@ Checked against OpenCode v2.0.18 on 2026-10-03. v2 does not load v1 plugins. v2-
 |---|---|---|---|
 | loop watchdog, decision dataset | our code | every worker, every Jev question | must |
 | model registry + availability | our code over llama-swap `:8000` (4060), llama-vulkan `:8092` (iGPU), FLM `:52625` (NPU), OpenCode Go | routing (§19) | must |
-| decision server (GLiNER2) | our small Python service, Jev wire format, CPU or 4060 | G0, guards, shadow mode (§20) | must |
+| decision server (GLiNER2) | our small Python service, Jev wire format, on the CPU | G0, guards, shadow mode (§20) | must |
 | Open-Jev server | `openjev` backend, Jev wire format | optional local backend (§20) | later |
 | cc-safety-net | plugin (dual, `./opencode/v2`) | N13 hard rule #0 inside our hook (assumption: the import resolves from the symlinked plugin, spike A6; else its own plugin) | must |
 | shell-strategy | instructions file | system prompt of code, test, debug | must |
@@ -567,19 +573,25 @@ Floors live next to the question wordings in `src/catalog.ts`, and change only t
   - N3's Jev part, N7, N10–N12 as Jev nodes;
   - wayfinder maps, DCP, the memory plugin, otel, plannotator.
 
-## 17. Assumptions and spikes (Phase A)
-| # | Assumption | Fallback if it fails |
-|---|---|---|
-| A1 | The plugin sees each user turn in the dictator chat and can steer the next turn (chat hook, `session.synthetic` / system transform) | a plugin-driven facilitator session, answered through the question form |
-| A2 | `ctx.session.create/prompt/wait` starts a worker with agent, model and background | keep the built-in `subagent` tool; `tool.hook` rewrites agent, model and prompt to the agenda's choice (today's path) |
-| A3 | A custom tool can return output (the open Phase 0 schema question) | the planner's final message carries JSON that the plugin parses |
-| A4 | Event names for idle, error and question; `ctx.shell` runs inside a worktree; `ctx.session.interrupt` stops a worker | poll `session.get`; run gates through a worker of role test |
-| A5 | The `evaluate` hook fires for allow too, so the profile can tighten every effect | one variant agent per profile |
-| A6 | cc-safety-net imports from the symlinked plugin file | its own plugin, order of the hooks checked |
-| A7 | glm, qwen and deepseek see their own tool output and reasoning through OpenCode Go (and the local models through llama.cpp) | that model is dropped from the routing table |
-| A8 | llama-swap and FLM report what is loaded and how long a swap takes; OpenCode routes to the local providers | availability from our own swap log; static device assignment |
-| A9 | the decision server answers through the Jev wire format fast enough on CPU while a llama-swap model holds the 4060 | GLiNER on the 4060 between swaps, or guards only |
-| A10 | a refusal by a local censored model (ornith, mimo) is detectable from its reply | the refusal signature uses GLiNER's noul only |
+## 17. Assumptions and spikes (Phase A, done 2026-10-04)
+Run against private `opencode run --standalone` servers with only a spike plugin loaded (OpenCode 2.0.18).
+Details are in plan.md, "Phase A results".
+
+| # | Assumption | Result | Consequence |
+|---|---|---|---|
+| A1 | the plugin sees and steers each user turn | **yes**: `session.hook("prompt")` sees and may rewrite every turn; `session.hook("context")` sees system, messages and tools per provider turn | steer through a system block or `session.synthetic`, never the user's text (it was ignored as an injection) |
+| A2 | the plugin starts workers with agent and model | **yes**: `session.create({parentID, title, agent, model, permissions})` → `prompt` → `wait({sessionID})` | workers are plugin sessions; the built-in `subagent` tool is not needed |
+| A3 | a custom tool returns output | **yes**, with no output schema (text `content`) or with one (structured `output` + `content`) | `plan_submit`, `job` and a `papers` tool are possible |
+| A4 | events, shell in a worktree, interrupt | `session.interrupt` stops a worker at once; `worktree.create({projectID, name})` / `remove` work (worktrees live in `~/.local/share/opencode/worktree/<project>/`, detached unless an existing branch is given; `commands.start` from the project config runs on create); `ctx.event.subscribe` delivered **no** events; there is no `ctx.shell` to run commands | the watchdog reads `tool.execute.before/after` and the `context` hook instead of events; gates run through node's `child_process` in the worktree |
+| A5 | the profile can tighten every effect | **yes**: `evaluate` fires for allow and ask (not deny) and can set deny with a message; per-session `permissions` hide denied tools | profiles are session permissions plus the hook; deny tool groups |
+| A6 | cc-safety-net imports from the symlinked plugin | **yes**: imports resolve from the real path | embed `checkCommand` as hard rule #0; a deny goes to the user. It adds `find -delete`, `git checkout --`, `dd` to devices and dynamic `curl \| sh`; it lets `sudo` through, which our own rule catches |
+| A7 | models see their own tool output and reasoning | **yes** for glm-5.3-flash, qwen3.8-flash, deepseek-v4.1-flash, ornith-u (4060, 17 s) and qwen3.8-u (iGPU, 125 s): correct answer, no re-read, reasoning and tool results stay in context; qwen3:4b on the NPU answered right but skipped the required tool | all stay in the routing table; the NPU model is quick tier only |
+| A8 | local availability is readable | llama-swap `/v1/models` (loaded / unloaded) and `/running`; llama-vulkan `/health`, `/props` (n_ctx 16384), `/slots` (`is_processing` for 4 slots); FLM lists only its catalog. A swap took 12–19 s with the file in the page cache (1–2 min cold) | the registry reads these live; the swap cost is about 20 s warm |
+| A9 | GLiNER answers fast enough on the CPU | **yes**: about 370 ms for four guard questions on 8 threads, 2–3 s load; zero-shot GLiNER is useless (all about 0.5); the oc-voice fine-tune separates injection and harmful but flags legitimate security work as harmful and knows no `refusal_likely` | a guard fine-tune with hard negatives is required; until then a G0 "yes" only asks the user (§20) |
+| A10 | a refusal by a local censored model is detectable | **open**: only the swap time was measured; the refusal probe set comes from the user's own bench cases | `worker_refused` stays designed; its patterns are calibrated on the user's probe set |
+
+A side finding: a private standalone server sometimes hangs at start, before it loads any plugin. The spike
+harness retried such runs; the plugin itself is not involved.
 
 ## 18. Code layout (target)
 - **New:**
@@ -618,7 +630,7 @@ Floors live next to the question wordings in `src/catalog.ts`, and change only t
 |---|---|---|---|
 | RTX 4060 8 GB | llama-swap `:8000` | `oss-u` (gpt-oss-20b unc, deep), `ornith-u` / `ornith-u-s` (Ornith-1.5-9B unc, agent, vision), `ornith` (censored agent), `mimo` (censored, fast), `qwen3.5-u` (4B unc, quick, vision) | one model at a time; a swap takes 1–2 min |
 | Radeon 890M iGPU | llama-vulkan `:8092` | `qwen3.8-u` (27B unc, about 6.5 t/s) | resident |
-| XDNA2 NPU | FLM `:52625` | `qwen3:4b`, `qwen3vl-it:4b`, `qwen3.5:4b`, `gpt-oss:20b` | runs beside GPU load; gpt-oss on the NPU and qwen3.8-u on the iGPU do not both fit in RAM |
+| XDNA2 NPU | FLM `:52625` | Whisper V3 Turbo (STT), plus at most one small LLM (`qwen3:4b` / `qwen3vl-it:4b`) | reserved for speech; a quick tier only, never agentic work (A7: qwen3:4b skipped the tool it was told to use) |
 | cloud | OpenCode Go | glm-5.3-flash, qwen3.8-flash, deepseek-v4.1-flash | long contexts, hard tasks |
 
 Every local model is configured with a 16k context.
@@ -644,12 +656,12 @@ The fixed `MODELS` in `src/roles.ts` become the default entries.
 3. **Availability, read live:**
    - llama-swap `/v1/models` (loaded or unloaded);
    - FLM and llama-vulkan health;
-   - the RAM rule.
+   - the RAM rule (the 27B on the iGPU and a large model on the NPU do not both fit).
 
    A loaded model beats one that needs a swap.
 4. **Per-device concurrency:**
    - A GPU behind llama-swap runs one model at a time, so the scheduler batches tasks by model.
-   - Parallel workers spread over the 4060, the iGPU, the NPU and the cloud.
+   - Parallel workers spread over the 4060, the iGPU and the cloud. The NPU takes only quick-tier calls.
 5. **Reviewer:** another family (Ornith, MiMo, gpt-oss and Qwen are different families). It is local too when the
    task is local-only.
 
@@ -669,12 +681,12 @@ are split (N4) or go to the cloud.
 | Backend | Where | Strength |
 |---|---|---|
 | `typesafe` | TypeSafe cloud Jev | best on fine decisions; the teacher in shadow mode |
-| `gliner` | our decision server (GLiNER2, `fastino/GLiNER2.5-*-Decide` or a fine-tune), CPU or 4060; not the NPU | local, about 80–190 ms; guards already at Jev level or better |
+| `gliner` | our decision server (GLiNER2, a fine-tune of `fastino/GLiNER2.5-*-Decide`), on the CPU | local; about 370 ms for the four G0 guards on 8 threads (A9); needs our own fine-tune before it decides guards |
 | `openjev` | a local Open-Jev server | local, generative-free probabilities; larger |
 | `rules` | code | always available |
 
-- **The decision server** is a small Python service (uv, a systemd user unit). It keeps the TypeScript plugin
-  free of Python.
+- **The decision server** is a small Python service (uv, a systemd user unit) on the CPU. The 4060 stays free for
+  llama-swap and the NPU for Whisper. It keeps the TypeScript plugin free of Python.
 - **Mapping to GLiNER**, after oc-voice's `decision/gliner.py` (a concept, not a code dependency):
   - Choice → a single-label task;
   - Noul → yes/no;
@@ -694,6 +706,11 @@ Its outcomes:
 - `sensitive` or `refusal_likely` → the job or task becomes **local-only**: every later node uses `gliner` or
   `openjev`, and every worker runs locally.
 - Otherwise each node uses its configured backend.
+
+**Until our own GLiNER fine-tune passes the guard bench** (A9: the oc-voice fine-tune flags a port scan of the
+user's own LAN as harmful and a credential rotation as injection, and has no notion of `refusal_likely`), a G0
+"yes" from GLiNER only sends the question to the user; it never blocks or routes on its own. `refusal_likely` is
+then caught at runtime by the `worker_refused` signature instead.
 
 **Starting backends per node** follow oc-voice's measured verdict: GLiNER fine-tunes beat Jev on guards but
 reached 0.85 against 0.98 on intent.

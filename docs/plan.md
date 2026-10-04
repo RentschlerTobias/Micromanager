@@ -3,7 +3,7 @@
 Status (2026-10-04): Phase 0 (spike) and Phase 1 done, and Jev on permission requests works (part of the old
 Phases 2 and 3). The design was reworked on 2026-10-03/04: [design.md](design.md) is now the design and
 [design.html](design.html) its flow chart. Extended the same day by local vs cloud routing, censorship guards, decision backends (cloud Jev or
-local GLiNER) and user overrides (design.md §19–§22). The next step is Phase A (spikes) below.
+local GLiNER) and user overrides (design.md §19–§22). Phase A (spikes) is done (results below); the next step is Phase B.
 
 ## Context
 An OpenCode plugin that orchestrates sub-agents the way oh-my-openagent (OmO) does: it splits a job into
@@ -184,6 +184,109 @@ Sources are listed at the end of design.md.
 - Sessions on a second server share `~/.local/share/opencode/opencode.db` (the spike's sessions were deleted
   afterwards).
 
+## Phase A results (spikes against private standalone servers, opencode 2.0.18, 2026-10-04)
+**Setup.**
+- A spike plugin in its own `XDG_CONFIG_HOME`, so neither the jev-dictator plugin nor the user's hub was
+  touched.
+- `opencode run --standalone` in a throwaway git project.
+- Every session was deleted afterwards.
+
+**Plugin context (v2 runtime).** `ctx` has app, location, options, agent, aisdk, command, event, experimental,
+generate, model, provider, integration, mcp, permission, plugin, reference, rpc, skill, storage, tool, vcs,
+websearch, worktree, session, shell.
+- **`ctx.session`:** `hook, create, get, switchAgent, switchModel, prompt, generate, command, synthetic, interrupt,
+  update, move, wait, context`. Its arguments follow the server API, e.g. `wait({ sessionID })`.
+- **Hook names found in the binary:**
+  - session: `prompt`, `context`, `compaction`, `generate`, `title`, `model.request`, `http.request`,
+    `http.response`, `retry`;
+  - tool: `execute.before`, `execute.after`;
+  - permission: `evaluate`;
+  - shell: `create.before`.
+- **`ctx.shell`** only has a hook; there is no way to run a command through it.
+
+**A1 user turns and steering.**
+- `session.hook("prompt")` gets `{sessionID, messageID, prompt: {text, files, agents, skills}, metadata,
+  delivery}` for every user turn and may rewrite it.
+- **Steering through the user text failed.** deepseek-v4.1-flash called an appended "note from the plugin" an
+  injection and ignored it.
+- **Steering through the system prompt worked.** `session.hook("context")` gets `{sessionID, model, system,
+  messages, options, agent, tools}`, where `system` is an array of `{type: "text", text}`. A pushed system block
+  was followed (the reply ended with the requested token).
+- **`session.synthetic({sessionID, text, resume: false})`** also worked: the child answered with the injected
+  secret word.
+
+**A2 workers.**
+- `session.create({parentID, title, agent: "explore", model: {providerID, id}})` created the child in about
+  10 ms, with that agent and model.
+- `prompt({sessionID, text})` then `wait({sessionID})` returned when the child was done; `context({sessionID})`
+  returned its messages.
+
+**A3 custom tools.**
+- With no `output` schema, `execute` returns `{content}`.
+- With an output schema, it returns `{output, content}`. The input schema reused as output schema worked.
+- The model reached both through the `execute` code-mode tool.
+
+**A4.**
+- `session.interrupt({sessionID})` stopped a long child at once ("Step interrupted").
+- **Worktrees:**
+  - `worktree.list/create/remove({projectID, …})`, where `projectID` comes from `ctx.location.project.id`.
+  - The worktree is created in `~/.local/share/opencode/worktree/<project>/<name>`.
+  - `branch` must be an existing branch, otherwise the HEAD is detached; `from` is the directory of a registered
+    worktree, not a git ref.
+  - The project config's `commands.start` runs after create.
+- `ctx.event.subscribe(cb)` returned but delivered no events in a standalone run.
+
+**A5.**
+- `permission.hook("evaluate")` fires for allow and ask (deny short-circuits before it). Setting `effect = "deny"`
+  with a message blocked the read.
+- `session.create({permissions: [{action: "read", resource: "*", effect: "deny"}]})` removed `read` from the
+  child's toolset. The child then read the file with `grep`, so profiles must deny tool groups.
+
+**A6.**
+- `cc-safety-net@2.5.2` (no dependencies; `checkCommand({command, cwd})` → `allow` or `deny` with `ruleId`)
+  imported fine from a plugin file symlinked into the plugins directory. `import.meta.url` is the real path.
+- **It denies:** force push, `reset --hard`, `clean -f`, `checkout --`, `rm -rf` outside the cwd, `find -delete`,
+  `dd` to a device, `.env` reads, dynamic `curl | sh`.
+- **It allows:** `rm -rf node_modules`, and `sudo pacman -S` (our own rule catches that).
+
+**A7.** The task: read a file, compute with bash, answer.
+- **Correct, each tool once:** glm-5.3-flash, qwen3.8-flash, deepseek-v4.1-flash, `ornith-u` on the 4060 (17 s,
+  one extra shell call), `qwen3.8-u` on the iGPU (125 s). Reasoning and tool results stayed in every later turn's
+  context.
+- **`qwen3:4b` on the NPU** (107 s) answered correctly but skipped the bash tool.
+
+**A8.**
+- llama-swap reports `loaded` / `unloaded` per model and the running model's state.
+- llama-vulkan reports `/health`, `/props` (n_ctx 16384) and `/slots` (4 slots with `is_processing`).
+- FLM lists only its catalog.
+- **Swap times:** cold to warm, with the file in the page cache: ornith 17.1 s, mimo 12.0 s, ornith-u 19.4 s.
+- **Warm replies:** 0.8–7.9 s.
+
+**A9.** GLiNER2 on the CPU, 8 threads, four G0 guards per request, 13 cases:
+- **Speed:** about 370 ms per request, 2–3 s load.
+- **Zero-shot `GLiNER2.5-multi-Decide`:** about 0.5 everywhere, useless.
+- **oc-voice fine-tune `multi-decide-g2`:**
+  - injection: 1.0 on both attacks;
+  - harmful: 1.0 on all three harmful cases, but also 1.0 on a port scan of the user's own LAN and 0.53 on
+    harm-reduction;
+  - `refusal_likely`: unknown to it (0.0);
+  - `sensitive`: right on bank data and credentials, with false positives;
+  - credential rotation: also flagged as injection.
+
+**A10.** Only the swap time was measured. The refusal probe set comes from the user's own bench cases; the
+`worker_refused` patterns are calibrated on it.
+
+**Decisions from Phase A.**
+- **GLiNER runs on the CPU.** The NPU is reserved for Whisper V3 Turbo plus at most one small quick-tier LLM.
+- **Workers are plugin sessions.** Profiles are session permissions per tool group, plus the evaluate hook.
+- **Steering** goes through system blocks and synthetic messages.
+- **The watchdog** reads tool and context hooks.
+- **Gates** run through `child_process`.
+- **G0 on GLiNER** only asks the user until our guard fine-tune passes the bench.
+
+**Side finding.** A private standalone server sometimes hung at start, before it loaded any plugin. The spike
+harness detects an empty log after 40 s and retries.
+
 ## Design
 The architecture, the job state, the planning session, Jev's decision nodes, the pipelines, the loop watchdog,
 parallelism, the stack and the decision dataset are in [design.md](design.md). It replaces this file's earlier
@@ -231,7 +334,8 @@ OpenCode permission per tool: allow / ask / deny. Write rights apply only inside
    permission decisions: done.
 
 From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
-- **A. Spikes A1–A10.** A1 (chat-turn hook + steering) first; then A2, A3, A4, A7, A8 (local availability),
+- **A. Spikes A1–A10: done 2026-10-04** (results above; A10 waits for the user's refusal probe set). Order was A1
+  (chat-turn hook + steering) first; then A2, A3, A4, A7, A8 (local availability),
   A9 (GLiNER decision server), A10 (refusal detection), A6, A5. Each result picks the
   design or its named fallback.
 - **B. Core:**
