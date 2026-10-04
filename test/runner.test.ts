@@ -427,3 +427,32 @@ test("a task text flagged as injection is blocked before any worker sees it", as
   assert.equal(done.phase, "ask_user")
   assert.equal(fake.created.filter((c) => c.agent !== "dictator-plan").length, 0)
 })
+
+test("N4: a task the model finds too big is split by the planner, at most two levels deep", async () => {
+  const project = repo()
+  const big = { id: "T1", title: "parser and cli", description: "both", role: "code", acceptance: ["A1", "A2"], dependsOn: [], files: ["p.js", "c.js"] }
+  const first = "```json\n" + JSON.stringify({ acceptance: [{ id: "A1", text: "p", verify: "test -f p.js" }, { id: "A2", text: "c", verify: "test -f c.js" }], tasks: [big] }) + "\n```"
+  const splitAnswer = "```json\n" + JSON.stringify({ splits: { T1: [
+    { id: "T1.1", title: "parser", description: "p", role: "code", acceptance: ["A1"], dependsOn: [], files: ["p.js"] },
+    { id: "T1.2", title: "cli", description: "c", role: "code", acceptance: ["A2"], dependsOn: ["T1.1"], files: ["c.js"] },
+  ] } }) + "\n```"
+  const fake = fakeSession({ plan: [first, splitAnswer] })
+  let n4 = 0
+  const decider = nodeDecider({ N4: { "too_big.T1": noul(0.9), "splittable.T1": noul(0.8), "too_big.T1.1": noul(0.1), "too_big.T1.2": noul(0.2) } })
+  const ask = decider.ask.bind(decider)
+  decider.ask = (node, ...rest) => { if (node === "N4") n4++; return ask(node, ...rest) }
+  const { job, errors } = await runner(project, fake.api, { decider }).plan("goal")
+  assert.equal(errors, undefined)
+  assert.deepEqual(job.tasks.map((t) => `${t.id}<${t.parent ?? ""}`), ["T1.1<T1", "T1.2<T1"])
+  assert.equal(n4, 2, "the children are asked once more (level 2), then it stops")
+})
+
+test("N4 without a decision model: more than 3 files means too big; an invalid split keeps the task whole", async () => {
+  const project = repo()
+  const wide = { id: "T1", title: "many files", description: "x", role: "code", acceptance: ["A1"], dependsOn: [], files: ["a.js", "b.js", "c.js", "d.js"] }
+  const first = "```json\n" + JSON.stringify({ acceptance: [{ id: "A1", text: "p" }], tasks: [wide] }) + "\n```"
+  const fake = fakeSession({ plan: [first, "no", "still no"] })
+  const { job } = await runner(project, fake.api).plan("goal")
+  assert.deepEqual(job.tasks.map((t) => t.id), ["T1"])
+  assert.match(job.lessons.at(-1)!, /split of T1 kept whole/)
+})

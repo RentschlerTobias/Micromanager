@@ -7,7 +7,7 @@ import { join } from "node:path"
 
 import { buildAgenda, nextProposal } from "./agenda.ts"
 import { Decider, RulesBackend } from "./backends.ts"
-import { ANSWER, CHOICE_FLOOR, complexityOf, NOUL_FLOOR, nextQuestionChoice, TRIAGE } from "./catalog.ts"
+import { ANSWER, CHOICE_FLOOR, complexityOf, NOUL_FLOOR, nextQuestionChoice, splitQuestions, TRIAGE } from "./catalog.ts"
 import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, type Unchecked } from "./gate.ts"
 import { brief, fixPrompt, lastAssistantText, parseReport, taskAcceptance, usage } from "./brief.ts"
 import { changedFiles, commitTask, exec as defaultExec, hashFiles, prepareIntegration, revertFiles, runGate, workingDiff, type Exec, type GateResult } from "./integration.ts"
@@ -17,7 +17,7 @@ import {
   choosePipeline, citationCheck, greenNote, readerCount, readerPrompt, redPrompt, researchPath, reviewFixPrompt, reviewPrompt, parseReview,
   synthesisPrompt, TEST_FILE, type Review,
 } from "./pipelines.ts"
-import { applyPlan, parsePlan, PLAN_FORMAT, type Parsed } from "./plan.ts"
+import { applyPlan, applySplits, MAX_SPLIT_LEVEL, parsePlan, PLAN_FORMAT, splitFormat, type Parsed, type Plan, type PlannedTask } from "./plan.ts"
 import { classifyQuestions, classifyState, combine, narrowing, profileText, type Profile, type Skill } from "./profile.ts"
 import { resolvePolicy, type Policies } from "./policy.ts"
 import { route, type Availability, type ModelEntry } from "./registry.ts"
@@ -174,10 +174,49 @@ export class Runner {
       saveJob(this.#d.project, job)
       return { job, errors: answer.timedOut ? ["the planner timed out"] : parsed.errors }
     }
-    applyPlan(job, parsed.plan)
+    let plan = parsed.plan
+    let candidates: readonly PlannedTask[] = plan.tasks
+    for (let level = 1; level <= MAX_SPLIT_LEVEL && candidates.length > 0 && !answer.stopped; level++) {
+      const before = new Set(plan.tasks.map((t) => t.id))
+      plan = await this.#split(job, s.id, plan, candidates)
+      candidates = plan.tasks.filter((t) => !before.has(t.id))
+    }
+    applyPlan(job, plan)
     moveJob(job, "plan_gate")
     saveJob(this.#d.project, job)
     return { job }
+  }
+
+  // N4: tasks that are too big for one fresh session and can be split go back to the planner, which writes the parts;
+  // code re-validates. Without a decision model, more than 3 files means too big. A split that stays invalid keeps
+  // the task whole.
+  async #split(job: Job, plannerSession: string, plan: Plan, candidates: readonly PlannedTask[]): Promise<Plan> {
+    const policy = resolvePolicy("N4", this.#policies(job)).policy
+    if (policy.kind === "fixed") return plan // "N4": "fixed:no" keeps the planner's tasks
+    const asked = policy.kind === "rule" ? undefined : await this.#decider.ask("N4", { goal: job.goal }, splitQuestions(candidates), { localOnly: job.flags?.localOnly, job: job.id })
+    const a = asked?.decision.answers ?? {}
+    const p = (q: string) => (a[q]?.type === "noul" ? (a[q] as { noul: number }).noul : undefined)
+    const ids = candidates.filter((t) => {
+      const big = p(`too_big.${t.id}`)
+      const hard = p(`hard.${t.id}`)
+      const splittable = p(`splittable.${t.id}`)
+      if (big === undefined && hard === undefined) return t.files.length > 3
+      return Math.max(big ?? 0, hard ?? 0) >= NOUL_FLOOR && (splittable ?? 0) >= NOUL_FLOOR
+    }).map((t) => t.id)
+    if (ids.length === 0) return plan
+    this.#say(`splitting ${ids.join(", ")}`)
+    let answer = await this.#ask(plannerSession, `${HEADER} ${splitFormat(ids)}`)
+    let r = answer.stopped || answer.timedOut ? { errors: ["the planner stopped"] } as Parsed : applySplits(plan, answer.text, ids)
+    if (r.errors && !answer.stopped && !answer.timedOut) {
+      answer = await this.#ask(plannerSession, `${HEADER} The split has these problems:\n- ${r.errors.join("\n- ")}\n\nAnswer again with the corrected JSON only.`)
+      r = answer.stopped || answer.timedOut ? { errors: ["the planner stopped"] } : applySplits(plan, answer.text, ids)
+    }
+    if (r.errors) {
+      job.lessons.push(`split of ${ids.join(", ")} kept whole: ${r.errors.slice(0, 3).join("; ")}`)
+      this.#say(`the split of ${ids.join(", ")} stays invalid; the tasks stay whole`)
+      return plan
+    }
+    return r.plan
   }
 
   // A new job from the dictator: the local gate, triage, then a planning session or the planner (design.md §6).

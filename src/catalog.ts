@@ -135,3 +135,16 @@ export function roleChoice(roles: Record<string, string>): Question {
 export function skillQuestion(name: string, description: string): Question {
   return { type: "noul", instructions: `Doing this task well needs the skill "${name}": ${description}` }
 }
+
+// --- N4: split a task until it is small (design.md §7) ------------------------------------------------------
+// One request per plan: three questions per task, keyed "<question>.<task id>".
+export function splitQuestions(tasks: readonly { id: string; title: string; description: string; files: readonly string[] }[]): Record<string, Question> {
+  const out: Record<string, Question> = {}
+  for (const t of tasks) {
+    const what = `task ${t.id} ("${t.title}": ${t.description.slice(0, 300)}; files: ${t.files.join(", ") || "none"})`
+    out[`too_big.${t.id}`] = { type: "noul", instructions: `The ${what} is too much for one coding agent in one fresh session: it needs more reading or more changes than fit in one context.` }
+    out[`splittable.${t.id}`] = { type: "noul", instructions: `The ${what} can be split into smaller tasks that can each be checked on their own.` }
+    out[`hard.${t.id}`] = { type: "noul", instructions: `The ${what} is hard: subtle logic or many decisions, more than a small change.` }
+  }
+  return out
+}

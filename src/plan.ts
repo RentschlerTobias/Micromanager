@@ -12,6 +12,7 @@ export interface PlannedTask {
   readonly acceptance: readonly string[]
   readonly dependsOn: readonly string[]
   readonly files: readonly string[]
+  readonly parent?: string // the task it was split from (N4)
 }
 
 export interface Plan {
@@ -48,19 +49,17 @@ export function parsePlan(text: string): Parsed {
     return { errors: [`invalid JSON: ${err instanceof Error ? err.message : String(err)}`] }
   }
   const errors: string[] = []
-  const acceptance: Acceptance[] = []
   if (!Array.isArray(raw.acceptance) || raw.acceptance.length === 0) errors.push("acceptance: a non-empty list is required")
-  for (const [i, a] of (Array.isArray(raw.acceptance) ? raw.acceptance : []).entries()) {
-    const item = a as { id?: unknown; text?: unknown; verify?: unknown }
-    if (typeof item.id !== "string" || !ID.test(item.id) || typeof item.text !== "string" || !item.text.trim()) {
-      errors.push(`acceptance[${i}]: needs an id and a text`)
-      continue
-    }
-    acceptance.push({ id: item.id, text: item.text, verify: typeof item.verify === "string" && item.verify.trim() ? item.verify : undefined })
-  }
-  const tasks: PlannedTask[] = []
+  const acceptance = parseAcceptance(raw.acceptance, errors)
   if (!Array.isArray(raw.tasks) || raw.tasks.length === 0) errors.push("tasks: a non-empty list is required")
-  for (const [i, t] of (Array.isArray(raw.tasks) ? raw.tasks : []).entries()) {
+  const tasks = parseTasks(raw.tasks, errors)
+  errors.push(...checkGraph(acceptance, tasks))
+  return errors.length > 0 ? { errors } : { plan: { acceptance, tasks } }
+}
+
+function parseTasks(raw: unknown, errors: string[]): PlannedTask[] {
+  const tasks: PlannedTask[] = []
+  for (const [i, t] of (Array.isArray(raw) ? raw : []).entries()) {
     const item = t as Record<string, unknown>
     const where = `tasks[${i}]${typeof item.id === "string" ? ` (${item.id})` : ""}`
     const acc = strings(item.acceptance ?? [])
@@ -81,8 +80,20 @@ export function parsePlan(text: string): Parsed {
       files,
     })
   }
-  errors.push(...checkGraph(acceptance, tasks))
-  return errors.length > 0 ? { errors } : { plan: { acceptance, tasks } }
+  return tasks
+}
+
+function parseAcceptance(raw: unknown, errors: string[]): Acceptance[] {
+  const out: Acceptance[] = []
+  for (const [i, a] of (Array.isArray(raw) ? raw : []).entries()) {
+    const item = a as { id?: unknown; text?: unknown; verify?: unknown }
+    if (typeof item.id !== "string" || !ID.test(item.id) || typeof item.text !== "string" || !item.text.trim()) {
+      errors.push(`acceptance[${i}]: needs an id and a text`)
+      continue
+    }
+    out.push({ id: item.id, text: item.text, verify: typeof item.verify === "string" && item.verify.trim() ? item.verify : undefined })
+  }
+  return out
 }
 
 function checkGraph(acceptance: readonly Acceptance[], tasks: readonly PlannedTask[]): string[] {
@@ -162,6 +173,7 @@ export function applyPlan(job: Job, plan: Plan): void {
     dependsOn: [...t.dependsOn],
     files: [...t.files],
     wave: w.get(t.id) ?? 0,
+    ...(t.parent ? { parent: t.parent } : {}),
     status: "pending",
     attempts: 0,
     stages: [],
@@ -185,3 +197,73 @@ export const PLAN_FORMAT = `Answer with one JSON object in a \`\`\`json fence, n
 }
 Rules: split the job into tasks as small as possible, each a vertical slice that can be verified on its own;
 every acceptance point is covered by a task; a task that changes files lists them; no dependency cycles.`
+
+// --- N4: splitting tasks (design.md §7) -------------------------------------------------------------------
+
+export const MAX_SPLIT_LEVEL = 2
+
+export function splitFormat(ids: readonly string[]): string {
+  return `Split these tasks into smaller ones: ${ids.join(", ")}.
+Answer with one JSON object in a \`\`\`json fence, nothing else after it:
+{
+  "acceptance": [{ "id": "A7", "text": "...", "verify": "..." }],
+  "splits": { "${ids[0] ?? "T1"}": [{ "id": "${ids[0] ?? "T1"}.1", "title": "...", "description": "...", "role": "...", "acceptance": ["A1"], "dependsOn": [], "files": ["..."] }] }
+}
+Rules: each split task becomes at least two tasks with ids "<task>.1", "<task>.2", …; each is a vertical slice with its
+own acceptance point (reuse the task's points or add new ones under "acceptance"), changes only files of the task it
+comes from, and may depend on its siblings and on the tasks the original depended on. Together they cover all of the
+original's acceptance points. Do not split a task when the parts could only be checked together.`
+}
+
+// Puts the planner's splits into the plan: children replace their parent, tasks that waited for the parent wait for
+// its last children. Code re-validates the whole graph.
+export function applySplits(plan: Plan, text: string, asked: readonly string[]): Parsed {
+  const json = extractJson(text)
+  if (!json) return { errors: ["no JSON object found"] }
+  let raw: { acceptance?: unknown; splits?: unknown }
+  try {
+    raw = JSON.parse(json)
+  } catch (err) {
+    return { errors: [`invalid JSON: ${err instanceof Error ? err.message : String(err)}`] }
+  }
+  const errors: string[] = []
+  const added = parseAcceptance(raw.acceptance, errors)
+  const splits = raw.splits && typeof raw.splits === "object" ? (raw.splits as Record<string, unknown>) : {}
+  const children = new Map<string, PlannedTask[]>()
+  for (const [parentId, list] of Object.entries(splits)) {
+    const parent = plan.tasks.find((t) => t.id === parentId)
+    if (!parent || !asked.includes(parentId)) {
+      errors.push(`splits.${parentId}: not one of the tasks to split`)
+      continue
+    }
+    const kidErrors: string[] = []
+    const kids = parseTasks(list, kidErrors)
+    errors.push(...kidErrors.map((e) => `splits.${parentId}: ${e}`))
+    if (!Array.isArray(list) || list.length < 2) errors.push(`splits.${parentId}: a split needs at least two tasks`)
+    for (const k of kids) {
+      if (!k.id.startsWith(`${parentId}.`)) errors.push(`splits.${parentId}: ${k.id} must be named ${parentId}.<n>`)
+      if (parent.files.length && k.files.some((f) => !parent.files.includes(f))) errors.push(`splits.${parentId}: ${k.id} changes files outside ${parentId}'s`)
+    }
+    const covered = new Set(kids.flatMap((k) => k.acceptance))
+    for (const a of parent.acceptance) if (!covered.has(a)) errors.push(`splits.${parentId}: no part covers ${a}`)
+    if (kids.length >= 2 && kids.every((k) => k.files.join() === kids[0]!.files.join() && k.acceptance.join() === kids[0]!.acceptance.join())) {
+      errors.push(`splits.${parentId}: the parts share files and acceptance points, so the split only adds coordination`)
+    }
+    children.set(parentId, kids)
+  }
+  if (errors.length) return { errors }
+  // The last children of a split: the ones no sibling depends on.
+  const sinks = (id: string) => {
+    const kids = children.get(id)!
+    return kids.filter((k) => !kids.some((o) => o.dependsOn.includes(k.id))).map((k) => k.id)
+  }
+  const rewire = (deps: readonly string[]) => deps.flatMap((d) => (children.has(d) ? sinks(d) : [d]))
+  const tasks = plan.tasks.flatMap((t) =>
+    children.has(t.id)
+      ? children.get(t.id)!.map((k) => ({ ...k, parent: t.id, dependsOn: [...new Set([...rewire(k.dependsOn), ...rewire(t.dependsOn)])] }))
+      : [{ ...t, dependsOn: rewire(t.dependsOn) }],
+  )
+  const acceptance = [...plan.acceptance, ...added]
+  const graph = checkGraph(acceptance, tasks)
+  return graph.length ? { errors: graph } : { plan: { acceptance, tasks } }
+}
