@@ -113,7 +113,7 @@ export class Runner {
   }
 
   // The model for a role: the user's preset if any, else the router over the registry, else the role's cloud model.
-  async #model(job: Job, role: string, difficulty: number, task?: string, avoidFamilies?: string[]): Promise<{ id: string; reason: string }> {
+  async #model(job: Job, role: string, difficulty: number, task?: string, avoidFamilies?: string[], vision = false): Promise<{ id: string; reason: string }> {
     const preset = resolvePolicy("N5.model", this.#policies(job, task))
     const presetModel = preset.policy.kind === "fixed" ? this.#d.registry.find((m) => m.id === (preset.policy as { value: string }).value) : undefined
     const presetBreaksGate = job.flags?.localOnly && (presetModel?.location === "cloud" || (job.flags.uncensored && presetModel?.censored))
@@ -123,7 +123,7 @@ export class Runner {
     }
     if (presetBreaksGate) this.#say(`preset ${(preset.policy as { value: string }).value} ignored: the job must stay local${job.flags?.uncensored ? " and uncensored" : ""}`)
     const availability = await this.#d.availability?.().catch(() => undefined)
-    const r = route(this.#d.registry, { role, difficulty, sensitive: job.flags?.localOnly, refusalLikely: job.flags?.uncensored, avoidFamilies }, availability)
+    const r = route(this.#d.registry, { role, difficulty, vision, sensitive: job.flags?.localOnly, refusalLikely: job.flags?.uncensored, avoidFamilies }, availability)
     const id = r.model ?? roleById(role)?.models[0] ?? this.#d.registry[0]!.id
     this.#journal({ kind: "routing", job: job.id, task, role, model: id, reason: r.model ? r.reason : `fallback: ${r.reason}`, ranked: r.ranked.slice(0, 5) })
     return { id, reason: r.model ? r.reason : "fallback" }
@@ -455,7 +455,7 @@ export class Runner {
       return this.#stop(job, `confirm ${task.id} before it runs: ${profileText(profile)} · pipeline ${pipeline.id} (${pipeline.reason}). Run the job again to go on, or pin a change first ("${task.id} use <model>", "pipeline P2").`)
     }
     moveTask(task, "planned")
-    let model = await this.#model(job, task.role, profile.difficulty, task.id)
+    let model = await this.#model(job, task.role, profile.difficulty, task.id, undefined, profile.vision)
     task.model = model.id
     moveTask(task, "running")
     job.budget.workersUsed++
@@ -524,7 +524,7 @@ export class Runner {
           this.#escalate(job, task, `stopped twice by the loop watchdog: ${answer.stopped.detail}`)
           return undefined
         }
-        const model = await this.#model(job, task.role, task.profile?.difficulty ?? 0.5, task.id, [this.#family(work.model.id)])
+        const model = await this.#model(job, task.role, task.profile?.difficulty ?? 0.5, task.id, [this.#family(work.model.id)], task.profile?.vision)
         task.model = model.id
         this.#say(`${task.id}: stopped by the loop watchdog (${answer.stopped.detail}), fresh session on ${model.id}`)
         const s = await this.#workerSession(job, task, model.id)
@@ -602,7 +602,7 @@ export class Runner {
   // evidence is advisory; a review that is not JSON after one reminder counts as advisory too.
   async #review(job: Job, task: Task, workerModel: string): Promise<Review> {
     const worktree = job.integrationWorktree!
-    const model = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [this.#family(workerModel)])
+    const model = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [this.#family(workerModel)], task.profile?.vision)
     const s = await this.#workerSession(job, task, model.id, "review", TIER_STEPS.S)
     const diff = await workingDiff(worktree, this.#exec)
     let answer = await this.#ask(s.id, [reviewPrompt(job, task, taskAcceptance(job, task), diff), skillLine(this.#skills("review", task))].filter(Boolean).join("\n\n"))
@@ -619,10 +619,15 @@ export class Runner {
   async #research(job: Job, task: Task, model: string): Promise<void> {
     const worktree = job.integrationWorktree!
     const n = readerCount(task.profile?.difficulty ?? 0.5)
-    const readers = await Promise.all(Array.from({ length: n }, async (_, i) => {
+    const read = async (i: number) => {
       const s = await this.#workerSession(job, task, model, "research")
       return this.#ask(s.id, [readerPrompt(job, task, i, n), skillLine(this.#skills("reader", task))].filter(Boolean).join("\n\n"))
-    }))
+    }
+    // Readers run in parallel in the cloud; a local device serves one model at a time, so there they take turns.
+    const local = this.#d.registry.find((m) => m.id === model)?.location === "local"
+    const readers: Awaited<ReturnType<typeof read>>[] = []
+    if (local) for (let i = 0; i < n; i++) readers.push(await read(i))
+    else readers.push(...(await Promise.all(Array.from({ length: n }, (_, i) => read(i)))))
     const notes = readers.filter((r) => !r.stopped && !r.timedOut && r.text).map((r) => r.text)
     readers.forEach((r, i) => saveNote(this.#d.project, job.id, `${task.id}.reader${i + 1}`, r.text || "(no answer)"))
     stage(task, "readers", notes.length ? "pass" : "fail", `${notes.length} of ${n} readers answered`)

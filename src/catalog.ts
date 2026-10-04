@@ -109,6 +109,7 @@ export const CLASSIFY: Record<string, Question> = {
   bug_unknown_cause: { type: "noul", instructions: "The task is a bug whose cause is not known yet." },
   "tool.shell": { type: "noul", instructions: "Doing this task needs running shell commands: tests, builds, scripts or git." },
   "tool.web": { type: "noul", instructions: "Doing this task needs the web: documentation, APIs or other repositories online." },
+  needs_vision: { type: "noul", instructions: "Doing this task needs looking at images: screenshots, mockups, diagrams or rendered pages." },
   perm_profile: {
     type: "choice",
     instructions: "How tightly should the agent doing this task be restricted?",

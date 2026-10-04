@@ -41,6 +41,7 @@ export interface Profile {
   readonly bugFix: boolean
   readonly approachUncertain: boolean
   readonly bugUnknownCause: boolean
+  readonly vision: boolean // routed to a model with image input
   readonly tools: Readonly<Record<ToolGroup, number | undefined>> // the decision model's yes per group; undefined: not asked
   readonly skills: readonly string[]
   readonly perm: PermProfile
@@ -150,6 +151,7 @@ export function combine(task: Task, acceptance: readonly Acceptance[], asked: As
     bugFix: yes("is_bug_fix"),
     approachUncertain: yes("approach_uncertain"),
     bugUnknownCause: yes("bug_unknown_cause"),
+    vision: yes("needs_vision"),
     tools,
     skills: picked,
     perm,
@@ -187,6 +189,7 @@ export function profileText(p: Profile): string {
     p.testFirst ? "test first possible" : undefined,
     p.bugFix ? "bug fix" : undefined,
     p.approachUncertain ? "approach uncertain" : undefined,
+    p.vision ? "needs vision" : undefined,
     `${p.perm} rights${groups.length ? ` (${groups.join(", ")})` : ""}`,
     `budget ${p.budget}`,
     p.skills.length ? `skills ${p.skills.join(", ")}` : undefined,

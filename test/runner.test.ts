@@ -456,3 +456,32 @@ test("N4 without a decision model: more than 3 files means too big; an invalid s
   assert.deepEqual(job.tasks.map((t) => t.id), ["T1"])
   assert.match(job.lessons.at(-1)!, /split of T1 kept whole/)
 })
+
+test("a task that needs images goes to a vision model; local research readers take turns", async () => {
+  const project = repo()
+  const fake = fakeSession({ plan: [plan1({})], worker: (dir) => { writeFileSync(join(dir, "add.js"), "x\n"); return DONE } })
+  const r = runner(project, fake.api, { decider: nodeDecider({ N5: { needs_vision: noul(0.9), has_test_oracle: noul(0.9) } }) })
+  await r.run((await r.plan("goal")).job.id)
+  const worker = fake.created.find((c) => c.agent === "dictator-code")!
+  const id = `${(worker.model as { providerID: string }).providerID}/${(worker.model as { id: string }).id}`
+  assert.ok(DEFAULT_REGISTRY.find((m) => m.id === id)!.vision, id)
+
+  const project2 = repo()
+  let running = 0
+  let most = 0
+  const fake2 = fakeSession({
+    plan: [plan1({ title: "q", role: "research", files: [] }, [{ id: "A1", text: "answered" }])],
+    worker: (dir, prompt) => {
+      if (prompt.includes("research for task")) return "- x (https://a.dev/x)"
+      execFileSync("mkdir", ["-p", join(dir, "docs", "research")])
+      writeFileSync(join(dir, "docs", "research", "q.md"), "[x](https://a.dev/x)\n")
+      return "STATUS: DONE"
+    },
+  })
+  const slow = { ...fake2.api, async wait() { running++; most = Math.max(most, running); await new Promise((res) => setTimeout(res, 5)); running--; return {} } }
+  const local = runner(project2, slow, { decider: nodeDecider({ N5: { difficulty: { type: "score", score: 4, confidence: 0.9, probabilities: {} } } }), policies: { global: { "N5.model": "fixed:llamaswap/ornith-u" } } })
+  const done = await local.run((await local.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.equal(fake2.created.filter((c) => c.agent === "dictator-research").length, 5)
+  assert.equal(most, 1, "one reader at a time on the local GPU")
+})
