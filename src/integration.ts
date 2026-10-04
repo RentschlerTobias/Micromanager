@@ -83,3 +83,24 @@ export async function runGate(worktree: string, commands: readonly string[], run
   }
   return out
 }
+
+// The worker's change against the last commit, new files included, for a reviewer that has no git.
+export async function workingDiff(worktree: string, run: Exec = exec): Promise<string> {
+  await run("git", ["add", "-A", "-N"], { cwd: worktree })
+  return (await run("git", ["diff", "HEAD"], { cwd: worktree })).stdout
+}
+
+// Content hashes of files, to see whether frozen tests were changed; a missing file hashes to "".
+export async function hashFiles(worktree: string, files: readonly string[], run: Exec = exec): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  for (const f of files) out.set(f, (await run("git", ["hash-object", "--", f], { cwd: worktree })).stdout.trim())
+  return out
+}
+
+// Undoes a worker's changes to the given files: tracked ones back to the last commit, new ones removed.
+export async function revertFiles(worktree: string, files: readonly string[], run: Exec = exec): Promise<void> {
+  for (const f of files) {
+    const restored = await run("git", ["checkout", "-q", "HEAD", "--", f], { cwd: worktree })
+    if (restored.code !== 0) await run("git", ["clean", "-q", "-f", "--", f], { cwd: worktree })
+  }
+}

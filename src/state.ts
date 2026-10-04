@@ -5,6 +5,7 @@
 
 import type { JobFlags } from "./gate.ts"
 import type { PolicySet } from "./policy.ts"
+import type { Profile } from "./profile.ts"
 import type { DesignTree } from "./session.ts"
 
 export type JobPhase =
@@ -115,6 +116,9 @@ export interface Task {
   stages: Stage[]
   signatures: string[] // hashes for stall detection
   summary?: string
+  profile?: Profile // N5 + N5b, set when the task is first dispatched
+  pipeline?: string // N6: P1, P2, P3 or P9
+  confirmed?: boolean // false: waits for the user's go (destructive risk, or "ask me about everything")
 }
 
 export interface Job {

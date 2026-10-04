@@ -266,3 +266,164 @@ test("a planner stopped by the watchdog gets one fresh try, then the job fails w
   assert.equal(failed.job.phase, "failed")
   assert.deepEqual(failed.errors, ["the planner was stopped by the loop watchdog: read .jev-dictator 3x"])
 })
+
+// --- Phase D: classification, profile and pipelines -----------------------------------------------------------
+
+const choice = (c: string, confidence = 0.9) => ({ type: "choice" as const, choice: c, confidence, probabilities: {} })
+const plan1 = (task: Record<string, unknown>, acceptance: Record<string, unknown>[] = [{ id: "A1", text: "add.js exists", verify: "test -f add.js" }]) =>
+  "```json\n" + JSON.stringify({ acceptance, tasks: [{ id: "T1", title: "write add.js", description: "create it", role: "code", acceptance: ["A1"], dependsOn: [], files: ["add.js"], ...task }] }) + "\n```"
+const PASS = '```json\n{"verdict":"PASS","checks":[{"point":"A1","met":true,"evidence":"add.js exists"}],"fixes":[]}\n```'
+const FAIL = '```json\n{"verdict":"FAIL","checks":[{"point":"A1","met":false,"evidence":"add.js:1 adds strings"}],"fixes":["coerce to numbers"]}\n```'
+const DONE = "STATUS: DONE\nFILES: add.js\nEVIDENCE: ok\nOPEN: nothing"
+
+test("P2: a risky task gets a reviewer of another family; a blocking finding goes back to the worker", async () => {
+  const project = repo()
+  const reviews: string[] = [FAIL, PASS]
+  const prompts: string[] = []
+  const fake = fakeSession({
+    plan: [plan1({})],
+    worker: (dir, prompt) => {
+      prompts.push(prompt)
+      if (prompt.includes("review of task")) return reviews.shift()!
+      writeFileSync(join(dir, "add.js"), prompt.includes("reviewer of another model family") ? "export const add = (a, b) => +a + +b\n" : "export const add = (a, b) => a + b\n")
+      return DONE
+    },
+  })
+  const r = runner(project, fake.api, { decider: nodeDecider({ N5: { risk: choice("public_api"), has_test_oracle: noul(0.9) } }) })
+  const done = await r.run((await r.plan("goal")).job.id)
+  const t = done.tasks[0]!
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.equal(t.pipeline, "P2")
+  assert.deepEqual(t.stages.filter((s) => s.stage === "review").map((s) => s.result), ["fail", "pass"])
+  assert.ok(prompts.some((p) => p.includes("add.js:1 adds strings")), "the finding reaches the worker")
+  const worker = fake.created.find((c) => c.agent === "dictator-code")!
+  const reviewer = fake.created.find((c) => c.agent === "dictator-review")!
+  const fam = (m: unknown) => DEFAULT_REGISTRY.find((e) => e.id === `${(m as { providerID: string }).providerID}/${(m as { id: string }).id}`)!.family
+  assert.notEqual(fam(reviewer.model), fam(worker.model), "the reviewer is of another family")
+  assert.match(readFileSync(join(done.integrationWorktree!, "add.js"), "utf8"), /\+a \+ \+b/)
+})
+
+test("P3: tests first must fail, the implementation is undone, and changed tests fail the gate", async () => {
+  const project = repo()
+  const prompts: string[] = []
+  let greenTurns = 0
+  const fake = fakeSession({
+    plan: [plan1({ files: ["add.js", "add.test.js"] }, [{ id: "A1", text: "add works", verify: "test -f add.js && grep -q add add.test.js" }])],
+    worker: (dir, prompt) => {
+      prompts.push(prompt)
+      if (prompt.includes("review of task")) return PASS
+      if (prompt.includes("tests first for task")) {
+        writeFileSync(join(dir, "add.test.js"), "import { add } from './add.js'\n")
+        writeFileSync(join(dir, "add.js"), "too early\n") // not allowed in red: undone by the plugin
+        return "STATUS: DONE\nFILES: add.test.js"
+      }
+      greenTurns++
+      writeFileSync(join(dir, "add.js"), "export const add = (a, b) => a + b\n")
+      if (greenTurns === 1) writeFileSync(join(dir, "add.test.js"), "// weakened\n") // touches the frozen test
+      else writeFileSync(join(dir, "add.test.js"), "import { add } from './add.js'\n") // restores it
+      return DONE
+    },
+  })
+  const r = runner(project, fake.api, { decider: nodeDecider({ N5: { test_first_possible: noul(0.9), is_bug_fix: noul(0.9), has_test_oracle: noul(0.9) } }) })
+  const done = await r.run((await r.plan("goal")).job.id)
+  const t = done.tasks[0]!
+  assert.equal(t.pipeline, "P3")
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.equal(t.stages.find((s) => s.stage === "red")?.result, "pass")
+  assert.ok(fake.created.some((c) => c.agent === "dictator-test"), "a test worker writes the tests")
+  const green = prompts.find((p) => p.includes("are frozen"))!
+  assert.match(green, /add\.test\.js/)
+  assert.deepEqual(t.stages.filter((s) => s.stage === "gate").map((s) => s.result), ["fail", "pass"], "the changed test failed the first gate")
+  assert.ok(prompts.some((p) => p.includes("changed after the red stage: add.test.js")))
+})
+
+test("P3 falls back to P2 when the new tests pass before the change", async () => {
+  const project = repo()
+  const fake = fakeSession({
+    plan: [plan1({ files: ["add.js", "add.test.js"] }, [{ id: "A1", text: "a test exists", verify: "test -f add.test.js" }])],
+    worker: (dir, prompt) => {
+      if (prompt.includes("review of task")) return PASS
+      writeFileSync(join(dir, "add.test.js"), "ok\n")
+      if (!prompt.includes("tests first")) writeFileSync(join(dir, "add.js"), "x\n")
+      return DONE
+    },
+  })
+  const r = runner(project, fake.api, { decider: nodeDecider({ N5: { test_first_possible: noul(0.9), is_bug_fix: noul(0.9) } }) })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.equal(done.tasks[0]!.stages.find((s) => s.stage === "red")?.result, "skip")
+})
+
+test("P9: parallel readers, a synthesis whose URLs all come from the readers, committed under docs/research", async () => {
+  const project = repo()
+  const prompts: string[] = []
+  let syntheses = 0
+  const fake = fakeSession({
+    plan: [plan1({ title: "Which YAML parser", role: "research", files: [] }, [{ id: "A1", text: "the question is answered" }])],
+    worker: (dir, prompt) => {
+      prompts.push(prompt)
+      if (prompt.includes("research for task")) return "- yaml is fast (https://eemeli.org/yaml/)\n- js-yaml is older (https://github.com/nodeca/js-yaml)"
+      syntheses++
+      execFileSync("mkdir", ["-p", join(dir, "docs", "research")])
+      const extra = syntheses === 1 ? " and [a blog](https://made-up.example/x)" : ""
+      writeFileSync(join(dir, "docs", "research", "which-yaml-parser.md"), `Use [yaml](https://eemeli.org/yaml/)${extra}.\n`)
+      return "STATUS: DONE\nFILES: docs/research/which-yaml-parser.md"
+    },
+  })
+  const r = runner(project, fake.api, { decider: nodeDecider({ N5: { difficulty: { type: "score", score: 2, confidence: 0.9, probabilities: {} } } }) })
+  const done = await r.run((await r.plan("goal")).job.id)
+  const t = done.tasks[0]!
+  assert.equal(t.pipeline, "P9")
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.equal(fake.created.filter((c) => c.agent === "dictator-research").length, 3, "a moderate question gets 3 readers")
+  assert.equal(new Set(prompts.filter((p) => p.includes("research for task")).map((p) => p.match(/reader \d of 3/)?.[0])).size, 3, "each reader has its own angle")
+  assert.deepEqual(t.stages.filter((s) => s.stage === "citations").map((s) => s.result), ["fail", "pass"])
+  assert.ok(prompts.some((p) => p.includes("https://made-up.example/x")), "the unknown URL is named to the writer")
+  const log = execFileSync("git", ["-C", project, "show", "--stat", "--format=%s", done.integrationBranch!]).toString()
+  assert.match(log, /T1: Which YAML parser[\s\S]*docs\/research\/which-yaml-parser\.md/)
+})
+
+test("a task that must run the tests is moved off a role without shell, and its rights are narrowed", async () => {
+  const project = repo()
+  const narrowed: unknown[] = []
+  const fake = fakeSession({ plan: [plan1({ title: "Run the test suite", role: "oracle", files: [] })], worker: (dir) => { writeFileSync(join(dir, "add.js"), "x\n"); return "STATUS: DONE\nFILES: none" } })
+  const r = runner(project, fake.api, {
+    decider: nodeDecider({ N5: { "tool.shell": noul(0.95), "tool.web": noul(0.05), has_test_oracle: noul(0.9) } }),
+    onWorker: (_s: string, _t: string, rules: unknown[]) => narrowed.push(rules),
+  })
+  const done = await r.run((await r.plan("goal")).job.id)
+  const t = done.tasks[0]!
+  assert.equal(t.role, "review")
+  assert.match(t.stages.find((s) => s.stage === "classify")!.evidence!, /oracle has no shell/)
+  const session = fake.created.find((c) => c.agent === "dictator-review")!
+  assert.deepEqual((session.permissions as { action: string }[]).map((p) => p.action), ["webfetch", "websearch"])
+  assert.deepEqual(narrowed[0], session.permissions)
+})
+
+test("a destructive task waits for the user's go; running the job again is the go; it is classified once", async () => {
+  const project = repo()
+  let n5 = 0
+  const decider = nodeDecider({ N5: { risk: choice("destructive"), has_test_oracle: noul(0.9) } })
+  const ask = decider.ask.bind(decider)
+  decider.ask = (node, ...rest) => { if (node === "N5") n5++; return ask(node, ...rest) }
+  const fake = fakeSession({ plan: [plan1({})], worker: (dir, prompt) => prompt.includes("review of task") ? PASS : (writeFileSync(join(dir, "add.js"), "x\n"), DONE) })
+  const r = runner(project, fake.api, { decider })
+  const id = (await r.plan("goal")).job.id
+  const first = await r.run(id)
+  assert.equal(first.phase, "ask_user")
+  assert.match(first.lessons.at(-1)!, /confirm T1 before it runs: .*risk destructive/)
+  assert.equal(fake.created.filter((c) => c.agent !== "dictator-plan").length, 0, "no worker started")
+  const second = await r.run(id)
+  assert.equal(second.phase, "integrate", summary(second))
+  assert.equal(n5, 1)
+})
+
+test("a task text flagged as injection is blocked before any worker sees it", async () => {
+  const project = repo()
+  const fake = fakeSession({ plan: [plan1({})] })
+  const r = runner(project, fake.api, { decider: nodeDecider({ N5: { injection: noul(0.9) } }) })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.tasks[0]!.status, "blocked")
+  assert.equal(done.phase, "ask_user")
+  assert.equal(fake.created.filter((c) => c.agent !== "dictator-plan").length, 0)
+})

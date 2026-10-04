@@ -13,7 +13,7 @@ import { record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe } from "./registry.ts"
-import { DICTATOR, ROLES } from "./roles.ts"
+import { DICTATOR, ROLES, type Rule } from "./roles.ts"
 import { recentFailure, Runner, summary, type SessionApi } from "./runner.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
 import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
@@ -90,6 +90,9 @@ export default {
     // the task of each worker session the runner started.
     const tasks = new Map<string, string>()
     const workerTasks = new Map<string, string>()
+    // A worker's narrowed rights (N5b): the session's own rules already remove the tools; the evaluate hook denies
+    // what still comes through, e.g. a tool reached from the code-mode execute tool.
+    const workerRules = new Map<string, readonly Rule[]>()
 
     await ctx.tool.hook("execute.before", (call) => {
       const routed = routeSubagentCall(call, routing)
@@ -116,6 +119,13 @@ export default {
     // else the user is asked as usual.
     const dictatorReads = new Map<string, number>()
     await ctx.permission.hook("evaluate", async (evaluation) => {
+      const narrowed = workerRules.get(evaluation.sessionID)?.find((r) => r.effect === "deny" && r.action === evaluation.action && r.resource === "*")
+      if (narrowed && evaluation.effect !== "deny") {
+        evaluation.effect = "deny"
+        evaluation.message = `This task's profile does not include ${evaluation.action}. If the task really needs it, say so in your report (STATUS: NEEDS_CONTEXT).`
+        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "task profile" })
+        return
+      }
       if (evaluation.agent === DICTATOR.agent && READS.has(evaluation.action) && evaluation.effect !== "deny") {
         const reads = (dictatorReads.get(evaluation.sessionID) ?? 0) + 1
         dictatorReads.set(evaluation.sessionID, reads)
@@ -175,7 +185,10 @@ export default {
         availability: () => probe(registry),
         progress: (text) => log("info", text),
         parentID,
-        onWorker: (sessionID, task) => workerTasks.set(sessionID, task),
+        onWorker: (sessionID, task, rules) => {
+          workerTasks.set(sessionID, task)
+          if (rules.length) workerRules.set(sessionID, rules)
+        },
         watch: (sessionID, maxSteps) => watchdog.watch(sessionID, { maxSteps }),
         stopped: (sessionID) => stops.get(sessionID),
       })

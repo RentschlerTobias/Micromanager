@@ -14,18 +14,22 @@ export interface Report {
   readonly text: string
 }
 
+// Caveman (design.md §13.2): text that only code or another agent reads is terse. Briefs to workers stay plain.
+export const CAVEMAN = `Style (only code reads this): answer first; no greeting, recap or filler; fragments are fine. Keep every
+"not", number, path, command and quote exact.`
+
 const REPORT_FORMAT = `End your answer with this report, nothing after it:
 STATUS: DONE | DONE_WITH_CONCERNS | NEEDS_CONTEXT | BLOCKED
 FILES: the files you changed, comma separated, or none
 EVIDENCE: the commands you ran and their results, short
 OPEN: what is left open or what you need, or nothing
-Write the report tersely: no greeting, no recap. Keep every "not" and every path and command exact.`
+${CAVEMAN}`
 
 export function taskAcceptance(job: Job, task: Task): Acceptance[] {
   return job.acceptance.filter((a) => task.acceptance.includes(a.id))
 }
 
-export function brief(job: Job, task: Task, model: string, directory: string): string {
+export function brief(job: Job, task: Task, model: string, directory: string, skills: readonly string[] = []): string {
   const acceptance = taskAcceptance(job, task)
     .map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}`)
     .join("\n")
@@ -45,6 +49,8 @@ export function brief(job: Job, task: Task, model: string, directory: string): s
     `Work only in ${directory}. Do only this task.`,
     done.length ? `Already done: ${done.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
     job.decisions.length ? `Decisions that apply: ${job.decisions.map((d) => d.text).join("; ")}` : "",
+    job.lessons.length ? `Learned earlier in this job: ${job.lessons.slice(-3).join("; ")}` : "",
+    skills.length ? `Load these skills before you start: ${skills.join(", ")}.` : "",
     "",
     REPORT_FORMAT,
   ].filter((line, i, all) => line !== "" || all[i - 1] !== "").join("\n").trim()
