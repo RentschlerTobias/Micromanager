@@ -101,7 +101,7 @@ test("the facilitator's instruction forbids options and recommendations", () => 
   const step = nextStep(t)
   const text = instruction(step, "job-1", t)
   assert.match(text, /Ask the user question D1 now/)
-  assert.match(text, /Give no options and no recommendation/)
+  assert.match(text, /Give no options, no examples of possible answers and no recommendation/)
   assert.match(instruction({ kind: "checkpoint" }, "job-1", t), /"confirm".*"discuss"/s)
 })
 
@@ -135,4 +135,11 @@ test("the guard bench sweeps recall and false positives per guard", async () => 
   ]
   const h = sweep(rows, [0.5, 0.7]).filter((s) => s.guard === "harmful")
   assert.deepEqual(h.map((s) => [s.floor, s.recall, s.fpr]), [[0.5, 1, 1], [0.7, 1, 0]])
+})
+
+test("a firm answer settles the question even when the reading also scores 'asks for options'", () => {
+  const t = tree()
+  nextStep(t)
+  assert.equal(applyAnswer(t, "transliterate to ASCII", { settles: true, asksOptions: true }), undefined)
+  assert.equal(t.nodes[0]!.status, "settled")
 })

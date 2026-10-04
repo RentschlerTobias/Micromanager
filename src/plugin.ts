@@ -163,6 +163,8 @@ export default {
         parentID,
         onWorker: (sessionID, task) => workerTasks.set(sessionID, task),
       })
+    // The dictator's newest job in a session, for the user's turns (planning session, gate answer, pins).
+    const sessionJob = (sessionID: string) => listJobs(project).find((j) => j.facilitator === sessionID)
     const JOB_ID = /^job-\d{8}-\d{6}-[0-9a-f]{1,4}$/
     await ctx.tool.transform((draft) => {
       try {
@@ -170,7 +172,13 @@ export default {
           plan: async (goal, tctx) => {
             const text = goal.trim()
             if (!text) return "dictator_plan needs the goal in the user's words, or a job id to continue."
-            const out = JOB_ID.test(text) ? await runner(tctx.sessionID).continueJob(text) : await runner(tctx.sessionID).start(text, tctx.sessionID)
+            // One job at a time per dictator session: until a job is finished, stopped or failed, a goal continues it
+            // instead of starting another (live test: the dictator re-sent the goal mid-session and after confirm).
+            const active = tctx.sessionID ? sessionJob(tctx.sessionID) : undefined
+            const planning = active && !["done", "stopped", "failed", "integrate", "wrap"].includes(active.phase)
+            const out = JOB_ID.test(text) ? await runner(tctx.sessionID).continueJob(text)
+              : planning ? await runner(tctx.sessionID).continueJob(active.id)
+              : await runner(tctx.sessionID).start(text, tctx.sessionID)
             if (out.job.facilitator === undefined && tctx.sessionID) {
               out.job.facilitator = tctx.sessionID
               saveJob(project, out.job)
@@ -189,8 +197,6 @@ export default {
       }
     })
 
-    // The dictator's newest job in a session, for the user's turns (planning session, gate answer, pins).
-    const sessionJob = (sessionID: string) => listJobs(project).find((j) => j.facilitator === sessionID)
     // What the dictator must do in its next turn, per session; set from the user's turn, used by every provider
     // turn of that answer (steering through a system block, Phase A1), replaced at the user's next turn.
     const steering = new Map<string, string>()

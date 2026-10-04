@@ -22,8 +22,11 @@ Restart the OpenCode server afterwards (plugins load at start). Requires opencod
 ## Use
 
 Pick the agent **dictator** in OpenCode and give it a job. The dictator never works on the code itself:
-1. `dictator_plan`: a planner sub-agent reads the project and splits the job into small tasks with acceptance
-   points and checks; the plugin validates the plan, and the dictator shows it to you.
+1. `dictator_plan`: a local check (G0) looks at the job first. If the job leaves decisions open, a planning
+   session asks you about them, one open question per turn and without suggested answers. Answer in your own
+   words, or use "skip", "wait what", "back to D2", "light" / "normal" / "frequent" and "stop". It ends in a
+   checkpoint you confirm. Then a planner sub-agent reads the project and splits the job into small tasks with
+   acceptance points and checks; the plugin validates the plan, and the dictator shows it to you.
 2. `dictator_run`, after your go: the plugin runs one task at a time in a role sub-agent (`dictator-code`,
    `-test`, `-write`, …, rights per role in `src/roles.ts`) on the job's own branch `jev/<job>`, in a worktree
    under `.jev-dictator/worktrees/`. It runs the checks itself, gives a worker up to two fix rounds, and commits
@@ -51,7 +54,9 @@ Optional settings in `~/.config/opencode/jev-dictator.jsonc`:
 
 Hard rules (pushes, `sudo`, system installs, deleting tracked files, …) always go to you, whatever a preset says.
 
-The local GLiNER decision server (`decider/`, see its README) answers guard questions on the CPU; the journal
+`./install.sh --skills` links the `deliberate` skill (the facilitator's rules) into OpenCode. The local GLiNER
+decision server (`decider/`, see its README) answers guard questions on the CPU, and `npm run bench-guards`
+measures them; the journal
 `~/.local/state/jev-dictator/decisions.jsonl` feeds `npm run eval` and `npm run export-dataset`.
 
 ## Flow chart

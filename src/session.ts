@@ -188,7 +188,9 @@ export function applyAnswer(tree: DesignTree, text: string, reading: AnswerReadi
   tree.turn++
   const node = tree.nodes.find((n) => n.id === tree.current)
   if (!node) return undefined
-  if (reading.stuck || reading.asksOptions) return { kind: "explain", node }
+  // A clear decision wins: help is offered only when the answer does not decide the question (live test: a firm
+  // answer also scored 0.71 on "asks for options").
+  if ((reading.stuck || reading.asksOptions) && !reading.settles) return { kind: "explain", node }
   if (reading.outOfScope) {
     node.status = "out_of_scope"
     node.answer = text
@@ -255,7 +257,7 @@ export function nextStep(tree: DesignTree, pick?: string): Step {
 // --- what the facilitator is told -------------------------------------------------------------------------
 
 const RULES = `Rules of the planning session: ask exactly one question, in plain words, with one to three sentences of
-context. Give no options and no recommendation. Do not answer the question yourself. If a term may be new to the
+context. Give no options, no examples of possible answers and no recommendation. Do not answer the question yourself. If a term may be new to the
 user, add a short "Concept:" or "Why this matters:" line. Then stop and wait for the user's answer.`
 
 export function instruction(step: Step, job: string, tree: DesignTree): string {

@@ -40,6 +40,7 @@ export async function scoreCases(decider: Decider, cases: readonly Case[]): Prom
 export function sweep(rows: readonly { yes: readonly string[]; p: Record<string, number> }[], floors = [0.3, 0.5, 0.7, 0.9]): GuardScore[] {
   return Object.keys(GUARDS).flatMap((guard) => {
     const scored = rows.filter((r) => r.p[guard] !== undefined)
+    if (scored.length === 0) return [] // no answers for this guard: nothing to report, not 0 %
     const pos = scored.filter((r) => r.yes.includes(guard))
     const neg = scored.filter((r) => !r.yes.includes(guard))
     return floors.map((floor) => ({
@@ -53,7 +54,7 @@ export function sweep(rows: readonly { yes: readonly string[]; p: Record<string,
 }
 
 export function formatSweep(scores: readonly GuardScore[]): string {
-  if (scores.length === 0) return "no answers: is the decision server running?"
+  if (scores.length === 0) return "no answers from the G0 backend: is the decision server running and fast enough?"
   const pct = (x: number) => `${(x * 100).toFixed(0)}%`.padStart(5)
   return ["guard           floor  recall   fpr", ...scores.map((s) => `${s.guard.padEnd(15)} ${s.floor.toFixed(1).padStart(5)} ${pct(s.recall)} ${pct(s.fpr)}`)].join("\n")
 }

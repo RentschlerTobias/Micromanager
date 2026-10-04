@@ -3,7 +3,8 @@
 Status (2026-10-04): Phase 0 (spike) and Phase 1 done, and Jev on permission requests works (part of the old
 Phases 2 and 3). The design was reworked on 2026-10-03/04: [design.md](design.md) is now the design and
 [design.html](design.html) its flow chart. Extended the same day by local vs cloud routing, censorship guards, decision backends (cloud Jev or
-local GLiNER) and user overrides (design.md §19–§22). Phase A (spikes) and Phase B (core) are done (results below); the next step is Phase C.
+local GLiNER) and user overrides (design.md §19–§22). Phases A (spikes), B (core) and C (planning session and gate) are done (results below); the next step is
+Phase D.
 
 ## Context
 An OpenCode plugin that orchestrates sub-agents the way oh-my-openagent (OmO) does: it splits a job into
@@ -346,7 +347,7 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - journal with state objects, eval harness, dataset export;
   - the model registry, decision backends per node (typesafe, gliner, rules), the policy / override layer;
   - the GLiNER decision server.
-- **C. Planning session and gate:**
+- **C. Planning session and gate: done 2026-10-04** (results below the phase list):
   - G0 local-first gate with the four guards (sensitive, refusal_likely, injection, harmful) and the guard
     bench;
   - the `deliberate` skill;
@@ -414,6 +415,58 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   job.
 - **Planners write verify commands** that the plugin runs with `sh -c` at low priority. The planner chose sound
   checks (an import check, `npm test`).
+
+### Phase C results (2026-10-04)
+**What exists now:**
+- `src/catalog.ts`: the question wordings and floors.
+- `src/gate.ts`: G0 with the four guards. A flagged guard asks the user; an unchecked job stays local.
+- `src/session.ts`: the design tree, frontier, one question per turn, shortcuts, caps and checkpoint.
+- **Runner:** `start`, `continueJob`, `questions`, `answer`.
+- **Plugin:**
+  - `dictator_questions`;
+  - the prompt hook reads the user's turns and pins;
+  - the context hook adds the dictator's instruction as a system block;
+  - the dictator's reads are capped at 12 per session.
+- `skills/deliberate` with `install.sh --skills`.
+- `bench/guard_cases.json` and `npm run bench-guards`.
+- Tests: 77 TypeScript tests, 6 Python tests.
+
+**Live, in a throwaway project** (real plugin, the GLiNER server on the CPU at low priority, cloud Jev for
+N1 / N2 / N2b / N2c, workers on a cloud model by preset):
+- G0 ran locally (about 0.5 s) and flagged nothing. N1 gave complexity 3 and open decisions 0.73, so a planning
+  session started.
+- The dictator drafted 5 decisions. Over 5 turns it asked one open question each time; the user's words were
+  stored as answers, "skip" turned one question into an assumption, and Jev picked the order (N2b).
+- The checkpoint showed the decisions apart from the assumption, which was marked as a proposal. After
+  "confirm" the planner wrote 2 tasks with 7 acceptance points carrying every decision, and "go" ran both tasks
+  to commits.
+- The result matched the decisions, and its 10 tests passed.
+
+**Guard bench with the oc-voice fine-tune** (16 cases, floor 0.5):
+- injection: recall 100 %, false positives 7 %;
+- harmful: recall 100 %, false positives 8 %;
+- refusal_likely: recall 0 %, false positives 17 %;
+- sensitive: recall 33 %, false positives 23 %.
+
+So our own fine-tune is needed before a guard may decide alone (Phase J).
+
+**Fixed during the live test:**
+- **A firm answer was read as "asks for options".** It scored settles 0.93 and asks_options 0.71, and the
+  dictator explained options. A clear decision now wins.
+- **The dictator re-sent the goal mid-session and after "confirm", which started new jobs.** A goal now
+  continues the session's unfinished job.
+- **The draft listed possible answers inside its questions, and one asked question gave example answers.** The
+  draft and ask instructions now forbid options and examples.
+- **The decision server kept working on requests whose client had timed out.** It now drops them (it checks the
+  connection between questions). The client waits 5 s instead of 2 s, and the bench reports "no answers"
+  instead of 0 %.
+
+**Open:**
+- **How a worker's permission prompt reaches the user in the TUI.** Headless runs need presets. In the run
+  above, `--auto` also approved the dictator reading files outside the project when it got confused; in the TUI
+  that is an ask.
+- **Transliteration:** "Straße" became "strae" (ß dropped). It is consistent with "drop what has no ASCII
+  equivalent", but a review stage (Phase E) should question such details.
 
 ## Verification
 - **Per phase: tests** with a fake Jev:

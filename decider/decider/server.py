@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import select
+import socket
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Protocol
 
@@ -75,12 +77,27 @@ def answer(classifier: Classifier, text: str, qid: str, question: Mapping[str, A
     return None
 
 
-def decide(classifier: Classifier, body: Mapping[str, Any], model: str) -> dict[str, Any]:
+class Abandoned(Exception):
+    """The client went away; the rest of its questions are not worth the CPU."""
+
+
+def client_gone(sock: socket.socket) -> bool:
+    """True when the peer closed the connection (readable, and a peek returns nothing)."""
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        return bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
+    except OSError:
+        return True
+
+
+def decide(classifier: Classifier, body: Mapping[str, Any], model: str, alive: Callable[[], bool] = lambda: True) -> dict[str, Any]:
     t0 = time.perf_counter()
     text = render_state(body.get("state", ""))
     questions = body.get("questions") or {}
     answers: dict[str, Any] = {}
     for qid, question in dict(questions).items():
+        if not alive():
+            raise Abandoned
         if isinstance(question, Mapping):
             result = answer(classifier, text, str(qid), question)
             if result is not None:
@@ -155,7 +172,9 @@ def make_handler(classifier: Classifier, model: str) -> type[BaseHTTPRequestHand
                 self._send(400, {"error": f"bad request: {exc}"})
                 return
             try:
-                self._send(200, decide(classifier, body, model))
+                self._send(200, decide(classifier, body, model, alive=lambda: not client_gone(self.connection)))
+            except (Abandoned, BrokenPipeError):
+                return  # the client timed out and left; nobody reads the answer
             except Exception as exc:  # a model error must not kill the server
                 self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
 

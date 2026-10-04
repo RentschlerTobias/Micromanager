@@ -48,7 +48,8 @@ export function makeAskers(config: BackendConfig, jevKey: string | undefined, fe
   const out: Partial<Record<BackendName, Asker>> = { rules: new RulesBackend() }
   if (jevKey && config.urls.typesafe) out.typesafe = new Jev(jevKey, { url: config.urls.typesafe, fetch: fetcher })
   // Local servers take any key; their timeout is short so a dead server costs little.
-  if (config.urls.gliner) out.gliner = new Jev("local", { url: config.urls.gliner, model: "gliner", timeoutMs: 2000, fetch: fetcher })
+  // GLiNER answers four guards in about 0.4 s on the CPU; 5 s leaves room for a loaded machine.
+  if (config.urls.gliner) out.gliner = new Jev("local", { url: config.urls.gliner, model: "gliner", timeoutMs: 5000, fetch: fetcher })
   if (config.urls.openjev) out.openjev = new Jev("local", { url: config.urls.openjev, model: "openjev", timeoutMs: 5000, fetch: fetcher })
   return out
 }

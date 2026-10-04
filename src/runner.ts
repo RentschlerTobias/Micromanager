@@ -487,7 +487,8 @@ export function draftInstruction(job: Job): string {
 Draft the design questions this job leaves open and send them with dictator_questions (job "${job.id}", tree as a
 JSON list): [{ "id": "D1", "question": "...", "kind": "decision" | "fact" | "assumption", "dependsOn": [], "impact":
 "low" | "medium" | "high" }]. Decisions are what only the user can decide (behaviour, scope, interfaces, trade-offs);
-facts are what agents can look up; at most 25. Do not ask the user anything in this turn.`
+facts are what agents can look up; at most 25. Write every question open: never list possible answers or examples
+of answers in it. Do not ask the user anything in this turn, and do not call dictator_plan again.`
 }
 
 // The project's top-level entries, as cheap context for triage.

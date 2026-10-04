@@ -7,7 +7,7 @@ import urllib.request
 from collections.abc import Mapping
 from http.server import ThreadingHTTPServer
 
-from decider.server import YES_NO, decide, make_handler, render_state
+from decider.server import YES_NO, Abandoned, decide, make_handler, render_state
 
 
 class FakeClassifier:
@@ -56,6 +56,12 @@ class DecideTest(unittest.TestCase):
     def test_unknown_or_empty_questions_are_left_unanswered(self) -> None:
         out = decide(FakeClassifier(), {"state": "x", "questions": {"a": {"type": "vote"}, "b": {"type": "choice", "criteria": {}}}}, "g")
         self.assertEqual(out["answers"], {})
+
+    def test_a_gone_client_stops_the_work(self) -> None:
+        fake = FakeClassifier()
+        with self.assertRaises(Abandoned):
+            decide(fake, {"state": "x", "questions": QUESTIONS}, "gliner", alive=lambda: False)
+        self.assertEqual(fake.calls, [])
 
     def test_state_text_puts_the_task_first(self) -> None:
         self.assertEqual(render_state({"other": 1, "text": "hello"}), "text: hello\nother: 1")
