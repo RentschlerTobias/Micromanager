@@ -94,6 +94,10 @@ export default {
     // A worker's narrowed rights (N5b): the session's own rules already remove the tools; the evaluate hook denies
     // what still comes through, e.g. a tool reached from the code-mode execute tool.
     const workerRules = new Map<string, readonly Rule[]>()
+    // Sessions the runner started (planner, workers, reviewers, readers). Nobody sits at them: a question there would
+    // wait until the worker times out (live tests, headless and with --auto). So they never ask the user directly;
+    // they stop and report, and the job asks the user in the dictator's session.
+    const runnerSessions = new Set<string>()
 
     await ctx.tool.hook("execute.before", (call) => {
       const routed = routeSubagentCall(call, routing)
@@ -138,6 +142,12 @@ export default {
         }
       }
       if (evaluation.effect !== "ask" || !ours.has(evaluation.agent)) return
+      if (runnerSessions.has(evaluation.sessionID) && evaluation.action === "external_directory") {
+        evaluation.effect = "deny"
+        evaluation.message = "Stay inside your working directory; the job's state and the user's checkout are not part of your task. If you need something from outside, say so in your report (STATUS: NEEDS_CONTEXT)."
+        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "runner session outside its directory" })
+        return
+      }
       const request: PermissionRequest = {
         sessionID: evaluation.sessionID,
         agent: evaluation.agent,
@@ -153,6 +163,10 @@ export default {
       const preset = policy.kind === "ask" ? "user" : policy.kind === "fixed" && (policy.value === "allow" || policy.value === "deny") ? policy.value : undefined
       const outcome = await decide(jev, request, floors, undefined, preset)
       if (outcome.verdict !== "user") evaluation.effect = outcome.verdict
+      else if (runnerSessions.has(evaluation.sessionID)) {
+        evaluation.effect = "deny"
+        evaluation.message = `This needs the user's decision (${outcome.reason}). Do not try another way: stop and report STATUS: NEEDS_CONTEXT with what you wanted to do and why.`
+      }
       record({ kind: "permission", ...request, task: request.task?.slice(0, 500), ...outcome })
       log("info", `${evaluation.action} ${evaluation.resources.join(" | ").slice(0, 120)}: ${outcome.verdict} (${outcome.reason})`)
     })
@@ -193,7 +207,10 @@ export default {
           workerTasks.set(sessionID, task)
           if (rules.length) workerRules.set(sessionID, rules)
         },
-        watch: (sessionID, maxSteps) => watchdog.watch(sessionID, { maxSteps }),
+        watch: (sessionID, maxSteps) => {
+          runnerSessions.add(sessionID)
+          watchdog.watch(sessionID, { maxSteps })
+        },
         stopped: (sessionID) => stops.get(sessionID),
         skills: SKILLS.filter((s) => s.asked && installed.has(s.name)),
         installedSkills: installed,

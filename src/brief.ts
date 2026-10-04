@@ -29,9 +29,15 @@ export function taskAcceptance(job: Job, task: Task): Acceptance[] {
   return job.acceptance.filter((a) => task.acceptance.includes(a.id))
 }
 
+// An acceptance point several tasks cover: each task does and is judged on its own part only.
+export function sharedNote(job: Job, task: Task, id: string): string {
+  const others = job.tasks.filter((t) => t.id !== task.id && t.acceptance.includes(id)).map((t) => t.id)
+  return others.length ? ` [shared with ${others.join(", ")}: only this task's part counts here]` : ""
+}
+
 export function brief(job: Job, task: Task, model: string, directory: string, skills: readonly string[] = []): string {
   const acceptance = taskAcceptance(job, task)
-    .map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}`)
+    .map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}${sharedNote(job, task, a.id)}`)
     .join("\n")
   const done = job.tasks.filter((t) => t.status === "passed" || t.status === "merged")
   return [

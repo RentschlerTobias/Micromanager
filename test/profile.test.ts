@@ -133,3 +133,10 @@ test("small helpers: reader count, research path, test file names", () => {
   for (const f of ["stats.test.js", "test/a.js", "tests/test_x.py", "src/a.spec.ts", "test_b.py"]) assert.ok(TEST_FILE.test(f), f)
   for (const f of ["stats.js", "latest.js", "contest/a.js"]) assert.ok(!TEST_FILE.test(f), f)
 })
+
+test("an acceptance point several tasks cover is marked as shared in the brief and the review", async () => {
+  const { sharedNote } = await import("../src/brief.ts")
+  const job = { tasks: [task(), task({ id: "T2" }), task({ id: "T3", acceptance: ["A2"] })] } as unknown as Parameters<typeof sharedNote>[0]
+  assert.equal(sharedNote(job, task(), "A1"), " [shared with T2: only this task's part counts here]")
+  assert.equal(sharedNote(job, task({ id: "T3", acceptance: ["A2"] }), "A2"), "")
+})

@@ -3,7 +3,7 @@
 // the runner; this file holds the choice and the pure parts: review and research prompts, their parsers, and the
 // citation check.
 
-import { CAVEMAN } from "./brief.ts"
+import { CAVEMAN, sharedNote } from "./brief.ts"
 import { CHOICE_FLOOR, type Risk } from "./catalog.ts"
 import { HEADER } from "./hooks.ts"
 import { resolvePolicy, type Policies } from "./policy.ts"
@@ -81,15 +81,16 @@ The task (${task.id}): ${task.title}
 ${task.description}
 
 Acceptance points:
-${acceptance.map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}`).join("\n") || "- none given"}
+${acceptance.map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}${sharedNote(job, task, a.id)}`).join("\n") || "- none given"}
 
 The change (the plugin already ran the checks; they pass):
 \`\`\`diff
 ${shown || "(no diff)"}
 \`\`\`
 
-Check the change against each acceptance point and the task. Read the changed files if you need more. Report a
-point as not met only with evidence: a file and line, a failing command, or a concrete input that breaks it.
+Check the change against each acceptance point and the task. A point shared with other tasks counts as met when
+this task's part of it is done; what belongs to the others is not this task's finding. Read the changed files if
+you need more; stay in this directory. Report a point as not met only with evidence: a file and line, a failing command, or a concrete input that breaks it.
 Answer only with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "A1", "met": true, "evidence": "..."}],
 "fixes": ["what to change, one per entry"]}`
 }
