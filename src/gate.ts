@@ -22,16 +22,43 @@ export interface JobFlags {
   gate?: GateResult
 }
 
-export async function checkGuards(decider: Decider, text: string, job?: string, task?: string): Promise<GateResult> {
-  const asked = await decider.ask("G0", { text }, GUARDS, { localOnly: true, job, task })
+// The same text scored 0.59 and 2e-8 for injection in two runs of Phase D, so every text is scored twice and the
+// higher score counts: a guard errs towards asking the user.
+export async function checkGuards(decider: Decider, text: string, job?: string, task?: string, repeats = 2): Promise<GateResult> {
   const scores: Partial<Record<Guard, number>> = {}
-  for (const g of Object.keys(GUARDS) as Guard[]) {
-    const a = asked.decision.answers[g]
-    if (a?.type === "noul") scores[g] = a.noul
+  let checked = false
+  let decision: string | undefined
+  for (let i = 0; i < repeats; i++) {
+    const asked = await decider.ask("G0", { text }, GUARDS, { localOnly: true, job, task })
+    decision ??= asked.id
+    for (const g of Object.keys(GUARDS) as Guard[]) {
+      const a = asked.decision.answers[g]
+      if (a?.type === "noul") scores[g] = Math.max(scores[g] ?? 0, a.noul)
+    }
+    checked ||= asked.backend !== "rules" && Object.keys(asked.decision.answers).length > 0
   }
-  const checked = asked.backend !== "rules" && Object.keys(scores).length > 0
-  return { flagged: (Object.keys(scores) as Guard[]).filter((g) => scores[g]! >= GUARD_FLOOR), scores, checked, decision: asked.id }
+  return { flagged: (Object.keys(scores) as Guard[]).filter((g) => scores[g]! >= GUARD_FLOOR), scores, checked, decision }
 }
+
+const CHUNK = 1500
+const MAX_CHUNKS = 6
+
+// Indirect injection (E2b): text a worker did not write but reads (web pages, research notes, a worker's question)
+// is checked for injection alone, in chunks, since an injection can hide anywhere in a long page. Returns the highest
+// score, or undefined when nothing local answered.
+export async function injectionScore(decider: Decider, text: string, job?: string, task?: string): Promise<number | undefined> {
+  const chunks: string[] = []
+  for (let i = 0; i < text.length && chunks.length < MAX_CHUNKS; i += CHUNK) chunks.push(text.slice(i, i + CHUNK))
+  let best: number | undefined
+  for (const chunk of chunks) {
+    const asked = await decider.ask("G0.injection", { text: chunk }, { injection: GUARDS.injection }, { localOnly: true, job, task })
+    const a = asked.decision.answers.injection
+    if (asked.backend !== "rules" && a?.type === "noul") best = Math.max(best ?? 0, a.noul)
+  }
+  return best
+}
+
+export const injected = (score: number | undefined): boolean => (score ?? 0) >= GUARD_FLOOR
 
 // What the job does when nothing local could check it. "local" is the privacy-first default (user, 2026-10-04).
 export type Unchecked = "local" | "user" | "cloud"

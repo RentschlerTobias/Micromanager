@@ -25,7 +25,7 @@ export interface BackendConfig {
 // Guards start on GLiNER, everything else on cloud Jev (oc-voice's verdict, Phase A9). G0 never leaves the machine.
 export const DEFAULT_BACKENDS: BackendConfig = {
   default: "typesafe",
-  nodes: { G0: "gliner", G: "gliner" },
+  nodes: { G0: "gliner", "G0.injection": "gliner", G: "gliner" },
   urls: {
     typesafe: "https://api.typesafe.ai/v1/systemone",
     gliner: "http://127.0.0.1:8781/v1/systemone",
@@ -35,7 +35,7 @@ export const DEFAULT_BACKENDS: BackendConfig = {
 
 const LOCAL: ReadonlySet<BackendName> = new Set(["gliner", "openjev", "rules"])
 // Nodes whose questions carry user and task text that must never reach the cloud.
-const ALWAYS_LOCAL = new Set(["G0"])
+const ALWAYS_LOCAL = new Set(["G0", "G0.injection"])
 
 export class RulesBackend implements Asker {
   // Answers nothing: every caller falls back to its code default, as without Jev.

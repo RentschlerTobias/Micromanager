@@ -9,6 +9,7 @@ export interface ToolCall {
   agent?: string // the agent making the call
   sessionID?: string
   input: Record<string, unknown>
+  result?: unknown // tool.execute.after: what the model will see
 }
 
 export interface Routed {
@@ -32,4 +33,44 @@ export function routeSubagentCall(call: ToolCall, routing: Routing, workerModel?
     call.input.prompt = `${HEADER} role: ${role.id} · model: ${choice.model}\n\n${prompt}`
   }
   return { role: role.id, model: choice.model, reason: choice.reason }
+}
+
+// The text of a tool result as the model sees it: result.content[] text parts, plus string fields of result.output
+// (shapes seen in the Phase E spike for read, shell, execute and custom tools).
+function textSlots(result: unknown): { get(): string; set(v: string): void }[] {
+  const slots: { get(): string; set(v: string): void }[] = []
+  const r = result as { content?: unknown; output?: unknown } | undefined
+  if (!r || typeof r !== "object") return slots
+  if (Array.isArray(r.content)) {
+    for (const part of r.content as { text?: unknown }[]) {
+      if (part && typeof part.text === "string") slots.push({ get: () => part.text as string, set: (v) => { part.text = v } })
+    }
+  }
+  if (typeof r.output === "string") slots.push({ get: () => r.output as string, set: (v) => { r.output = v } })
+  else if (r.output && typeof r.output === "object") {
+    const o = r.output as Record<string, unknown>
+    for (const key of ["output", "content", "text"]) {
+      if (typeof o[key] === "string") slots.push({ get: () => o[key] as string, set: (v) => { o[key] = v } })
+    }
+  }
+  return slots
+}
+
+export function resultText(result: unknown): string {
+  return textSlots(result).map((s) => s.get()).join("\n")
+}
+
+// Rewrites a tool result in place before the model sees it (tool.execute.after is awaited, Phase E spike); returns
+// whether anything changed.
+export function rewriteResult(result: unknown, fn: (text: string) => string): boolean {
+  let changed = false
+  for (const slot of textSlots(result)) {
+    const before = slot.get()
+    const after = fn(before)
+    if (after !== before) {
+      slot.set(after)
+      changed = true
+    }
+  }
+  return changed
 }

@@ -1,11 +1,11 @@
 // Command line: npm run eval -- [--floor 0.8] [--backend typesafe] [--journal path]
 //               npm run export-dataset -- [--target openjev|gliner] [--out file] [--journal path]
-//               npm run bench-guards -- [--cases bench/guard_cases.json] [--url http://127.0.0.1:8781/v1/systemone]
+//               npm run bench-guards -- [--cases bench/guard_cases.json] [--url http://127.0.0.1:8781/v1/systemone] [--repeat]
 
 import { writeFileSync } from "node:fs"
 
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
-import { formatSweep, loadCases, scoreCases, sweep } from "./bench.ts"
+import { drift, formatDrift, formatSweep, loadCases, scoreCases, sweep } from "./bench.ts"
 import { glinerRows, openJevRows } from "./dataset.ts"
 import { evaluate, formatReport } from "./eval.ts"
 import { journalPath, readJournal } from "./journal.ts"
@@ -19,8 +19,11 @@ export async function main(argv: readonly string[]): Promise<number> {
   const [command, ...args] = argv
   if (command === "bench-guards") {
     const config = { ...DEFAULT_BACKENDS, urls: { ...DEFAULT_BACKENDS.urls, gliner: flag(args, "url") ?? DEFAULT_BACKENDS.urls.gliner } }
-    const rows = await scoreCases(new Decider(config, makeAskers(config, undefined), () => {}), loadCases(flag(args, "cases") ?? "bench/guard_cases.json"))
+    const decider = new Decider(config, makeAskers(config, undefined), () => {})
+    const cases = loadCases(flag(args, "cases") ?? "bench/guard_cases.json")
+    const rows = await scoreCases(decider, cases)
     console.log(formatSweep(sweep(rows)))
+    if (args.includes("--repeat")) console.log(`\nrepeat run:\n${formatDrift(drift(rows, await scoreCases(decider, cases)))}`)
     return 0
   }
   const entries = readJournal(flag(args, "journal") ?? journalPath())

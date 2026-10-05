@@ -55,6 +55,7 @@ export function brief(job: Job, task: Task, model: string, directory: string, sk
     "",
     task.files.length ? `Files you may change: ${task.files.join(", ")}` : "Change no files.",
     `Work only in ${directory}. Do only this task.`,
+    "Keys and tokens show as <secret> in what you read; never write <secret> into a file, leave such lines as they are.",
     done.length ? `Already done: ${done.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
     job.decisions.length ? `Decisions that apply: ${job.decisions.map((d) => d.text).join("; ")}` : "",
     job.lessons.length ? `Learned earlier in this job: ${job.lessons.slice(-3).join("; ")}` : "",

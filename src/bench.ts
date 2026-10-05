@@ -58,3 +58,17 @@ export function formatSweep(scores: readonly GuardScore[]): string {
   const pct = (x: number) => `${(x * 100).toFixed(0)}%`.padStart(5)
   return ["guard           floor  recall   fpr", ...scores.map((s) => `${s.guard.padEnd(15)} ${s.floor.toFixed(1).padStart(5)} ${pct(s.recall)} ${pct(s.fpr)}`)].join("\n")
 }
+
+// Repeat-run check (Phase D: one goal scored 0.59, then 2e-8): the same cases scored twice, and per guard the largest
+// change between the runs and how many cases crossed the floor.
+export function drift(a: readonly { p: Record<string, number> }[], b: readonly { p: Record<string, number> }[], floor = 0.5): { guard: string; maxDelta: number; flips: number }[] {
+  return Object.keys(GUARDS).flatMap((guard) => {
+    const pairs = a.map((r, i) => [r.p[guard], b[i]?.p[guard]] as const).filter((x): x is readonly [number, number] => x[0] !== undefined && x[1] !== undefined)
+    if (pairs.length === 0) return []
+    return [{ guard, maxDelta: Math.max(...pairs.map(([x, y]) => Math.abs(x - y))), flips: pairs.filter(([x, y]) => (x >= floor) !== (y >= floor)).length }]
+  })
+}
+
+export function formatDrift(rows: readonly { guard: string; maxDelta: number; flips: number }[]): string {
+  return ["guard           max change  floor flips", ...rows.map((r) => `${r.guard.padEnd(15)} ${r.maxDelta.toFixed(3).padStart(10)} ${String(r.flips).padStart(12)}`)].join("\n")
+}

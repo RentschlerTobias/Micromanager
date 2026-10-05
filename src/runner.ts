@@ -8,9 +8,10 @@ import { join } from "node:path"
 import { buildAgenda, nextProposal } from "./agenda.ts"
 import { Decider, RulesBackend } from "./backends.ts"
 import { ANSWER, CHOICE_FLOOR, complexityOf, followUpQuestions, NOUL_FLOOR, nextQuestionChoice, splitQuestions, TRIAGE } from "./catalog.ts"
-import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, type Unchecked } from "./gate.ts"
+import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, injected, injectionScore, type Unchecked } from "./gate.ts"
 import { brief, fixPrompt, lastAssistantText, parseReport, skillLine, taskAcceptance, usage } from "./brief.ts"
 import { changedFiles, commitTask, exec as defaultExec, hashFiles, prepareIntegration, revertFiles, runGate, workingDiff, type Exec, type GateResult } from "./integration.ts"
+import { redact } from "./jev.ts"
 import { record } from "./journal.ts"
 import { HEADER } from "./hooks.ts"
 import {
@@ -138,7 +139,8 @@ export class Runner {
 
   async #ask(sessionID: string, text: string): Promise<{ text: string; timedOut: boolean; stopped?: Signal }> {
     if (this.#d.cancelled?.()) throw new Cancelled()
-    await this.#d.session.prompt({ sessionID, text })
+    // Briefs, handoff notes, check output and review diffs may quote a key; no model needs one (E2b).
+    await this.#d.session.prompt({ sessionID, text: redact(text) })
     const timeoutMs = this.#d.workerTimeoutMs ?? 20 * 60_000
     let timer: ReturnType<typeof setTimeout> | undefined
     let timedOut: boolean
@@ -567,7 +569,14 @@ export class Runner {
         : needed !== undefined || inScope !== undefined ? Math.max(needed ?? 0, inScope ?? 0) >= NOUL_FLOOR
         : item.files.length > 0 && item.files.every((f) => planned.has(f))
       let reason: Later["reason"] | undefined
-      if ((noul(`user.${i}`) ?? 0) >= NOUL_FLOOR) reason = "user_should_decide"
+      // A follow-up is text a model wrote, so it passes the local guards like a goal before it can become a task.
+      const guard = take ? await checkGuards(this.#decider, `${item.what}. ${item.why}`, job.id, task.id) : undefined
+      if (guard?.flagged.includes("sensitive") && !job.flags?.localOnly) {
+        job.flags = { ...job.flags, localOnly: true }
+        this.#say(`a follow-up of ${task.id} looks sensitive: the rest of the job stays on this machine`)
+      }
+      if (guard?.flagged.some((g) => g === "injection" || g === "harmful")) reason = "flagged"
+      else if ((noul(`user.${i}`) ?? 0) >= NOUL_FLOOR) reason = "user_should_decide"
       else if (!take) reason = "out_of_scope"
       else if (item.files.length === 0) reason = "no_files"
       else if (job.tasks.filter((t) => t.origin === "discovered").length >= discoveredCap(job)) reason = "cap"
@@ -758,8 +767,18 @@ export class Runner {
     const readers: Awaited<ReturnType<typeof read>>[] = []
     if (local) for (let i = 0; i < n; i++) readers.push(await read(i))
     else readers.push(...(await Promise.all(Array.from({ length: n }, (_, i) => read(i)))))
-    const notes = readers.filter((r) => !r.stopped && !r.timedOut && r.text).map((r) => r.text)
+    const answered = readers.filter((r) => !r.stopped && !r.timedOut && r.text).map((r) => r.text)
     readers.forEach((r, i) => saveNote(this.#d.project, job.id, `${task.id}.reader${i + 1}`, r.text || "(no answer)"))
+    // Readers quote the web; a note that carries an injection never reaches the synthesis (E2b).
+    const notes: string[] = []
+    for (const note of answered) {
+      const score = await injectionScore(this.#decider, note, job.id, task.id)
+      if (!injected(score)) notes.push(note)
+      else {
+        this.#journal({ kind: "guard", job: job.id, task: task.id, guard: "injection", score, action: "reader note dropped" })
+        job.lessons.push(`${task.id}: a research note was dropped, it looked like a prompt injection (${score!.toFixed(2)})`)
+      }
+    }
     stage(task, "readers", notes.length ? "pass" : "fail", `${notes.length} of ${n} readers answered`)
     if (notes.length === 0) return this.#escalate(job, task, "no research reader came back with findings")
     const path = researchPath(task)

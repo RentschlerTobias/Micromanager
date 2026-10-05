@@ -112,7 +112,7 @@ export interface FollowUp {
 // A follow-up that did not become a task: shown to the user at the end of the job.
 export interface Later extends FollowUp {
   readonly from: string // the task that found it
-  readonly reason: "out_of_scope" | "user_should_decide" | "cap" | "no_files" | "invalid"
+  readonly reason: "out_of_scope" | "user_should_decide" | "cap" | "no_files" | "invalid" | "flagged"
 }
 
 export interface Task {
