@@ -434,12 +434,15 @@ export default {
             }
             return [`job ${job.id} on branch ${job.integrationBranch ?? `jev/${job.id}`}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}`)].join("\n")
           },
-          answer: async (taskId, text, tctx) => {
+          answer: async (taskId, text, checksText, tctx) => {
+            const checks = checksText.split(/\n|;;/).map((c) => c.trim()).filter(Boolean)
+            const bad = checks.map(checkProblem).filter(Boolean)
+            if (bad.length) return `Not changed: checks must be shell commands. ${bad.join("; ")}`
             const job = tctx.sessionID ? listJobs(project).find((j) => j.facilitator === tctx.sessionID && j.rolling) : undefined
             if (!job) return "No task delegated in this session yet."
             // A running job takes the answer in memory; one that is not running, in its file.
-            const applied = live.get(job.id)?.answerTask(job.id, taskId.trim(), text.trim())
-            const err = applied === false || applied === undefined ? Runner.answer(job, taskId.trim(), text.trim()) : applied
+            const applied = live.get(job.id)?.answerTask(job.id, taskId.trim(), text.trim(), checks)
+            const err = applied === false || applied === undefined ? Runner.answer(job, taskId.trim(), text.trim(), checks) : applied
             if (err) return err
             if (applied === false || applied === undefined) saveJob(project, job)
             scheduler.enqueue(job.id, tctx.sessionID)

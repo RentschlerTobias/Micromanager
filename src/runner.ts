@@ -723,20 +723,27 @@ export class Runner {
 
   // The user's answer for a task of the job this runner works on, applied to the live job so the run loop starts the
   // task again; undefined when this runner does not work on that job.
-  answerTask(jobId: string, taskId: string, text: string): string | undefined | false {
+  answerTask(jobId: string, taskId: string, text: string, checks: readonly string[] = []): string | undefined | false {
     const job = this.#job
     if (!job || job.id !== jobId) return false
-    const err = Runner.answer(job, taskId, text)
+    const err = Runner.answer(job, taskId, text, checks)
     if (!err) saveJob(this.#d.project, job)
     return err
   }
 
   // A rolling job's task that waits for the user: the answer becomes a decision every later brief carries, and the
   // task starts again from the job's newest commit.
-  static answer(job: Job, taskId: string, text: string): string | undefined {
+  // checks: new checks for the task, replacing the ones it was delegated with (live test: a check with a wrong path
+  // kept a finished reader blocked, and no answer could change it).
+  static answer(job: Job, taskId: string, text: string, checks: readonly string[] = []): string | undefined {
     const task = job.tasks.find((t) => t.id === taskId)
     if (!task) return `no task ${taskId}`
     if (task.status !== "blocked" && task.status !== "escalated") return `task ${taskId} is ${task.status}; it waits for nobody`
+    if (checks.length) {
+      const own = job.acceptance.filter((a) => task.acceptance.includes(a.id) && !job.tasks.some((t) => t.id !== task.id && t.acceptance.includes(a.id)))
+      if (!own.length) return `task ${taskId} shares its acceptance points with other tasks; its checks cannot change alone`
+      job.acceptance = job.acceptance.map((a) => (own.some((o) => o.id === a.id) ? { ...a, verify: checks.join(" && ") } : a))
+    }
     job.decisions.push({ id: `U${job.decisions.length + 1}`, text: `${taskId}: ${text}`, origin: "user" })
     moveTask(task, "pending")
     task.confirmed = true

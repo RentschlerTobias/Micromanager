@@ -561,7 +561,7 @@ test("a run that ended mid-task starts that task again on a clean worktree", asy
 // --- Phase E: the task queue (priority, follow-ups, replan) ----------------------------------------------
 
 import { buildAgenda } from "../src/agenda.ts"
-import { moveJob, newJob } from "../src/state.ts"
+import { moveJob, moveTask, newJob } from "../src/state.ts"
 import { saveJob } from "../src/store.ts"
 
 test("a worker's follow-up in the plan's files becomes a task after its finder; one outside goes to later", async () => {
@@ -1122,4 +1122,14 @@ test("delegated files are project paths; prose and paths outside are refused", a
   assert.deepEqual(parseFiles("", p), { files: [] })
   assert.match(parseFiles("none (read-only; only /tmp/opencode/x.md may be written)", p).problem!, /must be paths in the project/)
   assert.match(parseFiles("/tmp/x.md", p).problem!, /inside the project/)
+})
+
+test("rolling: an answer can replace a task's wrong checks", () => {
+  const project = repo()
+  const job = rolling(project)
+  addDelegated(job, { title: "map oc-voice", prompt: "read it", files: [], dependsOn: [], checks: ["test -f /x/oc-voice/voice/loop.py"] })
+  moveTask(job.tasks[0]!, "ready"); moveTask(job.tasks[0]!, "planned"); moveTask(job.tasks[0]!, "running"); moveTask(job.tasks[0]!, "blocked")
+  assert.equal(Runner.answer(job, "T1", "the path was wrong", ["test -f /x/oc-voice/src/voice_agent/voice/loop.py"]), undefined)
+  assert.equal(job.acceptance.find((a) => a.id === job.tasks[0]!.acceptance[0])!.verify, "test -f /x/oc-voice/src/voice_agent/voice/loop.py")
+  assert.equal(job.tasks[0]!.status, "pending")
 })

@@ -31,7 +31,7 @@ export interface ToolContext {
 export interface Handlers {
   task(input: TaskInput, ctx: ToolContext): Promise<string>
   tasks(id: string, ctx: ToolContext): Promise<string>
-  answer(task: string, text: string, ctx: ToolContext): Promise<string>
+  answer(task: string, text: string, checks: string, ctx: ToolContext): Promise<string>
   plan(goal: string, ctx: ToolContext): Promise<string>
   questions(job: string, tree: string, ctx: ToolContext): Promise<string>
   run(job: string, note: string, ctx: ToolContext): Promise<string>
@@ -71,9 +71,9 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dict
   draft.add({
     id: "dictator_answer",
     name: "dictator_answer",
-    description: "Give a task that waits for the user the user's answer or go, in their words; the task starts again with it.",
-    input: input("task", "text"),
-    execute: guarded(([task, text], ctx) => handlers.answer(task!, text!, ctx), "task", "text"),
+    description: "Start a task again that waits for the user or was given up: text is the user's answer or go in their words, or your correction; checks (optional, shell commands one per line) replace the task's checks when they were wrong, e.g. a wrong path. Leave checks empty to keep them.",
+    input: input("task", "text", "checks"),
+    execute: guarded(([task, text, checks], ctx) => handlers.answer(task!, text!, checks!, ctx), "task", "text", "checks"),
   })
   draft.add({
     id: "dictator_plan",
