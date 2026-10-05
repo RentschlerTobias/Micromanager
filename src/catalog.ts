@@ -180,6 +180,6 @@ export const ESCALATION = {
   too_hard: "the workers tried and failed; the task needs another approach or smaller steps",
 } as const
 
-export type EscalationKind = keyof typeof ESCALATION | "budget"
+export type EscalationKind = keyof typeof ESCALATION | "budget" | "refused"
 
 export const ESCALATE: Question = { type: "choice", instructions: "Why could this task not be finished?", criteria: ESCALATION }

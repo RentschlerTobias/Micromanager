@@ -758,3 +758,41 @@ test("P2 with two axes: a confident standards finding goes back to the worker; t
   assert.ok(t1.stages.some((s) => s.stage === "review_notes" && /style \(40\)/.test(s.evidence ?? "")))
   assert.ok(done.tasks.some((t) => t.origin === "discovered" && t.title === "document add in notes"))
 })
+
+// --- Phase E: worker_refused ---------------------------------------------------------------------------------
+
+import { refused } from "../src/brief.ts"
+
+test("a refusal without a report is recognised; a report that mentions refusing is not", () => {
+  assert.equal(refused("I'm sorry, but I can't help with writing that scanner."), true)
+  assert.equal(refused("I cannot assist with this request as it is against my guidelines."), true)
+  assert.equal(refused("Done. I can't help noticing the old code was odd.\nSTATUS: DONE\nFILES: a.js"), false)
+  assert.equal(refused("Wrote the file.\nSTATUS: DONE"), false)
+})
+
+test("a refusing worker gets one fresh session on a local uncensored model; a second refusal goes to the user", async () => {
+  const project = repo()
+  const models: string[] = []
+  const fake = fakeSession({ worker: () => "I'm sorry, but I can't help with that." })
+  const r = runner(project, fake.api, { onWorker: () => {} })
+  const done = await r.run((await r.plan("goal")).job.id)
+  for (const c of fake.created.filter((c) => c.agent === "dictator-code")) models.push(`${(c.model as { providerID: string }).providerID}/${(c.model as { id: string }).id}`)
+  assert.equal(models.length, 2)
+  const second = DEFAULT_REGISTRY.find((m) => m.id === models[1])!
+  assert.deepEqual([second.location, second.censored], ["local", false])
+  assert.equal(done.phase, "ask_user")
+  assert.equal(done.tasks[0]!.escalation?.kind, "refused")
+  assert.match(summary(done), /why: T1 \(refused\): even a local uncensored model refused/)
+})
+
+test("a refusal in a job the gate flagged as possibly harmful goes straight to the user", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: () => "I cannot assist with this." })
+  const r = runner(project, fake.api)
+  const { job } = await r.plan("goal")
+  job.flags = { gate: { flagged: ["harmful"], scores: { harmful: 0.9 }, checked: true } }
+  saveJob(project, job)
+  const done = await r.run(job.id)
+  assert.equal(fake.created.filter((c) => c.agent === "dictator-code").length, 1, "no reroute")
+  assert.equal(done.tasks[0]!.escalation?.kind, "refused")
+})

@@ -109,6 +109,14 @@ export function parseReport(text: string): Report {
   }
 }
 
+// worker_refused (design.md §10.2): a reply without a report that reads like a safety refusal. Code decides, by
+// phrasing; the patterns are conservative until the refusal probe set (A10) calibrates them.
+const REFUSAL = /\b(I can(?:'|no)t (?:help|assist|do|comply|provide|write|create)|I(?:'m| am) (?:not able|unable) to (?:help|assist|comply|do)|I won't (?:help|do|write|create|be able)|I must decline|I(?:'m| am) sorry, but I can|against (?:my|the|our) (?:guidelines|policies|policy|usage policies))/i
+
+export function refused(text: string): boolean {
+  return REFUSAL.test(text) && parseReport(text).status === undefined
+}
+
 // The last assistant message's text, from ctx.session.context() (shape seen in Phase A).
 export function lastAssistantText(messages: unknown): string {
   if (!Array.isArray(messages)) return ""

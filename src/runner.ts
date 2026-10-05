@@ -14,7 +14,7 @@ import {
   type EscalationKind,
 } from "./catalog.ts"
 import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, injected, injectionScore, type Unchecked } from "./gate.ts"
-import { brief, fixPrompt, handoffText, lastAssistantText, parseReport, skillLine, taskAcceptance, usage } from "./brief.ts"
+import { brief, fixPrompt, handoffText, lastAssistantText, parseReport, refused, skillLine, taskAcceptance, usage } from "./brief.ts"
 import { changedFiles, commitTask, exec as defaultExec, hashFiles, prepareIntegration, revertFiles, runGate, workingDiff, type Exec, type GateResult } from "./integration.ts"
 import { redact } from "./jev.ts"
 import { record } from "./journal.ts"
@@ -82,6 +82,7 @@ interface Work {
   model: { id: string; reason: string }
   answer: { text: string; timedOut: boolean; stopped?: Signal }
   fresh: boolean
+  uncensored?: boolean // rerouted to a local uncensored model after a refusal
 }
 
 const REVIEW_ROUNDS = 3
@@ -130,20 +131,23 @@ export class Runner {
   }
 
   // The model for a role: the user's preset if any, else the router over the registry, else the role's cloud model.
-  async #model(job: Job, role: string, difficulty: number, task?: string, avoidFamilies?: string[], vision = false): Promise<{ id: string; reason: string }> {
+  // uncensored: this task needs a local uncensored model (a worker refused it); routed is false when none fits.
+  async #model(job: Job, role: string, difficulty: number, task?: string, avoidFamilies?: string[], vision = false, uncensored = false): Promise<{ id: string; reason: string; routed: boolean }> {
     const preset = resolvePolicy("N5.model", this.#policies(job, task))
     const presetModel = preset.policy.kind === "fixed" ? this.#d.registry.find((m) => m.id === (preset.policy as { value: string }).value) : undefined
-    const presetBreaksGate = job.flags?.localOnly && (presetModel?.location === "cloud" || (job.flags.uncensored && presetModel?.censored))
+    const local = job.flags?.localOnly || uncensored
+    const free = job.flags?.uncensored || uncensored
+    const presetBreaksGate = local && (presetModel?.location === "cloud" || (free && presetModel?.censored !== false))
     if (preset.policy.kind === "fixed" && !presetBreaksGate) {
       this.#journal({ kind: "routing", job: job.id, task, role, model: preset.policy.value, reason: `preset (${preset.level})` })
-      return { id: preset.policy.value, reason: `preset (${preset.level})` }
+      return { id: preset.policy.value, reason: `preset (${preset.level})`, routed: true }
     }
-    if (presetBreaksGate) this.#say(`preset ${(preset.policy as { value: string }).value} ignored: the job must stay local${job.flags?.uncensored ? " and uncensored" : ""}`)
+    if (presetBreaksGate) this.#say(`preset ${(preset.policy as { value: string }).value} ignored: the ${uncensored ? "task" : "job"} must stay local${free ? " and uncensored" : ""}`)
     const availability = await this.#d.availability?.().catch(() => undefined)
-    const r = route(this.#d.registry, { role, difficulty, vision, sensitive: job.flags?.localOnly, refusalLikely: job.flags?.uncensored, avoidFamilies }, availability)
+    const r = route(this.#d.registry, { role, difficulty, vision, sensitive: local, refusalLikely: free, avoidFamilies }, availability)
     const id = r.model ?? roleById(role)?.models[0] ?? this.#d.registry[0]!.id
     this.#journal({ kind: "routing", job: job.id, task, role, model: id, reason: r.model ? r.reason : `fallback: ${r.reason}`, ranked: r.ranked.slice(0, 5) })
-    return { id, reason: r.model ? r.reason : "fallback" }
+    return { id, reason: r.model ? r.reason : "fallback", routed: r.model !== undefined }
   }
 
   async #ask(sessionID: string, text: string): Promise<{ text: string; timedOut: boolean; stopped?: Signal }> {
@@ -721,6 +725,21 @@ export class Runner {
         ;[work, lastDiff, lastFailure] = [next, undefined, undefined]
         continue
       }
+      if (!answer.timedOut && refused(answer.text)) {
+        // worker_refused: a safety-tuned model said no. Never for a job the gate flagged as possibly harmful; else one
+        // fresh session on a local uncensored model (design.md §10.2, §21).
+        stage(task, "implement", "fail", `worker_refused: ${answer.text.slice(0, 200)}`)
+        this.#journal({ kind: "watchdog", job: job.id, task: task.id, signal: "worker_refused", model: work.model.id })
+        const harmful = job.flags?.gate?.flagged.includes("harmful")
+        if (harmful || work.uncensored) {
+          await this.#escalate(job, task, harmful ? "the model refused, and the gate flagged the job as possibly harmful" : "even a local uncensored model refused", answer.text.slice(-1500), "refused")
+          return undefined
+        }
+        const next = await this.#nextRung(job, task, { ...work, fresh: false }, frozen, "the model refused the task", "", "too_hard", true)
+        if (!next) return undefined
+        ;[work, lastDiff, lastFailure] = [next, undefined, undefined]
+        continue
+      }
       const report = parseReport(answer.text)
       collectFollowUps(task, report.followUps)
       stage(task, "implement", answer.timedOut ? "fail" : "pass", answer.timedOut ? "timed out" : `status ${report.status ?? "missing"}`)
@@ -775,13 +794,17 @@ export class Runner {
 
   // N9 (design.md §10.2): rung 1 is the fix rounds in the same session; rung 2 a fresh session on another model family
   // with a handoff note; rung 3 the escalation. A budget that is used up skips rung 2.
-  async #nextRung(job: Job, task: Task, work: Work, frozen: ReadonlyMap<string, string>, reason: string, details: string, hint: EscalationKind = "too_hard"): Promise<Work | undefined> {
+  async #nextRung(job: Job, task: Task, work: Work, frozen: ReadonlyMap<string, string>, reason: string, details: string, hint: EscalationKind = "too_hard", uncensored = work.uncensored ?? false): Promise<Work | undefined> {
     const over = this.#overBudget(job)
     if (work.fresh || over) {
       await this.#escalate(job, task, over ?? reason, details, over ? "budget" : hint)
       return undefined
     }
-    const model = await this.#model(job, task.role, task.profile?.difficulty ?? 0.5, task.id, [this.#family(work.model.id)], task.profile?.vision)
+    const model = await this.#model(job, task.role, task.profile?.difficulty ?? 0.5, task.id, [this.#family(work.model.id)], task.profile?.vision, uncensored)
+    if (uncensored && !model.routed) {
+      await this.#escalate(job, task, `${reason}, and no local uncensored model is available`, details, "refused")
+      return undefined
+    }
     task.model = model.id
     toRunning(task)
     task.attempts = 0
@@ -794,7 +817,7 @@ export class Runner {
       frozen.size ? greenNote([...frozen.keys()]) : "",
       handoffText(reason, details, await changedFiles(worktree, this.#exec)),
     ].filter(Boolean).join("\n\n")
-    return { s, model, answer: await this.#ask(s.id, text), fresh: true }
+    return { s, model, answer: await this.#ask(s.id, text), fresh: true, uncensored }
   }
 
   // P3's red stage: a test worker writes the tests first, and they must fail before anything is built. Returns the
@@ -964,7 +987,7 @@ export class Runner {
   async #escalate(job: Job, task: Task, reason: string, details = "", hint: EscalationKind = "too_hard"): Promise<void> {
     let kind = hint
     let decision: string | undefined
-    if (hint !== "budget") {
+    if (hint !== "budget" && hint !== "refused") {
       const asked = await this.#decider.ask(
         "N9",
         { goal: job.goal, task: `${task.id} ${task.title}: ${task.description}`, acceptance: taskAcceptance(job, task).map((a) => a.text), reason, details: details.slice(-2000), stages: task.stages.slice(-6).map((s) => `${s.stage} ${s.result}${s.evidence ? `: ${s.evidence.slice(0, 200)}` : ""}`) },
