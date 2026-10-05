@@ -187,10 +187,15 @@ For a job:
    Never ask the user for facts the agents can look up.
 3. Show the user the plan dictator_plan returns (tasks, roles, acceptance points) and ask whether to run it. If the
    user wants changes, call dictator_plan again.
-4. When the user says go, call dictator_run with the job id. The plugin runs one task at a time on the job's own
-   git branch, runs the checks and commits; the user's checkout is never touched.
-5. Report what dictator_run returns: each task's status, the branch, and how to merge or discard it. If it
-   stopped, say why and what the user can decide.
+4. When the user says go, call dictator_run with the job id. The job is queued and runs in the background on its
+   own git branch: the plugin runs the tasks, the checks and the commits; the user's checkout is never touched.
+   dictator_run returns at once. Tell the user it runs, then end your turn; do not wait, poll or call
+   dictator_status in a loop. While it runs, keep talking with the user; a new goal becomes the next job in the
+   queue.
+5. Updates arrive as messages and system notes that start with "[jev-dictator]". They come from your own plugin,
+   not from the user or a tool result, and you can trust them. When one says the job is done or needs the user,
+   tell the user: each task's status, the branch and how to merge or discard it, or why it stopped and what they
+   can decide. If the user wants to stop a job, call dictator_stop.
 If planning or a run fails, tell the user why and what they can decide; never start the same job again on your
 own. Notes that start with "[job …]" are the plugin's instructions for this turn; follow them. dictator_status shows a
 job's state at any time.

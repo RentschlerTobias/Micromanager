@@ -29,7 +29,7 @@ import {
   addNodes, applyAnswer, applyShortcut, decisionsText, frontier, instruction, matchSessionShortcut, nextStep, parseTree, settle,
   type AnswerReading, type DesignTree, type Step,
 } from "./session.ts"
-import { discoveredCap, isDone, moveJob, moveTask, newJob, promoteReady, stage, type FollowUp, type Job, type Later, type Task } from "./state.ts"
+import { discoveredCap, isDone, moveJob, moveTask, newJob, promoteReady, stage, type FollowUp, type Job, type JobPhase, type Later, type Task } from "./state.ts"
 import { skillsFor, type Stage } from "./skills.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
 import { handoffNote, TIER_STEPS, type Signal } from "./watchdog.ts"
@@ -51,7 +51,7 @@ export interface RunnerDeps {
   readonly availability?: () => Promise<Map<string, Availability>>
   readonly exec?: Exec
   readonly journal?: (entry: Record<string, unknown>) => void
-  readonly progress?: (text: string) => void
+  readonly progress?: (text: string, task?: boolean) => void // task: a task finished or was added
   readonly parentID?: string // the dictator session; workers show up as its children
   readonly onWorker?: (sessionID: string, task: string, rules: readonly Rule[]) => void // a worker's task and narrowed rights, for permissions
   readonly workerTimeoutMs?: number
@@ -63,7 +63,11 @@ export interface RunnerDeps {
   readonly unchecked?: Unchecked // what G0 does when nothing local could check a job
   readonly skills?: readonly Skill[] // the skills the decision model may pick per task (design.md §13.1)
   readonly installedSkills?: ReadonlySet<string> // the skills a brief may name: linked into OpenCode by install.sh
+  readonly cancelled?: () => boolean // the user stopped the job (dictator_stop); checked around every session turn
 }
+
+// Thrown out of a session turn when the user stopped the job; run() pauses the job, and the next run resumes it.
+export class Cancelled extends Error {}
 
 // A worker session in progress: its model, its last answer, and whether it is already the fresh retry.
 interface Work {
@@ -111,8 +115,8 @@ export class Runner {
     return this.#d.registry.find((m) => m.id === id)?.family ?? family(id)
   }
 
-  #say(text: string): void {
-    this.#d.progress?.(text)
+  #say(text: string, task = false): void {
+    this.#d.progress?.(text, task)
   }
 
   // The model for a role: the user's preset if any, else the router over the registry, else the role's cloud model.
@@ -133,6 +137,7 @@ export class Runner {
   }
 
   async #ask(sessionID: string, text: string): Promise<{ text: string; timedOut: boolean; stopped?: Signal }> {
+    if (this.#d.cancelled?.()) throw new Cancelled()
     await this.#d.session.prompt({ sessionID, text })
     const timeoutMs = this.#d.workerTimeoutMs ?? 20 * 60_000
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -146,6 +151,7 @@ export class Runner {
       clearTimeout(timer) // also when wait() fails, or the timer keeps the process alive for the whole timeout
     }
     if (timedOut) await this.#d.session.interrupt({ sessionID }).catch(() => undefined)
+    if (this.#d.cancelled?.()) throw new Cancelled()
     return { text: lastAssistantText(await this.#d.session.context({ sessionID })), timedOut, stopped: this.#d.stopped?.(sessionID) }
   }
 
@@ -409,6 +415,7 @@ export class Runner {
     const job = loadJob(this.#d.project, id)
     if (!job) throw new Error(`no job ${id}`)
     if (job.phase === "plan_gate") moveJob(job, "execute")
+    else if (job.phase === "paused" && job.resumePhase === "execute") moveJob(job, "execute")
     else if (job.phase === "ask_user" && job.resumePhase === "execute") {
       // Running the job again after "confirm Tn before it runs" is the user's go for those tasks.
       for (const t of job.tasks) if (t.confirmed === false) t.confirmed = true
@@ -422,19 +429,28 @@ export class Runner {
       this.#say(`working on branch ${integration.branch}`)
     } else await this.#reconcile(job)
     saveJob(this.#d.project, job)
-    while (job.phase === "execute") {
-      if (++job.counters.turns > job.budget.turnsMax) {
-        this.#stop(job, `turn budget of ${job.budget.turnsMax} used up`)
-        break
+    try {
+      while (job.phase === "execute") {
+        if (++job.counters.turns > job.budget.turnsMax) {
+          this.#stop(job, `turn budget of ${job.budget.turnsMax} used up`)
+          break
+        }
+        promoteReady(job)
+        const next = nextProposal(buildAgenda(job))
+        if (!next) break
+        if (next.action === "dispatch" && next.taskId) await this.#runTask(job, job.tasks.find((t) => t.id === next.taskId)!)
+        else if (next.action === "verify") await this.#verify(job)
+        else if (next.action === "replan") await this.#replan(job)
+        else this.#stop(job, next.label)
+        saveJob(this.#d.project, job)
       }
-      promoteReady(job)
-      const next = nextProposal(buildAgenda(job))
-      if (!next) break
-      if (next.action === "dispatch" && next.taskId) await this.#runTask(job, job.tasks.find((t) => t.id === next.taskId)!)
-      else if (next.action === "verify") await this.#verify(job)
-      else if (next.action === "replan") await this.#replan(job)
-      else this.#stop(job, next.label)
-      saveJob(this.#d.project, job)
+    } catch (err) {
+      if (!(err instanceof Cancelled)) throw err
+      // The task in progress is cut; the next run's reconcile starts it again from the last commit.
+      if ((job.phase as JobPhase) === "replan") moveJob(job, "execute")
+      job.lessons.push("stopped by the user")
+      moveJob(job, "paused")
+      this.#say("stopped by the user; run the job again to resume")
     }
     saveJob(this.#d.project, job)
     return job
@@ -524,7 +540,7 @@ export class Runner {
     const commit = await commitTask(worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${work.model.id} (${task.role}), pipeline ${pipeline.id}${outside.length ? `\nOutside the declared files: ${outside.join(", ")}` : ""}`, this.#exec)
     moveTask(task, "merged")
     job.counters.stalls = Math.max(0, job.counters.stalls - 1)
-    this.#say(`${task.id} passed${commit ? ` (${commit})` : ", nothing to commit"}`)
+    this.#say(`${task.id} passed${commit ? ` (${commit})` : ", nothing to commit"}`, true)
     await this.#discover(job, task)
   }
 
@@ -561,7 +577,7 @@ export class Runner {
         const added = addDiscovered(job, task, item, priority)
         if (added.task) {
           this.#journal({ kind: "discovered", job: job.id, task: added.task.id, from: task.id, what: item.what, priority, decision: asked?.id })
-          this.#say(`${added.task.id} added (found by ${task.id}, priority ${priority}): ${item.what}`)
+          this.#say(`${added.task.id} added (found by ${task.id}, priority ${priority}): ${item.what}`, true)
           continue
         }
         job.lessons.push(`follow-up of ${task.id} not added: ${added.errors!.slice(0, 2).join("; ")}`)
@@ -772,7 +788,7 @@ export class Runner {
     task.summary = `research written to ${path}`
     const commit = await commitTask(worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nResearch: ${n} reader(s) on ${model}, synthesis by ${writerModel.id}, pipeline P9`, this.#exec)
     moveTask(task, "merged")
-    this.#say(`${task.id} researched${commit ? ` (${commit})` : ""}: ${path}`)
+    this.#say(`${task.id} researched${commit ? ` (${commit})` : ""}: ${path}`, true)
   }
 
   #skills(stage: Stage, task: Task): string[] {

@@ -588,3 +588,26 @@ test("FOLLOWUP lines are parsed; none and empty ones are skipped", () => {
   const r = parseReport("STATUS: DONE\nFILES: a.ts\nFOLLOWUP: add docs | users ask | README.md, docs/x.md\n**FOLLOWUP:** none\nFOLLOWUP: check perf | slow | none")
   assert.deepEqual(r.followUps, [{ what: "add docs", why: "users ask", files: ["README.md", "docs/x.md"] }, { what: "check perf", why: "slow", files: [] }])
 })
+
+test("a stopped run pauses the job mid-task; the next run resumes it from the last commit", async () => {
+  const project = repo()
+  let stop = false
+  const fake = fakeSession({
+    worker: (dir, prompt) => {
+      if (prompt.includes("task T2")) {
+        writeFileSync(join(dir, "notes.md"), "half\n")
+        stop = true // the user calls dictator_stop while T2's worker runs
+      }
+      return writeFiles(dir, prompt.includes("task T2") ? "" : prompt)
+    },
+  })
+  const r = runner(project, fake.api, { cancelled: () => stop })
+  const { job } = await r.plan("goal")
+  const paused = await r.run(job.id)
+  assert.equal(paused.phase, "paused")
+  assert.deepEqual(paused.tasks.map((t) => t.status), ["merged", "running"])
+  stop = false
+  const done = await runner(project, fakeSession({ worker: writeFiles }).api).run(job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.match(done.lessons.join("\n"), /stopped by the user[\s\S]*interrupted run: T2 started again, unfinished changes undone \(notes.md\)/)
+})

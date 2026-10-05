@@ -4,6 +4,8 @@
 // the plugin needs no package of its own. The runtime context has more domains than the typed SDK shows
 // (seen on opencode 2.0.18): agent, tool, session, event, permission, worktree, generate, storage, skill, …
 
+import { execFile } from "node:child_process"
+
 import { installAgents, type AgentDraft } from "./agents.ts"
 import { loadSettings } from "./config.ts"
 import { decide, type PermissionRequest } from "./decide.ts"
@@ -15,6 +17,7 @@ import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe } from "./registry.ts"
 import { DICTATOR, ROLES, type Rule } from "./roles.ts"
 import { recentFailure, Runner, summary, type SessionApi } from "./runner.ts"
+import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
 import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
@@ -51,7 +54,10 @@ interface Context {
     hook(name: string, callback: (call: ToolCall) => void): Promise<unknown>
     transform(callback: (draft: ToolDraft) => void): Promise<unknown>
   }
-  session: SessionApi & { hook(name: string, callback: (input: SessionHookInput) => Promise<void> | void): Promise<unknown> }
+  session: SessionApi & {
+    hook(name: string, callback: (input: SessionHookInput) => Promise<void> | void): Promise<unknown>
+    synthetic(args: { sessionID: string; text: string; resume: boolean }): Promise<unknown>
+  }
   permission: { hook(name: string, callback: (evaluation: Evaluation) => Promise<void> | void): Promise<unknown> }
   location?: { directory?: string }
   app?: { log?(entry: { level: string; message: string }): unknown }
@@ -72,7 +78,7 @@ export default {
   id: "jev-dictator",
   setup: async (ctx: Context): Promise<void> => {
     const log = logger(ctx)
-    const { routing, floors, decisions, registry, error } = loadSettings()
+    const { notify, routing, floors, decisions, registry, error } = loadSettings()
     if (error) log("warn", `config ignored, defaults used: ${error}`)
 
     await ctx.agent.transform((draft) => {
@@ -193,7 +199,18 @@ export default {
     // Skills are read once per start, like the agents: install.sh --skills and a restart make new ones known.
     const installed = installedSkills()
     log("info", `skills for workers: ${[...installed].join(", ") || "none (./install.sh --skills)"}`)
-    const runner = (parentID?: string) =>
+    // What the dictator must do in its next turn, per session; set from the user's turn or a job update, used by
+    // every provider turn of that answer (steering through a system block, Phase A1), replaced at the user's next turn.
+    const steering = new Map<string, string>()
+    const notifier = new Notifier({
+      mode: notify,
+      synthetic: (sessionID, text, resume) => ctx.session.synthetic({ sessionID, text, resume }),
+      steer: (sessionID, note) => steering.set(sessionID, note),
+      desktop: (title, body) => {
+        execFile("notify-send", ["-a", "jev-dictator", title, body], (err) => { if (err) log("info", `no desktop notification: ${err.message}`) })
+      },
+    })
+    const runner = (parentID?: string, job?: string, cancel?: Cancel) =>
       new Runner({
         session: ctx.session,
         project,
@@ -201,20 +218,34 @@ export default {
         decider,
         policies: { global: decisions },
         availability: () => probe(registry),
-        progress: (text) => log("info", text),
+        progress: (text, task) => {
+          log("info", text)
+          if (job) notifier.progress(parentID, `${job}: ${text}`, task)
+        },
         parentID,
+        cancelled: cancel ? () => cancel.cancelled : undefined,
         onWorker: (sessionID, task, rules) => {
           workerTasks.set(sessionID, task)
           if (rules.length) workerRules.set(sessionID, rules)
         },
         watch: (sessionID, maxSteps) => {
           runnerSessions.add(sessionID)
+          if (job) scheduler.working(job, sessionID)
           watchdog.watch(sessionID, { maxSteps })
         },
         stopped: (sessionID) => stops.get(sessionID),
         skills: SKILLS.filter((s) => s.asked && installed.has(s.name)),
         installedSkills: installed,
       })
+    // The job queue: dictator_run queues, the scheduler runs in the background and the notifier reports the end.
+    const scheduler = new Scheduler({
+      run: (id, cancel) => runner(loadJob(project, id)?.facilitator, id, cancel).run(id),
+      finished: (job, session) => void notifier.finished(session ?? job.facilitator, job.id, ending(job), summary(job)),
+      failed: (id, session, err) => {
+        log("error", `job ${id} failed: ${String(err)}`)
+        void notifier.finished(session, id, "failed", `The run broke off: ${err instanceof Error ? err.message : String(err)}. dictator_run resumes it.`)
+      },
+    })
     await ctx.tool.hook("execute.after", (call) => {
       if (!call.sessionID || !watchdog.watching(call.sessionID)) return
       const signal = watchdog.onTool(call.sessionID, call.tool, call.input)
@@ -232,7 +263,9 @@ export default {
             // One job at a time per dictator session: until a job is finished, stopped or failed, a goal continues it
             // instead of starting another (live test: the dictator re-sent the goal mid-session and after confirm).
             const active = tctx.sessionID ? sessionJob(tctx.sessionID) : undefined
-            const planning = active && !["done", "stopped", "failed", "integrate", "wrap"].includes(active.phase)
+            // A job that runs or waits in the queue is not in planning: a new goal becomes the next job.
+            const planning = active && !["done", "stopped", "failed", "integrate", "wrap", "execute", "replan", "verify"].includes(active.phase) &&
+              !(["paused", "ask_user"].includes(active.phase) && ["execute", "replan", "verify"].includes(active.resumePhase ?? ""))
             const failed = !JOB_ID.test(text) && !planning ? recentFailure(active, text) : undefined
             if (failed) return failed
             const fresh = text.replace(/^retry:\s*/i, "")
@@ -246,20 +279,36 @@ export default {
             return out.kind === "plan" ? planText(out.job) : out.text
           },
           questions: async (job, tree, tctx) => runner(tctx.sessionID).questions(job.trim(), tree),
-          run: async (id, tctx) => summary(await runner(tctx.sessionID).run(id.trim())),
+          run: async (id, tctx) => {
+            const job = loadJob(project, id.trim())
+            if (!job) return `no job ${id.trim()}`
+            const ready = job.phase === "plan_gate" || job.phase === "execute" || ((job.phase === "paused" || job.phase === "ask_user") && job.resumePhase === "execute")
+            if (!ready) return `job ${job.id} is in phase ${job.phase}, not ready to run`
+            if (tctx.sessionID && !job.facilitator) {
+              job.facilitator = tctx.sessionID
+              saveJob(project, job)
+            }
+            const place = scheduler.enqueue(job.id, job.facilitator ?? tctx.sessionID)
+            return place === 0
+              ? `job ${job.id} runs now in the background. Updates arrive as [jev-dictator] notes; tell the user and end your turn.`
+              : `job ${job.id} is queued at place ${place}; it starts when the jobs before it end. Tell the user and end your turn.`
+          },
           status: async (id) => {
             const job = id.trim() ? loadJob(project, id.trim()) : listJobs(project)[0]
-            return job ? `${summary(job)}\n\n${planText(job)}` : "no job yet"
+            const q = scheduler.snapshot()
+            const queue = `queue: ${q.running ? `running ${q.running}` : "nothing running"}${q.queued.length ? `; waiting: ${q.queued.join(", ")}` : ""}`
+            return job ? `${queue}\n\n${summary(job)}\n\n${planText(job)}` : `${queue}\nno job yet`
+          },
+          stop: async (id) => {
+            const r = scheduler.stop(id.trim() || undefined)
+            if (r.session) await ctx.session.interrupt({ sessionID: r.session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
+            return r.state === "stopping" ? "The running job stops now and pauses; dictator_run resumes it." : r.state === "dequeued" ? "The job left the queue." : "No such job running or waiting."
           },
         }, DICTATOR.agent, (sessionID) => runnerSessions.has(sessionID))
       } catch (err) {
         log("error", `dictator tools not installed: ${String(err)}`)
       }
     })
-
-    // What the dictator must do in its next turn, per session; set from the user's turn, used by every provider
-    // turn of that answer (steering through a system block, Phase A1), replaced at the user's next turn.
-    const steering = new Map<string, string>()
 
     await ctx.session.hook("prompt", async (input) => {
       const sessionID = input.sessionID

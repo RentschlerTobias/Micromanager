@@ -14,7 +14,7 @@ function fakeDraft() {
   return { draft, added, str }
 }
 
-test("the three tools are built from the read tool's schema and refuse other agents", async () => {
+test("the tools are built from the read tool's schema and refuse other agents", async () => {
   const { draft, added, str } = fakeDraft()
   const calls: string[] = []
   const ids = installTools(draft, {
@@ -22,6 +22,7 @@ test("the three tools are built from the read tool's schema and refuse other age
     questions: async (job, tree) => { calls.push(`questions:${job}:${tree}`); return "asked" },
     run: async (job) => { calls.push(`run:${job}`); return "ran" },
     status: async () => { throw new Error("boom") },
+    stop: async (job) => { calls.push(`stop:${job}`); return "stopping" },
   })
   assert.deepEqual(ids, [...TOOL_IDS])
   assert.deepEqual(added[0]!.input, { mapped: { goal: str } })
@@ -32,15 +33,16 @@ test("the three tools are built from the read tool's schema and refuse other age
   assert.deepEqual(await exec(2)({ job: "job-1" }, { agent: "build" }), { content: "Only the dictator agent may use this tool." })
   assert.deepEqual(await exec(3)({ job: "" }, { agent: "dictator" }), { content: "failed: boom" })
   assert.deepEqual(await exec(2)({ job: "job-1" }, {}), { content: "Only the dictator agent may use this tool." })
-  assert.deepEqual(calls, ["plan:add a flag", "questions:job-1:[]"])
-  assert.throws(() => installTools({ get: () => undefined, add: () => {} }, { plan: async () => "", questions: async () => "", run: async () => "", status: async () => "" }))
+  assert.deepEqual(await exec(4)({ job: "" }, { agent: "dictator" }), { content: "stopping" })
+  assert.deepEqual(calls, ["plan:add a flag", "questions:job-1:[]", "stop:"])
+  assert.throws(() => installTools({ get: () => undefined, add: () => {} }, { plan: async () => "", questions: async () => "", run: async () => "", status: async () => "", stop: async () => "" }))
 })
 
 test("a session the runner started is refused even as the dictator agent", async () => {
   const { draft, added } = fakeDraft()
   const ran: string[] = []
   const ok = async () => "ok"
-  installTools(draft, { plan: ok, questions: ok, run: async (job) => { ran.push(job); return "ran" }, status: ok }, "dictator", (id) => id === "ses_worker")
+  installTools(draft, { plan: ok, questions: ok, run: async (job) => { ran.push(job); return "ran" }, status: ok, stop: ok }, "dictator", (id) => id === "ses_worker")
   const run = added[2]!.execute as (a: Record<string, unknown>, c: object) => Promise<{ content: string }>
   assert.deepEqual(await run({ job: "job-1" }, { agent: "dictator", sessionID: "ses_worker" }), { content: "Only the dictator agent may use this tool." })
   assert.deepEqual(await run({ job: "job-1" }, { agent: "dictator", sessionID: "ses_user" }), { content: "ran" })

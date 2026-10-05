@@ -5,7 +5,7 @@
 
 import type { Job } from "./state.ts"
 
-export const TOOL_IDS = ["dictator_plan", "dictator_questions", "dictator_run", "dictator_status"] as const
+export const TOOL_IDS = ["dictator_plan", "dictator_questions", "dictator_run", "dictator_status", "dictator_stop"] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
 export interface ToolDraft {
@@ -23,6 +23,7 @@ export interface Handlers {
   questions(job: string, tree: string, ctx: ToolContext): Promise<string>
   run(job: string, ctx: ToolContext): Promise<string>
   status(job: string, ctx: ToolContext): Promise<string>
+  stop(job: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dictator", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -57,16 +58,23 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dict
   draft.add({
     id: "dictator_run",
     name: "dictator_run",
-    description: "Run a planned job after the user said go: one task at a time on the job's own git branch, with checks. Takes the job id from dictator_plan. Returns each task's status and the branch.",
+    description: "Run a planned job after the user said go, or resume a stopped one. Takes the job id from dictator_plan. The job is queued and runs in the background on its own git branch; this returns at once. Updates arrive later as [jev-dictator] notes: do not wait or poll, end your turn and keep talking with the user.",
     input: input("job"),
     execute: guarded(([job], ctx) => handlers.run(job!, ctx), "job"),
   })
   draft.add({
     id: "dictator_status",
     name: "dictator_status",
-    description: "Show a job's state: phase, tasks, branch. An empty job id shows the newest job.",
+    description: "Show the queue (running and waiting jobs) and a job's state: phase, tasks with status and priority, branch, and what was found but not done. An empty job id shows the newest job.",
     input: input("job"),
     execute: guarded(([job], ctx) => handlers.status(job!, ctx), "job"),
+  })
+  draft.add({
+    id: "dictator_stop",
+    name: "dictator_stop",
+    description: "Stop a job when the user asks: the running worker is interrupted, and the job pauses; dictator_run resumes it later. A waiting job leaves the queue. An empty job id stops the running job.",
+    input: input("job"),
+    execute: guarded(([job], ctx) => handlers.stop(job!, ctx), "job"),
   })
   return [...TOOL_IDS]
 }

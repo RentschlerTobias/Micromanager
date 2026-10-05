@@ -9,6 +9,7 @@ import { validatePolicies, type PolicySet } from "./policy.ts"
 import { DEFAULT_REGISTRY, mergeRegistry, type ModelEntry } from "./registry.ts"
 import { DEFAULT_ROUTING, type Routing } from "./routing.ts"
 import { roleById, type RoleId } from "./roles.ts"
+import type { NotifyMode } from "./scheduler.ts"
 
 export function configPath(): string {
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config")
@@ -83,7 +84,16 @@ export function parseRegistry(text: string): ModelEntry[] {
   return mergeRegistry(DEFAULT_REGISTRY, raw as Partial<ModelEntry>[])
 }
 
+// "notify": desktop notifications when a job needs the user or ends ("jobs", the default), also per task ("tasks"),
+// or never ("off"). Updates in the dictator's session come either way.
+export function parseNotify(text: string): NotifyMode {
+  const raw = (JSON.parse(stripComments(text)) as { notify?: unknown }).notify ?? "jobs"
+  if (raw !== "jobs" && raw !== "tasks" && raw !== "off") throw new Error('notify must be "jobs", "tasks" or "off"')
+  return raw
+}
+
 export interface Settings {
+  readonly notify: NotifyMode
   readonly routing: Routing
   readonly floors: Floors
   readonly decisions: PolicySet
@@ -95,11 +105,11 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
+    return { notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
+    return { notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
   } catch (err) {
-    return { routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
+    return { notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }
 }
