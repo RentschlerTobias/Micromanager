@@ -8,7 +8,7 @@ import { CHOICE_FLOOR, type Risk } from "./catalog.ts"
 import { HEADER } from "./hooks.ts"
 import { resolvePolicy, type Policies } from "./policy.ts"
 import { WRITERS, type Profile } from "./profile.ts"
-import type { Acceptance, Job, Task } from "./state.ts"
+import type { Acceptance, FollowUp, Job, Task } from "./state.ts"
 
 export type PipelineId = "P1" | "P2" | "P3" | "P9"
 export type Modifier = "user_confirm" | "oracle"
@@ -60,15 +60,23 @@ export interface ReviewCheck {
   readonly point: string
   readonly met: boolean
   readonly evidence: string
+  readonly confidence: number // 0..100; under BLOCKING_CONFIDENCE a finding is advisory (design.md §9)
 }
+
+export type ReviewAxis = "spec" | "standards"
 
 export interface Review {
   readonly verdict?: "PASS" | "FAIL"
   readonly checks: readonly ReviewCheck[]
   readonly fixes: readonly string[]
-  readonly blocking: readonly ReviewCheck[] // unmet points with evidence; without evidence a finding is advisory
+  readonly blocking: readonly ReviewCheck[] // unmet points with evidence and confidence; the rest is advisory
+  readonly outside: readonly FollowUp[] // work the reviewer saw the job needs outside this task (N7 candidates)
   readonly error?: string
 }
+
+export const BLOCKING_CONFIDENCE = 80
+
+const OUTSIDE_FORMAT = `"outside": [{"what": "work the job needs that is not this task's", "why": "...", "files": ["..."]}]`
 
 const MAX_DIFF = 12000
 
@@ -91,30 +99,79 @@ ${shown || "(no diff)"}
 Check the change against each acceptance point and the task. A point shared with other tasks counts as met when
 this task's part of it is done; what belongs to the others is not this task's finding. Read the changed files if
 you need more; stay in this directory. Report a point as not met only with evidence: a file and line, a failing command, or a concrete input that breaks it.
-Answer only with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "A1", "met": true, "evidence": "..."}],
-"fixes": ["what to change, one per entry"]}`
+Answer only with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "A1", "met": true, "evidence": "...", "confidence": 0-100}],
+"fixes": ["what to change, one per entry"], ${OUTSIDE_FORMAT}}`
 }
 
-export function parseReview(text: string): Review {
+// The second axis (design.md §9: standards ∥ spec): not whether the task is done, but whether it is done well in this
+// repository. Another reviewer, in parallel, so neither axis crowds out the other.
+export function standardsPrompt(job: Job, task: Task, diff: string): string {
+  const shown = diff.length > MAX_DIFF ? `${diff.slice(0, MAX_DIFF)}\n… (cut; read the files for the rest)` : diff
+  return `${HEADER} standards review of task ${task.id}
+
+The job: ${job.goal}
+The task (${task.id}): ${task.title}
+
+The change (the checks pass; another reviewer checks the acceptance points):
+\`\`\`diff
+${shown || "(no diff)"}
+\`\`\`
+
+Review the change against this repository's own standards, not your taste. Read neighbouring code first, then check:
+- it follows the conventions around it: naming, structure, error handling, comment style;
+- tests test behaviour through the public interface, not implementation details, and would fail if the code broke;
+- inputs at the edges: empty, very large, non-ASCII text (umlauts, ß, emoji), missing files, concurrent calls;
+- no dead code, debug output, commented-out code or needless new dependencies;
+- nothing silently swallows an error, and nothing leaks a secret.
+Only findings in this change count. Give each a confidence 0-100 that it is a real problem; below 80 it is a note.
+Every finding needs evidence: a file and line, a command and its output, or a concrete input that breaks it.
+Answer only with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "short name of the issue", "met": false, "evidence": "...", "confidence": 0-100}],
+"fixes": ["what to change, one per entry"], ${OUTSIDE_FORMAT}}`
+}
+
+// A spec finding without a confidence keeps the old meaning (evidence decides); a standards finding must give one.
+export function parseReview(text: string, defaultConfidence = 100): Review {
   const json = text.match(/```(?:json)?\s*\n([\s\S]*?)```/)?.[1] ?? text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)
-  let raw: { verdict?: unknown; checks?: unknown; fixes?: unknown }
+  let raw: { verdict?: unknown; checks?: unknown; fixes?: unknown; outside?: unknown }
   try {
     raw = JSON.parse(json)
   } catch {
-    return { checks: [], fixes: [], blocking: [], error: "the review is not JSON" }
+    return { checks: [], fixes: [], blocking: [], outside: [], error: "the review is not JSON" }
   }
   const checks: ReviewCheck[] = (Array.isArray(raw.checks) ? raw.checks : [])
     .filter((c): c is Record<string, unknown> => Boolean(c) && typeof c === "object")
-    .map((c) => ({ point: String(c.point ?? ""), met: c.met !== false, evidence: typeof c.evidence === "string" ? c.evidence.trim() : "" }))
+    .map((c) => ({
+      point: String(c.point ?? ""),
+      met: c.met !== false,
+      evidence: typeof c.evidence === "string" ? c.evidence.trim() : "",
+      confidence: typeof c.confidence === "number" ? Math.max(0, Math.min(100, c.confidence <= 1 ? c.confidence * 100 : c.confidence)) : defaultConfidence,
+    }))
   const fixes = Array.isArray(raw.fixes) ? raw.fixes.filter((f): f is string => typeof f === "string" && f.trim() !== "") : []
   const verdict = raw.verdict === "PASS" || raw.verdict === "FAIL" ? raw.verdict : undefined
-  return { verdict, checks, fixes, blocking: checks.filter((c) => !c.met && c.evidence.length > 0) }
+  const outside = (Array.isArray(raw.outside) ? raw.outside : [])
+    .filter((o): o is Record<string, unknown> => Boolean(o) && typeof o === "object" && typeof (o as { what?: unknown }).what === "string")
+    .map((o): FollowUp => ({ what: String(o.what), why: typeof o.why === "string" ? o.why : "", files: Array.isArray(o.files) ? o.files.filter((f): f is string => typeof f === "string") : [] }))
+  return { verdict, checks, fixes, outside, blocking: checks.filter((c) => !c.met && c.evidence.length > 0 && c.confidence >= BLOCKING_CONFIDENCE) }
+}
+
+// Both axes as one result: what blocks on either blocks, findings keep their axis in the point name.
+export function mergeReviews(spec: Review, standards: Review): Review {
+  const tag = (r: Review, axis: ReviewAxis) => (c: ReviewCheck) => ({ ...c, point: axis === "spec" ? c.point : `standards: ${c.point}` })
+  const error = spec.error && standards.error ? `${spec.error}; ${standards.error}` : undefined
+  return {
+    verdict: spec.verdict === "FAIL" || standards.verdict === "FAIL" ? "FAIL" : spec.verdict ?? standards.verdict,
+    checks: [...spec.checks.map(tag(spec, "spec")), ...standards.checks.map(tag(standards, "standards"))],
+    fixes: [...spec.fixes, ...standards.fixes],
+    blocking: [...spec.blocking.map(tag(spec, "spec")), ...standards.blocking.map(tag(standards, "standards"))],
+    outside: [...spec.outside, ...standards.outside],
+    ...(error ? { error } : {}),
+  }
 }
 
 export function reviewFixPrompt(review: Review): string {
   const points = review.blocking.map((c) => `- ${c.point}: ${c.evidence}`).join("\n")
   const fixes = review.fixes.length ? `\nSuggested fixes:\n${review.fixes.map((f) => `- ${f}`).join("\n")}` : ""
-  return `${HEADER} A reviewer of another model family found acceptance points not met:\n${points}${fixes}\n\nFix them in your task's files, then report again in the same format.`
+  return `${HEADER} Reviewers of another model family found problems (acceptance points not met, or "standards:" findings about how it is done):\n${points}${fixes}\n\nFix them in your task's files, then report again in the same format.`
 }
 
 // --- tests first (P3) --------------------------------------------------------------------------------------

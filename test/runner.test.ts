@@ -327,6 +327,7 @@ const plan1 = (task: Record<string, unknown>, acceptance: Record<string, unknown
 const PASS = '```json\n{"verdict":"PASS","checks":[{"point":"A1","met":true,"evidence":"add.js exists"}],"fixes":[]}\n```'
 const FAIL = '```json\n{"verdict":"FAIL","checks":[{"point":"A1","met":false,"evidence":"add.js:1 adds strings"}],"fixes":["coerce to numbers"]}\n```'
 const DONE = "STATUS: DONE\nFILES: add.js\nEVIDENCE: ok\nOPEN: nothing"
+const STANDARDS_OK = '```json\n{"verdict":"PASS","checks":[],"fixes":[]}\n```'
 
 test("P2: a risky task gets a reviewer of another family; a blocking finding goes back to the worker", async () => {
   const project = repo()
@@ -336,8 +337,9 @@ test("P2: a risky task gets a reviewer of another family; a blocking finding goe
     plan: [plan1({})],
     worker: (dir, prompt) => {
       prompts.push(prompt)
+      if (prompt.includes("standards review of task")) return STANDARDS_OK
       if (prompt.includes("review of task")) return reviews.shift()!
-      writeFileSync(join(dir, "add.js"), prompt.includes("reviewer of another model family") ? "export const add = (a, b) => +a + +b\n" : "export const add = (a, b) => a + b\n")
+      writeFileSync(join(dir, "add.js"), prompt.includes("Reviewers of another model family") ? "export const add = (a, b) => +a + +b\n" : "export const add = (a, b) => a + b\n")
       return DONE
     },
   })
@@ -349,9 +351,10 @@ test("P2: a risky task gets a reviewer of another family; a blocking finding goe
   assert.deepEqual(t.stages.filter((s) => s.stage === "review").map((s) => s.result), ["fail", "pass"])
   assert.ok(prompts.some((p) => p.includes("add.js:1 adds strings")), "the finding reaches the worker")
   const worker = fake.created.find((c) => c.agent === "dictator-code")!
-  const reviewer = fake.created.find((c) => c.agent === "dictator-review")!
+  const reviewers = fake.created.filter((c) => c.agent === "dictator-review")
   const fam = (m: unknown) => DEFAULT_REGISTRY.find((e) => e.id === `${(m as { providerID: string }).providerID}/${(m as { id: string }).id}`)!.family
-  assert.notEqual(fam(reviewer.model), fam(worker.model), "the reviewer is of another family")
+  assert.equal(reviewers.length, 4, "two axes, two rounds")
+  assert.ok(reviewers.every((r) => fam(r.model) !== fam(worker.model)), "every reviewer is of another family")
   assert.match(readFileSync(join(done.integrationWorktree!, "add.js"), "utf8"), /\+a \+ \+b/)
 })
 
@@ -712,4 +715,46 @@ test("when the decision model sees progress, a repeated failure keeps its fix ro
   const r = runner(project, fake.api, { decider, fixRounds: 2 })
   await r.run((await r.plan("goal")).job.id)
   assert.equal(rounds, 4, "two fix rounds in each of the two sessions")
+})
+
+// --- Phase E: two-axis review ----------------------------------------------------------------------------------
+
+import { mergeReviews, parseReview } from "../src/pipelines.ts"
+
+test("review parsing: confidence decides blocking, standards findings need one, outside work is kept", () => {
+  const text = '{"verdict":"FAIL","checks":[{"point":"umlauts","met":false,"evidence":"slug(\\"Straße\\") gives strae","confidence":0.9},{"point":"naming","met":false,"evidence":"x.js:3"}],"fixes":[],"outside":[{"what":"slug the titles in the CLI too","why":"same bug","files":["cli.js"]}]}'
+  const standards = parseReview(text, 0)
+  assert.deepEqual(standards.blocking.map((c) => [c.point, c.confidence]), [["umlauts", 90]], "no confidence on a standards finding: advisory")
+  assert.deepEqual(standards.outside, [{ what: "slug the titles in the CLI too", why: "same bug", files: ["cli.js"] }])
+  const spec = parseReview('{"verdict":"PASS","checks":[{"point":"A1","met":false,"evidence":"a.js:1"}],"fixes":["f"]}')
+  assert.equal(spec.blocking.length, 1, "a spec finding without confidence still blocks on evidence")
+  const merged = mergeReviews(spec, standards)
+  assert.equal(merged.verdict, "FAIL")
+  assert.deepEqual(merged.blocking.map((c) => c.point), ["A1", "standards: umlauts"])
+  assert.equal(merged.outside.length, 1)
+})
+
+test("P2 with two axes: a confident standards finding goes back to the worker; the reviewer's outside find becomes a task", async () => {
+  const project = repo()
+  const prompts: string[] = []
+  let standards = 0
+  const STANDARDS_FAIL = '```json\n{"verdict":"FAIL","checks":[{"point":"edge case","met":false,"evidence":"add(\\"1\\",2) gives 12","confidence":95},{"point":"style","met":false,"evidence":"add.js:1 arrow","confidence":40}],"fixes":["coerce"],"outside":[{"what":"document add in notes","why":"users","files":["notes.md"]}]}\n```'
+  const fake = fakeSession({
+    plan: ["```json\n" + JSON.stringify(PLAN) + "\n```"],
+    worker: (dir, prompt) => {
+      prompts.push(prompt)
+      if (prompt.includes("standards review of task T1\n")) return standards++ === 0 ? STANDARDS_FAIL : STANDARDS_OK
+      if (prompt.includes("review of task")) return STANDARDS_OK
+      return writeFiles(dir, prompt)
+    },
+  })
+  const r = runner(project, fake.api, { decider: nodeDecider({ N5: { risk: choice("public_api"), has_test_oracle: noul(0.9) } }) })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  const fix = prompts.find((p) => p.includes("Reviewers of another model family"))!
+  assert.match(fix, /standards: edge case: add\("1",2\) gives 12/)
+  assert.doesNotMatch(fix, /style/, "a finding under 80 is only a note")
+  const t1 = done.tasks.find((t) => t.id === "T1")!
+  assert.ok(t1.stages.some((s) => s.stage === "review_notes" && /style \(40\)/.test(s.evidence ?? "")))
+  assert.ok(done.tasks.some((t) => t.origin === "discovered" && t.title === "document add in notes"))
 })

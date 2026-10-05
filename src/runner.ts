@@ -20,8 +20,8 @@ import { redact } from "./jev.ts"
 import { record } from "./journal.ts"
 import { HEADER } from "./hooks.ts"
 import {
-  choosePipeline, citationCheck, greenNote, readerCount, readerPrompt, redPrompt, researchPath, reviewFixPrompt, reviewPrompt, parseReview,
-  synthesisPrompt, TEST_FILE, type Review,
+  choosePipeline, citationCheck, greenNote, mergeReviews, readerCount, readerPrompt, redPrompt, researchPath, reviewFixPrompt, reviewPrompt, parseReview,
+  standardsPrompt, synthesisPrompt, TEST_FILE, type Review, type ReviewAxis,
 } from "./pipelines.ts"
 import {
   addDiscovered, applyPlan, applyReplan, applySplits, MAX_SPLIT_LEVEL, parsePlan, PLAN_FORMAT, replanFormat, splitFormat, waves,
@@ -831,21 +831,39 @@ export class Runner {
     return hashFiles(worktree, tests, this.#exec)
   }
 
-  // A reviewer of another model family reads the change against the acceptance points (P2, P3). A finding without
-  // evidence is advisory; a review that is not JSON after one reminder counts as advisory too.
+  // Two reviewers of other model families read the change in parallel (P2, P3; design.md §9): one against the
+  // acceptance points, one against the repository's standards. Only findings with evidence and confidence block; what
+  // they saw outside the task becomes a follow-up. A reviewer whose answer is not JSON after one reminder blocks
+  // nothing.
   async #review(job: Job, task: Task, workerModel: string): Promise<Review> {
     const worktree = job.integrationWorktree!
-    const model = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [this.#family(workerModel)], task.profile?.vision)
-    const s = await this.#workerSession(job, task, model.id, "review", TIER_STEPS.S)
     const diff = await workingDiff(worktree, this.#exec)
-    let answer = await this.#ask(s.id, [reviewPrompt(job, task, taskAcceptance(job, task), diff), skillLine(this.#skills("review", task))].filter(Boolean).join("\n\n"))
-    let review = answer.stopped || answer.timedOut ? { checks: [], fixes: [], blocking: [], error: answer.stopped ? `reviewer stopped: ${answer.stopped.detail}` : "reviewer timed out" } : parseReview(answer.text)
-    if (review.error && !answer.stopped && !answer.timedOut) {
-      answer = await this.#ask(s.id, `${HEADER} Answer again with the JSON only.`)
-      review = parseReview(answer.text)
+    const worker = this.#family(workerModel)
+    const specModel = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [worker], task.profile?.vision)
+    const standardsModel = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [worker, this.#family(specModel.id)], task.profile?.vision)
+    const skills = skillLine(this.#skills("review", task))
+    const one = async (axis: ReviewAxis, model: string, prompt: string): Promise<Review> => {
+      const s = await this.#workerSession(job, task, model, "review", TIER_STEPS.S)
+      let answer = await this.#ask(s.id, [prompt, skills].filter(Boolean).join("\n\n"))
+      const confidence = axis === "spec" ? 100 : 0
+      let review: Review = answer.stopped || answer.timedOut ? { checks: [], fixes: [], blocking: [], outside: [], error: answer.stopped ? `${axis} reviewer stopped: ${answer.stopped.detail}` : `${axis} reviewer timed out` } : parseReview(answer.text, confidence)
+      if (review.error && !answer.stopped && !answer.timedOut) {
+        answer = await this.#ask(s.id, `${HEADER} Answer again with the JSON only.`)
+        review = parseReview(answer.text, confidence)
+      }
+      saveNote(this.#d.project, job.id, `${task.id}.review-${axis}`, `# ${axis} review of ${task.id} by ${model}\n\n${answer.text}\n`)
+      return review
     }
-    saveNote(this.#d.project, job.id, `${task.id}.review`, `# review of ${task.id} by ${model.id}\n\n${answer.text}\n`)
-    return review
+    const spec = () => one("spec", specModel.id, reviewPrompt(job, task, taskAcceptance(job, task), diff))
+    const standards = () => one("standards", standardsModel.id, standardsPrompt(job, task, diff))
+    // A local device serves one model at a time, so local reviewers take turns (like P9 readers).
+    const local = [specModel, standardsModel].every((m) => this.#d.registry.find((e) => e.id === m.id)?.location === "local")
+    const [a, b] = local ? [await spec(), await standards()] : await Promise.all([spec(), standards()])
+    const merged = mergeReviews(a, b)
+    collectFollowUps(task, merged.outside)
+    const advisory = merged.checks.filter((c) => !c.met && !merged.blocking.includes(c))
+    if (advisory.length) stage(task, "review_notes", "skip", advisory.map((c) => `${c.point} (${c.confidence}): ${c.evidence}`).join("; ").slice(0, 500))
+    return merged
   }
 
   // P9: parallel readers, one synthesis written to docs/research/, and a citation check by code.
