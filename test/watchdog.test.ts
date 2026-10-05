@@ -36,7 +36,8 @@ test("a re-read only counts until the file is written", () => {
   d.onTool("s", "edit", { path: "a.ts" })
   d.onTool("s", "read", { path: "a.ts", offset: 1 })
   assert.equal(d.onTool("s", "read", { path: "a.ts", offset: 50 }), undefined)
-  assert.equal(d.onTool("s", "read", { path: "a.ts", offset: 99 })?.kind, "read_loop")
+  assert.equal(d.onTool("s", "read", { path: "a.ts", offset: 1 }), undefined, "the same part twice since the write")
+  assert.equal(d.onTool("s", "read", { path: "a.ts", offset: 1 })?.kind, "read_loop")
 })
 
 test("reads without any new file, and a session that starts over", () => {
@@ -72,4 +73,14 @@ test("the handoff note names the reason and the files already changed", () => {
   const note = handoffNote({ kind: "read_loop", detail: "read a.ts 3x with no write in between" }, ["a.ts"])
   assert.match(note, /stopped by the loop watchdog: read a.ts 3x/)
   assert.match(note, /Files already changed in this directory: a.ts/)
+})
+
+test("reading one long file in parts is no read loop; the same part three times is", () => {
+  const w = new Watchdog()
+  w.watch("s")
+  for (const offset of [0, 100, 213, 380]) assert.equal(w.onTool("s", "read", { path: "/r/conversation.py", offset, limit: 120 }), undefined)
+  w.watch("t", { sameCall: 99 })
+  w.onTool("t", "read", { path: "/r/a.py", offset: 10, limit: 50 })
+  w.onTool("t", "read", { path: "/r/a.py", offset: 10, limit: 50 })
+  assert.equal(w.onTool("t", "read", { path: "/r/a.py", offset: 10, limit: 50 })?.kind, "read_loop")
 })

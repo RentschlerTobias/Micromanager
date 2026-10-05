@@ -93,9 +93,13 @@ export class Watchdog {
       s.readCount.clear() // a write changes what a re-read shows
       s.readsSinceNew = 0
     } else if (READS.has(tool) && path) {
-      const n = (s.readCount.get(path) ?? 0) + 1
-      s.readCount.set(path, n)
-      if (n >= s.limits.readRepeat) return { kind: "read_loop", detail: `read ${path} ${n}x with no write in between` }
+      // A long file read part by part (offset/limit) is no loop (live test: a reader stopped while reading
+      // conversation.py in three parts); the same part again is.
+      const i = input as { offset?: unknown; limit?: unknown } | undefined
+      const part = `${path}@${String(i?.offset ?? 0)}+${String(i?.limit ?? "")}`
+      const n = (s.readCount.get(part) ?? 0) + 1
+      s.readCount.set(part, n)
+      if (n >= s.limits.readRepeat) return { kind: "read_loop", detail: `read ${path}${i?.offset !== undefined ? ` from line ${String(i.offset)}` : ""} ${n}x with no write in between` }
       if (s.readPaths.has(path)) s.readsSinceNew++
       else {
         s.readPaths.add(path)
