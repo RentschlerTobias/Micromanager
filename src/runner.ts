@@ -64,6 +64,8 @@ export interface RunnerDeps {
   readonly parentID?: string // the dictator session; workers show up as its children
   readonly onWorker?: (sessionID: string, task: string, rules: readonly Rule[]) => void // a worker's task and narrowed rights, for permissions
   readonly workerTimeoutMs?: number
+  readonly stallMs?: number // a session whose messages do not change this long is stalled (default 4 min)
+  readonly pollMs?: number // how often a running session is looked at for that (default 20 s)
   readonly fixRounds?: number
   readonly planRetries?: number
   readonly decider?: Decider // the decision model per node; without one, the rules decide
@@ -165,24 +167,49 @@ export class Runner {
     const timeoutMs = this.#d.workerTimeoutMs ?? 20 * 60_000
     let timer: ReturnType<typeof setTimeout> | undefined
     let timedOut: boolean
+    let stalled: Signal | undefined
+    let done = false
     try {
       // Briefs, handoff notes, check output and review diffs may quote a key; no model needs one (E2b).
       await this.#d.session.prompt({ sessionID, text: redact(text) })
       timedOut = await Promise.race([
         this.#d.session.wait({ sessionID }).then(() => false),
         new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), timeoutMs) }),
+        this.#stall(sessionID, () => done).then((s) => { stalled = s; return s !== undefined }),
       ])
     } finally {
+      done = true
       clearTimeout(timer) // also when wait() fails, or the timer keeps the process alive for the whole timeout
       release()
     }
-    if (timedOut) await this.#d.session.interrupt({ sessionID }).catch(() => undefined)
+    if (timedOut && !stalled) await this.#d.session.interrupt({ sessionID }).catch(() => undefined) // a stall interrupted already
     if (this.#d.cancelled?.()) throw new Cancelled()
     const messages = await this.#d.session.context({ sessionID })
     const used = this.#count(sessionID, messages)
     const cap = this.#tokenCaps.get(sessionID)
-    const stopped = this.#d.stopped?.(sessionID) ?? (cap && used.tokens > cap ? { kind: "tokens" as const, detail: `${used.tokens} tokens in one session, over the task's ${cap}` } : undefined)
-    return { text: lastAssistantText(messages), timedOut, stopped }
+    const stopped = stalled ?? this.#d.stopped?.(sessionID) ?? (cap && used.tokens > cap ? { kind: "tokens" as const, detail: `${used.tokens} tokens in one session, over the task's ${cap}` } : undefined)
+    return { text: lastAssistantText(messages), timedOut: timedOut && !stalled, stopped }
+  }
+
+  // A provider stream that stops mid-answer leaves a session waiting with no hook firing (live test: a reviewer's
+  // message started streaming and never completed). The session's messages are looked at every pollMs; when nothing
+  // changed for stallMs, it is stalled and treated like a watchdog stop: a fresh session on another family.
+  async #stall(sessionID: string, finished: () => boolean): Promise<Signal | undefined> {
+    const pollMs = this.#d.pollMs ?? 20_000
+    const stallMs = this.#d.stallMs ?? 4 * 60_000
+    let last = ""
+    let since = Date.now()
+    while (!finished()) {
+      await new Promise<void>((resolve) => { const t = setTimeout(resolve, pollMs); t.unref?.() })
+      if (finished()) return undefined
+      const now = JSON.stringify(await this.#d.session.context({ sessionID }).catch(() => last))
+      if (now !== last) [last, since] = [now, Date.now()]
+      else if (Date.now() - since >= stallMs) {
+        await this.#d.session.interrupt({ sessionID }).catch(() => undefined)
+        return { kind: "stalled", detail: `no progress for ${Math.round(stallMs / 1000)} s (the model stopped answering)` }
+      }
+    }
+    return undefined
   }
 
   // A turn on a model waits for a free slot: 2 sessions per cloud model, 1 per local one (design.md §11).
@@ -1026,9 +1053,17 @@ export class Runner {
     const specModel = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [worker], task.profile?.vision)
     const standardsModel = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [worker, this.#family(specModel.id)], task.profile?.vision)
     const skills = skillLine(this.#skills("review", task))
-    const one = async (axis: ReviewAxis, model: string, prompt: string): Promise<Review> => {
-      const s = await this.#workerSession(job, task, model, "review", TIER_STEPS.S)
+    const one = async (axis: ReviewAxis, first: string, prompt: string): Promise<Review> => {
+      let model = first
+      let s = await this.#workerSession(job, task, model, "review", TIER_STEPS.S)
       let answer = await this.#ask(s.id, [prompt, skills].filter(Boolean).join("\n\n"))
+      if (answer.stopped?.kind === "stalled") {
+        // The model stopped answering: once more on another family, so a hanging provider does not skip the review.
+        model = (await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [worker, this.#family(model)], task.profile?.vision)).id
+        this.#say(`${task.id}: the ${axis} reviewer stalled; again on ${model}`)
+        s = await this.#workerSession(job, task, model, "review", TIER_STEPS.S)
+        answer = await this.#ask(s.id, [prompt, skills].filter(Boolean).join("\n\n"))
+      }
       const confidence = axis === "spec" ? 100 : 0
       let review: Review = answer.stopped || answer.timedOut ? { checks: [], fixes: [], blocking: [], outside: [], error: answer.stopped ? `${axis} reviewer stopped: ${answer.stopped.detail}` : `${axis} reviewer timed out` } : parseReview(answer.text, confidence)
       if (review.error && !answer.stopped && !answer.timedOut) {

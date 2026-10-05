@@ -6,7 +6,7 @@
 // The signatures come from real failures: Kimi restarting its task, Gemini's read loops, and a local planner
 // that read the same directory sixty times in this project's own test.
 
-export type SignalKind = "steps" | "same_call" | "read_loop" | "no_new_files" | "restart" | "monologue" | "repeat_text" | "tokens"
+export type SignalKind = "steps" | "same_call" | "read_loop" | "no_new_files" | "restart" | "monologue" | "repeat_text" | "tokens" | "stalled"
 
 export interface Signal {
   readonly kind: SignalKind

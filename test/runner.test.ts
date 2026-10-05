@@ -917,3 +917,20 @@ test("a blocked task starts again after the user's answer, which reaches its bri
   assert.equal(done.phase, "integrate", summary(done))
   assert.match(prompts.at(-2)!, /Decisions that apply: use add.js/)
 })
+
+test("a session whose model stops answering is stalled: interrupted, and the task goes on in a fresh session", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles })
+  const interrupted: string[] = []
+  const wait = fake.api.wait
+  fake.api.wait = async (args) => {
+    if (args.sessionID === "ses_2") return new Promise(() => {}) // the first worker's stream never completes
+    return wait(args)
+  }
+  fake.api.interrupt = async ({ sessionID }) => { interrupted.push(sessionID); return {} }
+  const r = runner(project, fake.api, { stallMs: 40, pollMs: 10 })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.deepEqual(interrupted, ["ses_2"])
+  assert.ok(done.tasks[0]!.stages.some((s) => /loop watchdog: no progress .* \(the model stopped answering\)/.test(s.evidence ?? "")))
+})

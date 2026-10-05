@@ -270,6 +270,29 @@ Ready tasks are ordered: in-progress parent first, then priority, then fewer dep
 
 **Decision:** Jev picks among the proposals. Below the floor, or without Jev, the first proposal wins.
 
+**The task queue (Phase E).** Tasks carry a priority (1 to 5, from the planner, or from N7 for found work) and an
+origin (plan, split, discovered, replan). Among ready tasks, priority comes first. The queue grows while it runs:
+- **Workers report `FOLLOWUP: what | why | files`** for work the job needs outside their task; reviewers report
+  it as `outside`. The brief lists the job's other open tasks, so planned work is not reported again.
+- **N7, one request per report**, asks per item: needed for the acceptance points, in scope, already covered by
+  another task, the user's call, and its priority.
+  - Needed or in scope: code builds a task after its finder, with its own acceptance point, and re-validates the
+    graph. The item first passes G0 like a goal.
+  - Already planned: dropped.
+  - Everything else, or anything over the cap (half the planned tasks, at least 3): the job's "later" list,
+    shown at the end.
+- **Without Jev:** an item on files of tasks still open is already planned, and one on files of done tasks is in
+  scope.
+
+**Background runs (Phase E).**
+- `dictator_run` queues the job with a scheduler in the plugin and returns at once.
+- **Updates.** Progress goes to the dictator's session as quiet synthetic messages (no new turn). When a job ends
+  or needs the user, a synthetic message with `resume` wakes the dictator. The update itself goes in as a system
+  block, because a Phase E spike showed that models take synthetic text for an injection. `notify-send` adds a
+  desktop notification.
+- **Stop and resume.** `dictator_stop` interrupts the running worker and pauses the job. `dictator_run` with the
+  user's answer as a note resumes it: the note becomes a decision every later brief carries.
+
 ### 8.1 Classification and profile: one Jev request per task (N5 + N5b)
 Jev answers many questions in one call, "in parallel and in isolation against the same state". Adding questions
 barely changes the latency, and only input tokens are billed.
@@ -325,7 +348,8 @@ Rules for these requests:
 - **Report**, written by the worker in caveman style. Code parses it into the task state, and the full text goes
   to `<project>/.jev-dictator/notes/<job>/<task>.md`. Fields:
   - status: DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED,
-  - changed files, evidence, open issues, pointers.
+  - changed files, evidence, open issues, pointers,
+  - `FOLLOWUP` lines (Phase E): work outside the task, for N7.
 - **Where the notes live.** The notes directory sits inside the project, so no `external_directory` ask is
   triggered, and the plugin adds it to `.git/info/exclude`.
 - **Handoff note.** On a fresh session after a failure, a model switch, an interrupt or a resumed job, code
@@ -401,6 +425,21 @@ endless read loops.
   root cause → new plan), at most 2 times, then the user.
 - **Budgets:** workers, requests, tokens, and an optional cost cap. They are checked before every start.
 
+**Implemented (Phase E):**
+- **N8.** The same diff hash as the last round ends the fix rounds. So does the same failure, when Jev calls it a
+  loop (without Jev, always). The same unmet review points twice skip the remaining review rounds.
+- **N9 rung 2** generalizes the watchdog's fresh session: another family, a handoff note with the reason, the
+  failures and the changed files.
+- **Rung 3 types the reason by Jev (N9):** spec_ambiguous, external_dependency, conflicting_review, too_hard.
+  - too_hard does not stop the job: other tasks go on, the stall counter grows, and the agenda replans when
+    escalated tasks block the rest, before the user.
+  - budget, refused and merge_conflict are typed by code.
+- **Budgets.** Every session's usage goes to the job's counters. The config sets limits per job (default 4M tokens,
+  800 requests) under hard ceilings. N5's tier also caps tokens per session (S 250k, M 600k, L 1.5M).
+- **worker_refused.** A reply without a report that reads like a safety refusal gets one fresh session on a
+  local uncensored model. It goes to the user when the gate flagged the job harmful, when no such model is
+  available, or after a second refusal.
+
 ## 11. Parallelism and merging
 - **Waves** come from the DAG. A batch takes only parallel-safe ready tasks: at most 3 per job and 2 per model.
 - **Worker starts are confirmed per batch** ("start T1 and T3 in parallel?"): Jev first, the user when Jev is not
@@ -414,6 +453,16 @@ endless read loops.
 - **Merge train:** one branch at a time; rebase → gate → merge; roll back on failure; a conflict goes back to its
   owner once, then to the user.
 - **Integrate:** the user chooses merge / keep / discard. Nothing is ever pushed.
+
+**Implemented (Phase F):**
+- **Dispatch.** `parallel` (default 3) tasks of a job at the same time, disjoint files only. Turns on one model
+  wait for a slot: `perModel` (default 2) per cloud model, 1 per local model.
+- **Batch confirmation.** N10 asks Jev whether each new task of a batch is independent of the others. A doubted
+  task waits for a later batch, and the user is not asked: nobody sits at a background run.
+- **Branches.** Each task works in `.jev-dictator/worktrees/<job>--<task>` on `jev/<job>--<task>`.
+- **The merge train.** Rebase, then the checks again when the job's branch moved, then a fast-forward. A conflict
+  sends the task back once, from the newest commit; a second conflict goes to the user.
+- **Done means merged.** A task counts as done only once it is merged.
 
 ## 12. Permissions (N13)
 - **Path of an ask:**
