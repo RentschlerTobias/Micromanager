@@ -1,7 +1,7 @@
 // The model registry and the router over it (design.md §19): which models exist, where they run, what they can
 // do, and which one a task gets. Local when capable; cloud for hard tasks, long contexts, or busy hardware.
 
-import { MODELS, family } from "./roles.ts"
+import { MODELS, family, roleById } from "./roles.ts"
 
 export type Location = "local" | "cloud"
 export type Device = "cuda" | "igpu" | "npu" | "cloud"
@@ -167,6 +167,10 @@ export function route(registry: readonly ModelEntry[], needs: RouteNeeds, availa
   // Local when capable: a local model covers the tier, and nothing pins the cloud.
   const localCovers = candidates.some((m) => m.location === "local" && TIER_RANK[m.tier] >= TIER_RANK[tier] && !avail(m.id).busy)
   const wantLocal = local || (localCovers && !needs.preferCloud)
+  // The role matrix's models in their order (src/roles.ts) break ties, so roles spread over the families instead of
+  // all landing on the alphabetically first one (live test: deepseek got every role).
+  const preferred = roleById(needs.role)?.models ?? []
+  const rank = (id: string) => (preferred.includes(id) ? preferred.indexOf(id) : preferred.length)
   const score = (m: ModelEntry): number[] => {
     const a = avail(m.id)
     return [
@@ -176,6 +180,7 @@ export function route(registry: readonly ModelEntry[], needs: RouteNeeds, availa
       m.resident || a.loaded || m.id === needs.loadedModel || m.location === "cloud" ? 0 : 1, // no swap
       Math.abs(TIER_RANK[m.tier] - TIER_RANK[tier]), // no bigger than needed
       -(m.tokPerSec ?? 0),
+      rank(m.id),
     ]
   }
   const ranked = [...candidates].sort((a, b) => {

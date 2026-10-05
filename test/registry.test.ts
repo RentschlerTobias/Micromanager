@@ -82,3 +82,12 @@ test("tiers and registry overrides", () => {
   assert.equal(merged.find((m) => m.id === "llamaswap/mimo")?.disabled, true)
   assert.deepEqual(merged.find((m) => m.id === "llamaswap/new-model"), { id: "llamaswap/new-model", location: "local", device: "cuda", censored: false, family: "new", tier: "agent", vision: false, ctx: 16384 })
 })
+
+test("cloud roles follow the role matrix when the router has nothing else to choose by", () => {
+  const cloud = DEFAULT_REGISTRY.filter((m) => m.location === "cloud")
+  const pick = (role: string, avoidFamilies?: string[]) => route(cloud, { role, difficulty: 0.5, avoidFamilies }).model
+  assert.equal(pick("code"), "opencode-go/glm-5.3-flash")
+  assert.equal(pick("plan"), "opencode-go/qwen3.8-flash")
+  assert.equal(pick("explore"), "opencode-go/deepseek-v4.1-flash")
+  assert.equal(pick("code", ["glm"]), "opencode-go/qwen3.8-flash", "rung 2 takes the role's fallback")
+})
