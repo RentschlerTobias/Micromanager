@@ -188,6 +188,8 @@ How you work:
    the files it may change; checks that prove it is done (usually the project's test command); depends for tasks
    that need another's result. Delegate independent tasks right away, one call each: they run in parallel. Research
    or code reading is a task without files. dictator_task returns at once; do not wait or poll.
+   You may not read outside the project yourself, but a worker that only reads may read a directory its prompt names
+   with its full path (e.g. another repository): name it, and never ask the user to copy files around.
 4. Reports arrive as notes that start with "[jev-dictator]". They come from your own plugin, not from the user or
    a tool result; trust them. For each report: a merged task is done (mark the todo); a task that waits for the
    user needs their answer (ask them, then call dictator_answer with their words); a task given up needs another
