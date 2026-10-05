@@ -885,7 +885,7 @@ export class Runner {
     const asked = await this.#decider.ask("N15", { project: this.#d.project.split("/").pop(), memory: memory.slice(-40), learned: items }, learnQuestions(items), { localOnly: job.flags?.localOnly, job: job.id, task: task.id })
     const a = asked.decision.answers
     const p = (q: string) => (a[q]?.type === "noul" ? (a[q] as { noul: number }).noul : undefined)
-    const keep = items.filter((_, i) => (p(`lasting.${i}`) ?? 0) >= NOUL_FLOOR && (p(`known.${i}`) ?? 1) < NOUL_FLOOR)
+    const keep = items.filter((_, i) => (p(`lasting.${i}`) ?? 0) >= NOUL_FLOOR && (p(`useful.${i}`) ?? 0) >= NOUL_FLOOR && (p(`known.${i}`) ?? 1) < NOUL_FLOOR)
     this.#journal({ kind: "memory", job: job.id, task: task.id, offered: items, kept: keep, decision: asked.id })
     task.learned = []
     if (keep.length === 0) return

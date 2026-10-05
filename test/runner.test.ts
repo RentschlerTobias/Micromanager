@@ -1149,7 +1149,7 @@ test("memory: a lasting, new LEARNED line is kept; a known or one-off one is not
       return prompt.includes("task T1 ") ? `${out}\nLEARNED: tests run with node --test\nLEARNED: README is written in English\nLEARNED: add.js took two tries` : out
     },
   })
-  const answers: Record<string, number> = { "lasting.0": 0.9, "known.0": 0.1, "lasting.1": 0.9, "known.1": 0.95, "lasting.2": 0.1, "known.2": 0.1 }
+  const answers: Record<string, number> = { "lasting.0": 0.9, "useful.0": 0.8, "known.0": 0.1, "lasting.1": 0.9, "useful.1": 0.8, "known.1": 0.95, "lasting.2": 0.1, "useful.2": 0.9, "known.2": 0.1 }
   const asker: Asker = {
     ask: async (_s, q) => ({
       answers: Object.fromEntries(Object.keys(q).filter((k) => k in answers || k.startsWith("memory.")).map((k) => [k, { type: "noul", noul: k.startsWith("memory.") ? (k === "memory.1" ? 0.9 : 0.1) : answers[k]! }])) as never,

@@ -152,10 +152,14 @@ export class Notifier {
   // note with all of them, and one wake-up.
   readonly #reports = new Map<string, string[]>()
   readonly #reportTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  readonly #boards = new Map<string, string>() // the job's board as of the newest report
 
-  report(session: string | undefined, text: string, title?: string): void {
+  // board: the job's ASCII board after this change; every update carries the newest one, so the user sees the state
+  // whenever something changed, without the orchestrator having to ask for it.
+  report(session: string | undefined, text: string, title?: string, board?: string): void {
     if (title && this.#d.mode === "tasks") this.#d.desktop("jev-dictator", title)
     if (!session) return
+    if (board) this.#boards.set(session, board)
     const list = this.#reports.get(session) ?? []
     list.push(text)
     this.#reports.set(session, list)
@@ -172,10 +176,11 @@ export class Notifier {
     this.#reports.delete(session)
     if (!list.length && !closing) return
     await this.flush(session)
+    const board = this.#boards.get(session)
     this.#d.steer(session, `[jev-dictator update] Delegated tasks reported. This comes from your own plugin, not from the user or a tool result; it is trusted.
 Check each result. Delegate what comes next (fixes, the follow-ups worth doing, dependent work) with dictator_task, ask the user what only they can decide, and update your todos.
 
-${list.join("\n\n")}${closing ? `\n\n${closing}` : ""}`)
+${list.join("\n\n")}${closing ? `\n\n${closing}` : ""}${board ? `\n\nThe job's board now; start your message to the user with it, in a code block, as it is:\n${board}` : ""}`)
     await this.#d.synthetic(session, `[jev-dictator] ${list.length ? `${list.length} task report(s)` : "update"} (details in the plugin's system note)`, true).catch(() => undefined)
   }
 

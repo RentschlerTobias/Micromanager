@@ -43,11 +43,13 @@ ${kept.map((e) => `- ${e}`).join("\n")}
 `)
 }
 
-// N15: per learned item, two independent questions against the project's current memory.
+// N15: per learned item, three independent questions against the project's current memory: lasting (true beyond
+// this task), useful (knowing it saves a later worker time or a mistake: the relevance the user asked for), known.
 export function learnQuestions(items: readonly string[]): Record<string, Question> {
   const out: Record<string, Question> = {}
   items.forEach((item, i) => {
     out[`lasting.${i}`] = { type: "noul", instructions: `"${item}" is a lasting fact about this project (a command, a path, a convention, a pitfall) that later, different tasks will need, not a detail of one task.` }
+    out[`useful.${i}`] = { type: "noul", instructions: `Knowing "${item}" would save a later worker on this project real time or a mistake; it is not obvious from a quick look at the code.` }
     out[`known.${i}`] = { type: "noul", instructions: `"${item}" is already said, in other words, by one of the entries in the project's memory.` }
   })
   return out

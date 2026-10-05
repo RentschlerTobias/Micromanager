@@ -122,3 +122,13 @@ test("a stop the user asked for is a quiet note that wakes nobody", async () => 
   assert.deepEqual(sent, [false])
   assert.deepEqual(notes, [])
 })
+
+test("every task update carries the job's newest board", async () => {
+  const notes: string[] = []
+  const n = new Notifier({ mode: "off", reportMs: 10_000, synthetic: async () => {}, steer: (_s, note) => notes.push(note), desktop: () => {} })
+  n.report("ses_1", "T1 merged", undefined, "BOARD v1")
+  n.report("ses_1", "T2 merged", undefined, "BOARD v2")
+  await n.flushReports("ses_1")
+  assert.match(notes[0]!, /T1 merged[\s\S]*T2 merged[\s\S]*start your message to the user with it, in a code block[\s\S]*BOARD v2/)
+  assert.doesNotMatch(notes[0]!, /BOARD v1/)
+})

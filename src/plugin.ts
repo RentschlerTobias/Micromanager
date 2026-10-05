@@ -309,7 +309,7 @@ export default {
         stopped: (sessionID) => stops.get(sessionID),
         skills: SKILLS.filter((s) => s.asked && installed.has(s.name)),
         installedSkills: installed,
-        taskEnded: (j, t) => notifier.report(j.facilitator, taskReport(j, t), `${t.id} ${t.title}: ${t.status}`),
+        taskEnded: (j, t) => notifier.report(j.facilitator, taskReport(j, t), `${t.id} ${t.title}: ${t.status}`, board(j, 100)),
       })
     // The job queue: dictator_run queues, the scheduler runs in the background and the notifier reports the end.
     const scheduler = new Scheduler({
