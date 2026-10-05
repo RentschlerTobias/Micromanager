@@ -1018,3 +1018,31 @@ test("a delegation is checked like a plan: unknown dependencies are refused", ()
   const reader = addDelegated(job, { title: "find the config loader", prompt: "p", files: [], dependsOn: [], checks: [] })
   assert.equal(reader.task!.role, "explore")
 })
+
+test("delegated checks must be shell commands, not sentences", async () => {
+  const { checkProblem } = await import("../src/plan.ts")
+  assert.match(checkProblem("Run `npm test` from the project root; it must pass with the new tests included.")!, /backticks/)
+  assert.match(checkProblem("Ensure all tests pass")!, /sentence/)
+  assert.match(checkProblem("The README lists the three helpers in the functions section.")!, /sentence/)
+  for (const ok of ["npm test", "node --test test/slug.test.js", "test -f src/slug.js", "grep -q slugify README.md", "npx tsc --noEmit"]) assert.equal(checkProblem(ok), undefined, ok)
+})
+
+test("rolling: an answer reaches a task of the job while it runs", async () => {
+  const project = repo()
+  const job = rolling(project)
+  addDelegated(job, { title: "write add.js", prompt: "create it", files: ["add.js"], dependsOn: [], checks: ["test -f add.js"] })
+  addDelegated(job, { title: "write notes", prompt: "notes", files: ["notes.md"], dependsOn: [], checks: ["grep -q ok notes.md"] })
+  saveJob(project, job)
+  let r: Runner
+  let asked = false
+  const fake = fakeSession({
+    worker: (dir, prompt) => {
+      if (prompt.includes("task T1 ") && !asked) { asked = true; return "STATUS: NEEDS_CONTEXT\nFILES: none\nOPEN: which name?" }
+      if (prompt.includes("task T2 ")) assert.equal(r.answerTask(job.id, "T1", "add.js"), undefined) // T1 waits by now
+      return writeFiles(dir, prompt)
+    },
+  })
+  r = runner(project, fake.api)
+  const done = await r.run(job.id)
+  assert.deepEqual(done.tasks.map((t) => t.status), ["merged", "merged"])
+})

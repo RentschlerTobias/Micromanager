@@ -24,7 +24,7 @@ import { moveJob, newJob, readyTasks, type Job } from "./state.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
-import { addDelegated } from "./plan.ts"
+import { addDelegated, checkProblem } from "./plan.ts"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
@@ -231,6 +231,7 @@ export default {
     // omo-hybrid: the runner working on a job right now, so a delegation goes into its live job; and the sessions in
     // ultrawork mode (the user said "ulw"/"ultrawork"), with how often their orchestrator was woken without delegating.
     const live = new Map<string, Runner>()
+    const rollingIds = new Set(listJobs(project).filter((j) => j.rolling).map((j) => j.id))
     const ultrawork = new Map<string, number>()
     const runner = (parentID?: string, job?: string, cancel?: Cancel) =>
       new Runner({
@@ -242,7 +243,8 @@ export default {
         availability: () => probe(registry),
         progress: (text, task) => {
           log("info", text)
-          if (job) notifier.progress(parentID, `${job}: ${text}`, task)
+          // A rolling job's orchestrator gets task reports instead (live test: one message per fix round was noise).
+          if (job && !rollingIds.has(job)) notifier.progress(parentID, `${job}: ${text}`, task)
         },
         parentID,
         cancelled: cancel ? () => cancel.cancelled : undefined,
@@ -330,6 +332,7 @@ export default {
       job.rolling = true
       job.facilitator = sessionID
       saveJob(project, job)
+      rollingIds.add(job.id)
       return job
     }
     const words = (text: string) => text.split(/[,\s]+/).map((w) => w.trim()).filter(Boolean)
@@ -355,6 +358,8 @@ export default {
               priority: Number(input.priority) || undefined,
               checks: input.checks.split(/\n|;;/).map((c) => c.trim()).filter(Boolean),
             }
+            const bad = d.checks.map(checkProblem).filter(Boolean)
+            if (bad.length) return `Not delegated: checks must be shell commands that exit 0 when the task is done. ${bad.join("; ")}`
             const r = live.get(job.id)?.addTask(job.id, d) ?? (() => {
               const added = addDelegated(job, d)
               if (added.task) saveJob(project, job)
@@ -384,10 +389,11 @@ export default {
           answer: async (taskId, text, tctx) => {
             const job = tctx.sessionID ? listJobs(project).find((j) => j.facilitator === tctx.sessionID && j.rolling) : undefined
             if (!job) return "No task delegated in this session yet."
-            if (live.has(job.id)) return "The tasks are still running; answer again once the others have reported."
-            const err = Runner.answer(job, taskId.trim(), text.trim())
+            // A running job takes the answer in memory; one that is not running, in its file.
+            const applied = live.get(job.id)?.answerTask(job.id, taskId.trim(), text.trim())
+            const err = applied === false || applied === undefined ? Runner.answer(job, taskId.trim(), text.trim()) : applied
             if (err) return err
-            saveJob(project, job)
+            if (applied === false || applied === undefined) saveJob(project, job)
             scheduler.enqueue(job.id, tctx.sessionID)
             return `${taskId.trim()} starts again with the user's answer.`
           },

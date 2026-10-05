@@ -695,6 +695,16 @@ export class Runner {
     return r
   }
 
+  // The user's answer for a task of the job this runner works on, applied to the live job so the run loop starts the
+  // task again; undefined when this runner does not work on that job.
+  answerTask(jobId: string, taskId: string, text: string): string | undefined | false {
+    const job = this.#job
+    if (!job || job.id !== jobId) return false
+    const err = Runner.answer(job, taskId, text)
+    if (!err) saveJob(this.#d.project, job)
+    return err
+  }
+
   // A rolling job's task that waits for the user: the answer becomes a decision every later brief carries, and the
   // task starts again from the job's newest commit.
   static answer(job: Job, taskId: string, text: string): string | undefined {

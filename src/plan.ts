@@ -390,3 +390,13 @@ export function addDelegated(job: Job, d: Delegation): { task?: Task; errors?: s
   job.tasks.push(task)
   return { task }
 }
+
+// A check must be a shell command (live test: the orchestrator passed "Run `npm test` from the project root; it must
+// pass ..." as a check, which no worker could ever make exit 0). Returns why a check is not one.
+export function checkProblem(check: string): string | undefined {
+  const c = check.trim()
+  if (/`/.test(c)) return `"${c.slice(0, 80)}" has backticks: give the command itself, e.g. npm test`
+  if (/^(run|ensure|make sure|check|verify|confirm|the|it|all|tests?)\b/i.test(c) && !/^test\s+-/.test(c)) return `"${c.slice(0, 80)}" reads like a sentence: give a shell command that exits 0 when the task is done, e.g. npm test`
+  if (/[.!?]$/.test(c) && /\s\w+\s\w+\s\w+\s/.test(c)) return `"${c.slice(0, 80)}" reads like a sentence: give a shell command, e.g. npm test`
+  return undefined
+}
