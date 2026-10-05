@@ -100,7 +100,8 @@ export interface Budget {
   readonly cost?: number
 }
 
-export const DEFAULT_BUDGET: Budget = { tokens: 4_000_000, requests: 800 }
+// No limits unless the config sets them (the user's choice, 2026-10-05: a job cut at a limit wastes its work).
+export const DEFAULT_BUDGET: Budget = {}
 const CEILINGS = { tokens: 50_000_000, requests: 5000, cost: 1000 } as const
 
 export function parseBudget(text: string): Budget {

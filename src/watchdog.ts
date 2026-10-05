@@ -27,6 +27,9 @@ export const DEFAULT_LIMITS: Limits = { maxSteps: 60, sameCall: 3, window: 10, r
 
 // The budget tier the decision model picks (design.md §8.1) maps to step limits; code keeps the ceiling.
 export const TIER_STEPS = { S: 30, M: 60, L: 120 } as const
+// The user's choice (2026-10-05): no budget estimates per task, since a cut session wastes what it did. Loops are
+// caught by the signatures above; this is only the last safety net for a session that never ends.
+export const MAX_STEPS = 200
 // ... and to tokens per session (input + output over all turns), checked after each turn by the runner.
 export const TIER_TOKENS = { S: 250_000, M: 600_000, L: 1_500_000 } as const
 

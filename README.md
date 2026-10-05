@@ -39,7 +39,8 @@ Jev and the plugin securing every task:
    - **Quality.** The plugin runs the checks itself, with fix rounds and, for a task that keeps failing, a fresh
      session on another model family. A review by another model family runs for risky or unchecked tasks, and
      tests first for bug fixes.
-   - **Limits.** Loops and stalled models are stopped, and budgets cap tokens and requests.
+   - **Limits.** The watchdog stops loops and stalled models. Token and request budgets per job are optional
+     and off by default, since a job cut at a limit wastes what it did.
 3. **Reports come back.** When a task merges, is given up or needs you, its report goes to the micromanager: status,
    checks, the worker's summary and its follow-ups. Reports close together arrive as one. The micromanager decides what
    comes next, asks you what only you can decide (`answer_task` passes your answer on) and, at the end, tells you
@@ -78,7 +79,7 @@ Optional settings in `~/.config/opencode/jev-dictator.jsonc`:
   "registry": [{ "id": "llamaswap/mimo", "disabled": true }],
   "parallel": 3,          // tasks of one job at the same time (1: one after another)
   "perModel": 2,          // sessions of one cloud model at the same time; a local model serves one
-  "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // per job; tokens and requests are the defaults
+  "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // optional limits per job; none by default
   "notify": "jobs"        // desktop notifications: "jobs", "tasks" (also per task) or "off"
 }
 ```

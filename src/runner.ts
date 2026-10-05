@@ -43,7 +43,7 @@ import {
 import { discoveredCap, isDone, parallelSafe, moveJob, moveTask, newJob, promoteReady, stage, type FollowUp, type Job, type JobPhase, type Later, type Task } from "./state.ts"
 import { skillsFor, type Stage } from "./skills.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
-import { handoffNote, TIER_STEPS, TIER_TOKENS, type Signal } from "./watchdog.ts"
+import { handoffNote, MAX_STEPS, TIER_STEPS, type Signal } from "./watchdog.ts"
 
 // The part of ctx.session the runner needs (argument shapes as seen in Phase A).
 export interface SessionApi {
@@ -1284,8 +1284,7 @@ export class Runner {
     task.session = s.id
     this.#sessionModel.set(s.id, model)
     this.#d.onWorker?.(s.id, `${task.id} ${task.title}: ${task.description}`, rules)
-    this.#d.watch?.(s.id, steps ?? TIER_STEPS[task.profile?.budget ?? "M"])
-    this.#tokenCaps.set(s.id, TIER_TOKENS[task.profile?.budget ?? "M"])
+    this.#d.watch?.(s.id, steps ?? MAX_STEPS)
     saveJob(this.#d.project, job)
     return s
   }
