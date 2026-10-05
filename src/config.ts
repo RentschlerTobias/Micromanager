@@ -128,7 +128,21 @@ export function parseParallel(text: string): { parallel: number; perModel: numbe
   return { parallel: int(raw.parallel, "parallel", 3, 6), perModel: int(raw.perModel, "perModel", 2, 4) }
 }
 
+// "cloudOnly": true (the default for now, the user's choice of 2026-10-05) routes no task to a local model and asks
+// cloud Jev for the guards instead of the local GLiNER server. false brings the local fleet and GLiNER back.
+export function parseCloudOnly(text: string): boolean {
+  const raw = (JSON.parse(stripComments(text)) as { cloudOnly?: unknown }).cloudOnly ?? true
+  if (typeof raw !== "boolean") throw new Error("cloudOnly must be true or false")
+  return raw
+}
+
+// With cloudOnly, local models stay in the registry (they show up in the journal's ranking) but are never routed to.
+export function cloudRegistry(registry: readonly ModelEntry[]): ModelEntry[] {
+  return registry.map((m) => (m.location === "local" ? { ...m, disabled: true } : m))
+}
+
 export interface Settings {
+  readonly cloudOnly: boolean
   readonly parallel: number
   readonly perModel: number
   readonly budget: Budget
@@ -144,11 +158,11 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
+    return { cloudOnly: true, parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
+    return { cloudOnly: parseCloudOnly(text), ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
   } catch (err) {
-    return { parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
+    return { cloudOnly: true, parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }
 }

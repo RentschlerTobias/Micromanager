@@ -73,6 +73,7 @@ export interface RunnerDeps {
   readonly watch?: (sessionID: string, maxSteps: number) => void // the loop watchdog starts judging a session
   readonly stopped?: (sessionID: string) => Signal | undefined // why the watchdog stopped a session, if it did
   readonly unchecked?: Unchecked // what G0 does when nothing local could check a job
+  readonly cloudOnly?: boolean // local models are switched off (the user's choice for now): nothing may need them
   readonly skills?: readonly Skill[] // the skills the decision model may pick per task (design.md §13.1)
   readonly installedSkills?: ReadonlySet<string> // the skills a brief may name: linked into OpenCode by install.sh
   readonly cancelled?: () => boolean // the user stopped the job (dictator_stop); checked around every session turn
@@ -336,12 +337,12 @@ export class Runner {
     excludeFromGit(this.#d.project)
     moveJob(job, "triage")
     const gate = await checkGuards(this.#decider, goal, job.id)
-    const flags = flagsWithoutUser(gate, this.#d.unchecked ?? "local")
+    const flags = flagsWithoutUser(gate, this.#d.unchecked ?? (this.#d.cloudOnly ? "cloud" : "local"), this.#d.cloudOnly)
     if (flags === "ask_user") {
       job.flags = { gate }
       moveJob(job, "ask_user")
       saveJob(this.#d.project, job)
-      return { kind: "gate", job, text: `[job ${job.id}] Only the user can answer the local check, so ask them now: show the question below word for word, call no tool, and end your turn. Their reply reaches the plugin by itself.\n\n${gateQuestion(gate)}` }
+      return { kind: "gate", job, text: `[job ${job.id}] Only the user can answer the local check, so ask them now: show the question below word for word, call no tool, and end your turn. Their reply reaches the plugin by itself.\n\n${gateQuestion(gate, this.#d.cloudOnly)}` }
     }
     job.flags = flags
     return this.#triage(job)
@@ -522,6 +523,12 @@ export class Runner {
     if (note?.trim()) job.decisions.push({ id: `U${job.decisions.length + 1}`, text: note.trim(), origin: "user" })
     if (job.phase !== "execute") throw new Error(`job ${id} is in phase ${job.phase}, not ready to run`)
     this.#job = job
+    // Never quietly to the cloud: a job that must stay on this machine waits while local models are switched off.
+    if (this.#d.cloudOnly && job.flags?.localOnly) {
+      this.#stop(job, "this job must stay on this machine, but local models are switched off (cloudOnly); the user can let it go to the cloud, or switch local models on")
+      saveJob(this.#d.project, job)
+      return job
+    }
     job.budget.tokensMax ??= this.#d.budget?.tokens
     job.budget.requestsMax ??= this.#d.budget?.requests
     job.budget.costMax ??= this.#d.budget?.cost
@@ -872,7 +879,7 @@ export class Runner {
       // A follow-up is text a model wrote, so it passes the local guards like a goal before it can become a task.
       if (v.kind === "task") {
         const guard = await checkGuards(this.#decider, `${item.what}. ${item.why}`, job.id, task.id)
-        if (guard.flagged.includes("sensitive") && !job.flags?.localOnly) {
+        if (guard.flagged.includes("sensitive") && !job.flags?.localOnly && !this.#d.cloudOnly) {
           job.flags = { ...job.flags, localOnly: true }
           this.#say(`a follow-up of ${task.id} looks sensitive: the rest of the job stays on this machine`)
         }

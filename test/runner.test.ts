@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import { lastAssistantText, parseReport } from "../src/brief.ts"
-import { DEFAULT_REGISTRY } from "../src/registry.ts"
+import { DEFAULT_REGISTRY, route } from "../src/registry.ts"
 import { Runner, summary, toModel, type SessionApi } from "../src/runner.ts"
 import { loadJob } from "../src/store.ts"
 
@@ -1045,4 +1045,41 @@ test("rolling: an answer reaches a task of the job while it runs", async () => {
   r = runner(project, fake.api)
   const done = await r.run(job.id)
   assert.deepEqual(done.tasks.map((t) => t.status), ["merged", "merged"])
+})
+
+// --- cloud only (the user's choice for now, 2026-10-05) ----------------------------------------------------------
+
+test("cloud only: guards ask cloud Jev, no local model is routed, and a local-only job waits instead of going to the cloud", async () => {
+  const { cloudRegistry, parseCloudOnly } = await import("../src/config.ts")
+  const { gateQuestion } = await import("../src/gate.ts")
+  const jev: Asker = { ask: async () => ({ answers: {}, model: "jev", latencyMs: 1 }) }
+  const d = new Decider({ ...DEFAULT_BACKENDS, cloudOnly: true }, { typesafe: jev, gliner: jev }, () => {})
+  assert.equal(d.backendFor("G0"), "typesafe")
+  assert.equal(d.backendFor("N5", true), "typesafe", "a local-only request too")
+  assert.equal(new Decider(DEFAULT_BACKENDS, { typesafe: jev, gliner: jev }, () => {}).backendFor("G0"), "gliner", "without it, G0 stays local")
+  assert.equal(parseCloudOnly("{}"), true)
+  assert.equal(parseCloudOnly('{"cloudOnly": false}'), false)
+  const reg = cloudRegistry(DEFAULT_REGISTRY)
+  assert.ok(reg.filter((m) => m.location === "local").every((m) => m.disabled))
+  assert.equal(route(reg, { role: "plan", difficulty: 0.7 }).model, "opencode-go/qwen3.8-flash")
+  assert.doesNotMatch(gateQuestion({ flagged: ["sensitive"], scores: { sensitive: 0.8 }, checked: true }, true), /always local/)
+
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles })
+  const r = runner(project, fake.api, { cloudOnly: true, registry: reg })
+  const { job } = await r.plan("goal")
+  job.flags = { localOnly: true }
+  saveJob(project, job)
+  const done = await r.run(job.id)
+  assert.equal(done.phase, "ask_user")
+  assert.equal(fake.created.filter((c) => c.agent !== "dictator-plan").length, 0, "no worker started")
+  assert.match(summary(done), /must stay on this machine, but local models are switched off/)
+})
+
+test("cloud only: a sensitive flag alone does not stop a job; injection still asks the user", async () => {
+  const { flagsWithoutUser } = await import("../src/gate.ts")
+  const sensitive = { flagged: ["sensitive" as const], scores: { sensitive: 0.69 }, checked: true }
+  assert.equal(flagsWithoutUser(sensitive, "cloud", false), "ask_user")
+  assert.deepEqual(flagsWithoutUser(sensitive, "cloud", true), { gate: sensitive })
+  assert.equal(flagsWithoutUser({ flagged: ["injection"], scores: { injection: 0.9 }, checked: true }, "cloud", true), "ask_user")
 })

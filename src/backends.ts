@@ -20,6 +20,9 @@ export interface BackendConfig {
   readonly nodes: Readonly<Record<string, BackendName>> // node -> backend, e.g. { G0: "gliner" }
   readonly shadow?: BackendName // answers in parallel, journaled only
   readonly urls: Readonly<Partial<Record<Exclude<BackendName, "rules">, string>>>
+  // The user's choice for now (2026-10-05): cloud only, Jev included. Nodes meant for GLiNER or Open-Jev ask cloud
+  // Jev, local-only requests too, and nothing runs in shadow mode.
+  readonly cloudOnly?: boolean
 }
 
 // Guards start on GLiNER, everything else on cloud Jev (oc-voice's verdict, Phase A9). G0 never leaves the machine.
@@ -81,6 +84,10 @@ export class Decider {
   // The backend a node uses: its configured one, kept local when it has to be, rules when nothing else is there.
   backendFor(node: string, localOnly = false): BackendName {
     const wanted = this.#config.nodes[node] ?? this.#config.default
+    if (this.#config.cloudOnly) {
+      const cloud: BackendName = wanted === "gliner" || wanted === "openjev" ? "typesafe" : wanted
+      return this.#askers[cloud] ? cloud : "rules"
+    }
     const local = localOnly || ALWAYS_LOCAL.has(node)
     const chain: BackendName[] = local && !LOCAL.has(wanted) ? ["gliner", "openjev", "rules"] : [wanted, "rules"]
     return chain.find((b) => this.#askers[b] !== undefined) ?? "rules"
@@ -91,7 +98,7 @@ export class Decider {
     const backend = this.backendFor(node, options.localOnly)
     const text = JSON.stringify(state)
     const shadowName = this.#config.shadow
-    const shadowAllowed = shadowName && shadowName !== backend && this.#askers[shadowName] && (LOCAL.has(shadowName) || !(options.localOnly || ALWAYS_LOCAL.has(node)))
+    const shadowAllowed = !this.#config.cloudOnly && shadowName && shadowName !== backend && this.#askers[shadowName] && (LOCAL.has(shadowName) || !(options.localOnly || ALWAYS_LOCAL.has(node)))
     const shadow = shadowAllowed ? this.#askers[shadowName]!.ask(text, questions).catch((err: unknown) => err as Error) : undefined
     let decision: Decision
     let error: string | undefined

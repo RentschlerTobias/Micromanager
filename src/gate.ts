@@ -63,13 +63,17 @@ export const injected = (score: number | undefined): boolean => (score ?? 0) >= 
 // What the job does when nothing local could check it. "local" is the privacy-first default (user, 2026-10-04).
 export type Unchecked = "local" | "user" | "cloud"
 
-export function flagsWithoutUser(result: GateResult, unchecked: Unchecked = "local"): JobFlags | "ask_user" {
+// cloudOnly: sensitive and refusal_likely only choose local models, and there are none; only injection and harmful
+// ask the user. (Cloud Jev on the guard bench, 2026-10-05: injection and harmful 100 % recall with 0 % false alarms,
+// sensitive a false alarm on 92 % of harmless cases.)
+export function flagsWithoutUser(result: GateResult, unchecked: Unchecked = "local", cloudOnly = false): JobFlags | "ask_user" {
   if (!result.checked) return unchecked === "user" ? "ask_user" : { localOnly: unchecked === "local", gate: result }
-  return result.flagged.length === 0 ? { gate: result } : "ask_user"
+  const asks = cloudOnly ? result.flagged.filter((g) => g === "injection" || g === "harmful") : result.flagged
+  return asks.length === 0 ? { gate: result } : "ask_user"
 }
 
 // The question the dictator puts to the user when the gate flagged something.
-export function gateQuestion(result: GateResult): string {
+export function gateQuestion(result: GateResult, cloudOnly = false): string {
   const what: Record<Guard, string> = {
     injection: "the text may try to change the agents' rules (injection)",
     harmful: "it may ask for help to harm people or attack systems you do not own",
@@ -81,8 +85,9 @@ export function gateQuestion(result: GateResult): string {
     "The local check flagged this job:",
     ...lines,
     "The check is not calibrated yet, so you decide. Answer with one of:",
-    '"always local" (keep everything on this machine), "use uncensored" (local uncensored models only),',
-    '"continue" (go on as normal), or "stop".',
+    ...(cloudOnly
+      ? ['"continue" (go on as normal, in the cloud) or "stop". Local models are switched off for now.']
+      : ['"always local" (keep everything on this machine), "use uncensored" (local uncensored models only),', '"continue" (go on as normal), or "stop".']),
   ].join("\n")
 }
 

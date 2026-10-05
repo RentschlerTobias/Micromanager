@@ -7,7 +7,7 @@
 import { execFile } from "node:child_process"
 
 import { installAgents, type AgentDraft } from "./agents.ts"
-import { loadSettings } from "./config.ts"
+import { cloudRegistry, loadSettings } from "./config.ts"
 import { decide, type PermissionRequest } from "./decide.ts"
 import { injected, injectionScore } from "./gate.ts"
 import { resultText, rewriteResult, routeSubagentCall, type ToolCall } from "./hooks.ts"
@@ -85,7 +85,9 @@ export default {
   id: "jev-dictator",
   setup: async (ctx: Context): Promise<void> => {
     const log = logger(ctx)
-    const { parallel, perModel, budget, notify, routing, floors, decisions, registry, error } = loadSettings()
+    const settings = loadSettings()
+    const { cloudOnly, parallel, perModel, budget, notify, routing, floors, decisions, error } = settings
+    const registry = cloudOnly ? cloudRegistry(settings.registry) : settings.registry
     if (error) log("warn", `config ignored, defaults used: ${error}`)
 
     await ctx.agent.transform((draft) => {
@@ -201,7 +203,9 @@ export default {
       log("warn", "no project directory: the dictator tools are not installed")
       return
     }
-    const decider = new Decider(DEFAULT_BACKENDS, makeAskers(DEFAULT_BACKENDS, key))
+    const backends = { ...DEFAULT_BACKENDS, cloudOnly }
+    const decider = new Decider(backends, makeAskers(backends, key))
+    if (cloudOnly) log("info", "cloud only: no local models, guards on cloud Jev")
     // The loop watchdog judges the planner and worker sessions the runner starts; a signal interrupts the session
     // and the runner reads why (design.md §10.1).
     const watchdog = new Watchdog()
@@ -240,7 +244,7 @@ export default {
         registry,
         decider,
         policies: { global: decisions },
-        availability: () => probe(registry),
+        availability: cloudOnly ? undefined : () => probe(registry), // no local servers to ask
         progress: (text, task) => {
           log("info", text)
           // A rolling job's orchestrator gets task reports instead (live test: one message per fix round was noise).
@@ -248,6 +252,7 @@ export default {
         },
         parentID,
         cancelled: cancel ? () => cancel.cancelled : undefined,
+        cloudOnly,
         budget,
         parallel,
         perModel,
@@ -349,7 +354,7 @@ export default {
               return `The local check flagged this task (${guard.flagged.join(", ")}). Ask the user whether it should run before you delegate it again.`
             }
             const job = rollingJob(tctx.sessionID)
-            if (guard.flagged.includes("sensitive") && !job.flags?.localOnly) job.flags = { ...job.flags, localOnly: true }
+            if (guard.flagged.includes("sensitive") && !job.flags?.localOnly && !cloudOnly) job.flags = { ...job.flags, localOnly: true }
             const d = {
               title: input.title.trim(),
               prompt: input.prompt.trim(),
