@@ -251,7 +251,7 @@ export default {
             const job = id.trim() ? loadJob(project, id.trim()) : listJobs(project)[0]
             return job ? `${summary(job)}\n\n${planText(job)}` : "no job yet"
           },
-        })
+        }, DICTATOR.agent, (sessionID) => runnerSessions.has(sessionID))
       } catch (err) {
         log("error", `dictator tools not installed: ${String(err)}`)
       }

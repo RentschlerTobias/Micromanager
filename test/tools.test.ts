@@ -31,8 +31,20 @@ test("the three tools are built from the read tool's schema and refuse other age
   assert.deepEqual(await exec(1)({ job: "job-1", tree: "[]" }, { agent: "dictator" }), { content: "asked" })
   assert.deepEqual(await exec(2)({ job: "job-1" }, { agent: "build" }), { content: "Only the dictator agent may use this tool." })
   assert.deepEqual(await exec(3)({ job: "" }, { agent: "dictator" }), { content: "failed: boom" })
+  assert.deepEqual(await exec(2)({ job: "job-1" }, {}), { content: "Only the dictator agent may use this tool." })
   assert.deepEqual(calls, ["plan:add a flag", "questions:job-1:[]"])
   assert.throws(() => installTools({ get: () => undefined, add: () => {} }, { plan: async () => "", questions: async () => "", run: async () => "", status: async () => "" }))
+})
+
+test("a session the runner started is refused even as the dictator agent", async () => {
+  const { draft, added } = fakeDraft()
+  const ran: string[] = []
+  const ok = async () => "ok"
+  installTools(draft, { plan: ok, questions: ok, run: async (job) => { ran.push(job); return "ran" }, status: ok }, "dictator", (id) => id === "ses_worker")
+  const run = added[2]!.execute as (a: Record<string, unknown>, c: object) => Promise<{ content: string }>
+  assert.deepEqual(await run({ job: "job-1" }, { agent: "dictator", sessionID: "ses_worker" }), { content: "Only the dictator agent may use this tool." })
+  assert.deepEqual(await run({ job: "job-1" }, { agent: "dictator", sessionID: "ses_user" }), { content: "ran" })
+  assert.deepEqual(ran, ["job-1"])
 })
 
 test("the plan text lists acceptance points and tasks", () => {

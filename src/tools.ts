@@ -1,5 +1,7 @@
 // The dictator's tools (Phase A, A3: custom tools work, with text content as their result). Only the dictator
 // agent may use them; every other agent gets a refusal, and the context hook hides them from other agents.
+// A role agent can still reach them through the code-mode execute tool; the nested call carries the caller's
+// agent (Phase E spike), so the same check refuses it. A call without an agent is refused too.
 
 import type { Job } from "./state.ts"
 
@@ -23,7 +25,7 @@ export interface Handlers {
   status(job: string, ctx: ToolContext): Promise<string>
 }
 
-export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dictator"): string[] {
+export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dictator", runnerSession: (id: string) => boolean = () => false): string[] {
   // A schema must come from the server's own Effect instance (Phase 0), so it is built from a built-in tool's.
   const read = draft.get("read")
   const str = read?.input?.fields?.path
@@ -31,7 +33,7 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dict
   const input = (...names: string[]) => read.input!.mapFields!(() => Object.fromEntries(names.map((n) => [n, str])))
   const guarded = (fn: (values: string[], ctx: ToolContext) => Promise<string>, ...names: string[]) =>
     async (args: Record<string, unknown>, ctx: ToolContext) => {
-      if (ctx?.agent && ctx.agent !== agent) return { content: `Only the ${agent} agent may use this tool.` }
+      if (ctx?.agent !== agent || (ctx.sessionID !== undefined && runnerSession(ctx.sessionID))) return { content: `Only the ${agent} agent may use this tool.` }
       try {
         return { content: await fn(names.map((n) => String(args?.[n] ?? "")), ctx ?? {}) }
       } catch (err) {
