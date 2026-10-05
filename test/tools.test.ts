@@ -65,3 +65,14 @@ test("the plan text lists acceptance points and tasks", () => {
   assert.match(text, /- A1: flag works \(check: npm test\)/)
   assert.match(text, /- T1 \[code\] add flag\n  files: cli.js\n  covers: A1/)
 })
+
+test("a reader may read outside the project only in a directory its task names", async () => {
+  const { namedInTask } = await import("../src/plugin.ts")
+  const task = "T2 Map oc-voice fluency: read /home/t1dde/Fun/Projects/Repos/oc-voice/voice/loop.py and the README in /home/t1dde/Fun/Projects/Repos/oc-voice"
+  assert.equal(namedInTask(task, ["/home/t1dde/Fun/Projects/Repos/oc-voice/*"]), true)
+  assert.equal(namedInTask(task, ["/home/t1dde/Fun/Projects/Repos/oc-voice/voice/*"]), true)
+  assert.equal(namedInTask(task, ["/home/t1dde/.ssh/*"]), false)
+  assert.equal(namedInTask(task, ["/home/t1dde/Fun/Projects/Repos/oc-voice-secrets/*"]), false)
+  assert.equal(namedInTask("no paths here", ["/home/t1dde/x/*"]), false)
+  assert.equal(namedInTask("read /home/t1dde/Repos/a/src/main.py", ["/home/t1dde/Repos/a/src/*"]), true, "a named file opens its directory")
+})

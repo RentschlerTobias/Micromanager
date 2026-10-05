@@ -16,7 +16,8 @@ import { record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe } from "./registry.ts"
-import { DICTATOR, ROLES, type Rule } from "./roles.ts"
+import { DICTATOR, ROLES, roleByAgent, type Rule } from "./roles.ts"
+import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
 import { jobId } from "./store.ts"
@@ -70,6 +71,37 @@ interface Context {
   app?: { log?(entry: { level: string; message: string }): unknown }
 }
 
+// What the plugin knows about the sessions the runner started, shared by every instance of the plugin in one server.
+// The hub runs one instance per directory, and a worker in its worktree (.jev-dictator/worktrees/…) is served by
+// another instance than the one that started it (live test in the user's hub: a worker's question outside its
+// directory went to the user, because that instance did not know the session; it waited for an answer nobody saw).
+// On globalThis, so it is shared even if the server loads this module once per instance.
+interface Shared {
+  workerTasks: Map<string, string> // session -> the task it works on, for Jev's context
+  workerRules: Map<string, readonly Rule[]> // session -> its narrowed rights
+  runnerSessions: Set<string> // sessions the runner started: they never ask the user
+  watchdog: Watchdog
+  stops: Map<string, Signal> // why the watchdog stopped a session
+}
+const SHARED: Shared = ((globalThis as { __jevDictator?: Shared }).__jevDictator ??= {
+  workerTasks: new Map(),
+  workerRules: new Map(),
+  runnerSessions: new Set(),
+  watchdog: new Watchdog(),
+  stops: new Map(),
+})
+
+// A path outside the project that a reader may read: one its task names (live test: "map oc-voice" needs oc-voice).
+export function namedInTask(task: string | undefined, resources: readonly string[]): boolean {
+  if (!task) return false
+  const dirs = [...task.matchAll(/(?:~|\/home\/[\w.-]+)(?:\/[\w.@+-]+)+/g)].map((m) => m[0].replace(/^~/, process.env.HOME ?? "~").replace(/\/+$/, ""))
+    .map((p) => (/\.[a-z0-9]{1,5}$/i.test(p) ? p.slice(0, p.lastIndexOf("/")) : p)) // a named file: its directory
+  return resources.length > 0 && resources.every((r) => {
+    const path = r.replace(/\/\*+$/, "")
+    return dirs.some((d) => d.length > 1 && (path === d || path.startsWith(`${d}/`)))
+  })
+}
+
 function logger(ctx: Context) {
   return (level: "info" | "warn" | "error", message: string): void => {
     try {
@@ -105,14 +137,14 @@ export default {
     // The sub-task each agent works on, for Jev's context: the dictator's last delegation per role agent, and
     // the task of each worker session the runner started.
     const tasks = new Map<string, string>()
-    const workerTasks = new Map<string, string>()
+    const workerTasks = SHARED.workerTasks
     // A worker's narrowed rights (N5b): the session's own rules already remove the tools; the evaluate hook denies
     // what still comes through, e.g. a tool reached from the code-mode execute tool.
-    const workerRules = new Map<string, readonly Rule[]>()
+    const workerRules = SHARED.workerRules
     // Sessions the runner started (planner, workers, reviewers, readers). Nobody sits at them: a question there would
     // wait until the worker times out (live tests, headless and with --auto). So they never ask the user directly;
     // they stop and report, and the job asks the user in the dictator's session.
-    const runnerSessions = new Set<string>()
+    const runnerSessions = SHARED.runnerSessions
 
     await ctx.tool.hook("execute.before", (call) => {
       const routed = routeSubagentCall(call, routing)
@@ -158,6 +190,13 @@ export default {
       }
       if (evaluation.effect !== "ask" || !ours.has(evaluation.agent)) return
       if (runnerSessions.has(evaluation.sessionID) && evaluation.action === "external_directory") {
+        // A reader may read a directory its task names; nothing else outside, and writers never.
+        const reader = !WRITERS.has(roleByAgent(evaluation.agent)?.id ?? "code")
+        if (reader && namedInTask(workerTasks.get(evaluation.sessionID), evaluation.resources)) {
+          evaluation.effect = "allow"
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: "a reader, in a directory its task names" })
+          return
+        }
         evaluation.effect = "deny"
         evaluation.message = "Stay inside your working directory; the job's state and the user's checkout are not part of your task. If you need something from outside, say so in your report (STATUS: NEEDS_CONTEXT)."
         record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "runner session outside its directory" })
@@ -208,8 +247,8 @@ export default {
     if (cloudOnly) log("info", "cloud only: no local models, guards on cloud Jev")
     // The loop watchdog judges the planner and worker sessions the runner starts; a signal interrupts the session
     // and the runner reads why (design.md §10.1).
-    const watchdog = new Watchdog()
-    const stops = new Map<string, Signal>()
+    const watchdog = SHARED.watchdog
+    const stops = SHARED.stops
     const stop = (sessionID: string, signal: Signal) => {
       if (stops.has(sessionID)) return
       stops.set(sessionID, signal)
