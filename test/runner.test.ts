@@ -1174,3 +1174,20 @@ test("memory: without a decision model nothing is kept", async () => {
   await r.run((await r.plan("goal")).job.id)
   assert.deepEqual(readMemory(project), [])
 })
+
+test("a checkpoint that hands a task back skips the fresh try: the micromanager rethinks it", async () => {
+  const project = repo()
+  const job = rolling(project)
+  addDelegated(job, { title: "write add.js", prompt: "create it", files: ["add.js"], dependsOn: [], checks: ["test -f add.js"] })
+  saveJob(project, job)
+  const fake = fakeSession({ worker: writeFiles })
+  const ended: string[] = []
+  const r = runner(project, fake.api, {
+    stopped: (id: string) => (id === "ses_1" ? { kind: "handback", detail: "task checkpoint: the task looks unclear or blocked" } : undefined),
+    taskEnded: (_j: unknown, t: { id: string; status: string }) => ended.push(`${t.id}:${t.status}`),
+  })
+  const done = await r.run(job.id)
+  assert.equal(fake.created.filter((c) => c.agent === "coder").length, 1, "no fresh session")
+  assert.deepEqual([done.tasks[0]!.status, done.tasks[0]!.escalation?.kind], ["escalated", "spec_ambiguous"])
+  assert.deepEqual(ended, ["T1:escalated"])
+})

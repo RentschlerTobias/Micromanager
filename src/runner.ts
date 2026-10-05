@@ -1008,6 +1008,12 @@ export class Runner {
     let lastFailure: string | undefined
     for (;;) {
       const answer = work.answer
+      if (answer.stopped?.kind === "handback") {
+        // A checkpoint found the task itself unclear or blocked: no fresh try, the micromanager rethinks it.
+        stage(task, "implement", "fail", answer.stopped.detail)
+        await this.#escalate(job, task, answer.stopped.detail, "", "spec_ambiguous")
+        return undefined
+      }
       if (answer.stopped) {
         // The watchdog stopped it: never resume that session.
         stage(task, "implement", "fail", `loop watchdog: ${answer.stopped.detail}`)

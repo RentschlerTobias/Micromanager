@@ -21,6 +21,7 @@ import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
 import { Compactor } from "./compact.ts"
+import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { jobId } from "./store.ts"
 import { moveJob, newJob, readyTasks, type Job } from "./state.ts"
@@ -350,7 +351,8 @@ export default {
     await ctx.tool.hook("execute.after", async (call) => {
       if (!call.sessionID) return
       if (watchdog.watching(call.sessionID)) {
-        const signal = watchdog.onTool(call.sessionID, call.tool, call.input)
+        const failed = /\b(error|failed|not found|denied|exception|traceback)\b/i.test(resultText(call.result).slice(0, 600))
+        const signal = watchdog.onTool(call.sessionID, call.tool, call.input, failed)
         if (signal) stop(call.sessionID, signal)
       }
       if (!runnerSessions.has(call.sessionID)) return
@@ -537,6 +539,15 @@ export default {
         if (input.sessionID && watchdog.watching(input.sessionID)) {
           const signal = watchdog.onTurn(input.sessionID, input.messages)
           if (signal) stop(input.sessionID, signal)
+          // Task checkpoint: every CHECKPOINT_STEPS steps Jev reviews the progress; the worker goes on unless it stalls.
+          else if (watchdog.checkpointDue(input.sessionID)) {
+            const progress = watchdog.progress(input.sessionID)!
+            const r = await review(decider, workerTasks.get(input.sessionID) ?? "", progress)
+            record({ kind: "checkpoint", sessionID: input.sessionID, verdict: r.verdict, progress, decision: r.decision })
+            log("info", `checkpoint ${input.sessionID}: ${r.verdict} after ${progress.steps} steps`)
+            const s = signalFor(r.verdict, progress)
+            if (s) stop(input.sessionID, s)
+          }
         }
         return
       }

@@ -184,3 +184,10 @@ export function batchQuestions(tasks: readonly { id: string; title: string }[], 
 }
 
 export const ESCALATE: Question = { type: "choice", instructions: "Why could this task not be finished?", criteria: ESCALATION }
+
+// --- N16: a task checkpoint (every CHECKPOINT_STEPS steps; src/watchdog.ts) -----------------------------------
+export const CHECKPOINT: Record<string, Question> = {
+  making_progress: { type: "noul", instructions: "The worker is getting closer to finishing its task: its recent calls change files or run checks that now pass, rather than repeating reads and failures." },
+  wrong_approach: { type: "noul", instructions: "The worker keeps hitting the same obstacle with the same approach; a fresh attempt with another approach would do better." },
+  task_unclear: { type: "noul", instructions: "The worker cannot finish because the task itself is unclear, too big or blocked by something outside it; the orchestrator should rethink it." },
+}
