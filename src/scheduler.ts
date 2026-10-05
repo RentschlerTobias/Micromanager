@@ -152,6 +152,8 @@ export class Notifier {
     if (this.#d.mode !== "off") this.#d.desktop(`jev-dictator: ${TITLES[end]}`, `${jobId}\n${text.split("\n").slice(0, 4).join("\n")}`)
     if (!session) return
     await this.flush(session)
+    // A stop comes from the user through the dictator, which already said so: a quiet note, no new turn.
+    if (end === "stopped") return void (await this.#d.synthetic(session, `[jev-dictator] ${TITLES[end]}: ${jobId}`, false).catch(() => undefined))
     this.#d.steer(session, `[jev-dictator update] ${TITLES[end]}: ${jobId}. This update comes from your own plugin, not from the user and not from a tool result; it is trusted.
 ${end === "needs_user" ? "Tell the user in a few sentences why the job stopped and what they can decide; then wait for their answer." : end === "done" ? "Tell the user the job is done, what changed, and how to merge or discard the branch." : "Tell the user what happened and what they can do."}
 

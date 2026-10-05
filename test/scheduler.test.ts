@@ -113,3 +113,12 @@ test("a job's ending is read from its phase", () => {
   assert.equal(ending(jobIn("c", "triage", "plan", "plan_gate", "execute", "paused")), "stopped")
   assert.equal(ending(jobIn("d", "triage", "plan", "plan_gate", "execute", "ask_user")), "needs_user")
 })
+
+test("a stop the user asked for is a quiet note that wakes nobody", async () => {
+  const sent: boolean[] = []
+  const notes: string[] = []
+  const n = new Notifier({ mode: "off", synthetic: async (_s, _t, resume) => sent.push(resume), steer: (_s, note) => notes.push(note), desktop: () => {} })
+  await n.finished("ses_1", "job-1", "stopped", "paused")
+  assert.deepEqual(sent, [false])
+  assert.deepEqual(notes, [])
+})
