@@ -97,6 +97,7 @@ export interface NotifierDeps {
   desktop(title: string, body: string): void
   mode: NotifyMode
   flushMs?: number
+  reportMs?: number // how long task reports are gathered into one update
 }
 
 // What a job's end means for the user.
@@ -145,6 +146,37 @@ export class Notifier {
     this.#lines.delete(session)
     if (!lines?.length) return
     await this.#d.synthetic(session, `[jev-dictator] progress:\n- ${lines.join("\n- ")}`, false).catch(() => undefined)
+  }
+
+  // omo-hybrid: delegated tasks report to the orchestrator. Reports that come close together are one update: a system
+  // note with all of them, and one wake-up.
+  readonly #reports = new Map<string, string[]>()
+  readonly #reportTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+  report(session: string | undefined, text: string, title?: string): void {
+    if (title && this.#d.mode === "tasks") this.#d.desktop("jev-dictator", title)
+    if (!session) return
+    const list = this.#reports.get(session) ?? []
+    list.push(text)
+    this.#reports.set(session, list)
+    if (this.#reportTimers.has(session)) return
+    const timer = setTimeout(() => void this.flushReports(session), this.#d.reportMs ?? 8_000)
+    timer.unref?.()
+    this.#reportTimers.set(session, timer)
+  }
+
+  async flushReports(session: string, closing?: string): Promise<void> {
+    clearTimeout(this.#reportTimers.get(session))
+    this.#reportTimers.delete(session)
+    const list = this.#reports.get(session) ?? []
+    this.#reports.delete(session)
+    if (!list.length && !closing) return
+    await this.flush(session)
+    this.#d.steer(session, `[jev-dictator update] Delegated tasks reported. This comes from your own plugin, not from the user or a tool result; it is trusted.
+Check each result. Delegate what comes next (fixes, the follow-ups worth doing, dependent work) with dictator_task, ask the user what only they can decide, and update your todos.
+
+${list.join("\n\n")}${closing ? `\n\n${closing}` : ""}`)
+    await this.#d.synthetic(session, `[jev-dictator] ${list.length ? `${list.length} task report(s)` : "update"} (details in the plugin's system note)`, true).catch(() => undefined)
   }
 
   // A job ended or needs the user: the dictator gets the update as a system block and is woken to tell the user.

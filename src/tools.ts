@@ -5,7 +5,17 @@
 
 import type { Job } from "./state.ts"
 
-export const TOOL_IDS = ["dictator_plan", "dictator_questions", "dictator_run", "dictator_status", "dictator_stop"] as const
+export const TOOL_IDS = ["dictator_task", "dictator_tasks", "dictator_answer", "dictator_plan", "dictator_questions", "dictator_run", "dictator_status", "dictator_stop"] as const
+
+// What dictator_task takes; every field is a string, as the tool schema is built from read's path field.
+export interface TaskInput {
+  readonly title: string
+  readonly prompt: string
+  readonly files: string // comma separated
+  readonly depends: string // task ids, comma separated
+  readonly priority: string // 1..5, or empty
+  readonly checks: string // shell commands, one per line
+}
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
 export interface ToolDraft {
@@ -19,6 +29,9 @@ export interface ToolContext {
 }
 
 export interface Handlers {
+  task(input: TaskInput, ctx: ToolContext): Promise<string>
+  tasks(id: string, ctx: ToolContext): Promise<string>
+  answer(task: string, text: string, ctx: ToolContext): Promise<string>
   plan(goal: string, ctx: ToolContext): Promise<string>
   questions(job: string, tree: string, ctx: ToolContext): Promise<string>
   run(job: string, note: string, ctx: ToolContext): Promise<string>
@@ -42,9 +55,30 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dict
       }
     }
   draft.add({
+    id: "dictator_task",
+    name: "dictator_task",
+    description: "Delegate one task to a worker agent; it runs in the background on the session's own git branch, in parallel with other tasks that change other files, and this returns at once with its id. title: short; prompt: everything the worker needs, as it knows nothing else; files: the files it may change, comma separated (empty for research or reading); depends: ids of tasks it must wait for, comma separated; priority: 1 (first) to 5 (last), empty for 3; checks: shell commands, one per line, that exit 0 when the task is done (e.g. npm test). The plugin picks the role, model, skills and rights, runs the checks and merges. You get a report when it ends: do not wait or poll.",
+    input: input("title", "prompt", "files", "depends", "priority", "checks"),
+    execute: guarded(([title, prompt, files, depends, priority, checks], ctx) => handlers.task({ title: title!, prompt: prompt!, files: files!, depends: depends!, priority: priority!, checks: checks! }, ctx), "title", "prompt", "files", "depends", "priority", "checks"),
+  })
+  draft.add({
+    id: "dictator_tasks",
+    name: "dictator_tasks",
+    description: "The tasks you delegated in this session with their status, or with a task id its full report (what the worker did, the checks, its follow-ups).",
+    input: input("id"),
+    execute: guarded(([id], ctx) => handlers.tasks(id!, ctx), "id"),
+  })
+  draft.add({
+    id: "dictator_answer",
+    name: "dictator_answer",
+    description: "Give a task that waits for the user the user's answer or go, in their words; the task starts again with it.",
+    input: input("task", "text"),
+    execute: guarded(([task, text], ctx) => handlers.answer(task!, text!, ctx), "task", "text"),
+  })
+  draft.add({
     id: "dictator_plan",
     name: "dictator_plan",
-    description: "Start or continue a job. With the user's goal: checks it, and either opens a planning session (follow the instruction it returns) or plans it right away. With a job id as goal: continues that job. Returns the plan to show the user, or what to do next. Changes nothing.",
+    description: "For a large or unclear job only (most work goes through dictator_task): a planner reads the project and writes a full plan with acceptance points, which the user approves before dictator_run. With the user's goal: checks it and plans it, or opens a planning session when the user asked to plan it together. With a job id as goal: continues that job. Changes nothing.",
     input: input("goal"),
     execute: guarded(([goal], ctx) => handlers.plan(goal!, ctx), "goal"),
   })

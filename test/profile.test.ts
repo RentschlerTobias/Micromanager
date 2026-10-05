@@ -91,7 +91,7 @@ test("skills: one noul per skill the role may load, at most three above the floo
   assert.match(profileText(p), /skills b, d, c/)
 })
 
-test("the pipeline follows the rules of design.md §9", () => {
+test("the pipeline follows the rules of design.md §9, lighter since omo-hybrid", () => {
   const pick = (answers: Record<string, Answer>, over: Partial<Task> = {}, pins = {}) => {
     const t = task(over)
     return choosePipeline(t, combine(t, acc, asked(answers), pins), pins)
@@ -102,7 +102,8 @@ test("the pipeline follows the rules of design.md §9", () => {
   assert.equal(pick({ test_first_possible: noul(0.9), is_bug_fix: noul(0.9) }).id, "P3")
   assert.equal(pick({ test_first_possible: noul(0.9), risk: choice("cosmetic") }).id, "P1", "test first alone is not enough")
   assert.equal(pick({ has_test_oracle: noul(0.9), role: choice("debug", 0.55) }).id, "P1", "a weak role answer is just ignored")
-  assert.equal(pick({ has_test_oracle: noul(0.9), "tool.shell": noul(0.9), risk: choice("internal", 0.7) }, { role: "write", files: ["README.md"] }).id, "P2", "a contradiction lowers confidence: one tier up")
+  assert.equal(pick({ has_test_oracle: noul(0.9), "tool.shell": noul(0.9), risk: choice("internal", 0.7) }, { role: "write", files: ["README.md"] }).id, "P1", "low confidence no longer adds a review")
+  assert.equal(pick({ test_first_possible: noul(0.9), has_test_oracle: noul(0.9), risk: choice("public_api") }).id, "P2", "test first without a bug: a review, no red stage")
   assert.equal(pick({ has_test_oracle: noul(0.9), risk: choice("internal", 0.7) }).id, "P1")
   assert.equal(pick({}, { role: "research", files: [] }).id, "P9")
   assert.equal(pick({}, { role: "explore", files: [] }).id, "P1")

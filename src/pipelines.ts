@@ -45,12 +45,12 @@ export function choosePipeline(task: Task, profile: Profile, policies: Policies)
   if (!writer) return { id: "P1", reason: "a reader: one session, checks if any", modifiers }
   let id: PipelineId
   let reason: string
-  if (profile.testFirst && (profile.bugFix || riskAtLeast(profile.risk, "public_api"))) [id, reason] = ["P3", `test first: ${profile.bugFix ? "a bug fix" : `risk ${profile.risk}`}`]
+  // omo-hybrid: lighter by default. Tests first only for a bug fix that can be shown red; a review only where the risk
+  // or a missing test oracle calls for one; everything else is P1 (checks and fix rounds).
+  if (profile.testFirst && profile.bugFix) [id, reason] = ["P3", "test first: a bug fix"]
   else if (riskAtLeast(profile.risk, "public_api")) [id, reason] = ["P2", `risk ${profile.risk}`]
   else if (!profile.testOracle) [id, reason] = ["P2", "no test oracle"]
   else [id, reason] = ["P1", "small and clear, with a test oracle"]
-  // Low confidence on the classification: one tier up.
-  if (id === "P1" && profile.confidence < CHOICE_FLOOR) [id, reason] = ["P2", `low confidence (${profile.confidence.toFixed(2)})`]
   return { id, reason, modifiers }
 }
 

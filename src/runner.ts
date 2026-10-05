@@ -24,12 +24,12 @@ import { redact } from "./jev.ts"
 import { record } from "./journal.ts"
 import { HEADER } from "./hooks.ts"
 import {
-  choosePipeline, citationCheck, greenNote, mergeReviews, readerCount, readerPrompt, redPrompt, researchPath, reviewFixPrompt, reviewPrompt, parseReview,
+  choosePipeline, citationCheck, riskAtLeast, greenNote, mergeReviews, readerCount, readerPrompt, redPrompt, researchPath, reviewFixPrompt, reviewPrompt, parseReview,
   standardsPrompt, synthesisPrompt, TEST_FILE, type Review, type ReviewAxis,
 } from "./pipelines.ts"
 import {
-  addDiscovered, applyPlan, applyReplan, applySplits, MAX_SPLIT_LEVEL, parsePlan, PLAN_FORMAT, replanFormat, splitFormat, waves,
-  type Parsed, type Plan, type PlannedTask,
+  addDelegated, addDiscovered, applyPlan, applyReplan, applySplits, MAX_SPLIT_LEVEL, parsePlan, PLAN_FORMAT, replanFormat, splitFormat, waves,
+  type Delegation, type Parsed, type Plan, type PlannedTask,
 } from "./plan.ts"
 import { classifyQuestions, classifyState, combine, narrowing, profileText, type Profile, type Skill } from "./profile.ts"
 import { resolvePolicy, type Policies } from "./policy.ts"
@@ -79,6 +79,7 @@ export interface RunnerDeps {
   readonly budget?: { tokens?: number; requests?: number; cost?: number } // per job, from the config (design.md §10.2)
   readonly parallel?: number // tasks of a job at the same time (Phase F); 1 runs them one after another in the job's worktree
   readonly perModel?: number // sessions of one cloud model at the same time; a local model serves one at a time
+  readonly taskEnded?: (job: Job, task: Task) => void // a task of a rolling job merged, escalated or waits for the user
 }
 
 // Thrown out of a session turn when the user stopped the job; run() pauses the job, and the next run resumes it.
@@ -552,7 +553,9 @@ export class Runner {
           continue
         }
         promoteReady(job)
-        const agenda = buildAgenda(job).filter((p) => !p.taskId || !running.has(p.taskId))
+        // A rolling job only runs what the orchestrator delegated: no verify, replan or wrap; it ends when nothing is
+        // left to start, and the next delegation runs it again.
+        const agenda = buildAgenda(job).filter((p) => (!p.taskId || !running.has(p.taskId)) && (!job.rolling || p.action === "dispatch"))
         const next = nextProposal(agenda)
         if (!next || (next.action !== "dispatch" && running.size)) {
           // verify, replan and asking the user wait until every running task has finished
@@ -606,7 +609,12 @@ export class Runner {
       const t = job.tasks.find((x) => x.id === p.taskId)!
       if ([...busy, ...batch].every((o) => parallelSafe(o, t))) batch.push(t)
     }
-    if (batch.length + busy.length < 2 || batch.length === 0) return batch
+    // N10 is opt-in ("N10": "auto" in the config): disjoint files are enough to run side by side.
+    const n10 = resolvePolicy("N10", this.#policies(job))
+    if (batch.length + busy.length < 2 || batch.length === 0 || n10.level === undefined || n10.policy.kind !== "auto") {
+      if (batch.length + busy.length > 1) this.#say(`starting ${batch.map((t) => t.id).join(", ")}${busy.length ? ` next to ${busy.map((t) => t.id).join(", ")}` : " in parallel"}`)
+      return batch
+    }
     const all = [...busy, ...batch]
     const others = (id: string) => all.filter((t) => t.id !== id).map((t) => `${t.id} ("${t.title}")`).join(", ")
     const asked = await this.#decider.ask("N10", { goal: job.goal, tasks: all.map((t) => `${t.id} ${t.title}: ${t.description.slice(0, 300)} (files: ${t.files.join(", ") || "none"})`) }, batchQuestions(batch, others), { localOnly: job.flags?.localOnly, job: job.id })
@@ -662,7 +670,7 @@ export class Runner {
       stage(task, "merge", "pass", `merged into ${job.integrationBranch}`)
       this.#say(`${task.id} merged into ${job.integrationBranch}`, true)
       await this.#dropWorktree(task)
-      await this.#discover(job, task)
+      await this.#ended(job, task)
       return
     }
     task.conflicts = (task.conflicts ?? 0) + 1
@@ -675,6 +683,29 @@ export class Runner {
       return
     }
     await this.#escalate(job, task, `it did not merge twice: ${step.conflict}`, "", "merge_conflict")
+  }
+
+  // omo-hybrid: the orchestrator's delegation goes into the job this runner works on, so the run loop sees it at its
+  // next turn; undefined when this runner does not work on that job (the caller then writes the job file).
+  addTask(jobId: string, d: Delegation): { task?: Task; errors?: string[] } | undefined {
+    const job = this.#job
+    if (!job || job.id !== jobId) return undefined
+    const r = addDelegated(job, d)
+    if (r.task) saveJob(this.#d.project, job)
+    return r
+  }
+
+  // A rolling job's task that waits for the user: the answer becomes a decision every later brief carries, and the
+  // task starts again from the job's newest commit.
+  static answer(job: Job, taskId: string, text: string): string | undefined {
+    const task = job.tasks.find((t) => t.id === taskId)
+    if (!task) return `no task ${taskId}`
+    if (task.status !== "blocked" && task.status !== "escalated") return `task ${taskId} is ${task.status}; it waits for nobody`
+    job.decisions.push({ id: `U${job.decisions.length + 1}`, text: `${taskId}: ${text}`, origin: "user" })
+    moveTask(task, "pending")
+    task.confirmed = true
+    task.attempts = 0
+    return undefined
   }
 
   // A run that ended in the middle of a task (the server stopped, a crash) leaves it running with half a change in
@@ -702,8 +733,15 @@ export class Runner {
     this.#say(`resuming: ${cut.map((t) => t.id).join(", ")} start again`)
   }
 
-  #stop(job: Job, reason: string): void {
+  // task: the stop concerns one task. In a rolling job that never stops the job: the task waits, and the orchestrator
+  // hears of it and asks the user.
+  #stop(job: Job, reason: string, task?: Task): void {
     job.lessons.push(reason)
+    if (job.rolling && task) {
+      this.#say(`${task.id} waits: ${reason}`)
+      this.#d.taskEnded?.(job, task)
+      return
+    }
     // A parallel task may stop a job another task already stopped; the job keeps the phase it returns to.
     if (job.phase !== "ask_user" && job.phase !== "paused") moveJob(job, "ask_user")
     this.#say(`stopped: ${reason}`)
@@ -716,14 +754,18 @@ export class Runner {
     if (profile.injection) {
       moveTask(task, "blocked")
       task.summary = "the task text looks like an attempt to make the agent ignore its rules"
-      return this.#stop(job, `${task.id}: ${task.summary}; check the plan before going on`)
+      return this.#stop(job, `${task.id}: ${task.summary}; check the plan before going on`, task)
     }
     const pipeline = choosePipeline(task, profile, this.#policies(job, task.id))
     task.pipeline = pipeline.id
     const askFirst = pipeline.modifiers.includes("user_confirm") || resolvePolicy("N5", this.#policies(job, task.id)).policy.kind === "ask"
     if (askFirst && task.confirmed !== true) {
       task.confirmed = false
-      return this.#stop(job, `confirm ${task.id} before it runs: ${profileText(profile)} · pipeline ${pipeline.id} (${pipeline.reason}). Run the job again to go on, or pin a change first ("${task.id} use <model>", "pipeline P2").`)
+      if (job.rolling) {
+        moveTask(task, "blocked")
+        task.summary = `waits for the user's go: ${profileText(profile)}`
+      }
+      return this.#stop(job, `confirm ${task.id} before it runs: ${profileText(profile)} · pipeline ${pipeline.id} (${pipeline.reason}). Run the job again to go on, or pin a change first ("${task.id} use <model>", "pipeline P2").`, task)
     }
     moveTask(task, "planned")
     let model = await this.#model(job, task.role, profile.difficulty, task.id, undefined, profile.vision)
@@ -778,7 +820,14 @@ export class Runner {
     if (task.worktree) return this.#say(`${task.id} passed${commit ? ` (${commit})` : ", nothing to commit"}; waiting for the merge train`)
     moveTask(task, "merged")
     this.#say(`${task.id} passed${commit ? ` (${commit})` : ", nothing to commit"}`, true)
-    await this.#discover(job, task)
+    await this.#ended(job, task)
+  }
+
+  // A merged task: in a rolling job the orchestrator gets its report and decides on its follow-ups; in a planned job
+  // N7 does (design.md §8).
+  async #ended(job: Job, task: Task): Promise<void> {
+    if (job.rolling) this.#d.taskEnded?.(job, task)
+    else await this.#discover(job, task)
   }
 
   // N7: what the worker found outside its task. Needed or in scope: a new task after this one, with the priority the
@@ -929,7 +978,7 @@ export class Runner {
       if (report.status === "BLOCKED" || report.status === "NEEDS_CONTEXT") {
         moveTask(task, "blocked")
         task.summary = report.open || report.text.slice(-500)
-        this.#stop(job, `${task.id} needs the user: ${task.summary}`)
+        this.#stop(job, `${task.id} needs the user: ${task.summary}`, task)
         return undefined
       }
       moveTask(task, "gating")
@@ -1064,9 +1113,12 @@ export class Runner {
     }
     const spec = () => one("spec", specModel.id, reviewPrompt(job, task, taskAcceptance(job, task), diff))
     const standards = () => one("standards", standardsModel.id, standardsPrompt(job, task, diff))
+    // omo-hybrid: the standards axis only for data or security risk, or when the config asks for it.
+    const both = riskAtLeast(task.profile?.risk ?? "internal", "data_security") || resolvePolicy("N6.standards", this.#policies(job, task.id)).level !== undefined
+    const none: Review = { checks: [], fixes: [], blocking: [], outside: [] }
     // A local device serves one model at a time, so local reviewers take turns (like P9 readers).
     const local = [specModel, standardsModel].every((m) => this.#d.registry.find((e) => e.id === m.id)?.location === "local")
-    const [a, b] = local ? [await spec(), await standards()] : await Promise.all([spec(), standards()])
+    const [a, b] = !both ? [await spec(), none] : local ? [await spec(), await standards()] : await Promise.all([spec(), standards()])
     const merged = mergeReviews(a, b)
     collectFollowUps(task, merged.outside)
     const advisory = merged.checks.filter((c) => !c.met && !merged.blocking.includes(c))
@@ -1178,7 +1230,9 @@ export class Runner {
   async #escalate(job: Job, task: Task, reason: string, details = "", hint: EscalationKind = "too_hard"): Promise<void> {
     let kind = hint
     let decision: string | undefined
-    if (hint !== "budget" && hint !== "refused") {
+    // N9 is opt-in ("N9": "auto"): the call site's reason type is good enough by default (omo-hybrid).
+    const n9 = resolvePolicy("N9", this.#policies(job, task.id))
+    if (hint !== "budget" && hint !== "refused" && n9.level !== undefined && n9.policy.kind === "auto") {
       const asked = await this.#decider.ask(
         "N9",
         { goal: job.goal, task: `${task.id} ${task.title}: ${task.description}`, acceptance: taskAcceptance(job, task).map((a) => a.text), reason, details: details.slice(-2000), stages: task.stages.slice(-6).map((s) => `${s.stage} ${s.result}${s.evidence ? `: ${s.evidence.slice(0, 200)}` : ""}`) },
@@ -1196,9 +1250,10 @@ export class Runner {
     if (kind === "too_hard") {
       job.lessons.push(`${task.id} given up as planned: ${reason}`)
       this.#say(`${task.id} given up as planned (${reason}); the job goes on and replans around it`, true)
+      if (job.rolling) this.#d.taskEnded?.(job, task)
       return
     }
-    this.#stop(job, `${task.id} (${kind.replace(/_/g, " ")}): ${reason}`)
+    this.#stop(job, `${task.id} (${kind.replace(/_/g, " ")}): ${reason}`, task)
   }
 
   async #verify(job: Job): Promise<void> {
@@ -1265,6 +1320,23 @@ function noteText(task: Task, report: string, results: readonly { command: strin
     ...(outside.length ? ["", `## Changed outside the declared files`, outside.join(", ")] : []),
     "",
   ].join("\n")
+}
+
+// What the orchestrator learns when a delegated task ends (omo-hybrid): status and why, the worker's report, the
+// checks, and its follow-ups with a hint when another task already covers their files.
+export function taskReport(job: Job, task: Task): string {
+  const open = new Set(job.tasks.filter((t) => t.id !== task.id && !isDone(t) && t.status !== "cancelled").flatMap((t) => t.files))
+  const gate = [...task.stages].reverse().find((s) => s.stage === "gate")
+  const follow = (task.followUps ?? []).map((f) => `  - ${f.what}${f.why ? ` (${f.why})` : ""}${f.files.length ? ` · files: ${f.files.join(", ")}` : ""}${f.files.length && f.files.every((x) => open.has(x)) ? " · another open task has these files" : ""}`)
+  const status = task.status === "merged" ? `merged into ${job.integrationBranch}` : task.status === "escalated" ? `given up (${task.escalation?.kind?.replace(/_/g, " ")}): ${task.escalation?.detail}` : task.status === "blocked" ? `waits for the user: ${task.summary}` : task.status
+  return [
+    `${task.id} ${task.title}: ${status}`,
+    task.model ? `  ${task.role} on ${task.model}, ${task.pipeline ?? "P1"}` : "",
+    gate ? `  checks: ${gate.evidence}` : "",
+    task.status === "merged" && task.summary ? `  report: ${task.summary.replace(/\s+/g, " ").slice(-400)}` : "",
+    follow.length ? `  follow-ups the worker found (yours to decide):\n${follow.join("\n")}` : "",
+    `  notes: .jev-dictator/notes/${job.id}/${task.id}.md`,
+  ].filter(Boolean).join("\n")
 }
 
 export function summary(job: Job): string {

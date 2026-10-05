@@ -349,3 +349,44 @@ export function applyReplan(job: Job, text: string): Parsed {
   errors.push(...checkGraph(acceptance, [...done, ...fresh]))
   return errors.length ? { errors } : { plan: { acceptance, tasks: fresh } }
 }
+
+// --- delegated tasks (omo-hybrid): the orchestrator adds one task at a time to its session's rolling job ---------
+
+export interface Delegation {
+  readonly title: string
+  readonly prompt: string
+  readonly files: readonly string[] // what the task may change; empty for a reader
+  readonly dependsOn: readonly string[]
+  readonly priority?: number
+  readonly checks: readonly string[] // shell commands that exit 0 when the task is done
+}
+
+// The task a delegation becomes: a code task when it names files, an explore task when not (N5 may pick another role
+// when it is dispatched); its checks are its acceptance point. Returns the errors instead when the graph would break.
+export function addDelegated(job: Job, d: Delegation): { task?: Task; errors?: string[] } {
+  const n = Math.max(0, ...job.tasks.map((t) => Number(t.id.match(/^T(\d+)$/)?.[1] ?? 0))) + 1
+  const point = `A${Math.max(0, ...job.acceptance.map((a) => Number(a.id.match(/^A(\d+)$/)?.[1] ?? 0))) + 1}`
+  const byId = new Map(job.tasks.map((t) => [t.id, t]))
+  const task: Task = {
+    id: `T${n}`,
+    title: d.title.slice(0, 120),
+    description: d.prompt,
+    role: d.files.length ? "code" : "explore",
+    acceptance: [point],
+    dependsOn: [...d.dependsOn],
+    files: [...d.files],
+    wave: Math.max(-1, ...d.dependsOn.map((id) => byId.get(id)?.wave ?? 0)) + 1,
+    status: "pending",
+    attempts: 0,
+    stages: [],
+    signatures: [],
+    priority: d.priority !== undefined && d.priority >= 1 && d.priority <= 5 ? Math.round(d.priority) : DEFAULT_PRIORITY,
+    origin: "delegated",
+  }
+  const acceptance = [...job.acceptance, { id: point, text: d.title, ...(d.checks.length ? { verify: d.checks.join(" && ") } : {}) }]
+  const errors = checkGraph(acceptance, [...job.tasks.map(asPlanned), asPlanned(task)])
+  if (errors.length) return { errors }
+  job.acceptance = acceptance
+  job.tasks.push(task)
+  return { task }
+}

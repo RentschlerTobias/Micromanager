@@ -100,7 +100,7 @@ export interface Stage {
 }
 
 // Where a task came from: the plan, an N4 split, a worker's follow-up (N7), or a replan.
-export type TaskOrigin = "plan" | "split" | "discovered" | "replan"
+export type TaskOrigin = "plan" | "split" | "discovered" | "replan" | "delegated"
 
 // Work a worker found outside its own task (its report's FOLLOWUP lines).
 export interface FollowUp {
@@ -173,6 +173,7 @@ export interface Job {
   counters: { turns: number; stalls: number; replans: number; tokens?: number; requests?: number; cost?: number }
   lessons: string[]
   later?: Later[] // follow-ups that did not become tasks
+  rolling?: boolean // a dictator session's job: the orchestrator delegates tasks into it while it runs (omo-hybrid)
   created: string
   updated: string
 }

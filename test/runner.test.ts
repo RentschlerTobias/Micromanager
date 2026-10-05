@@ -133,7 +133,7 @@ test("the decision model types an escalation; a vague spec stops the job for the
     ask: async (_s, questions) => ({ answers: "reason" in questions ? { reason: { type: "choice", choice: "spec_ambiguous", confidence: 0.9, probabilities: {} } } : {}, model: "fake", latencyMs: 1 }) as never,
   }
   const decider = new Decider({ ...DEFAULT_BACKENDS, default: "typesafe" }, { typesafe: asker }, () => {})
-  const r = runner(project, fake.api, { decider })
+  const r = runner(project, fake.api, { decider, policies: { global: { N9: "auto" } } }) // N9 is opt-in
   const done = await r.run((await r.plan("goal")).job.id)
   assert.equal(done.phase, "ask_user")
   assert.equal(done.tasks[0]!.escalation?.kind, "spec_ambiguous")
@@ -353,7 +353,7 @@ test("P2: a risky task gets a reviewer of another family; a blocking finding goe
   const worker = fake.created.find((c) => c.agent === "dictator-code")!
   const reviewers = fake.created.filter((c) => c.agent === "dictator-review")
   const fam = (m: unknown) => DEFAULT_REGISTRY.find((e) => e.id === `${(m as { providerID: string }).providerID}/${(m as { id: string }).id}`)!.family
-  assert.equal(reviewers.length, 4, "two axes, two rounds")
+  assert.equal(reviewers.length, 2, "the spec axis only (internal data), two rounds")
   assert.ok(reviewers.every((r) => fam(r.model) !== fam(worker.model)), "every reviewer is of another family")
   assert.match(readFileSync(join(done.integrationWorktree!, "add.js"), "utf8"), /\+a \+ \+b/)
 })
@@ -749,7 +749,7 @@ test("P2 with two axes: a confident standards finding goes back to the worker; t
       return writeFiles(dir, prompt)
     },
   })
-  const r = runner(project, fake.api, { decider: nodeDecider({ N5: { risk: choice("public_api"), has_test_oracle: noul(0.9) } }) })
+  const r = runner(project, fake.api, { decider: nodeDecider({ N5: { risk: choice("data_security"), has_test_oracle: noul(0.9) } }) })
   const done = await r.run((await r.plan("goal")).job.id)
   assert.equal(done.phase, "integrate", summary(done))
   const fix = prompts.find((p) => p.includes("Reviewers of another model family"))!
@@ -892,7 +892,7 @@ test("parallel: the decision model can hold a task back from a batch", async () 
   const { fake, most } = parallelFake((dir, task) => writeFileSync(join(dir, `${task === "T1" ? "a" : task === "T2" ? "b" : "c"}.js`), "x\n"))
   const asker: Asker = { ask: async (_s, q) => ({ answers: Object.fromEntries(Object.keys(q).filter((k) => k.startsWith("independent.")).map((k) => [k, { type: "noul", noul: 0.1 }])), model: "fake", latencyMs: 1 }) as never }
   const decider = new Decider({ ...DEFAULT_BACKENDS, default: "typesafe" }, { typesafe: asker }, () => {})
-  const r = runner(project, fake.api, { parallel: 3, decider })
+  const r = runner(project, fake.api, { parallel: 3, decider, policies: { global: { N10: "auto" } } }) // N10 is opt-in
   const done = await r.run((await r.plan("goal")).job.id)
   assert.equal(done.phase, "integrate", summary(done))
   assert.equal(most(), 1, "held back: one at a time")
@@ -933,4 +933,88 @@ test("a session whose model stops answering is stalled: interrupted, and the tas
   assert.equal(done.phase, "integrate", summary(done))
   assert.deepEqual(interrupted, ["ses_2"])
   assert.ok(done.tasks[0]!.stages.some((s) => /loop watchdog: no progress .* \(the model stopped answering\)/.test(s.evidence ?? "")))
+})
+
+// --- omo-hybrid: the rolling session job ------------------------------------------------------------------------
+
+import { addDelegated } from "../src/plan.ts"
+import { taskReport } from "../src/runner.ts"
+
+function rolling(project: string) {
+  const job = newJob("job-20261005-120000-abcd", "the delegated tasks of dictator session ses_dict")
+  for (const p of ["triage", "plan", "plan_gate", "execute"] as const) moveJob(job, p)
+  job.rolling = true
+  job.facilitator = "ses_dict"
+  saveJob(project, job)
+  return job
+}
+
+test("rolling: delegated tasks run, each reports to the orchestrator, and the job stays open", async () => {
+  const project = repo()
+  const job = rolling(project)
+  assert.ok(addDelegated(job, { title: "write add.js", prompt: "create it", files: ["add.js"], dependsOn: [], checks: ["test -f add.js"] }).task)
+  assert.ok(addDelegated(job, { title: "write notes", prompt: "notes", files: ["notes.md"], dependsOn: ["T1"], checks: ["grep -q ok notes.md"], priority: 2 }).task)
+  saveJob(project, job)
+  const ended: string[] = []
+  const fake = fakeSession({ worker: (dir, prompt) => writeFiles(dir, prompt.replace("task T2", "task T2").replace("write notes", "notes")) })
+  const r = runner(project, fake.api, { taskEnded: (_j: unknown, t: { id: string; status: string }) => ended.push(`${t.id}:${t.status}`) })
+  const done = await r.run(job.id)
+  assert.equal(done.phase, "execute", "a rolling job is never verified or wrapped by the runner")
+  assert.deepEqual(ended, ["T1:merged", "T2:merged"])
+  assert.match(taskReport(done, done.tasks[0]!), /T1 write add.js: merged into jev\/job-20261005-120000-abcd[\s\S]*checks: test -f add.js: exit 0/)
+  const log = execFileSync("git", ["-C", project, "log", "--format=%s", done.integrationBranch!]).toString()
+  assert.match(log, /T2: write notes\nT1: write add.js/)
+})
+
+test("rolling: a task delegated while the job runs is picked up by the same run", async () => {
+  const project = repo()
+  const job = rolling(project)
+  addDelegated(job, { title: "write add.js", prompt: "create it", files: ["add.js"], dependsOn: [], checks: [] })
+  saveJob(project, job)
+  let r: Runner
+  const fake = fakeSession({
+    worker: (dir, prompt) => {
+      if (prompt.includes("task T1 ")) r.addTask(job.id, { title: "write notes", prompt: "notes", files: ["notes.md"], dependsOn: [], checks: [] })
+      return writeFiles(dir, prompt)
+    },
+  })
+  r = runner(project, fake.api)
+  const done = await r.run(job.id)
+  assert.deepEqual(done.tasks.map((t) => `${t.id}:${t.status}:${t.origin}`), ["T1:merged:delegated", "T2:merged:delegated"])
+})
+
+test("rolling: a task that needs the user waits without stopping the others, and the answer starts it again", async () => {
+  const project = repo()
+  const job = rolling(project)
+  addDelegated(job, { title: "write add.js", prompt: "create it", files: ["add.js"], dependsOn: [], checks: [] })
+  addDelegated(job, { title: "write notes", prompt: "notes", files: ["notes.md"], dependsOn: [], checks: [] })
+  saveJob(project, job)
+  const prompts: string[] = []
+  let asked = false
+  const fake = fakeSession({
+    worker: (dir, prompt) => {
+      prompts.push(prompt)
+      if (prompt.includes("task T1 ") && !asked) { asked = true; return "STATUS: NEEDS_CONTEXT\nFILES: none\nOPEN: which number type?" }
+      return writeFiles(dir, prompt)
+    },
+  })
+  const ended: string[] = []
+  const done = await runner(project, fake.api, { taskEnded: (_j: unknown, t: { id: string; status: string }) => ended.push(`${t.id}:${t.status}`) }).run(job.id)
+  assert.equal(done.phase, "execute")
+  assert.deepEqual(done.tasks.map((t) => t.status), ["blocked", "merged"])
+  assert.deepEqual(ended, ["T1:blocked", "T2:merged"])
+  assert.match(taskReport(done, done.tasks[0]!), /waits for the user: which number type\?/)
+  assert.equal(Runner.answer(done, "T1", "plain numbers"), undefined)
+  saveJob(project, done)
+  const again = await runner(project, fake.api).run(job.id)
+  assert.deepEqual(again.tasks.map((t) => t.status), ["merged", "merged"])
+  assert.match(prompts.filter((p) => p.includes("task T1 ")).at(-1)!, /Decisions that apply: T1: plain numbers/)
+})
+
+test("a delegation is checked like a plan: unknown dependencies are refused", () => {
+  const job = newJob("job-x", "g")
+  const r = addDelegated(job, { title: "x", prompt: "p", files: ["a.js"], dependsOn: ["T9"], checks: [] })
+  assert.match(r.errors!.join(), /depends on unknown task T9/)
+  const reader = addDelegated(job, { title: "find the config loader", prompt: "p", files: [], dependsOn: [], checks: [] })
+  assert.equal(reader.task!.role, "explore")
 })

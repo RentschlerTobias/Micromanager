@@ -17,10 +17,16 @@ import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe } from "./registry.ts"
 import { DICTATOR, ROLES, type Rule } from "./roles.ts"
-import { recentFailure, Runner, summary, type SessionApi } from "./runner.ts"
+import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
+import { checkGuards } from "./gate.ts"
+import { jobId } from "./store.ts"
+import { moveJob, newJob, readyTasks, type Job } from "./state.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
+import { addDelegated } from "./plan.ts"
+import { readFileSync } from "node:fs"
+import { join } from "node:path"
 import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 import { Watchdog, type Signal } from "./watchdog.ts"
 
@@ -222,6 +228,10 @@ export default {
         execFile("notify-send", ["-a", "jev-dictator", title, body], (err) => { if (err) log("info", `no desktop notification: ${err.message}`) })
       },
     })
+    // omo-hybrid: the runner working on a job right now, so a delegation goes into its live job; and the sessions in
+    // ultrawork mode (the user said "ulw"/"ultrawork"), with how often their orchestrator was woken without delegating.
+    const live = new Map<string, Runner>()
+    const ultrawork = new Map<string, number>()
     const runner = (parentID?: string, job?: string, cancel?: Cancel) =>
       new Runner({
         session: ctx.session,
@@ -251,11 +261,37 @@ export default {
         stopped: (sessionID) => stops.get(sessionID),
         skills: SKILLS.filter((s) => s.asked && installed.has(s.name)),
         installedSkills: installed,
+        taskEnded: (j, t) => notifier.report(j.facilitator, taskReport(j, t), `${t.id} ${t.title}: ${t.status}`),
       })
     // The job queue: dictator_run queues, the scheduler runs in the background and the notifier reports the end.
     const scheduler = new Scheduler({
-      run: (id, cancel, note) => runner(loadJob(project, id)?.facilitator, id, cancel).run(id, note),
-      finished: (job, session) => void notifier.finished(session ?? job.facilitator, job.id, ending(job), summary(job)),
+      run: async (id, cancel, note) => {
+        const r = runner(loadJob(project, id)?.facilitator, id, cancel)
+        live.set(id, r)
+        try {
+          return await r.run(id, note)
+        } finally {
+          live.delete(id)
+        }
+      },
+      finished: (job, session) => {
+        const to = session ?? job.facilitator
+        if (!job.rolling || job.phase !== "execute") return void notifier.finished(to, job.id, ending(job), summary(job))
+        // A rolling job's run ends when nothing is left to start. A delegation that came in at that moment runs it again;
+        // otherwise the orchestrator hears that everything delegated has ended.
+        if (readyTasks(job).length) return void scheduler.enqueue(job.id, to)
+        if (!to) return
+        const wakes = ultrawork.get(to)
+        const waiting = job.tasks.filter((t) => t.status === "blocked" || t.status === "escalated").map((t) => t.id)
+        const closing = [
+          `All delegated tasks have ended${waiting.length ? `; ${waiting.join(", ")} wait for the user or were given up` : ""}. Branch ${job.integrationBranch}.`,
+          wakes !== undefined && wakes < 3
+            ? "Ultrawork is on: go on with your open todos now; delegate the next tasks instead of waiting, and ask the user only what only they can decide. When every todo is done, give the final summary."
+            : `If your todos are done, give the user the final summary: what changed, and how to merge (git merge ${job.integrationBranch}) or discard the branch. Otherwise delegate what is left.`,
+        ].join("\n")
+        if (wakes !== undefined) ultrawork.set(to, wakes + 1)
+        void notifier.flushReports(to, closing)
+      },
       failed: (id, session, err) => {
         log("error", `job ${id} failed: ${String(err)}`)
         void notifier.finished(session, id, "failed", `The run broke off: ${err instanceof Error ? err.message : String(err)}. dictator_run resumes it.`)
@@ -283,11 +319,78 @@ export default {
       if (rewriteResult(call.result, redact)) record({ kind: "redacted", sessionID: call.sessionID, tool: call.tool })
     })
     // The dictator's newest job in a session, for the user's turns (planning session, gate answer, pins).
-    const sessionJob = (sessionID: string) => listJobs(project).find((j) => j.facilitator === sessionID)
+    // The newest planned job of a session, for the planning session's turns; a rolling job takes no planning answers.
+    const sessionJob = (sessionID: string) => listJobs(project).find((j) => j.facilitator === sessionID && !j.rolling)
+    // The session's rolling job (omo-hybrid), made at its first delegation; it runs on its own branch until stopped.
+    const rollingJob = (sessionID: string): Job => {
+      const found = listJobs(project).find((j) => j.facilitator === sessionID && j.rolling && !["done", "stopped", "failed"].includes(j.phase))
+      if (found) return found
+      const job = newJob(jobId(), `the delegated tasks of dictator session ${sessionID}`)
+      for (const p of ["triage", "plan", "plan_gate", "execute"] as const) moveJob(job, p)
+      job.rolling = true
+      job.facilitator = sessionID
+      saveJob(project, job)
+      return job
+    }
+    const words = (text: string) => text.split(/[,\s]+/).map((w) => w.trim()).filter(Boolean)
     const JOB_ID = /^job-\d{8}-\d{6}-[0-9a-f]{1,4}$/
     await ctx.tool.transform((draft) => {
       try {
         installTools(draft, {
+          task: async (input, tctx) => {
+            if (!tctx.sessionID) return "dictator_task needs a session."
+            if (!input.title.trim() || !input.prompt.trim()) return "dictator_task needs a title and a prompt."
+            // The delegation is text a model wrote from the user's words: the local guards look at it first.
+            const guard = await checkGuards(decider, `${input.title}. ${input.prompt}`)
+            if (guard.flagged.some((g) => g === "injection" || g === "harmful")) {
+              return `The local check flagged this task (${guard.flagged.join(", ")}). Ask the user whether it should run before you delegate it again.`
+            }
+            const job = rollingJob(tctx.sessionID)
+            if (guard.flagged.includes("sensitive") && !job.flags?.localOnly) job.flags = { ...job.flags, localOnly: true }
+            const d = {
+              title: input.title.trim(),
+              prompt: input.prompt.trim(),
+              files: words(input.files),
+              dependsOn: words(input.depends),
+              priority: Number(input.priority) || undefined,
+              checks: input.checks.split(/\n|;;/).map((c) => c.trim()).filter(Boolean),
+            }
+            const r = live.get(job.id)?.addTask(job.id, d) ?? (() => {
+              const added = addDelegated(job, d)
+              if (added.task) saveJob(project, job)
+              return added
+            })()
+            if (!r.task) return `Not delegated: ${r.errors!.join("; ")}`
+            ultrawork.has(tctx.sessionID) && ultrawork.set(tctx.sessionID, 0)
+            scheduler.enqueue(job.id, tctx.sessionID)
+            return `${r.task.id} delegated${r.task.dependsOn.length ? `, after ${r.task.dependsOn.join(", ")}` : ""} (job ${job.id}, branch jev/${job.id}). You get its report when it ends; go on with other work.`
+          },
+          tasks: async (id, tctx) => {
+            const job = tctx.sessionID ? listJobs(project).find((j) => j.facilitator === tctx.sessionID && j.rolling) : undefined
+            if (!job) return "No task delegated in this session yet."
+            const task = id.trim() ? job.tasks.find((t) => t.id === id.trim()) : undefined
+            if (id.trim() && !task) return `no task ${id.trim()}`
+            if (task) {
+              let note = ""
+              try {
+                note = readFileSync(join(project, ".jev-dictator", "notes", job.id, `${task.id}.md`), "utf8")
+              } catch {
+                // no note yet
+              }
+              return `${taskReport(job, task)}${note ? `\n\n${note.slice(-3000)}` : ""}`
+            }
+            return [`job ${job.id} on branch ${job.integrationBranch ?? `jev/${job.id}`}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}`)].join("\n")
+          },
+          answer: async (taskId, text, tctx) => {
+            const job = tctx.sessionID ? listJobs(project).find((j) => j.facilitator === tctx.sessionID && j.rolling) : undefined
+            if (!job) return "No task delegated in this session yet."
+            if (live.has(job.id)) return "The tasks are still running; answer again once the others have reported."
+            const err = Runner.answer(job, taskId.trim(), text.trim())
+            if (err) return err
+            saveJob(project, job)
+            scheduler.enqueue(job.id, tctx.sessionID)
+            return `${taskId.trim()} starts again with the user's answer.`
+          },
           plan: async (goal, tctx) => {
             const text = goal.trim()
             if (!text) return "dictator_plan needs the goal in the user's words, or a job id to continue."
@@ -346,6 +449,8 @@ export default {
       const text = String(input.prompt?.text ?? "")
       if (!sessionID || !text) return
       steering.delete(sessionID)
+      if (/\b(ulw|ultrawork)\b/i.test(text)) ultrawork.set(sessionID, 0)
+      else if (/^\s*stop\b/i.test(text)) ultrawork.delete(sessionID)
       const job = sessionJob(sessionID)
       if (!job) return
       try {
