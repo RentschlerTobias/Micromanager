@@ -21,6 +21,7 @@ import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
 import { Compactor } from "./compact.ts"
+import { board } from "./board.ts"
 import { jobId } from "./store.ts"
 import { moveJob, newJob, readyTasks, type Job } from "./state.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
@@ -488,7 +489,8 @@ export default {
             const job = id.trim() ? loadJob(project, id.trim()) : listJobs(project)[0]
             const q = scheduler.snapshot()
             const queue = `queue: ${q.running ? `running ${q.running}` : "nothing running"}${q.queued.length ? `; waiting: ${q.queued.join(", ")}` : ""}`
-            return job ? `${queue}\n\n${summary(job)}\n\n${planText(job)}` : `${queue}\nno job yet`
+            // The board first: what runs, waits and is done, at a glance (show it to the user as it is).
+            return job ? `${queue}\n\n${board(job)}\n\n${job.rolling ? "" : planText(job)}`.trim() : `${queue}\nno job yet`
           },
           stop: async (id) => {
             const r = scheduler.stop(id.trim() || undefined)

@@ -99,7 +99,7 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dict
   draft.add({
     id: "dictator_status",
     name: "dictator_status",
-    description: "Show the queue (running and waiting jobs) and a job's state: phase, tasks with status and priority, branch, and what was found but not done. An empty job id shows the newest job.",
+    description: "Show the queue and an ASCII board of a job: each task with its state, role, model and what it does now, the usage, and what was found but not done. Show the board to the user in a code block as it is. An empty job id shows the newest job.",
     input: input("job"),
     execute: guarded(([job], ctx) => handlers.status(job!, ctx), "job"),
   })

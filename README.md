@@ -51,6 +51,16 @@ Jev and the plugin securing every task:
 
 Jobs and task notes live in `.jev-dictator/`, kept out of git through `.git/info/exclude`.
 
+**Overview.** `dictator_status` shows an ASCII board of the job: each task with its state, role, model and what it does
+or waits for, plus tokens, requests and cost. In a terminal, in the project:
+
+```bash
+node ~/Fun/Projects/Repos/jev-dictator/src/cli.ts status --watch   # redraws every 2 s; --all for every job
+```
+
+**Memory.** Workers report what they learned about the project (`LEARNED:`); Jev keeps the lasting, new facts in
+`.opencode/memory/jev-project.md` (opencode-agent-memory's format) and picks the ones that help each task's brief.
+
 Models come from a registry of the OpenCode Go models and your local ones (llama-swap, iGPU, NPU), local
 first when they can do the task (`src/registry.ts`). Permission requests go to Jev first and to you when Jev is
 not sure (`src/decide.ts`). Some phases of the design are still to come: see docs/plan.md.
