@@ -78,7 +78,7 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dict
   draft.add({
     id: "dictator_plan",
     name: "dictator_plan",
-    description: "For a large or unclear job only (most work goes through dictator_task): a planner reads the project and writes a full plan with acceptance points, which the user approves before dictator_run. With the user's goal: checks it and plans it, or opens a planning session when the user asked to plan it together. With a job id as goal: continues that job. Changes nothing.",
+    description: "For a large or unclear job only (most work goes through dictator_task): a planner reads the project and writes a full plan with acceptance points, which the user approves before dictator_run. With the user's goal: checks it and plans it, or opens a planning session when the user asked to plan it together. With a job id as goal: continues that job. When a plan waits for the user's go and they want changes, call it with their change request as goal: the planner writes the plan again with it. Changes nothing.",
     input: input("goal"),
     execute: guarded(([goal], ctx) => handlers.plan(goal!, ctx), "goal"),
   })

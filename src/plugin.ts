@@ -415,7 +415,7 @@ export default {
             if (failed) return failed
             const fresh = text.replace(/^retry:\s*/i, "")
             const out = JOB_ID.test(text) ? await runner(tctx.sessionID).continueJob(text)
-              : planning ? await runner(tctx.sessionID).continueJob(active.id)
+              : planning ? await runner(tctx.sessionID).continueJob(active.id, active.phase === "plan_gate" ? text : undefined)
               : await runner(tctx.sessionID).start(fresh, tctx.sessionID)
             if (out.job.facilitator === undefined && tctx.sessionID) {
               out.job.facilitator = tctx.sessionID

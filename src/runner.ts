@@ -260,7 +260,17 @@ export class Runner {
   }
 
   // A job from triage or a confirmed checkpoint to a validated plan at the plan gate.
+  // In cloud-only mode a job is local-only only by the user's choice. A local-only flag that came from the "nothing
+  // local could check it" default (the GLiNER server was down) is dropped.
+  #cloudFlags(job: Job): void {
+    if (this.#d.cloudOnly && job.flags?.localOnly && job.flags.gate && !job.flags.gate.checked) {
+      job.flags = { ...job.flags, localOnly: false }
+      job.lessons.push("cloud only: the local-only default of an unchecked goal was dropped")
+    }
+  }
+
   async planJob(job: Job): Promise<{ job: Job; errors?: string[] }> {
+    this.#cloudFlags(job)
     if (job.phase !== "plan") moveJob(job, "plan")
     saveJob(this.#d.project, job)
     const model = await this.#model(job, "plan", 0.7)
@@ -349,9 +359,17 @@ export class Runner {
   }
 
   // dictator_plan with a job id: go on from wherever the job stands.
-  async continueJob(id: string): Promise<Outcome> {
+  // feedback: what the user wants changed in a plan at the plan gate. It becomes a decision, and the planner writes
+  // the plan again (live test: the dictator asked eight times for a fuller plan and always got the old one back).
+  async continueJob(id: string, feedback?: string): Promise<Outcome> {
     const job = loadJob(this.#d.project, id)
     if (!job) return { kind: "failed", job: newJob(id, ""), text: `no job ${id}` }
+    if (job.phase === "plan_gate" && feedback?.trim()) {
+      job.decisions.push({ id: `F${job.decisions.length + 1}`, text: `plan feedback: ${feedback.trim()}`, origin: "user" })
+      moveJob(job, "plan")
+      saveJob(this.#d.project, job)
+      return this.#planned(await this.planJob(job))
+    }
     if (job.phase === "triage") return this.#triage(job)
     if (job.phase === "plan") return this.#planned(await this.planJob(job))
     if (job.phase === "planning_session" && job.designTree) {
@@ -523,6 +541,7 @@ export class Runner {
     if (note?.trim()) job.decisions.push({ id: `U${job.decisions.length + 1}`, text: note.trim(), origin: "user" })
     if (job.phase !== "execute") throw new Error(`job ${id} is in phase ${job.phase}, not ready to run`)
     this.#job = job
+    this.#cloudFlags(job)
     // Never quietly to the cloud: a job that must stay on this machine waits while local models are switched off.
     if (this.#d.cloudOnly && job.flags?.localOnly) {
       this.#stop(job, "this job must stay on this machine, but local models are switched off (cloudOnly); the user can let it go to the cloud, or switch local models on")
@@ -1292,11 +1311,13 @@ export class Runner {
 }
 
 export function plannerPrompt(job: Job): string {
-  const decided = job.designTree ? decisionsText(job.designTree) : job.decisions.map((d) => d.text)
+  // The planning session's decisions and anything else decided with the user (plan feedback included).
+  const decided = [...(job.designTree ? decisionsText(job.designTree) : []), ...job.decisions.map((d) => d.text)]
   return `${HEADER} planning job ${job.id}
 
 The user's job: ${job.goal}
-${decided.length ? `\nDecided with the user (follow these; for assumed points, decide and say what you chose):\n- ${decided.join("\n- ")}\n` : ""}
+${decided.length ? `\nDecided with the user (follow these; for assumed points, decide and say what you chose). Every decision must show up in
+the plan's tasks and acceptance points; a large job gets as many tasks as it needs:\n- ${decided.join("\n- ")}\n` : ""}
 Read as much of the project as you need (read, glob, grep); change nothing.
 Verify commands run from the project root in a fresh checkout of the current commit; use only commands that
 work there, such as the project's own test script.

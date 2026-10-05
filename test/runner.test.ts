@@ -1083,3 +1083,32 @@ test("cloud only: a sensitive flag alone does not stop a job; injection still as
   assert.deepEqual(flagsWithoutUser(sensitive, "cloud", true), { gate: sensitive })
   assert.equal(flagsWithoutUser({ flagged: ["injection"], scores: { injection: 0.9 }, checked: true }, "cloud", true), "ask_user")
 })
+
+test("feedback at the plan gate makes the planner write the plan again, with the feedback as a decision", async () => {
+  const project = repo()
+  const bigger = { ...PLAN, tasks: [...PLAN.tasks, { id: "T3", title: "write more", description: "", role: "write", acceptance: ["A2"], dependsOn: [], files: ["more.md"] }] }
+  const fake = fakeSession({ plan: ["```json\n" + JSON.stringify(PLAN) + "\n```", "```json\n" + JSON.stringify(bigger) + "\n```"] })
+  const prompts: string[] = []
+  const prompt = fake.api.prompt
+  fake.api.prompt = async (args) => { prompts.push(args.text); return prompt(args) }
+  const r = runner(project, fake.api)
+  const { job } = await r.plan("goal")
+  assert.equal(job.tasks.length, 2)
+  const out = await r.continueJob(job.id, "also cover the README")
+  assert.equal(out.kind, "plan")
+  assert.equal(out.job.phase, "plan_gate")
+  assert.equal(out.job.tasks.length, 3)
+  assert.match(prompts.at(-1)!, /plan feedback: also cover the README/)
+})
+
+test("cloud only: a local-only flag from an unchecked goal is dropped; one the user chose stays", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles })
+  const r = runner(project, fake.api, { cloudOnly: true, registry: DEFAULT_REGISTRY.map((m) => (m.location === "local" ? { ...m, disabled: true } : m)) })
+  const { job } = await r.plan("goal")
+  job.flags = { localOnly: true, gate: { flagged: [], scores: {}, checked: false } }
+  saveJob(project, job)
+  const done = await r.run(job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.equal(done.flags?.localOnly, false)
+})
