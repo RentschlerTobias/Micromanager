@@ -10,9 +10,10 @@ import { Decider, RulesBackend } from "./backends.ts"
 import { createHash } from "node:crypto"
 
 import {
-  ANSWER, batchQuestions, CHOICE_FLOOR, complexityOf, ESCALATE, ESCALATION, followUpQuestions, NOUL_FLOOR, nextQuestionChoice, PROGRESS, splitQuestions, TRIAGE,
+  ANSWER, batchQuestions, CHOICE_FLOOR, complexityOf, ESCALATE, ESCALATION, NOUL_FLOOR, nextQuestionChoice, PROGRESS, splitQuestions, TRIAGE,
   type EscalationKind,
 } from "./catalog.ts"
+import { n7Questions, n7State, triage, type N7Context, type Verdict } from "./followups.ts"
 import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, injected, injectionScore, type Unchecked } from "./gate.ts"
 import { brief, fixPrompt, handoffText, lastAssistantText, parseReport, refused, skillLine, taskAcceptance, usage } from "./brief.ts"
 import {
@@ -787,61 +788,49 @@ export class Runner {
     const items = task.followUps ?? []
     if (items.length === 0) return
     const policy = resolvePolicy("N7", this.#policies(job, task.id)).policy
-    const asked = policy.kind === "rule" || policy.kind === "fixed" ? undefined : await this.#decider.ask(
-      "N7",
-      {
-        goal: job.goal,
-        acceptance: job.acceptance.map((a) => a.text),
-        task: `${task.id} ${task.title}`,
-        otherTasks: job.tasks.filter((t) => t.id !== task.id && t.status !== "cancelled").map((t) => `${t.id} ${t.title} (files: ${t.files.join(", ") || "none"})`),
-        followUps: items,
-      },
-      followUpQuestions(items),
-      { localOnly: job.flags?.localOnly, job: job.id, task: task.id },
-    )
-    const a = asked?.decision.answers ?? {}
-    const noul = (q: string) => (a[q]?.type === "noul" ? (a[q] as { noul: number }).noul : undefined)
-    // Without a model: a follow-up only on files of tasks still open is already planned (live test: workers reported
-    // the job's next tasks as follow-ups); one on files of done tasks is in scope; anything else is not.
-    const open = new Set(job.tasks.filter((t) => t.id !== task.id && !isDone(t) && t.status !== "cancelled").flatMap((t) => t.files))
-    const doneFiles = new Set(job.tasks.filter((t) => isDone(t) || t.id === task.id).flatMap((t) => t.files))
+    const live = job.tasks.filter((t) => t.id !== task.id && t.status !== "cancelled")
+    const ctx: N7Context = {
+      goal: job.goal,
+      acceptance: job.acceptance.map((a) => a.text),
+      task: `${task.id} ${task.title}`,
+      otherTasks: live.map((t) => `${t.id} ${t.title} (files: ${t.files.join(", ") || "none"})`),
+      openFiles: new Set(live.filter((t) => !isDone(t)).flatMap((t) => t.files)),
+      doneFiles: new Set(job.tasks.filter((t) => isDone(t) || t.id === task.id).flatMap((t) => t.files)),
+    }
+    const asked = policy.kind === "rule" || policy.kind === "fixed" ? undefined
+      : await this.#decider.ask("N7", n7State(ctx, items), n7Questions(items), { localOnly: job.flags?.localOnly, job: job.id, task: task.id })
+    // "N7": "fixed:yes" takes every follow-up as a task, "fixed:no" none.
+    const verdicts: Verdict[] = policy.kind === "fixed"
+      ? items.map((f) => (policy.value === "no" ? { kind: "later", reason: "out_of_scope" } : f.files.length ? { kind: "task", priority: 3 } : { kind: "later", reason: "no_files" }))
+      : triage(asked?.decision.answers ?? {}, items, ctx)
     for (const [i, item] of items.entries()) {
-      const needed = noul(`needed.${i}`)
-      const inScope = noul(`in_scope.${i}`)
-      const plannedP = noul(`planned.${i}`)
-      const alreadyPlanned = plannedP !== undefined ? plannedP >= NOUL_FLOOR : item.files.length > 0 && item.files.every((f) => open.has(f))
-      if (alreadyPlanned && policy.kind !== "fixed") {
+      const v = verdicts[i]!
+      if (v.kind === "planned") {
         this.#journal({ kind: "discovered", job: job.id, from: task.id, what: item.what, dropped: "already planned", decision: asked?.id })
         continue
       }
-      const take = policy.kind === "fixed" ? policy.value !== "no"
-        : needed !== undefined || inScope !== undefined ? Math.max(needed ?? 0, inScope ?? 0) >= NOUL_FLOOR
-        : item.files.length > 0 && item.files.every((f) => doneFiles.has(f))
-      let reason: Later["reason"] | undefined
+      let reason: Later["reason"] | undefined = v.kind === "later" ? v.reason : undefined
       // A follow-up is text a model wrote, so it passes the local guards like a goal before it can become a task.
-      const guard = take ? await checkGuards(this.#decider, `${item.what}. ${item.why}`, job.id, task.id) : undefined
-      if (guard?.flagged.includes("sensitive") && !job.flags?.localOnly) {
-        job.flags = { ...job.flags, localOnly: true }
-        this.#say(`a follow-up of ${task.id} looks sensitive: the rest of the job stays on this machine`)
+      if (v.kind === "task") {
+        const guard = await checkGuards(this.#decider, `${item.what}. ${item.why}`, job.id, task.id)
+        if (guard.flagged.includes("sensitive") && !job.flags?.localOnly) {
+          job.flags = { ...job.flags, localOnly: true }
+          this.#say(`a follow-up of ${task.id} looks sensitive: the rest of the job stays on this machine`)
+        }
+        if (guard.flagged.some((g) => g === "injection" || g === "harmful")) reason = "flagged"
+        else if (job.tasks.filter((t) => t.origin === "discovered").length >= discoveredCap(job)) reason = "cap"
       }
-      if (guard?.flagged.some((g) => g === "injection" || g === "harmful")) reason = "flagged"
-      else if ((noul(`user.${i}`) ?? 0) >= NOUL_FLOOR) reason = "user_should_decide"
-      else if (!take) reason = "out_of_scope"
-      else if (item.files.length === 0) reason = "no_files"
-      else if (job.tasks.filter((t) => t.origin === "discovered").length >= discoveredCap(job)) reason = "cap"
-      if (!reason) {
-        const p = a[`priority.${i}`]
-        const priority = p?.type === "choice" && p.confidence >= CHOICE_FLOOR ? ({ high: 1, normal: 3, low: 5 } as Record<string, number>)[p.choice] ?? 3 : 3
-        const added = addDiscovered(job, task, item, priority)
+      if (v.kind === "task" && !reason) {
+        const added = addDiscovered(job, task, item, v.priority)
         if (added.task) {
-          this.#journal({ kind: "discovered", job: job.id, task: added.task.id, from: task.id, what: item.what, priority, decision: asked?.id })
-          this.#say(`${added.task.id} added (found by ${task.id}, priority ${priority}): ${item.what}`, true)
+          this.#journal({ kind: "discovered", job: job.id, task: added.task.id, from: task.id, what: item.what, priority: v.priority, decision: asked?.id })
+          this.#say(`${added.task.id} added (found by ${task.id}, priority ${v.priority}): ${item.what}`, true)
           continue
         }
         job.lessons.push(`follow-up of ${task.id} not added: ${added.errors!.slice(0, 2).join("; ")}`)
         reason = "invalid"
       }
-      job.later = [...(job.later ?? []), { ...item, from: task.id, reason }]
+      job.later = [...(job.later ?? []), { ...item, from: task.id, reason: reason! }]
     }
     task.followUps = []
     saveJob(this.#d.project, job)

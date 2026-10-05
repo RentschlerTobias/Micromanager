@@ -1,11 +1,13 @@
 // Command line: npm run eval -- [--floor 0.8] [--backend typesafe] [--journal path]
 //               npm run export-dataset -- [--target openjev|gliner] [--out file] [--journal path]
 //               npm run bench-guards -- [--cases bench/guard_cases.json] [--url http://127.0.0.1:8781/v1/systemone] [--repeat]
+//               npm run bench-n7 -- [--cases bench/followup_cases.json]
 
 import { writeFileSync } from "node:fs"
 
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
-import { drift, formatDrift, formatSweep, loadCases, scoreCases, sweep } from "./bench.ts"
+import { drift, formatDrift, formatN7, formatSweep, loadCases, loadN7, scoreCases, scoreN7, sweep } from "./bench.ts"
+import { apiKey } from "./jev.ts"
 import { glinerRows, openJevRows } from "./dataset.ts"
 import { evaluate, formatReport } from "./eval.ts"
 import { journalPath, readJournal } from "./journal.ts"
@@ -24,6 +26,12 @@ export async function main(argv: readonly string[]): Promise<number> {
     const rows = await scoreCases(decider, cases)
     console.log(formatSweep(sweep(rows)))
     if (args.includes("--repeat")) console.log(`\nrepeat run:\n${formatDrift(drift(rows, await scoreCases(decider, cases)))}`)
+    return 0
+  }
+  if (command === "bench-n7") {
+    // N7 runs on cloud Jev by default; the journal is not written, so bench runs never become training rows.
+    const decider = new Decider(DEFAULT_BACKENDS, makeAskers(DEFAULT_BACKENDS, apiKey()), () => {})
+    console.log(formatN7(await scoreN7(decider, loadN7(flag(args, "cases") ?? "bench/followup_cases.json"))))
     return 0
   }
   const entries = readJournal(flag(args, "journal") ?? journalPath())
@@ -46,7 +54,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     console.error(`${rows.length} ${targetName} rows${out ? ` -> ${out}` : ""}`)
     return 0
   }
-  console.error("usage: cli.ts eval|export-dataset|bench-guards [options]")
+  console.error("usage: cli.ts eval|export-dataset|bench-guards|bench-n7 [options]")
   return 2
 }
 

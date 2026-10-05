@@ -594,7 +594,7 @@ test("the decision model's N7 answers set the priority, and the user's call goes
   const answers: Record<string, unknown> = {
     "needed.0": { type: "noul", noul: 0.9 }, "in_scope.0": { type: "noul", noul: 0.8 }, "user.0": { type: "noul", noul: 0.1 },
     "priority.0": { type: "choice", choice: "high", confidence: 0.9, probabilities: {} },
-    "needed.1": { type: "noul", noul: 0.2 }, "in_scope.1": { type: "noul", noul: 0.7 }, "user.1": { type: "noul", noul: 0.8 },
+    "needed.1": { type: "noul", noul: 0.2 }, "in_scope.1": { type: "noul", noul: 0.3 }, "user.1": { type: "noul", noul: 0.8 },
   }
   const asker: Asker = { ask: async (_s, questions) => ({ answers: Object.fromEntries(Object.keys(questions).filter((q) => q in answers).map((q) => [q, answers[q]])) as never, model: "fake", latencyMs: 1 }) }
   const decider = new Decider({ ...DEFAULT_BACKENDS, default: "typesafe" }, { typesafe: asker }, () => {})

@@ -1,0 +1,45 @@
+{
+  "about": "Cases for N7, a worker's follow-ups (design.md §8). Each case is one follow-up reported by the finder task in a job; expect is what should happen: task (a new task), planned (another task already covers it), user (only the user can decide), later (out of scope). priority is the expected urgency of a task, where one stands out. npm run bench-n7 scores the decision model and the file rule on them.",
+  "jobs": {
+    "blog": {
+      "goal": "Add a slugify(title) function in src/slug.js that turns a blog title into a URL slug: lowercase, words joined by single dashes, punctuation dropped, German umlauts transliterated. Add tests in test/slug.test.js and list the function in the README.",
+      "acceptance": ["src/slug.js exports slugify(title)", "slugify passes the behaviour checks, umlauts included", "test/slug.test.js exists and npm test passes", "README.md lists slugify"],
+      "tasks": [
+        { "id": "T1", "title": "Implement slugify in src/slug.js", "files": ["src/slug.js"], "done": true },
+        { "id": "T2", "title": "Add tests for slugify", "files": ["test/slug.test.js"], "done": false },
+        { "id": "T3", "title": "Document slugify in README", "files": ["README.md"], "done": false }
+      ]
+    },
+    "helpers": {
+      "goal": "Add readingTime(text) in src/reading.js and excerpt(text, n) in src/excerpt.js, each with tests. Both must handle empty text and German text.",
+      "acceptance": ["readingTime returns minutes at 200 wpm, at least 1", "excerpt returns the first n words with an ellipsis when cut", "npm test passes"],
+      "tasks": [
+        { "id": "T1", "title": "Implement readingTime with tests", "files": ["src/reading.js", "test/reading.test.js"], "done": true },
+        { "id": "T2", "title": "Implement excerpt with tests", "files": ["src/excerpt.js", "test/excerpt.test.js"], "done": false },
+        { "id": "T3", "title": "Verify the full test suite", "files": [], "done": false }
+      ]
+    }
+  },
+  "cases": [
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Write tests for slugify in test/slug.test.js", "why": "the job asks for tests", "files": ["test/slug.test.js"] }, "expect": "planned" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "List slugify in the README functions section", "why": "required by the job", "files": ["README.md"] }, "expect": "planned" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Export slugify from src/index.js as well", "why": "the other helpers are exported there and callers import from index", "files": ["src/index.js"] }, "expect": "task" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Transliterate French and Spanish accents too (é, ñ)", "why": "titles may contain them", "files": ["src/slug.js"] }, "expect": "user" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Rename titleCase to toTitleCase across the project", "why": "naming is inconsistent", "files": ["src/title.js", "test/title.test.js"] }, "expect": "later" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "titleCase crashes on an empty string (w[0] is undefined); slugify calls it", "why": "slugify('') throws", "files": ["src/title.js"] }, "expect": "task", "priority": "high" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Set up a CI workflow that runs npm test on every push", "why": "nothing runs the tests automatically", "files": [".github/workflows/test.yml"] }, "expect": "later" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Use slugify in the blog generator for post URLs", "why": "the generator still builds URLs by hand", "files": ["src/generate.js"] }, "expect": "user" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Add a package.json exports field for src/slug.js", "why": "consumers import by path", "files": ["package.json"] }, "expect": "later" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Collapse repeated dashes that come from dropped punctuation in slugify", "why": "'C++ Tips' gives 'c--tips', but the checks want 'c-tips'", "files": ["src/slug.js"] }, "expect": "task", "priority": "high" },
+    { "job": "blog", "finder": "T2", "followUp": { "what": "Implement slugify in src/slug.js", "why": "the tests need it", "files": ["src/slug.js"] }, "expect": "planned" },
+    { "job": "blog", "finder": "T3", "followUp": { "what": "Document titleCase's behaviour with acronyms in the README", "why": "the README is vague there", "files": ["README.md"] }, "expect": "later" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Switch the project to TypeScript", "why": "types would catch bugs", "files": ["tsconfig.json", "package.json"] }, "expect": "user" },
+    { "job": "blog", "finder": "T1", "followUp": { "what": "Add a node engines field so npm test uses node 22 with --test support", "why": "node --test fails on the old node the checks run with", "files": ["package.json"] }, "expect": "task", "priority": "high" },
+    { "job": "helpers", "finder": "T1", "followUp": { "what": "Implement excerpt(text, n) in src/excerpt.js with tests", "why": "part of the job", "files": ["src/excerpt.js", "test/excerpt.test.js"] }, "expect": "planned" },
+    { "job": "helpers", "finder": "T1", "followUp": { "what": "Run the full test suite", "why": "to check everything together", "files": [] }, "expect": "planned" },
+    { "job": "helpers", "finder": "T1", "followUp": { "what": "Share the word splitting of readingTime and excerpt in src/words.js", "why": "both split words the same way; excerpt is not written yet", "files": ["src/words.js", "src/reading.js"] }, "expect": "user" },
+    { "job": "helpers", "finder": "T1", "followUp": { "what": "readingTime counts hyphenated words as two; make it one", "why": "'E-Mail-Adresse' counts as three words", "files": ["src/reading.js", "test/reading.test.js"] }, "expect": "task", "priority": "normal" },
+    { "job": "helpers", "finder": "T1", "followUp": { "what": "Add a reading time badge to the blog templates", "why": "readers like it", "files": ["templates/post.html"] }, "expect": "later" },
+    { "job": "helpers", "finder": "T1", "followUp": { "what": "List readingTime and excerpt in the README", "why": "other helpers are listed there", "files": ["README.md"] }, "expect": "user" }
+  ]
+}

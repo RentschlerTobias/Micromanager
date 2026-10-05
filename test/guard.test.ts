@@ -60,3 +60,23 @@ test("drift reports the largest change and the floor flips between two bench run
   assert.deepEqual(rows.find((r) => r.guard === "injection"), { guard: "injection", maxDelta: 0.59 - 2e-8, flips: 1 })
   assert.equal(rows.find((r) => r.guard === "harmful")!.flips, 0)
 })
+
+test("N7 triage: planned first, then needed or in scope, the user's call only for what is not taken", async () => {
+  const { triage } = await import("../src/followups.ts")
+  const ctx = { goal: "", acceptance: [], task: "T1", otherTasks: [], openFiles: new Set(["README.md"]), doneFiles: new Set(["src/a.js"]) }
+  const n = (x: number) => ({ type: "noul" as const, noul: x })
+  const items = [
+    { what: "a", why: "", files: ["src/a.js"] },
+    { what: "b", why: "", files: ["x.js"] },
+    { what: "c", why: "", files: ["y.js"] },
+    { what: "d", why: "", files: ["README.md"] },
+  ]
+  const answers = {
+    "planned.0": n(0.1), "needed.0": n(0.62), "user.0": n(0.7), // needed beats the user's call
+    "planned.1": n(0.1), "needed.1": n(0.1), "in_scope.1": n(0.2), "user.1": n(0.8),
+    "planned.2": n(0.1), "needed.2": n(0.1), "in_scope.2": n(0.1), "user.2": n(0.2),
+    "planned.3": n(0.9),
+  }
+  assert.deepEqual(triage(answers, items, ctx).map((v) => v.kind === "later" ? v.reason : v.kind), ["task", "user_should_decide", "out_of_scope", "planned"])
+  assert.deepEqual(triage({}, items, ctx).map((v) => v.kind === "later" ? v.reason : v.kind), ["task", "out_of_scope", "out_of_scope", "planned"], "the file rule without a model")
+})

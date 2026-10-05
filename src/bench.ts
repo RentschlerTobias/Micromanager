@@ -5,6 +5,8 @@ import { readFileSync } from "node:fs"
 
 import type { Decider } from "./backends.ts"
 import { GUARDS } from "./catalog.ts"
+import { n7Questions, n7State, triage, type N7Context, type Verdict } from "./followups.ts"
+import type { FollowUp } from "./state.ts"
 
 export interface Case {
   readonly text: string
@@ -71,4 +73,91 @@ export function drift(a: readonly { p: Record<string, number> }[], b: readonly {
 
 export function formatDrift(rows: readonly { guard: string; maxDelta: number; flips: number }[]): string {
   return ["guard           max change  floor flips", ...rows.map((r) => `${r.guard.padEnd(15)} ${r.maxDelta.toFixed(3).padStart(10)} ${String(r.flips).padStart(12)}`)].join("\n")
+}
+
+// --- the N7 bench: a worker's follow-ups (bench/followup_cases.json) -----------------------------------------
+
+export type Expect = "task" | "planned" | "user" | "later"
+
+interface N7Job {
+  readonly goal: string
+  readonly acceptance: readonly string[]
+  readonly tasks: readonly { id: string; title: string; files: readonly string[]; done: boolean }[]
+}
+
+export interface N7Case {
+  readonly job: string
+  readonly finder: string
+  readonly followUp: FollowUp
+  readonly expect: Expect
+  readonly priority?: "high" | "normal" | "low"
+}
+
+export function loadN7(path: string): { jobs: Record<string, N7Job>; cases: N7Case[] } {
+  return JSON.parse(readFileSync(path, "utf8")) as { jobs: Record<string, N7Job>; cases: N7Case[] }
+}
+
+export function n7Context(job: N7Job, finder: string): N7Context {
+  const finderTask = job.tasks.find((t) => t.id === finder)!
+  const others = job.tasks.filter((t) => t.id !== finder)
+  return {
+    goal: job.goal,
+    acceptance: job.acceptance,
+    task: `${finderTask.id} ${finderTask.title}`,
+    otherTasks: others.map((t) => `${t.id} ${t.title}${t.done ? " (done)" : ""} (files: ${t.files.join(", ") || "none"})`),
+    openFiles: new Set(others.filter((t) => !t.done).flatMap((t) => t.files)),
+    doneFiles: new Set([...others.filter((t) => t.done), finderTask].flatMap((t) => t.files)),
+  }
+}
+
+// What a verdict means for the expected answer: the user's call and out of scope both land on the "later" list.
+export function outcome(v: Verdict): Expect {
+  return v.kind === "task" ? "task" : v.kind === "planned" ? "planned" : v.reason === "user_should_decide" ? "user" : "later"
+}
+
+export interface N7Row {
+  readonly expect: Expect
+  readonly model?: Expect
+  readonly rules: Expect
+  readonly priority?: string
+  readonly modelPriority?: { choice: string; confidence: number }
+}
+
+export async function scoreN7(decider: Decider, data: { jobs: Record<string, N7Job>; cases: readonly N7Case[] }): Promise<N7Row[]> {
+  const rows: N7Row[] = []
+  for (const c of data.cases) {
+    const ctx = n7Context(data.jobs[c.job]!, c.finder)
+    const items = [c.followUp]
+    const asked = await decider.ask("N7", n7State(ctx, items), n7Questions(items))
+    const answered = asked.backend !== "rules" && Object.keys(asked.decision.answers).length > 0
+    const p = asked.decision.answers["priority.0"]
+    rows.push({
+      expect: c.expect,
+      model: answered ? outcome(triage(asked.decision.answers, items, ctx)[0]!) : undefined,
+      rules: outcome(triage({}, items, ctx)[0]!),
+      priority: c.priority,
+      modelPriority: p?.type === "choice" ? { choice: p.choice, confidence: p.confidence } : undefined,
+    })
+  }
+  return rows
+}
+
+export function formatN7(rows: readonly N7Row[]): string {
+  const classes: Expect[] = ["task", "planned", "user", "later"]
+  const coarse = (e: Expect | undefined) => (e === "user" ? "later" : e)
+  const line = (name: string, pick: (r: N7Row) => Expect | undefined) => {
+    const per = classes.map((k) => {
+      const of = rows.filter((r) => r.expect === k)
+      return `${k} ${of.filter((r) => pick(r) === k).length}/${of.length}`
+    })
+    const exact = rows.filter((r) => pick(r) === r.expect).length
+    const rough = rows.filter((r) => coarse(pick(r)) === coarse(r.expect)).length
+    return `${name.padEnd(6)} exact ${exact}/${rows.length} · task/planned/later ${rough}/${rows.length} · ${per.join(" · ")}`
+  }
+  const prio = rows.filter((r) => r.priority && r.modelPriority)
+  const prioLine = prio.length
+    ? `priority: ${prio.filter((r) => r.modelPriority!.choice === r.priority).length}/${prio.length} right, confidence ${prio.map((r) => r.modelPriority!.confidence.toFixed(2)).join(" ")}`
+    : "priority: no answers"
+  const model = rows.some((r) => r.model) ? line("model", (r) => r.model) : "model  no answers (no Jev key, or the backend failed)"
+  return [model, line("rules", (r) => r.rules), prioLine].join("\n")
 }
