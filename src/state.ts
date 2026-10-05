@@ -142,6 +142,7 @@ export interface Task {
   worktree?: string // its own worktree while it runs in a parallel batch (Phase F)
   branch?: string
   conflicts?: number // merge train conflicts so far
+  learned?: string[] // the worker's LEARNED lines, for the project memory
 }
 
 export interface Job {

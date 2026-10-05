@@ -47,6 +47,9 @@ export function family(model: string): string {
 
 const rule = (action: string, effect: Effect, resource = "*"): Rule => ({ action, resource, effect })
 const WRITE_TOOLS = ["edit", "write", "patch"] as const
+// Workers never write the project memory themselves (opencode-agent-memory's tools); they report LEARNED lines and
+// Jev decides what is kept (src/memory.ts).
+const noMemory = ["memory_set", "memory_replace", "memory_oversized", "journal_write"].map((t) => rule(t, "deny"))
 const WEB_TOOLS = ["webfetch", "websearch"] as const
 
 const noWrite = WRITE_TOOLS.map((tool) => rule(tool, "deny"))
@@ -76,7 +79,7 @@ const role = (
   system: string,
   rules: readonly Rule[],
   models: readonly string[],
-): Role => ({ id, agent: `dictator-${id}`, description, system: `${SHARED}\n\n${system}`, rules: [...rules, ...noStateDir], models })
+): Role => ({ id, agent: `dictator-${id}`, description, system: `${SHARED}\n\n${system}`, rules: [...rules, ...noStateDir, ...noMemory], models })
 
 export const ROLES: readonly Role[] = [
   role(

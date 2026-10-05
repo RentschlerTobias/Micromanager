@@ -21,6 +21,7 @@ import {
   runGate, workingDiff, type Exec, type GateResult,
 } from "./integration.ts"
 import { redact } from "./jev.ts"
+import { learnQuestions, readMemory, RECALL_MAX, writeMemory } from "./memory.ts"
 import { record } from "./journal.ts"
 import { HEADER } from "./hooks.ts"
 import {
@@ -552,6 +553,7 @@ export class Runner {
     job.budget.requestsMax ??= this.#d.budget?.requests
     job.budget.costMax ??= this.#d.budget?.cost
     if (!job.integrationWorktree) {
+      excludeFromGit(this.#d.project) // also for a rolling job, which never passes plan or start
       const integration = await prepareIntegration(this.#d.project, job.id, this.#exec)
       job.integrationBranch = integration.branch
       job.integrationWorktree = integration.worktree
@@ -869,8 +871,27 @@ export class Runner {
   // A merged task: in a rolling job the orchestrator gets its report and decides on its follow-ups; in a planned job
   // N7 does (design.md §8).
   async #ended(job: Job, task: Task): Promise<void> {
+    await this.#learn(job, task)
     if (job.rolling) this.#d.taskEnded?.(job, task)
     else await this.#discover(job, task)
+  }
+
+  // N15: a merged task's LEARNED lines go into the project memory when Jev calls them lasting and not yet known.
+  // Without an answer nothing is kept: a wrong fact in the memory misleads every later task.
+  async #learn(job: Job, task: Task): Promise<void> {
+    const items = (task.learned ?? []).slice(0, 5)
+    if (items.length === 0) return
+    const memory = readMemory(this.#d.project)
+    const asked = await this.#decider.ask("N15", { project: this.#d.project.split("/").pop(), memory: memory.slice(-40), learned: items }, learnQuestions(items), { localOnly: job.flags?.localOnly, job: job.id, task: task.id })
+    const a = asked.decision.answers
+    const p = (q: string) => (a[q]?.type === "noul" ? (a[q] as { noul: number }).noul : undefined)
+    const keep = items.filter((_, i) => (p(`lasting.${i}`) ?? 0) >= NOUL_FLOOR && (p(`known.${i}`) ?? 1) < NOUL_FLOOR)
+    this.#journal({ kind: "memory", job: job.id, task: task.id, offered: items, kept: keep, decision: asked.id })
+    task.learned = []
+    if (keep.length === 0) return
+    excludeFromGit(this.#d.project)
+    writeMemory(this.#d.project, [...memory, ...keep.map((k) => k.slice(0, 300))])
+    this.#say(`${task.id}: remembered for this project: ${keep.join("; ")}`)
   }
 
   // N7: what the worker found outside its task. Needed or in scope: a new task after this one, with the priority the
@@ -968,8 +989,9 @@ export class Runner {
     const policies = this.#policies(job, task.id)
     const acceptance = taskAcceptance(job, task)
     const skip = resolvePolicy("N5", policies).policy.kind === "rule"
-    const asked = skip ? undefined : await this.#decider.ask("N5", classifyState(job.goal, task, acceptance), classifyQuestions(task, this.#d.skills ?? []), { localOnly: job.flags?.localOnly, job: job.id, task: task.id })
-    const profile = combine(task, acceptance, asked, policies, this.#d.skills ?? [])
+    const memory = readMemory(this.#d.project)
+    const asked = skip ? undefined : await this.#decider.ask("N5", { ...classifyState(job.goal, task, acceptance), ...(memory.length ? { projectMemory: memory.slice(-RECALL_MAX) } : {}) }, classifyQuestions(task, this.#d.skills ?? [], memory), { localOnly: job.flags?.localOnly, job: job.id, task: task.id })
+    const profile = combine(task, acceptance, asked, policies, this.#d.skills ?? [], memory)
     if (profile.role !== task.role) this.#say(`${task.id}: role ${task.role} -> ${profile.role} (${profile.roleReason})`)
     task.role = profile.role
     task.profile = profile
@@ -1011,6 +1033,7 @@ export class Runner {
       }
       const report = parseReport(answer.text)
       collectFollowUps(task, report.followUps)
+      for (const l of report.learned) if (!(task.learned ?? []).includes(l)) task.learned = [...(task.learned ?? []), l]
       stage(task, "implement", answer.timedOut ? "fail" : "pass", answer.timedOut ? "timed out" : `status ${report.status ?? "missing"}`)
       if (answer.timedOut) {
         const next = await this.#nextRung(job, task, work, frozen, "the worker timed out", "")

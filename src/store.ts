@@ -26,12 +26,16 @@ function atomicWrite(path: string, text: string): void {
 }
 
 // Adds .jev-dictator/ to the repository's local exclude file once; a directory that is no git repository is left alone.
+// The job state and the project memory (.opencode/memory/, opencode-agent-memory's place) stay out of git.
 export function excludeFromGit(project: string): boolean {
   const exclude = join(project, ".git", "info", "exclude")
   if (!existsSync(join(project, ".git"))) return false
-  const current = existsSync(exclude) ? readFileSync(exclude, "utf8") : ""
-  if (current.split("\n").some((line) => line.trim() === `${DIR}/` || line.trim() === DIR)) return true
-  atomicWrite(exclude, `${current}${current && !current.endsWith("\n") ? "\n" : ""}${DIR}/\n`)
+  let current = existsSync(exclude) ? readFileSync(exclude, "utf8") : ""
+  for (const entry of [`${DIR}/`, ".opencode/memory/"]) {
+    if (current.split("\n").some((line) => line.trim() === entry || line.trim() === entry.slice(0, -1))) continue
+    current = `${current}${current && !current.endsWith("\n") ? "\n" : ""}${entry}\n`
+    atomicWrite(exclude, current)
+  }
   return true
 }
 

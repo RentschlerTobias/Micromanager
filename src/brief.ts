@@ -12,6 +12,7 @@ export interface Report {
   readonly evidence: string
   readonly open: string
   readonly followUps: FollowUp[]
+  readonly learned: string[]
   readonly text: string
 }
 
@@ -25,6 +26,7 @@ FILES: the files you changed, comma separated, or none
 EVIDENCE: the commands you ran and their results, short
 OPEN: what is left open or what you need, or nothing
 FOLLOWUP: work the job needs that is outside your task | why | the files it would change (one line each; leave out if none)
+LEARNED: a lasting fact about this project that later tasks will need, e.g. how to run its tests or where something lives (one line each; leave out if none)
 ${CAVEMAN}`
 
 export function taskAcceptance(job: Job, task: Task): Acceptance[] {
@@ -61,6 +63,7 @@ export function brief(job: Job, task: Task, model: string, directory: string, sk
     others.length ? `Other tasks of this job, done by others (not yours, and not follow-ups): ${others.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
     job.decisions.length ? `Decisions that apply: ${job.decisions.map((d) => d.text).join("; ")}` : "",
     job.lessons.length ? `Learned earlier in this job: ${job.lessons.slice(-3).join("; ")}` : "",
+    task.profile?.recall?.length ? `Known about this project:\n${task.profile.recall.map((r) => `- ${r}`).join("\n")}` : "",
     skillLine(skills),
     "",
     REPORT_FORMAT,
@@ -101,12 +104,14 @@ export function parseReport(text: string): Report {
       why: why ?? "",
       files: !paths || /^none$/i.test(paths) ? [] : paths.split(/[,\s]+/).map((f) => f.replace(/[`*]/g, "")).filter(Boolean),
     }))
+  const learned = [...text.matchAll(/^\s*\**LEARNED\**\s*:\**\s*(.+)$/gim)].map((m) => m[1]!.trim()).filter((l) => l && !/^(none|nothing|-)$/i.test(l))
   return {
     status,
     files: !files || /^none$/i.test(files) ? [] : files.split(/[,\s]+/).map((f) => f.replace(/[`*]/g, "")).filter(Boolean),
     evidence: field("EVIDENCE"),
     open: field("OPEN"),
     followUps,
+    learned,
     text,
   }
 }

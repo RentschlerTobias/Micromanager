@@ -5,6 +5,7 @@
 import type { Asked } from "./backends.ts"
 import { CHOICE_FLOOR, CLASSIFY, NOUL_FLOOR, roleChoice, RISKS, skillQuestion, type Risk } from "./catalog.ts"
 import type { Question } from "./jev.ts"
+import { recallQuestions, recalled } from "./memory.ts"
 import { resolvePolicy, type Policies } from "./policy.ts"
 import { ROLES, roleById, type Role, type Rule } from "./roles.ts"
 import type { Acceptance, Task } from "./state.ts"
@@ -50,17 +51,19 @@ export interface Profile {
   readonly confidence: number // the weakest choice confidence, lowered by contradictions; 1 without a model
   readonly source: "model" | "rules"
   readonly decision?: string // journal id
+  readonly recall?: readonly string[] // the project memory entries N5 picked for this task's brief
   confirmed?: boolean // the user saw it (policy "ask")
 }
 
 // The questions for one task: the fixed set, the role choice, and one noul per skill the planner's role may load.
-export function classifyQuestions(task: Task, skills: readonly Skill[]): Record<string, Question> {
+export function classifyQuestions(task: Task, skills: readonly Skill[], memory: readonly string[] = []): Record<string, Question> {
   const roles = Object.fromEntries(ROLES.map((r) => [r.id, r.description]))
   const allowed = skills.filter((s) => s.roles.includes(task.role))
   return {
     role: roleChoice(roles),
     ...CLASSIFY,
     ...Object.fromEntries(allowed.map((s) => [`skill.${s.name}`, skillQuestion(s.name, s.description)])),
+    ...recallQuestions(memory),
   }
 }
 
@@ -88,7 +91,7 @@ function roleThatCan(group: ToolGroup, writer: boolean): Role | undefined {
 
 const MAX_SKILLS = 3
 
-export function combine(task: Task, acceptance: readonly Acceptance[], asked: Asked | undefined, policies: Policies, skills: readonly Skill[] = []): Profile {
+export function combine(task: Task, acceptance: readonly Acceptance[], asked: Asked | undefined, policies: Policies, skills: readonly Skill[] = [], memory: readonly string[] = []): Profile {
   const a = asked?.decision.answers ?? {}
   const noul = (q: string) => (a[q]?.type === "noul" ? (a[q] as { noul: number }).noul : undefined)
   const yes = (q: string) => (noul(q) ?? 0) >= NOUL_FLOOR
@@ -162,6 +165,7 @@ export function combine(task: Task, acceptance: readonly Acceptance[], asked: As
     confidence: confidence * penalty,
     source: asked && Object.keys(a).length > 0 ? "model" : "rules",
     decision: asked?.id,
+    recall: recalled(memory, a as never, NOUL_FLOOR),
   }
 }
 

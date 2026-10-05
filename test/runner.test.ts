@@ -1133,3 +1133,44 @@ test("rolling: an answer can replace a task's wrong checks", () => {
   assert.equal(job.acceptance.find((a) => a.id === job.tasks[0]!.acceptance[0])!.verify, "test -f /x/oc-voice/src/voice_agent/voice/loop.py")
   assert.equal(job.tasks[0]!.status, "pending")
 })
+
+// --- project memory: Jev keeps what workers learned and recalls it per task ---------------------------------------
+
+import { readMemory, writeMemory } from "../src/memory.ts"
+
+test("memory: a lasting, new LEARNED line is kept; a known or one-off one is not; the next task's brief recalls it", async () => {
+  const project = repo()
+  writeMemory(project, ["the README is in English"])
+  const prompts: string[] = []
+  const fake = fakeSession({
+    worker: (dir, prompt) => {
+      prompts.push(prompt)
+      const out = writeFiles(dir, prompt)
+      return prompt.includes("task T1 ") ? `${out}\nLEARNED: tests run with node --test\nLEARNED: README is written in English\nLEARNED: add.js took two tries` : out
+    },
+  })
+  const answers: Record<string, number> = { "lasting.0": 0.9, "known.0": 0.1, "lasting.1": 0.9, "known.1": 0.95, "lasting.2": 0.1, "known.2": 0.1 }
+  const asker: Asker = {
+    ask: async (_s, q) => ({
+      answers: Object.fromEntries(Object.keys(q).filter((k) => k in answers || k.startsWith("memory.")).map((k) => [k, { type: "noul", noul: k.startsWith("memory.") ? (k === "memory.1" ? 0.9 : 0.1) : answers[k]! }])) as never,
+      model: "jev", latencyMs: 1,
+    }),
+  }
+  const decider = new Decider({ ...DEFAULT_BACKENDS, default: "typesafe" }, { typesafe: asker }, () => {})
+  const r = runner(project, fake.api, { decider })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.deepEqual(readMemory(project), ["the README is in English", "tests run with node --test"])
+  assert.match(readFileSync(join(project, ".opencode", "memory", "jev-project.md"), "utf8"), /^---\nlabel: jev-project\n/)
+  assert.match(readFileSync(join(project, ".git", "info", "exclude"), "utf8"), /\.opencode\/memory\//)
+  // T2 was classified after T1 learned: memory.1 ("tests run with node --test") was picked for its brief
+  assert.match(prompts.find((p) => p.includes("task T2 "))!, /Known about this project:\n- tests run with node --test/)
+})
+
+test("memory: without a decision model nothing is kept", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: (dir, prompt) => `${writeFiles(dir, prompt)}\nLEARNED: something` })
+  const r = runner(project, fake.api)
+  await r.run((await r.plan("goal")).job.id)
+  assert.deepEqual(readMemory(project), [])
+})
