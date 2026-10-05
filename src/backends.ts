@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto"
 import { Jev, type Decision, type Question } from "./jev.ts"
 import { record } from "./journal.ts"
 
-export type BackendName = "typesafe" | "gliner" | "openjev" | "rules"
+export type BackendName = "typesafe" | "gliner" | "openjev" | "llm" | "rules"
 
 export interface Asker {
   ask(state: string, questions: Record<string, Question>): Promise<Decision>
@@ -44,8 +44,10 @@ export class RulesBackend implements Asker {
   }
 }
 
-export function makeAskers(config: BackendConfig, jevKey: string | undefined, fetcher?: typeof fetch): Partial<Record<BackendName, Asker>> {
-  const out: Partial<Record<BackendName, Asker>> = { rules: new RulesBackend() }
+// llm: an LLM asker (src/llm.ts), when the caller has a way to reach one. It counts as cloud: a local-only node
+// never uses it.
+export function makeAskers(config: BackendConfig, jevKey: string | undefined, fetcher?: typeof fetch, llm?: Asker): Partial<Record<BackendName, Asker>> {
+  const out: Partial<Record<BackendName, Asker>> = { rules: new RulesBackend(), ...(llm ? { llm } : {}) }
   if (jevKey && config.urls.typesafe) out.typesafe = new Jev(jevKey, { url: config.urls.typesafe, fetch: fetcher })
   // Local servers take any key; their timeout is short so a dead server costs little.
   // GLiNER answers four guards in about 0.4 s on the CPU; 5 s leaves room for a loaded machine.

@@ -10,6 +10,7 @@ import { DEFAULT_REGISTRY, mergeRegistry, type ModelEntry } from "./registry.ts"
 import { DEFAULT_ROUTING, type Routing } from "./routing.ts"
 import { roleById, type RoleId } from "./roles.ts"
 import type { NotifyMode } from "./scheduler.ts"
+import type { BackendName } from "./backends.ts"
 
 export function configPath(): string {
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config")
@@ -128,7 +129,24 @@ export function parseParallel(text: string): { parallel: number; perModel: numbe
   return { parallel: int(raw.parallel, "parallel", 3, 6), perModel: int(raw.perModel, "perModel", 2, 4) }
 }
 
+// "backends": the decision backend per node, e.g. { "N7": "llm" }, and "llmModel" for the llm backend. A node goes
+// to the backend its bench supports (npm run bench-n7, bench-guards).
+const BACKENDS = new Set(["typesafe", "gliner", "openjev", "llm", "rules"])
+
+export function parseBackends(text: string): { nodes: Record<string, BackendName>; llmModel: string } {
+  const raw = JSON.parse(stripComments(text)) as { backends?: unknown; llmModel?: unknown }
+  const nodes = raw.backends ?? {}
+  if (typeof nodes !== "object" || nodes === null || Array.isArray(nodes)) throw new Error("backends must be an object")
+  for (const [node, b] of Object.entries(nodes)) if (typeof b !== "string" || !BACKENDS.has(b)) throw new Error(`backends.${node}: unknown backend ${JSON.stringify(b)}`)
+  const llmModel = raw.llmModel ?? DEFAULT_LLM_MODEL
+  if (typeof llmModel !== "string" || !llmModel.includes("/")) throw new Error('llmModel must be "provider/model"')
+  return { nodes: nodes as Record<string, BackendName>, llmModel }
+}
+
+export const DEFAULT_LLM_MODEL = "opencode-go/qwen3.8-flash"
+
 export interface Settings {
+  readonly backends: { nodes: Record<string, BackendName>; llmModel: string }
   readonly parallel: number
   readonly perModel: number
   readonly budget: Budget
@@ -144,11 +162,11 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
+    return { backends: { nodes: {}, llmModel: DEFAULT_LLM_MODEL }, parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
+    return { backends: parseBackends(text), ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
   } catch (err) {
-    return { parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
+    return { backends: { nodes: {}, llmModel: DEFAULT_LLM_MODEL }, parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }
 }
