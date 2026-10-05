@@ -143,6 +143,7 @@ export interface Task {
   branch?: string
   conflicts?: number // merge train conflicts so far
   learned?: string[] // the worker's LEARNED lines, for the project memory
+  sessions?: string[] // every session that worked on it (worker, reviewers, fresh tries), to look into them
 }
 
 export interface Job {

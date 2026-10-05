@@ -50,11 +50,12 @@ export function board(job: Job, width = 110, now = Date.now()): string {
     `├${"─".repeat(Math.min(width, 100))}`,
   ]
   const rows = job.tasks.map((t) => {
-    const left = `│ ${ICON[t.status]} ${pad(t.id, 6)} ${pad(t.status, 9)} ${pad(t.role, 8)} ${pad(short(t.model), 12)} `
+    const left = `│ ${ICON[t.status]} ${pad(t.id, 6)} ${pad(t.status, 9)} ${pad(t.role, 8)} ${pad(short(t.model), 12)} ${pad(t.session ?? "-", 31)} `
     const rest = `${t.title}${detail(t, now) ? `  ← ${detail(t, now)}` : ""}`
     return `${left}${pad(rest, Math.max(20, width - left.length))}`
   })
+  const open = `│   open a task's session: opencode -s <session>  (in another terminal; it shows what the worker does)`
   const later = (job.later ?? []).map((l) => `│   later: ${pad(`${l.what} (${l.from}, ${l.reason.replace(/_/g, " ")})`, width - 12)}`)
   const lessons = job.lessons.slice(-3).map((l) => `│   note: ${pad(l, width - 11)}`)
-  return [...head, ...rows, ...(later.length || lessons.length ? [`├${"─".repeat(Math.min(width, 100))}`] : []), ...later, ...lessons, `└${"─".repeat(Math.min(width, 100))}`].join("\n")
+  return [...head, ...rows, `├${"─".repeat(Math.min(width, 100))}`, open, ...later, ...lessons, `└${"─".repeat(Math.min(width, 100))}`].join("\n")
 }

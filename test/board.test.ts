@@ -15,7 +15,7 @@ test("the board shows each task's state, model and what it does or waits for", (
   job.counters = { turns: 1, stalls: 0, replans: 0, tokens: 941_000, requests: 209, cost: 0.34 }
   job.tasks = [
     task("T1", "merged", { model: "opencode-go/deepseek-v4.1-flash", role: "explore" }),
-    task("T2", "running", { model: "opencode-go/glm-5.3-flash", attempts: 1, stages: [{ stage: "gate", result: "fail", at: new Date(Date.now() - 90_000).toISOString() }] }),
+    task("T2", "running", { model: "opencode-go/glm-5.3-flash", session: "ses_ef30ee4dcffeJX3bsfVck7FkAn", attempts: 1, stages: [{ stage: "gate", result: "fail", at: new Date(Date.now() - 90_000).toISOString() }] }),
     task("T3", "blocked", { summary: "which file?" }),
     task("T4", "pending", { dependsOn: ["T2"] }),
   ]
@@ -23,7 +23,8 @@ test("the board shows each task's state, model and what it does or waits for", (
   assert.match(b, /session tasks · intake/)
   assert.match(b, /1\/4 done · tokens 941k · requests 209 · \$0\.34/)
   assert.match(b, /✔ T1 +merged +explore +deepseek/)
-  assert.match(b, /▶ T2 +running +code +glm-5\.3 +task T2  ← gate · fix 1 · 1m/)
+  assert.match(b, /▶ T2 +running +code +glm-5\.3 +ses_ef30ee4dcffeJX3bsfVck7FkAn +task T2  ← gate · fix 1 · 1m/)
+  assert.match(b, /open a task's session: opencode -s <session>/)
   assert.match(b, /⏸ T3 .*← waits: which file\?/)
   assert.match(b, /· T4 .*← after T2/)
 })

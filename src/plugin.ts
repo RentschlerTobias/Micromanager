@@ -433,7 +433,7 @@ export default {
               // A reader's report is its result, so the whole note (up to a limit) comes back.
               return `${taskReport(job, task)}${note ? `\n\n${note.slice(-15000)}` : ""}`
             }
-            return [`job ${job.id} on branch ${job.integrationBranch ?? `jev/${job.id}`}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}`)].join("\n")
+            return [`job ${job.id} on branch ${job.integrationBranch ?? `jev/${job.id}`}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}${t.session ? ` · session ${t.session}` : ""}`), "The user can watch a task's worker with: opencode -s <session>"].join("\n")
           },
           answer: async (taskId, text, checksText, tctx) => {
             const checks = checksText.split(/\n|;;/).map((c) => c.trim()).filter(Boolean)

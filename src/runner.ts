@@ -1275,13 +1275,14 @@ export class Runner {
     const rules = role === task.role && task.profile ? narrowing(task.profile) : []
     const s = await this.#d.session.create({
       ...(this.#d.parentID ? { parentID: this.#d.parentID } : {}),
-      title: `${task.id} ${role === task.role ? "" : `${role} `}${task.title}`,
+      title: `${task.id} · ${roleById(role)?.agent ?? role} · ${task.title}`,
       agent: roleById(role)?.agent ?? "coder",
       model: toModel(model),
       location: { directory: this.#dir(job, task) },
       ...(rules.length ? { permissions: rules } : {}),
     })
     task.session = s.id
+    task.sessions = [...(task.sessions ?? []), s.id]
     this.#sessionModel.set(s.id, model)
     this.#d.onWorker?.(s.id, `${task.id} ${task.title}: ${task.description}`, rules)
     this.#d.watch?.(s.id, steps ?? MAX_STEPS)
@@ -1402,6 +1403,7 @@ export function taskReport(job: Job, task: Task): string {
     gate ? `  checks: ${gate.evidence}` : "",
     task.status === "merged" && task.summary ? `  report: ${task.summary.replace(/\s+/g, " ").slice(-400)}` : "",
     follow.length ? `  follow-ups the worker found (yours to decide):\n${follow.join("\n")}` : "",
+    task.sessions?.length ? `  sessions: ${task.sessions.join(", ")} (open one with: opencode -s <id>)` : "",
     `  notes: .jev-dictator/notes/${job.id}/${task.id}.md`,
   ].filter(Boolean).join("\n")
 }
