@@ -158,6 +158,7 @@ export function followUpQuestions(items: readonly { what: string; why: string; f
   const out: Record<string, Question> = {}
   items.forEach((f, i) => {
     const what = `the follow-up "${f.what}" (why: ${f.why || "not given"}; files: ${f.files.join(", ") || "none"})`
+    out[`planned.${i}`] = { type: "noul", instructions: `${what} is already covered by one of the job's other tasks listed in the state.` }
     out[`needed.${i}`] = { type: "noul", instructions: `Without ${what}, the job's acceptance points cannot all be met.` }
     out[`in_scope.${i}`] = { type: "noul", instructions: `${what} belongs to what the user asked for in this job.` }
     out[`user.${i}`] = { type: "noul", instructions: `Whether to do ${what} is the user's call: it changes behaviour, scope or interfaces the user did not decide.` }

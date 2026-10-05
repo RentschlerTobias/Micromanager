@@ -42,6 +42,7 @@ export function brief(job: Job, task: Task, model: string, directory: string, sk
     .map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}${sharedNote(job, task, a.id)}`)
     .join("\n")
   const done = job.tasks.filter((t) => t.status === "passed" || t.status === "merged")
+  const others = job.tasks.filter((t) => t.id !== task.id && !done.includes(t) && t.status !== "cancelled")
   return [
     `${HEADER} task ${task.id} · role ${task.role} · model ${model}`,
     "",
@@ -57,6 +58,7 @@ export function brief(job: Job, task: Task, model: string, directory: string, sk
     `Work only in ${directory}. Do only this task.`,
     "Keys and tokens show as <secret> in what you read; never write <secret> into a file, leave such lines as they are.",
     done.length ? `Already done: ${done.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
+    others.length ? `Other tasks of this job, done by others (not yours, and not follow-ups): ${others.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
     job.decisions.length ? `Decisions that apply: ${job.decisions.map((d) => d.text).join("; ")}` : "",
     job.lessons.length ? `Learned earlier in this job: ${job.lessons.slice(-3).join("; ")}` : "",
     skillLine(skills),

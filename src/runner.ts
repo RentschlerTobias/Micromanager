@@ -616,19 +616,34 @@ export class Runner {
     const policy = resolvePolicy("N7", this.#policies(job, task.id)).policy
     const asked = policy.kind === "rule" || policy.kind === "fixed" ? undefined : await this.#decider.ask(
       "N7",
-      { goal: job.goal, acceptance: job.acceptance.map((a) => a.text), task: `${task.id} ${task.title}`, followUps: items },
+      {
+        goal: job.goal,
+        acceptance: job.acceptance.map((a) => a.text),
+        task: `${task.id} ${task.title}`,
+        otherTasks: job.tasks.filter((t) => t.id !== task.id && t.status !== "cancelled").map((t) => `${t.id} ${t.title} (files: ${t.files.join(", ") || "none"})`),
+        followUps: items,
+      },
       followUpQuestions(items),
       { localOnly: job.flags?.localOnly, job: job.id, task: task.id },
     )
     const a = asked?.decision.answers ?? {}
     const noul = (q: string) => (a[q]?.type === "noul" ? (a[q] as { noul: number }).noul : undefined)
-    const planned = new Set(job.tasks.flatMap((t) => t.files))
+    // Without a model: a follow-up only on files of tasks still open is already planned (live test: workers reported
+    // the job's next tasks as follow-ups); one on files of done tasks is in scope; anything else is not.
+    const open = new Set(job.tasks.filter((t) => t.id !== task.id && !isDone(t) && t.status !== "cancelled").flatMap((t) => t.files))
+    const doneFiles = new Set(job.tasks.filter((t) => isDone(t) || t.id === task.id).flatMap((t) => t.files))
     for (const [i, item] of items.entries()) {
       const needed = noul(`needed.${i}`)
       const inScope = noul(`in_scope.${i}`)
+      const plannedP = noul(`planned.${i}`)
+      const alreadyPlanned = plannedP !== undefined ? plannedP >= NOUL_FLOOR : item.files.length > 0 && item.files.every((f) => open.has(f))
+      if (alreadyPlanned && policy.kind !== "fixed") {
+        this.#journal({ kind: "discovered", job: job.id, from: task.id, what: item.what, dropped: "already planned", decision: asked?.id })
+        continue
+      }
       const take = policy.kind === "fixed" ? policy.value !== "no"
         : needed !== undefined || inScope !== undefined ? Math.max(needed ?? 0, inScope ?? 0) >= NOUL_FLOOR
-        : item.files.length > 0 && item.files.every((f) => planned.has(f))
+        : item.files.length > 0 && item.files.every((f) => doneFiles.has(f))
       let reason: Later["reason"] | undefined
       // A follow-up is text a model wrote, so it passes the local guards like a goal before it can become a task.
       const guard = take ? await checkGuards(this.#decider, `${item.what}. ${item.why}`, job.id, task.id) : undefined
