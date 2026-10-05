@@ -2,7 +2,7 @@
 // (design.md §7). The planner writes; code decides whether the plan is usable.
 
 import { roleById } from "./roles.ts"
-import type { Acceptance, Job, Task } from "./state.ts"
+import { DEFAULT_PRIORITY, isDone, type Acceptance, type FollowUp, type Job, type Task } from "./state.ts"
 
 export interface PlannedTask {
   readonly id: string
@@ -13,6 +13,7 @@ export interface PlannedTask {
   readonly dependsOn: readonly string[]
   readonly files: readonly string[]
   readonly parent?: string // the task it was split from (N4)
+  readonly priority?: number // 1 (first) .. 5 (last)
 }
 
 export interface Plan {
@@ -78,6 +79,7 @@ function parseTasks(raw: unknown, errors: string[]): PlannedTask[] {
       acceptance: acc,
       dependsOn: deps,
       files,
+      ...(typeof item.priority === "number" && item.priority >= 1 && item.priority <= 5 ? { priority: Math.round(item.priority) } : {}),
     })
   }
   return tasks
@@ -174,6 +176,8 @@ export function applyPlan(job: Job, plan: Plan): void {
     files: [...t.files],
     wave: w.get(t.id) ?? 0,
     ...(t.parent ? { parent: t.parent } : {}),
+    priority: t.priority ?? DEFAULT_PRIORITY,
+    origin: t.parent ? "split" : "plan",
     status: "pending",
     attempts: 0,
     stages: [],
@@ -192,11 +196,13 @@ export const PLAN_FORMAT = `Answer with one JSON object in a \`\`\`json fence, n
     "role": "explore | research | plan | code | test | visual | write | debug | review | oracle",
     "acceptance": ["A1"],
     "dependsOn": [],
-    "files": ["paths this task may change; empty for read-only roles"]
+    "files": ["paths this task may change; empty for read-only roles"],
+    "priority": 3
   }]
 }
 Rules: split the job into tasks as small as possible, each a vertical slice that can be verified on its own;
-every acceptance point is covered by a task; a task that changes files lists them; no dependency cycles.`
+every acceptance point is covered by a task; a task that changes files lists them; no dependency cycles.
+Priority is 1 (do first) to 5 (do last), 3 when nothing stands out; among ready tasks the lower number runs first.`
 
 // --- N4: splitting tasks (design.md §7) -------------------------------------------------------------------
 
@@ -266,4 +272,80 @@ export function applySplits(plan: Plan, text: string, asked: readonly string[]):
   const acceptance = [...plan.acceptance, ...added]
   const graph = checkGraph(acceptance, tasks)
   return graph.length ? { errors: graph } : { plan: { acceptance, tasks } }
+}
+
+// --- N7: a worker's follow-up becomes a task (design.md §8) --------------------------------------------------
+
+// The task a follow-up becomes: a code task on the files it names, with its own acceptance point, after the task
+// that found it. Code builds it (no planner call); N5 classifies it like any other task when it is dispatched.
+// Returns the errors instead when the job's graph would break.
+export function addDiscovered(job: Job, from: Task, item: FollowUp, priority: number): { task?: Task; errors?: string[] } {
+  const n = job.tasks.filter((t) => t.id.startsWith(`${from.id}.d`)).length + 1
+  const point = `A${Math.max(0, ...job.acceptance.map((a) => Number(a.id.match(/^A(\d+)$/)?.[1] ?? 0))) + 1}`
+  const task: Task = {
+    id: `${from.id}.d${n}`,
+    title: item.what.slice(0, 120),
+    description: `Found while doing ${from.id} (${from.title}): ${item.what}. Why: ${item.why}`,
+    role: "code",
+    acceptance: [point],
+    dependsOn: [from.id],
+    files: [...item.files],
+    wave: from.wave + 1,
+    status: "pending",
+    attempts: 0,
+    stages: [],
+    signatures: [],
+    priority,
+    origin: "discovered",
+  }
+  const acceptance = [...job.acceptance, { id: point, text: item.what }]
+  const errors = checkGraph(acceptance, [...job.tasks.map(asPlanned), asPlanned(task)])
+  if (errors.length) return { errors }
+  job.acceptance = acceptance
+  job.tasks.push(task)
+  return { task }
+}
+
+const asPlanned = (t: Task): PlannedTask => ({ id: t.id, title: t.title, description: t.description, role: t.role, acceptance: t.acceptance, dependsOn: t.dependsOn, files: t.files })
+
+// --- replan (design.md §10.2, Magentic-One) -----------------------------------------------------------------
+
+export function replanFormat(job: Job): string {
+  const done = job.tasks.filter(isDone)
+  const open = job.tasks.filter((t) => !isDone(t) && t.status !== "cancelled")
+  return `The job is stalled. Rewrite the unfinished part of the plan.
+
+Done (keep, do not repeat; new tasks may depend on them): ${done.map((t) => `${t.id} ${t.title}`).join("; ") || "none"}
+Unfinished (these are replaced by your tasks):
+${open.map((t) => `- ${t.id} [${t.role}] ${t.title} (${t.status}${t.stages.length ? `; last: ${t.stages.at(-1)!.stage} ${t.stages.at(-1)!.result}${t.stages.at(-1)!.evidence ? `: ${t.stages.at(-1)!.evidence!.slice(0, 200)}` : ""}` : ""})`).join("\n") || "- none"}
+What went wrong so far: ${job.lessons.slice(-5).join("; ") || "nothing recorded"}
+Acceptance points: ${job.acceptance.map((a) => `${a.id}: ${a.text}${a.verify ? ` (verify: ${a.verify})` : ""}`).join("; ")}
+
+First find the root cause of the stall from the facts above; then plan around it, e.g. a smaller step, another
+order, or a task that removes the obstacle. Use new task ids that are not used yet; you may add acceptance points with
+new ids, and keep the verify commands of existing ones.
+${PLAN_FORMAT.replace('"acceptance": [{', '"acceptance": [(only new points) {')}`
+}
+
+// Replaces the unfinished tasks with the planner's new ones; done tasks and their commits stay. The old unfinished
+// tasks are cancelled, so their history stays in the job file.
+export function applyReplan(job: Job, text: string): Parsed {
+  const json = extractJson(text)
+  if (!json) return { errors: ["no JSON object found"] }
+  let raw: { acceptance?: unknown; tasks?: unknown }
+  try {
+    raw = JSON.parse(json)
+  } catch (err) {
+    return { errors: [`invalid JSON: ${err instanceof Error ? err.message : String(err)}`] }
+  }
+  const errors: string[] = []
+  const added = parseAcceptance(raw.acceptance ?? [], errors).filter((a) => !job.acceptance.some((x) => x.id === a.id))
+  if (!Array.isArray(raw.tasks) || raw.tasks.length === 0) errors.push("tasks: a non-empty list is required")
+  const fresh = parseTasks(raw.tasks, errors)
+  const used = new Set(job.tasks.map((t) => t.id))
+  for (const t of fresh) if (used.has(t.id)) errors.push(`task ${t.id}: id already used; pick a new one`)
+  const done = job.tasks.filter(isDone).map(asPlanned)
+  const acceptance = [...job.acceptance, ...added]
+  errors.push(...checkGraph(acceptance, [...done, ...fresh]))
+  return errors.length ? { errors } : { plan: { acceptance, tasks: fresh } }
 }

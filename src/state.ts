@@ -99,6 +99,22 @@ export interface Stage {
   readonly at: string
 }
 
+// Where a task came from: the plan, an N4 split, a worker's follow-up (N7), or a replan.
+export type TaskOrigin = "plan" | "split" | "discovered" | "replan"
+
+// Work a worker found outside its own task (its report's FOLLOWUP lines).
+export interface FollowUp {
+  readonly what: string
+  readonly why: string
+  readonly files: readonly string[]
+}
+
+// A follow-up that did not become a task: shown to the user at the end of the job.
+export interface Later extends FollowUp {
+  readonly from: string // the task that found it
+  readonly reason: "out_of_scope" | "user_should_decide" | "cap" | "no_files" | "invalid"
+}
+
 export interface Task {
   readonly id: string
   title: string
@@ -119,6 +135,9 @@ export interface Task {
   profile?: Profile // N5 + N5b, set when the task is first dispatched
   pipeline?: string // N6: P1, P2, P3 or P9
   confirmed?: boolean // false: waits for the user's go (destructive risk, or "ask me about everything")
+  priority?: number // 1 (first) .. 5 (last); 3 when the planner gave none
+  origin?: TaskOrigin
+  followUps?: FollowUp[] // what the task's worker reported as work outside its task
 }
 
 export interface Job {
@@ -137,9 +156,10 @@ export interface Job {
   facilitator?: string // the dictator session that runs this job's planning session
   pins?: PolicySet // job-level policies from the user's shortcuts ("always local", "pipeline P1", …)
   taskPins?: Record<string, PolicySet> // task-level ones ("T3 use llamaswap/oss-u")
-  budget: { workersMax: number; workersUsed: number; turnsMax: number; replansMax: number }
+  budget: { workersMax: number; workersUsed: number; turnsMax: number; replansMax: number; discoveredMax?: number }
   counters: { turns: number; stalls: number; replans: number }
   lessons: string[]
+  later?: Later[] // follow-ups that did not become tasks
   created: string
   updated: string
 }
@@ -204,6 +224,13 @@ export function parallelSafe(a: Task, b: Task): boolean {
   if (a.files.length === 0 || b.files.length === 0) return true
   const mine = new Set(a.files)
   return !b.files.some((f) => mine.has(f))
+}
+
+export const DEFAULT_PRIORITY = 3
+
+// How many discovered tasks a job may add: half its planned tasks, at least 3.
+export function discoveredCap(job: Job): number {
+  return job.budget.discoveredMax ?? Math.max(3, Math.ceil(job.tasks.filter((t) => t.origin !== "discovered").length / 2))
 }
 
 export function allDone(job: Job): boolean {

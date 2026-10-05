@@ -2,7 +2,7 @@
 // points and files go in verbatim. The report is short and fixed, so code can read it.
 
 import { HEADER } from "./hooks.ts"
-import type { Acceptance, Job, Task } from "./state.ts"
+import type { Acceptance, FollowUp, Job, Task } from "./state.ts"
 
 export type WorkerStatus = "DONE" | "DONE_WITH_CONCERNS" | "NEEDS_CONTEXT" | "BLOCKED"
 
@@ -11,6 +11,7 @@ export interface Report {
   readonly files: string[]
   readonly evidence: string
   readonly open: string
+  readonly followUps: FollowUp[]
   readonly text: string
 }
 
@@ -23,6 +24,7 @@ STATUS: DONE | DONE_WITH_CONCERNS | NEEDS_CONTEXT | BLOCKED
 FILES: the files you changed, comma separated, or none
 EVIDENCE: the commands you ran and their results, short
 OPEN: what is left open or what you need, or nothing
+FOLLOWUP: work the job needs that is outside your task | why | the files it would change (one line each; leave out if none)
 ${CAVEMAN}`
 
 export function taskAcceptance(job: Job, task: Task): Acceptance[] {
@@ -78,11 +80,20 @@ export function parseReport(text: string): Report {
   const statusText = field("STATUS").toUpperCase()
   const status = STATUSES.find((s) => statusText.startsWith(s))
   const files = field("FILES")
+  const followUps = [...text.matchAll(/^\s*\**FOLLOWUP\**\s*:\**\s*(.+)$/gim)]
+    .map((m) => m[1]!.split("|").map((p) => p.trim()))
+    .filter(([what]) => what && !/^(none|nothing|-)$/i.test(what))
+    .map(([what, why, paths]): FollowUp => ({
+      what: what!,
+      why: why ?? "",
+      files: !paths || /^none$/i.test(paths) ? [] : paths.split(/[,\s]+/).map((f) => f.replace(/[`*]/g, "")).filter(Boolean),
+    }))
   return {
     status,
     files: !files || /^none$/i.test(files) ? [] : files.split(/[,\s]+/).map((f) => f.replace(/[`*]/g, "")).filter(Boolean),
     evidence: field("EVIDENCE"),
     open: field("OPEN"),
+    followUps,
     text,
   }
 }

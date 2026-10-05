@@ -149,3 +149,19 @@ export function splitQuestions(tasks: readonly { id: string; title: string; desc
   }
   return out
 }
+
+// --- N7: a worker's follow-ups (design.md §8) ---------------------------------------------------------------
+// One request per report: questions per follow-up, keyed "<question>.<n>".
+export const PRIORITIES = { high: "do it before the other open tasks", normal: "in the usual order", low: "after everything else" } as const
+
+export function followUpQuestions(items: readonly { what: string; why: string; files: readonly string[] }[]): Record<string, Question> {
+  const out: Record<string, Question> = {}
+  items.forEach((f, i) => {
+    const what = `the follow-up "${f.what}" (why: ${f.why || "not given"}; files: ${f.files.join(", ") || "none"})`
+    out[`needed.${i}`] = { type: "noul", instructions: `Without ${what}, the job's acceptance points cannot all be met.` }
+    out[`in_scope.${i}`] = { type: "noul", instructions: `${what} belongs to what the user asked for in this job.` }
+    out[`user.${i}`] = { type: "noul", instructions: `Whether to do ${what} is the user's call: it changes behaviour, scope or interfaces the user did not decide.` }
+    out[`priority.${i}`] = { type: "choice", instructions: `How urgent is ${what} compared to the job's other open tasks?`, criteria: PRIORITIES }
+  })
+  return out
+}

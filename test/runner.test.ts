@@ -502,3 +502,89 @@ test("a run that ended mid-task starts that task again on a clean worktree", asy
   assert.match(done.lessons.join("\n"), /interrupted run: T1 started again, unfinished changes undone \(add\.js, half\.js\)/)
   assert.equal(existsSync(join(done.integrationWorktree!, "half.js")), false)
 })
+
+// --- Phase E: the task queue (priority, follow-ups, replan) ----------------------------------------------
+
+import { buildAgenda } from "../src/agenda.ts"
+import { moveJob, newJob } from "../src/state.ts"
+import { saveJob } from "../src/store.ts"
+
+test("a worker's follow-up in the plan's files becomes a task after its finder; one outside goes to later", async () => {
+  const project = repo()
+  const fake = fakeSession({
+    worker: (dir, prompt) => {
+      const out = writeFiles(dir, prompt)
+      return prompt.includes("task T1 ") ? `${out}\nFOLLOWUP: mention add in notes | users look there | notes.md\nFOLLOWUP: add a CLI | nice to have | cli.js` : out
+    },
+  })
+  const r = runner(project, fake.api)
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  const d1 = done.tasks.find((t) => t.id === "T1.d1")!
+  assert.deepEqual([d1.origin, d1.dependsOn, d1.files, d1.status], ["discovered", ["T1"], ["notes.md"], "merged"])
+  assert.ok(done.acceptance.some((a) => d1.acceptance.includes(a.id) && a.text === "mention add in notes"))
+  assert.deepEqual(done.later?.map((l) => [l.what, l.reason]), [["add a CLI", "out_of_scope"]])
+  assert.match(summary(done), /found but not done[\s\S]*add a CLI \(from T1, out of scope\)/)
+})
+
+test("the decision model's N7 answers set the priority, and the user's call goes to later", async () => {
+  const project = repo()
+  const fake = fakeSession({
+    worker: (dir, prompt) => {
+      const out = writeFiles(dir, prompt)
+      return prompt.includes("task T1 ") ? `${out}\nFOLLOWUP: export add from index | callers | index.js\nFOLLOWUP: rename the package | clearer | package.json` : out
+    },
+  })
+  const answers: Record<string, unknown> = {
+    "needed.0": { type: "noul", noul: 0.9 }, "in_scope.0": { type: "noul", noul: 0.8 }, "user.0": { type: "noul", noul: 0.1 },
+    "priority.0": { type: "choice", choice: "high", confidence: 0.9, probabilities: {} },
+    "needed.1": { type: "noul", noul: 0.2 }, "in_scope.1": { type: "noul", noul: 0.7 }, "user.1": { type: "noul", noul: 0.8 },
+  }
+  const asker: Asker = { ask: async (_s, questions) => ({ answers: Object.fromEntries(Object.keys(questions).filter((q) => q in answers).map((q) => [q, answers[q]])) as never, model: "fake", latencyMs: 1 }) }
+  const decider = new Decider({ ...DEFAULT_BACKENDS, default: "typesafe" }, { typesafe: asker }, () => {})
+  const done = await runner(project, fake.api, { decider }).run((await runner(project, fake.api, { decider }).plan("goal")).job.id)
+  const d1 = done.tasks.find((t) => t.id === "T1.d1")!
+  assert.equal(d1.priority, 1)
+  // priority 1 runs before T2 (priority 3), although both became ready after T1
+  assert.ok(done.tasks.find((t) => t.id === "T2")!.stages[0]!.at >= d1.stages[0]!.at)
+  assert.deepEqual(done.later?.map((l) => l.reason), ["user_should_decide"])
+})
+
+test("a stalled job replans: unfinished tasks are cancelled, the new ones run, done ones stay", async () => {
+  const project = repo()
+  // the replanned tasks write what T1 and T2 wrote
+  const fake = fakeSession({ worker: (dir, prompt) => writeFiles(dir, prompt.replace("task T5", "task T1").replace("task T6", "task T2")) })
+  const r = runner(project, fake.api)
+  const { job } = await r.plan("goal")
+  job.counters.stalls = 3
+  saveJob(project, job)
+  const replan = {
+    tasks: [
+      { id: "T5", title: "write add.js again", description: "create it", role: "code", acceptance: ["A1"], dependsOn: [], files: ["add.js"], priority: 2 },
+      { id: "T6", title: "write notes", description: "notes", role: "write", acceptance: ["A2"], dependsOn: ["T5"], files: ["notes.md"] },
+    ],
+  }
+  fake.setPlan(["```json\n" + JSON.stringify({ tasks: [{ ...replan.tasks[0], id: "T1" }] }) + "\n```", "```json\n" + JSON.stringify(replan) + "\n```"])
+  const done = await r.run(job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.deepEqual(done.tasks.map((t) => `${t.id}:${t.status}`), ["T1:cancelled", "T2:cancelled", "T5:merged", "T6:merged"])
+  assert.equal(done.counters.replans, 1)
+  assert.equal(done.tasks.find((t) => t.id === "T5")!.origin, "replan")
+})
+
+test("ready tasks run by priority first", () => {
+  const job = newJob("job-q", "goal")
+  moveJob(job, "triage"); moveJob(job, "plan"); moveJob(job, "plan_gate"); moveJob(job, "execute")
+  const t = (id: string, priority?: number) => ({ id, title: id, description: "", role: "code", acceptance: [], dependsOn: [], files: [id], wave: 0, status: "pending" as const, attempts: 0, stages: [], signatures: [], priority })
+  job.tasks = [t("T1"), t("T2", 1), t("T3", 5)]
+  assert.deepEqual(buildAgenda(job).filter((p) => p.action === "dispatch").map((p) => p.taskId), ["T2", "T1", "T3"])
+  job.counters.stalls = 3
+  assert.equal(buildAgenda(job)[0]!.action, "replan")
+  job.counters.replans = job.budget.replansMax
+  assert.equal(buildAgenda(job)[0]!.action, "dispatch")
+})
+
+test("FOLLOWUP lines are parsed; none and empty ones are skipped", () => {
+  const r = parseReport("STATUS: DONE\nFILES: a.ts\nFOLLOWUP: add docs | users ask | README.md, docs/x.md\n**FOLLOWUP:** none\nFOLLOWUP: check perf | slow | none")
+  assert.deepEqual(r.followUps, [{ what: "add docs", why: "users ask", files: ["README.md", "docs/x.md"] }, { what: "check perf", why: "slow", files: [] }])
+})

@@ -7,7 +7,7 @@ import { join } from "node:path"
 
 import { buildAgenda, nextProposal } from "./agenda.ts"
 import { Decider, RulesBackend } from "./backends.ts"
-import { ANSWER, CHOICE_FLOOR, complexityOf, NOUL_FLOOR, nextQuestionChoice, splitQuestions, TRIAGE } from "./catalog.ts"
+import { ANSWER, CHOICE_FLOOR, complexityOf, followUpQuestions, NOUL_FLOOR, nextQuestionChoice, splitQuestions, TRIAGE } from "./catalog.ts"
 import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, type Unchecked } from "./gate.ts"
 import { brief, fixPrompt, lastAssistantText, parseReport, skillLine, taskAcceptance, usage } from "./brief.ts"
 import { changedFiles, commitTask, exec as defaultExec, hashFiles, prepareIntegration, revertFiles, runGate, workingDiff, type Exec, type GateResult } from "./integration.ts"
@@ -17,7 +17,10 @@ import {
   choosePipeline, citationCheck, greenNote, readerCount, readerPrompt, redPrompt, researchPath, reviewFixPrompt, reviewPrompt, parseReview,
   synthesisPrompt, TEST_FILE, type Review,
 } from "./pipelines.ts"
-import { applyPlan, applySplits, MAX_SPLIT_LEVEL, parsePlan, PLAN_FORMAT, splitFormat, type Parsed, type Plan, type PlannedTask } from "./plan.ts"
+import {
+  addDiscovered, applyPlan, applyReplan, applySplits, MAX_SPLIT_LEVEL, parsePlan, PLAN_FORMAT, replanFormat, splitFormat, waves,
+  type Parsed, type Plan, type PlannedTask,
+} from "./plan.ts"
 import { classifyQuestions, classifyState, combine, narrowing, profileText, type Profile, type Skill } from "./profile.ts"
 import { resolvePolicy, type Policies } from "./policy.ts"
 import { route, type Availability, type ModelEntry } from "./registry.ts"
@@ -26,7 +29,7 @@ import {
   addNodes, applyAnswer, applyShortcut, decisionsText, frontier, instruction, matchSessionShortcut, nextStep, parseTree, settle,
   type AnswerReading, type DesignTree, type Step,
 } from "./session.ts"
-import { moveJob, moveTask, newJob, promoteReady, stage, type Job, type Task } from "./state.ts"
+import { discoveredCap, isDone, moveJob, moveTask, newJob, promoteReady, stage, type FollowUp, type Job, type Later, type Task } from "./state.ts"
 import { skillsFor, type Stage } from "./skills.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
 import { handoffNote, TIER_STEPS, type Signal } from "./watchdog.ts"
@@ -429,6 +432,7 @@ export class Runner {
       if (!next) break
       if (next.action === "dispatch" && next.taskId) await this.#runTask(job, job.tasks.find((t) => t.id === next.taskId)!)
       else if (next.action === "verify") await this.#verify(job)
+      else if (next.action === "replan") await this.#replan(job)
       else this.#stop(job, next.label)
       saveJob(this.#d.project, job)
     }
@@ -519,7 +523,89 @@ export class Runner {
     const outside = (await changedFiles(worktree, this.#exec)).filter((f) => task.files.length > 0 && !task.files.includes(f) && !frozen.has(f))
     const commit = await commitTask(worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${work.model.id} (${task.role}), pipeline ${pipeline.id}${outside.length ? `\nOutside the declared files: ${outside.join(", ")}` : ""}`, this.#exec)
     moveTask(task, "merged")
+    job.counters.stalls = Math.max(0, job.counters.stalls - 1)
     this.#say(`${task.id} passed${commit ? ` (${commit})` : ", nothing to commit"}`)
+    await this.#discover(job, task)
+  }
+
+  // N7: what the worker found outside its task. Needed or in scope: a new task after this one, with the priority the
+  // model gave. The user's call, out of scope, or over the cap: the job's "later" list, shown at the end. Without a
+  // decision model a follow-up is in scope when every file it names is already in the plan.
+  async #discover(job: Job, task: Task): Promise<void> {
+    const items = task.followUps ?? []
+    if (items.length === 0) return
+    const policy = resolvePolicy("N7", this.#policies(job, task.id)).policy
+    const asked = policy.kind === "rule" || policy.kind === "fixed" ? undefined : await this.#decider.ask(
+      "N7",
+      { goal: job.goal, acceptance: job.acceptance.map((a) => a.text), task: `${task.id} ${task.title}`, followUps: items },
+      followUpQuestions(items),
+      { localOnly: job.flags?.localOnly, job: job.id, task: task.id },
+    )
+    const a = asked?.decision.answers ?? {}
+    const noul = (q: string) => (a[q]?.type === "noul" ? (a[q] as { noul: number }).noul : undefined)
+    const planned = new Set(job.tasks.flatMap((t) => t.files))
+    for (const [i, item] of items.entries()) {
+      const needed = noul(`needed.${i}`)
+      const inScope = noul(`in_scope.${i}`)
+      const take = policy.kind === "fixed" ? policy.value !== "no"
+        : needed !== undefined || inScope !== undefined ? Math.max(needed ?? 0, inScope ?? 0) >= NOUL_FLOOR
+        : item.files.length > 0 && item.files.every((f) => planned.has(f))
+      let reason: Later["reason"] | undefined
+      if ((noul(`user.${i}`) ?? 0) >= NOUL_FLOOR) reason = "user_should_decide"
+      else if (!take) reason = "out_of_scope"
+      else if (item.files.length === 0) reason = "no_files"
+      else if (job.tasks.filter((t) => t.origin === "discovered").length >= discoveredCap(job)) reason = "cap"
+      if (!reason) {
+        const p = a[`priority.${i}`]
+        const priority = p?.type === "choice" && p.confidence >= CHOICE_FLOOR ? ({ high: 1, normal: 3, low: 5 } as Record<string, number>)[p.choice] ?? 3 : 3
+        const added = addDiscovered(job, task, item, priority)
+        if (added.task) {
+          this.#journal({ kind: "discovered", job: job.id, task: added.task.id, from: task.id, what: item.what, priority, decision: asked?.id })
+          this.#say(`${added.task.id} added (found by ${task.id}, priority ${priority}): ${item.what}`)
+          continue
+        }
+        job.lessons.push(`follow-up of ${task.id} not added: ${added.errors!.slice(0, 2).join("; ")}`)
+        reason = "invalid"
+      }
+      job.later = [...(job.later ?? []), { ...item, from: task.id, reason }]
+    }
+    task.followUps = []
+    saveJob(this.#d.project, job)
+  }
+
+  // The job is stalled: the planner rewrites the unfinished part; done tasks and their commits stay.
+  async #replan(job: Job): Promise<void> {
+    moveJob(job, "replan")
+    job.counters.replans++
+    const model = await this.#model(job, "plan", 0.7)
+    this.#say(`replanning (${job.counters.replans} of ${job.budget.replansMax}) with ${model.id}`)
+    const s = await this.#plannerSession(job, model.id)
+    let answer = await this.#ask(s.id, `${HEADER} replanning job ${job.id}\n\nThe user's job: ${job.goal}\n\n${replanFormat(job)}`)
+    let r: Parsed = answer.stopped || answer.timedOut ? { errors: ["the planner stopped"] } : applyReplan(job, answer.text)
+    if (r.errors && !answer.stopped && !answer.timedOut) {
+      answer = await this.#ask(s.id, `${HEADER} The plan has these problems:\n- ${r.errors.join("\n- ")}\n\nAnswer again with the corrected JSON only.`)
+      r = answer.stopped || answer.timedOut ? { errors: ["the planner stopped"] } : applyReplan(job, answer.text)
+    }
+    if (r.errors) {
+      moveJob(job, "execute")
+      return this.#stop(job, `the replan failed: ${r.errors.slice(0, 3).join("; ")}`)
+    }
+    const cut = job.tasks.filter((t) => !isDone(t) && t.status !== "cancelled")
+    for (const t of cut) moveTask(t, "cancelled")
+    const w = waves([...job.tasks.filter(isDone).map((t) => ({ ...t, dependsOn: t.dependsOn })), ...r.plan.tasks])
+    job.acceptance = [...r.plan.acceptance]
+    for (const t of r.plan.tasks) {
+      job.tasks.push({
+        id: t.id, title: t.title, description: t.description, role: t.role, acceptance: [...t.acceptance], dependsOn: [...t.dependsOn],
+        files: [...t.files], wave: w.get(t.id) ?? 0, status: "pending", attempts: 0, stages: [], signatures: [],
+        priority: t.priority ?? 3, origin: "replan",
+      })
+    }
+    job.counters.stalls = 0
+    job.lessons.push(`replanned: ${cut.map((t) => t.id).join(", ")} replaced by ${r.plan.tasks.map((t) => t.id).join(", ")}`)
+    this.#journal({ kind: "replan", job: job.id, cancelled: cut.map((t) => t.id), added: r.plan.tasks.map((t) => t.id) })
+    this.#say(`replanned: ${cut.map((t) => t.id).join(", ")} -> ${r.plan.tasks.map((t) => t.id).join(", ")}`)
+    moveJob(job, "execute")
   }
 
   // N5 + N5b: one request classifies the task and sets its profile; the role may change to one that can do it.
@@ -560,6 +646,7 @@ export class Runner {
         continue
       }
       const report = parseReport(answer.text)
+      collectFollowUps(task, report.followUps)
       stage(task, "implement", answer.timedOut ? "fail" : "pass", answer.timedOut ? "timed out" : `status ${report.status ?? "missing"}`)
       if (answer.timedOut) {
         this.#escalate(job, task, "the worker timed out")
@@ -727,6 +814,7 @@ export class Runner {
   // Phase B's escalation ladder ends at the user; other families and best-of-N come in Phase E.
   #escalate(job: Job, task: Task, reason: string): void {
     moveTask(task, "escalated")
+    job.counters.stalls++
     this.#stop(job, `${task.id}: ${reason}`)
   }
 
@@ -761,6 +849,13 @@ work there, such as the project's own test script.
 ${PLAN_FORMAT}`
 }
 
+// A worker's follow-ups over all its reports in this task, without repeats.
+function collectFollowUps(task: Task, items: readonly FollowUp[]): void {
+  if (items.length === 0) return
+  const seen = new Set((task.followUps ?? []).map((f) => f.what.toLowerCase()))
+  task.followUps = [...(task.followUps ?? []), ...items.filter((f) => !seen.has(f.what.toLowerCase()))]
+}
+
 // Frozen tests (P3) must not change after red: a changed or deleted one fails the gate like a failing check.
 async function frozenCheck(worktree: string, frozen: ReadonlyMap<string, string>, run: Exec): Promise<GateResult[]> {
   if (frozen.size === 0) return []
@@ -790,7 +885,8 @@ export function summary(job: Job): string {
     ? `\nbranch ${job.integrationBranch} in ${job.integrationWorktree}\nmerge: git merge ${job.integrationBranch} · discard: git worktree remove --force ${job.integrationWorktree} && git branch -D ${job.integrationBranch}`
     : ""
   const why = job.phase === "ask_user" && job.lessons.length ? `\nwhy: ${job.lessons[job.lessons.length - 1]}` : ""
-  return `${head}\n${lines.join("\n")}${branch}${why}`
+  const later = job.later?.length ? `\nfound but not done (for the user to decide):\n${job.later.map((l) => `- ${l.what} (from ${l.from}, ${l.reason.replace(/_/g, " ")})`).join("\n")}` : ""
+  return `${head}\n${lines.join("\n")}${branch}${why}${later}`
 }
 
 // The instruction to draft the design tree; the format is the one parseTree reads.
