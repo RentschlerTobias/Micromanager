@@ -364,7 +364,7 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - caveman on outputs;
   - routing over the registry: locality, censorship, difficulty tier, live availability. Per-device concurrency
     is only "local readers take turns" so far; batching tasks by model belongs to Phase F.
-- **E. Quality loop:**
+- **E. Quality loop: done 2026-10-05** (results below the phase list):
   - gates run by the plugin;
   - two-axis review;
   - improvement loop;
@@ -373,8 +373,14 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - the N9 ladder with handoff notes;
   - budgets including requests and tokens;
   - the `worker_refused` signature and the locality-aware ladder.
-- **F. Parallelism:** parallel readers; then parallel writers in worktrees, the merge train into the integration
-  branch, batch confirmation.
+
+  Added on the user's request: the task queue (priorities, follow-ups that become tasks, replan), background runs
+  with updates and notifications, and guardrails past the goal.
+- **F. Parallelism: done 2026-10-05** (results below):
+  - parallel readers;
+  - parallel writers in worktrees;
+  - the merge train into the integration branch;
+  - batch confirmation.
 - **G. Flagged pipelines:** P0, P4–P8, Ralph; DCP. Each is switched on only with eval evidence.
 - **H. Extras:** memory plugin, research extras (papers skill, context7, Serena, graphify).
 - **J. Local decision model:** GLiNER shadow mode → retraining on Jev's answers, overrides and outcomes → a
@@ -522,6 +528,79 @@ So our own fine-tune is needed before a guard may decide alone (Phase J).
 - **The code-mode `execute` tool** lists every tool, `dictator_run` included, to role agents. Whether its nested
   calls pass the evaluate hook is not verified; the narrowed-rights deny in the hook is the safety net.
 - **`glob` with `hidden: true`** shows file names under `.jev-dictator/`; reads are denied.
+
+### Phase E and F results (2026-10-05)
+**What exists now:**
+- **E0 (spike, private server):**
+  - A tool called through the code-mode `execute` tool carries the caller's agent, so the dictator tools'
+    agent check refuses role agents. Calls without an agent and calls from runner sessions are refused now too.
+  - `tool.execute.after` is awaited, also when async, and can rewrite the result the model sees.
+  - `session.synthetic` with `resume` starts a turn in an idle session and is steered into a busy one. Models
+    took its text for an injection, so updates go in as system blocks.
+- **E1 the task queue** (`src/state.ts`, `src/plan.ts`, `src/agenda.ts`, the runner's `#discover` and `#replan`):
+  - priorities;
+  - `FOLLOWUP` lines and reviewers' `outside` items through N7: a new task, dropped as already planned, or the
+    "later" list;
+  - a replan when stalled.
+- **E2 background runs** (`src/scheduler.ts`):
+  - `dictator_run` queues and returns;
+  - progress as quiet messages, and the end as a system note plus a wake-up;
+  - `notify-send`;
+  - `dictator_stop`;
+  - `dictator_run` with the user's answer as a note.
+- **E2b guardrails:**
+  - G0 on follow-ups and workers' permission requests;
+  - injection checks on web results and research notes;
+  - secrets masked in every prompt and in runner sessions' tool results;
+  - G0 scored twice;
+  - `bench-guards --repeat`.
+- **E3 the ladder:**
+  - N8 signatures;
+  - rung 2 on another family with a handoff note;
+  - rung 3 typed by N9 (too_hard replans, the rest asks the user);
+  - token, request and cost budgets per job, and tokens per session by N5's tier.
+- **E4:** a spec review and a standards review in parallel; confidence ≥ 80 with evidence blocks.
+- **E5:** `worker_refused` reroutes once to a local uncensored model.
+- **F:** parallel tasks in their own worktrees, N10 batch confirmation, a merge train, per-model slots.
+- **A stalled session** (no change in 4 minutes) is interrupted and treated like a watchdog stop.
+- Tests: 151 TypeScript tests.
+
+**Live on a private `opencode serve`** (cloud only: local models off, routing over glm / qwen / deepseek; cloud
+Jev; GLiNER for G0):
+- **Run 1** (slugify with umlaut transliteration, tests, README; one task at a time, before the parallel and
+  follow-up fixes):
+  - "go" returned in 4 s. While the job ran, the dictator answered a status question in 8 s.
+  - All three tasks passed. Counters were exact (49k tokens and 21 requests after three tasks).
+  - The two reviewers ran in parallel on glm and qwen.
+  - It found two bugs, both fixed (see below).
+- **Run 2** (two independent helpers and a suite check; parallel 3, the new code):
+  - N10 confirmed T1 and T2 as independent (0.97 each). They started 0.1 s apart in their own worktrees, and the
+    train merged T2, then rebased and merged T1.
+  - "stop" through the dictator paused the job in T3 and removed T3's worktree. "go on" resumed it, and reconcile
+    started T3 again.
+  - The end woke the dictator through the system note. It reported the tasks, the branch and how to merge,
+    without calling the note an injection.
+  - No follow-up was reported twice.
+
+**Fixed during the live tests:**
+- **Workers reported the job's next tasks as follow-ups**, which became duplicate tasks. The brief now lists the
+  other tasks, N7 asks "already planned", and the rule without Jev looks at open tasks' files.
+- **The review hang of Phase D:** a reviewer's provider stream started and never completed, so the session waited
+  until the 20-minute timeout. Now a session is stalled after 4 minutes without change, and a stalled reviewer
+  gets one more try on another family.
+- **A user's stop woke the dictator a second time.** It is a quiet note now.
+- **Found in the code while building F:** a task blocked on NEEDS_CONTEXT could never continue, and the user's
+  answer never reached it. A parallel task that stopped an already stopped job broke its resume phase.
+
+**Open:**
+- **TUI:** the live runs used a private server and `opencode run --server`. How synthetic messages and progress
+  notes look in the TUI is still to see in a run of the user's own.
+- **Not exercised live:** budgets, the ladder's rung 2 and 3, worker_refused and the injection checks on web
+  results. Tests cover them with fakes.
+- **Reviewers' shell:** reviewers tried `git diff` and were denied (their bash is tests/lint only). They fell
+  back to reading files, and the review prompt carries the diff.
+- **Routing:** with every task on one family (deepseek won every worker role here), "another family" for review
+  works, but the ladder's rung 2 needs the registry to offer more than one family per tier.
 
 ## Verification
 - **Per phase: tests** with a fake Jev:
