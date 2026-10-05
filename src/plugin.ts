@@ -20,6 +20,7 @@ import { DICTATOR, ROLES, roleByAgent, type Rule } from "./roles.ts"
 import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
+import { Compactor } from "./compact.ts"
 import { jobId } from "./store.ts"
 import { moveJob, newJob, readyTasks, type Job } from "./state.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
@@ -522,7 +523,9 @@ export default {
       }
     })
 
-    await ctx.session.hook("context", (input) => {
+    // Jev drops the dictator's old tool results it no longer needs before each of its turns (src/compact.ts).
+    const compactor = new Compactor(decider, record)
+    await ctx.session.hook("context", async (input) => {
       // The tools exist for every agent; only the dictator sees them.
       if (input.agent !== DICTATOR.agent) {
         if (input.tools) for (const id of TOOL_IDS) delete input.tools[id]
@@ -531,6 +534,13 @@ export default {
           if (signal) stop(input.sessionID, signal)
         }
         return
+      }
+      if (input.sessionID) {
+        const c = await compactor.apply(input.sessionID, input.messages).catch((err: unknown) => {
+          log("warn", `compaction failed: ${String(err)}`)
+          return undefined
+        })
+        if (c?.asked) log("info", `compaction: ${c.removed} characters dropped from the dictator's context`)
       }
       const note = input.sessionID ? steering.get(input.sessionID) : undefined
       if (note && Array.isArray(input.system)) input.system.push({ type: "text", text: note })
