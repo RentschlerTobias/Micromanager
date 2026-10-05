@@ -25,29 +25,30 @@ Restart the OpenCode server afterwards (plugins load at start). Requires opencod
 Pick the agent **micromanager** in OpenCode and tell it what you want. It works like oh-my-openagent's orchestrator, with
 Jev and the plugin securing every task:
 
-1. **The micromanager orchestrates.** It splits your request into small tasks, keeps a todo list and delegates each
-   task with `delegate_task`: title, prompt, the files it may change, checks such as `npm test`, dependencies and a
-   priority. The call returns at once. Independent tasks (no shared files) run in parallel in the background, each
-   in its own worktree under `.jev-micromanager/worktrees/`. A merge train brings them one at a time onto the session's
-   branch `jev/<job>`. Your checkout is never touched.
-2. **Jev and the plugin decide per task:**
-   - **Guards.** A local check (G0, GLiNER on the CPU) looks at each delegation, at web content and at workers'
-     permission requests. Keys and tokens are masked.
-   - **The profile (N5).** One Jev request per task sets the role (`coder`, `-test`, `-write`, …), the
-     difficulty and so the model, the risk, the skills, and rights that can only narrow the role's.
-   - **Permissions (N13).** Workers' permission requests go to Jev first and to you only when Jev is not sure.
-   - **Quality.** The plugin runs the checks itself, with fix rounds and, for a task that keeps failing, a fresh
-     session on another model family. A review by another model family runs for risky or unchecked tasks, and
-     tests first for bug fixes.
-   - **Limits.** The watchdog stops loops and stalled models. Token and request budgets per job are optional
-     and off by default, since a job cut at a limit wastes what it did.
-3. **Reports come back.** When a task merges, is given up or needs you, its report goes to the micromanager: status,
-   checks, the worker's summary and its follow-ups. Reports close together arrive as one. The micromanager decides what
-   comes next, asks you what only you can decide (`answer_task` passes your answer on) and, at the end, tells you
-   how to merge or discard the branch. Say "ulw" or "ultrawork" and it goes on until every todo is done.
-   `notify-send` adds desktop notifications. `list_tasks` shows the tasks and their reports, and `stop_job`
-   pauses the work.
-4. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
+1. **The micromanager orchestrates.** It splits your request into small tasks, keeps a todo list and starts a worker
+   per task with OpenCode's own `subagent` tool, in the background: the role as agent (`coder`, `tester`, `writer`,
+   `explorer`, …), a short title, and a prompt that ends with `Files:` (what it may change) and `Checks:` (e.g.
+   `npm test`) for a worker that writes. The call returns at once; the workers show up in OpenCode as the
+   micromanager's child sessions, and the micromanager stays free to talk with you.
+2. **Each writer works in its own git worktree** under `.jev-micromanager/worktrees/`, branched off the session's
+   branch `jev/<job>`: OpenCode starts the child in your checkout, and the plugin moves it into the worktree before
+   its first step. Your checkout is never touched. Readers work on the session branch and change nothing.
+3. **Jev and the plugin secure each task:**
+   - **Guards.** A check looks at each delegation, at web content and at workers' permission requests. Keys and
+     tokens are masked.
+   - **Model and skills.** The plugin routes each role to its model and names the skills in the worker's brief.
+   - **Permissions (N13).** Workers' permission requests go to Jev; what Jev is not sure about is denied with a
+     note to report it, since nobody sits at a background worker.
+   - **Checks and merge.** A writer ends by calling `finish_task`: the plugin runs the checks in the worktree; on
+     a failure the worker gets the output and fixes it, on a pass the plugin commits and a merge train brings the
+     commit onto `jev/<job>` (rebased and checked again when another task got there first).
+   - **Limits.** The watchdog stops loops and stalled workers; every 60 steps Jev reviews a worker's progress.
+4. **Reports come back.** The plugin's note "T… merged into …" lands in the micromanager's session, then OpenCode
+   adds the worker's report and wakes the micromanager. It decides what comes next, continues a worker by its
+   session when something is left (it keeps its worktree), asks you what only you can decide and, at the end, tells
+   you how to merge or discard the branch. Say "ulw" or "ultrawork" and it goes on until every todo is done.
+   `list_tasks` shows the tasks with their worker sessions, and `stop_job` stops the workers.
+5. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
    after a planning session with you. You approve it, and `run_job` runs it.
 
 Jobs and task notes live in `.jev-micromanager/`, kept out of git through `.git/info/exclude`.
@@ -59,7 +60,7 @@ or waits for, plus tokens, requests and cost. In a terminal, in the project:
 node ~/Fun/Projects/Repos/jev-micromanager/src/cli.ts status --watch   # redraws every 2 s; --all for every job
 ```
 
-**Memory.** Workers report what they learned about the project (`LEARNED:`); Jev keeps the lasting, new facts in
+**Memory.** In planned jobs (`plan_job`), workers report what they learned about the project (`LEARNED:`); Jev keeps the lasting, new facts in
 `.opencode/memory/jev-project.md` (opencode-agent-memory's format) and picks the ones that help each task's brief.
 
 Models come from a registry of the OpenCode Go models and your local ones (llama-swap, iGPU, NPU), local

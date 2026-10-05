@@ -16,16 +16,16 @@ test("a role's first model, images to the vision model, a review in another fami
   assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.deepseek).model, MODELS.qwen)
 })
 
-test("the micromanager's subagent call gets the routed model, runs in the foreground, carries a header", () => {
+test("the micromanager's subagent call gets the routed model, runs in the background, carries a header", () => {
   const call = {
     tool: "subagent",
     agent: "micromanager",
-    input: { agent: "coder", model: "opencode-go/kimi-k3", prompt: "Add a --verbose flag.", background: true },
+    input: { agent: "coder", model: "opencode-go/kimi-k3", prompt: "Add a --verbose flag.", background: false },
   }
   const routed = routeSubagentCall(call, DEFAULT_ROUTING)
   assert.deepEqual(routed, { role: "code", model: MODELS.glm, reason: "first model for code" })
   assert.equal(call.input.model, MODELS.glm) // the model the micromanager asked for is overridden
-  assert.equal(call.input.background, false)
+  assert.equal(call.input.background, true)
   assert.ok(String(call.input.prompt).startsWith(`${HEADER} role: code · model: ${MODELS.glm}\n\nAdd a --verbose flag.`))
   routeSubagentCall(call, DEFAULT_ROUTING)
   assert.equal(String(call.input.prompt).split(HEADER).length, 2) // the header only once

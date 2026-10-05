@@ -113,10 +113,11 @@ export interface TaskWorktree {
 }
 
 // A task of a parallel batch works in its own worktree, on a branch off the job's branch at its current commit.
-// "jev/<job>--<task>", since "jev/<job>/<task>" cannot sit next to the branch "jev/<job>" in git's refs.
-export async function prepareTaskWorktree(project: string, jobId: string, taskId: string, from: string, run: Exec = exec): Promise<TaskWorktree> {
+// "jev/<job>--<task>", since "jev/<job>/<task>" cannot sit next to the branch "jev/<job>" in git's refs. at: another
+// place for it (a continued worker keeps its session's directory).
+export async function prepareTaskWorktree(project: string, jobId: string, taskId: string, from: string, run: Exec = exec, at?: string): Promise<TaskWorktree> {
   const branch = `jev/${jobId}--${taskId}`
-  const worktree = join(project, DIR, "worktrees", `${jobId}--${taskId}`)
+  const worktree = at ?? join(project, DIR, "worktrees", `${jobId}--${taskId}`)
   await removeTaskWorktree(project, { branch, worktree }, run) // a leftover of an interrupted run
   const added = await run("git", ["worktree", "add", "-q", "-b", branch, worktree, from], { cwd: project })
   if (added.code !== 0) throw new IntegrationError(`git worktree add failed: ${added.stderr.trim()}`)

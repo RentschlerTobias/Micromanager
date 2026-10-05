@@ -1,5 +1,5 @@
-// Before the micromanager's subagent call runs: the routed model goes into the call, the call runs in the
-// foreground (sequential in Phase 1), and a header tells the sub-agent its role and model.
+// Before the micromanager's subagent call runs: the routed model goes into the call, and the call runs in the
+// background (OpenCode notifies the micromanager when the worker ends; src/native.ts keeps writers in worktrees).
 
 import { chooseModel, guessNeeds, type Routing } from "./routing.ts"
 import { MICROMANAGER, roleByAgent } from "./roles.ts"
@@ -10,6 +10,7 @@ export interface ToolCall {
   sessionID?: string
   input: Record<string, unknown>
   result?: unknown // tool.execute.after: what the model will see
+  error?: unknown // tool.execute.after: why the tool failed (a hook's throw lands here too)
 }
 
 export interface Routed {
@@ -28,7 +29,7 @@ export function routeSubagentCall(call: ToolCall, routing: Routing, workerModel?
   const prompt = String(call.input.prompt ?? "")
   const choice = chooseModel(role, guessNeeds(prompt), routing, workerModel)
   call.input.model = choice.model
-  call.input.background = false
+  call.input.background = true
   if (!prompt.startsWith(HEADER)) {
     call.input.prompt = `${HEADER} role: ${role.id} · model: ${choice.model}\n\n${prompt}`
   }

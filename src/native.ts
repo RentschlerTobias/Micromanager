@@ -1,0 +1,414 @@
+// Native delegation: the micromanager starts workers with OpenCode's own subagent tool, in the background, and the
+// plugin keeps each writer in its own git worktree (spike of 2026-10-05, docs/plan.md).
+//
+// - Before the micromanager's subagent call runs, delegate() turns it into a task of the session's job: the "Files:"
+//   and "Checks:" lines at the end of its prompt are the task's write scope and checks, a writer gets its own
+//   worktree off the session branch, a reader works in the session branch's worktree, and the prompt becomes the
+//   worker's brief.
+// - OpenCode creates the child in the micromanager's directory (a child always starts in its parent's), and the
+//   plugin moves it in the child's first prompt hook (claim), before any tool runs.
+// - The writer ends through finish_task: the plugin runs the checks in the worktree, commits, and merges through the
+//   merge train; a failure goes back to the worker, which fixes it in the same turn loop. OpenCode then notifies the
+//   micromanager with the worker's report, after the merge.
+//
+// Every plugin instance of one server shares this state (a moved worker is served by the instance of its worktree).
+
+import { HEADER } from "./hooks.ts"
+import {
+  commitTask, exec as defaultExec, fastForward, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, runGate,
+  type Exec, type GateResult,
+} from "./integration.ts"
+import { addDelegated, checkProblem, parseFiles } from "./plan.ts"
+import { WRITERS } from "./profile.ts"
+import { ROLES, roleByAgent, type Role } from "./roles.ts"
+import { moveTask, newJob, moveJob, stage, type Job, type Task } from "./state.ts"
+import { excludeFromGit, jobId, listJobs, saveJob } from "./store.ts"
+import { skillLine } from "./brief.ts"
+
+// The first line OpenCode puts before a new subagent's prompt; how the prompt hook tells a child's first turn.
+export const CHILD_PREFIX = "You are a subagent spawned by another session."
+
+export class DelegationError extends Error {}
+
+export interface Delegation {
+  readonly body: string // the prompt without the Files and Checks lines
+  readonly files: string // as written, parsed by parseFiles
+  readonly checks: string[]
+}
+
+// The "Files:" and "Checks:" lines of a delegation, wherever they stand; the checks go on over the following lines
+// until a blank line or another such line.
+export function parseDelegation(prompt: string): Delegation {
+  const body: string[] = []
+  const checks: string[] = []
+  let files = ""
+  let inChecks = false
+  for (const line of prompt.split("\n")) {
+    const f = line.match(/^\s*files:\s*(.*)$/i)
+    const c = line.match(/^\s*checks:\s*(.*)$/i)
+    if (f) {
+      files = f[1]!.trim()
+      inChecks = false
+    } else if (c) {
+      inChecks = true
+      if (c[1]!.trim()) checks.push(c[1]!.trim())
+    } else if (inChecks && line.trim()) checks.push(line.trim().replace(/^[-*]\s+/, ""))
+    else {
+      inChecks = false
+      body.push(line)
+    }
+  }
+  return { body: body.join("\n").trim(), files, checks }
+}
+
+interface Entry {
+  readonly project: string
+  readonly jobId: string
+  taskId: string
+  readonly parent: string // the micromanager session
+  readonly writer: boolean
+  dir: string // where the worker works: its own worktree (writer) or the session branch's (reader)
+  branch?: string // a writer's task branch
+  removed?: boolean // the writer's worktree was removed after its merge
+  session?: string // the child session, once claimed
+  checks: string[]
+}
+
+export interface NativeDeps {
+  readonly exec?: Exec
+  readonly installedSkills?: ReadonlySet<string>
+}
+
+export interface Delegated {
+  readonly task: Task
+  readonly job: Job
+  readonly prompt: string // the worker's brief
+}
+
+export class Native {
+  readonly #exec: Exec
+  readonly #skills: ReadonlySet<string>
+  readonly #entries = new Map<string, Entry>() // "<job>/<task>" -> entry
+  readonly #bySession = new Map<string, string>() // child session -> its entry's key
+  readonly #jobs = new Map<string, Job>() // "<project>\0<job>" -> the live job
+  readonly #trains = new Map<string, Promise<unknown>>() // per job: one merge at a time
+  readonly #waiting = new Set<string>() // child sessions whose end is awaited
+  readonly #delegating = new Map<string, Promise<unknown>>() // per micromanager session: one delegation at a time
+
+  constructor(deps: NativeDeps = {}) {
+    this.#exec = deps.exec ?? defaultExec
+    this.#skills = deps.installedSkills ?? new Set()
+  }
+
+  // The micromanager session's job: made at its first delegation, kept until the session ends.
+  job(project: string, parent: string): Job {
+    const live = [...this.#jobs.values()].find((j) => j.facilitator === parent && j.rolling && this.#jobs.get(key(project, j.id)) === j)
+    if (live) return live
+    const found = listJobs(project).find((j) => j.facilitator === parent && j.rolling && !["done", "stopped", "failed"].includes(j.phase))
+    const job = found ?? newJob(jobId(), `the delegated tasks of micromanager session ${parent}`)
+    if (!found) {
+      for (const p of ["triage", "plan", "plan_gate", "execute"] as const) moveJob(job, p)
+      job.rolling = true
+      job.facilitator = parent
+      saveJob(project, job)
+    }
+    this.#jobs.set(key(project, job.id), job)
+    return job
+  }
+
+  // A new subagent call of the micromanager: the task, its worktree and the worker's brief. Throws a
+  // DelegationError the micromanager can act on when the call is not a valid delegation. Calls of one message come
+  // at the same time; they go one after another (live test: two made the session branch at once, and one failed).
+  delegate(project: string, parent: string, input: { agent: string; description: string; prompt: string }, model: string): Promise<Delegated> {
+    const next = (this.#delegating.get(parent) ?? Promise.resolve()).then(() => this.#delegate(project, parent, input, model))
+    this.#delegating.set(parent, next.catch(() => undefined))
+    return next
+  }
+
+  async #delegate(project: string, parent: string, input: { agent: string; description: string; prompt: string }, model: string): Promise<Delegated> {
+    const role = roleByAgent(input.agent)
+    if (!role) throw new DelegationError(`Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}), not ${input.agent || "none"}.`)
+    const d = parseDelegation(input.prompt)
+    const parsed = parseFiles(d.files, project)
+    if (parsed.problem) throw new DelegationError(`Not started: ${parsed.problem}`)
+    const writer = WRITERS.has(role.id)
+    if (writer && !parsed.files.length) throw new DelegationError(`Not started: a ${role.agent} changes files; end the prompt with a line "Files: <the project paths it may change>" and a line "Checks: <shell command>".`)
+    if (!writer && parsed.files.length) throw new DelegationError(`Not started: ${role.agent} only reads; leave out the Files line, or pick a role that writes.`)
+    const bad = d.checks.map(checkProblem).filter(Boolean)
+    if (bad.length) throw new DelegationError(`Not started: checks must be shell commands that exit 0 when the task is done. ${bad.join("; ")}`)
+    if (!d.body) throw new DelegationError("Not started: the prompt has no task.")
+
+    const job = this.job(project, parent)
+    if (!job.integrationWorktree) {
+      excludeFromGit(project)
+      const integration = await prepareIntegration(project, job.id, this.#exec)
+      job.integrationBranch = integration.branch
+      job.integrationWorktree = integration.worktree
+    }
+    const added = addDelegated(job, { title: input.description.trim() || d.body.split("\n")[0]!, prompt: d.body, files: parsed.files, dependsOn: [], checks: d.checks })
+    if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
+    const task = added.task
+    task.role = role.id
+    task.model = model
+    for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
+    stage(task, "delegate", "pass", `${role.agent} on ${model}`)
+    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: job.integrationWorktree!, checks: d.checks }
+    if (writer) {
+      const w = await prepareTaskWorktree(project, job.id, task.id, job.integrationBranch!, this.#exec)
+      entry.dir = w.worktree
+      entry.branch = w.branch
+      task.worktree = w.worktree
+      task.branch = w.branch
+    }
+    this.#entries.set(`${job.id}/${task.id}`, entry)
+    saveJob(project, job)
+    return { task, job, prompt: this.#brief(job, task, role, model, d, entry) }
+  }
+
+  // The subagent call failed before its child took the task (refused, an unknown agent): the task is dropped.
+  async abandon(prompt: string): Promise<void> {
+    const k = tokenOf(prompt)
+    const entry = k ? this.#entries.get(k) : undefined
+    if (!entry || entry.session) return
+    const job = this.#job(entry)
+    const task = job?.tasks.find((t) => t.id === entry.taskId)
+    if (task) {
+      moveTask(task, "cancelled")
+      stage(task, "delegate", "fail", "the subagent call failed")
+    }
+    await this.#dropWorktree(entry, task)
+    this.#entries.delete(k!)
+    if (job) saveJob(entry.project, job)
+  }
+
+  // A child's first prompt: the directory it must move to, when it carries one of our tasks.
+  claim(session: string, text: string): { dir: string; task: string; parent: string } | undefined {
+    if (!text.startsWith(CHILD_PREFIX)) return undefined
+    const k = tokenOf(text)
+    const entry = k ? this.#entries.get(k) : undefined
+    if (!entry || entry.session) return undefined
+    entry.session = session
+    this.#bySession.set(session, k!)
+    const job = this.#job(entry)
+    const task = job?.tasks.find((t) => t.id === entry.taskId)
+    if (job && task) {
+      task.session = session
+      task.sessions = [...(task.sessions ?? []), session]
+      saveJob(entry.project, job)
+    }
+    return { dir: entry.dir, task: `${entry.taskId} ${task?.title ?? ""}: ${task?.description ?? ""}`, parent: entry.parent }
+  }
+
+  // The micromanager continues a worker (subagent with its sessionID): a merged writer gets a fresh worktree from the
+  // session branch at the same place, as a new task, so its next change is checked and merged again.
+  async resume(session: string): Promise<Task | undefined> {
+    const entry = this.#entry(session)
+    const job = entry && this.#job(entry)
+    let task = job?.tasks.find((t) => t.id === entry!.taskId)
+    if (!entry || !job || !task) return undefined
+    if (entry.writer && (task.status === "merged" || task.status === "cancelled")) {
+      const added = addDelegated(job, { title: `${task.title} (continued)`, prompt: task.description, files: task.files, dependsOn: [], checks: entry.checks })
+      if (!added.task) return undefined
+      added.task.role = task.role
+      added.task.model = task.model
+      added.task.session = session
+      added.task.sessions = [session]
+      for (const s of ["ready", "planned", "running"] as const) moveTask(added.task, s)
+      stage(added.task, "delegate", "pass", `continues ${task.id} in session ${session}`)
+      this.#entries.delete(`${job.id}/${task.id}`)
+      entry.taskId = added.task.id
+      this.#entries.set(`${job.id}/${added.task.id}`, entry)
+      this.#bySession.set(session, `${job.id}/${added.task.id}`)
+      task = added.task
+    } else if (task.status === "escalated" || task.status === "blocked" || task.status === "passed") {
+      if (task.status === "passed") moveTask(task, "escalated") // a reader asked again
+      moveTask(task, "running")
+    }
+    if (entry.writer && entry.removed) {
+      // The session keeps its directory, so the worktree comes back where it was.
+      const w = await prepareTaskWorktree(entry.project, job.id, entry.taskId, job.integrationBranch!, this.#exec, entry.dir)
+      entry.branch = w.branch
+      entry.removed = false
+      task.worktree = w.worktree
+      task.branch = w.branch
+    }
+    saveJob(entry.project, job)
+    return task
+  }
+
+  isWorker(session: string): boolean {
+    return this.#bySession.has(session)
+  }
+
+  isWriter(session: string): boolean {
+    return this.#entry(session)?.writer ?? false
+  }
+
+  // finish_task: the checks in the worker's worktree, then the commit and the merge train. The text goes back to the
+  // worker; note is what the micromanager should hear (undefined: nothing new).
+  async finish(session: string, summary: string): Promise<{ text: string; note?: string; parent?: string }> {
+    const entry = this.#entry(session)
+    const job = entry && this.#job(entry)
+    const task = job?.tasks.find((t) => t.id === entry!.taskId)
+    if (!entry || !job || !task) return { text: "This session has no task of the micromanager; there is nothing to finish." }
+    if (!entry.writer) return { text: "You only read: there is nothing to check or merge. End with your findings; they are your result." }
+    if (task.status === "merged") return { text: `${task.id} is already merged into ${job.integrationBranch}. End with your short report.` }
+    if (task.status === "escalated") moveTask(task, "running")
+    moveTask(task, "gating")
+    task.summary = summary.trim().slice(0, 2000) || task.summary
+    const failed = (await runGate(entry.dir, entry.checks, this.#exec)).filter((r) => !r.passed)
+    if (failed.length) {
+      moveTask(task, "fixing")
+      moveTask(task, "running")
+      stage(task, "gate", "fail", failed.map((f) => f.command).join(", "))
+      saveJob(entry.project, job)
+      return { text: failText("The checks fail in your directory", failed) }
+    }
+    stage(task, "gate", "pass", entry.checks.length ? entry.checks.join(", ") : "no checks given")
+    const commit = await commitTask(entry.dir, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${task.model ?? "?"} (${task.role}), session ${session}${task.summary ? `\n\n${task.summary}` : ""}`, this.#exec)
+    moveTask(task, "passed")
+    const train = this.#trains.get(job.id) ?? Promise.resolve()
+    const step = train.then(() => this.#merge(entry, job, task))
+    this.#trains.set(job.id, step.catch(() => undefined))
+    const merged = await step
+    saveJob(entry.project, job)
+    if (!merged.ok) return { text: merged.text }
+    // The commit as merged: a rebase onto other tasks' commits gave it a new id (live test).
+    const head = commit && (await this.#exec("git", ["rev-parse", "--short", "HEAD"], { cwd: entry.dir })).stdout.trim()
+    const checks = entry.checks.length ? `checks passed: ${entry.checks.join("; ")}` : "no checks were given"
+    return {
+      text: `Merged into ${job.integrationBranch}${head ? ` as ${head}` : " (nothing to commit)"}; ${checks}. Now end with your short report.`,
+      note: `[jev-micromanager] ${task.id} ${task.title}: merged into ${job.integrationBranch}${head ? ` (${head})` : ", nothing changed"}; ${checks}.`,
+      parent: entry.parent,
+    }
+  }
+
+  // Rebase onto the session branch, the checks again when it moved, then the fast-forward.
+  async #merge(entry: Entry, job: Job, task: Task): Promise<{ ok: true } | { ok: false; text: string }> {
+    const w = { worktree: entry.dir, branch: entry.branch! }
+    const step = await rebaseTask(w, job.integrationBranch!, this.#exec)
+    if (!step.ok) {
+      moveTask(task, "escalated")
+      stage(task, "merge", "fail", step.conflict)
+      return { ok: false, text: `Your commit does not apply on top of ${job.integrationBranch}, which other tasks moved on meanwhile (${step.conflict}). Run git rebase ${job.integrationBranch} in your directory, resolve the conflict keeping both changes, run the checks, and call finish_task again.` }
+    }
+    if (step.moved) {
+      const failed = (await runGate(entry.dir, entry.checks, this.#exec)).filter((r) => !r.passed)
+      if (failed.length) {
+        moveTask(task, "escalated")
+        stage(task, "merge", "fail", `checks fail on top of the newer commits: ${failed.map((f) => f.command).join(", ")}`)
+        return { ok: false, text: failText(`Your change is rebased onto ${job.integrationBranch}, which other tasks moved on meanwhile, and there the checks fail`, failed) }
+      }
+    }
+    const ff = await fastForward(job.integrationWorktree!, entry.branch!, this.#exec)
+    if (!ff.ok) {
+      moveTask(task, "escalated")
+      stage(task, "merge", "fail", ff.conflict)
+      return { ok: false, text: `The merge into ${job.integrationBranch} failed (${ff.conflict}). Call finish_task again; if it fails the same way, report it.` }
+    }
+    moveTask(task, "merged")
+    stage(task, "merge", "pass", `merged into ${job.integrationBranch}`)
+    return { ok: true }
+  }
+
+  // Waits once per run for a worker's end (wait resolves when its session goes idle).
+  // reason: why the watchdog stopped the worker, if it did.
+  watchEnd(session: string, wait: () => Promise<unknown>, reason: () => string | undefined, ended: (note: string | undefined, parent: string) => void): void {
+    if (this.#waiting.has(session) || !this.#bySession.has(session)) return
+    this.#waiting.add(session)
+    void wait().catch(() => undefined).then(async () => {
+      this.#waiting.delete(session)
+      const r = await this.ended(session, reason())
+      if (r) ended(r.note, r.parent)
+    })
+  }
+
+  // A worker's run ended: a merged writer's worktree goes, a reader's task is done, and a writer that did not get
+  // through finish_task is reported, with its change still in its worktree. reason: why the watchdog stopped it.
+  async ended(session: string, reason?: string): Promise<{ note?: string; parent: string } | undefined> {
+    const entry = this.#entry(session)
+    const job = entry && this.#job(entry)
+    const task = job?.tasks.find((t) => t.id === entry!.taskId)
+    if (!entry || !job || !task) return undefined
+    let note: string | undefined
+    if (!entry.writer) {
+      if (task.status === "running") {
+        moveTask(task, "gating")
+        moveTask(task, "passed")
+        stage(task, "report", "pass", "the reader ended")
+      }
+    } else if (task.status === "merged") {
+      await this.#dropWorktree(entry, task)
+    } else {
+      stage(task, "end", "fail", reason ?? "ended without finish_task")
+      note = `[jev-micromanager] ${task.id} ${task.title}: its worker ended${reason ? ` (${reason})` : ""} without passing finish_task, so nothing was checked or merged; its change is still in ${entry.dir}. Continue it with the subagent tool and sessionID ${session} to finish, or tell the user.`
+    }
+    saveJob(entry.project, job)
+    return { note, parent: entry.parent }
+  }
+
+  // The workers of a micromanager session that still run.
+  running(parent: string): { session: string; task: string }[] {
+    return [...this.#entries.values()]
+      .filter((e) => e.parent === parent && e.session)
+      .filter((e) => ["running", "gating", "fixing"].includes(this.#job(e)?.tasks.find((t) => t.id === e.taskId)?.status ?? ""))
+      .map((e) => ({ session: e.session!, task: e.taskId }))
+  }
+
+  #entry(session: string): Entry | undefined {
+    const k = this.#bySession.get(session)
+    return k ? this.#entries.get(k) : undefined
+  }
+
+  #job(entry: Entry): Job | undefined {
+    return this.#jobs.get(key(entry.project, entry.jobId))
+  }
+
+  async #dropWorktree(entry: Entry, task?: Task): Promise<void> {
+    if (!entry.writer || entry.removed || !entry.branch) return
+    await removeTaskWorktree(entry.project, { worktree: entry.dir, branch: entry.branch }, this.#exec)
+    entry.removed = true
+    if (task) {
+      task.worktree = undefined
+      task.branch = undefined
+    }
+  }
+
+  #brief(job: Job, task: Task, role: Role, model: string, d: Delegation, entry: Entry): string {
+    const skills = [...(entry.writer ? ["verification-before-completion"] : []), ...(role.id === "research" ? ["research"] : [])].filter((s) => this.#skills.has(s))
+    const others = job.tasks.filter((t) => t.id !== task.id && ["running", "gating", "fixing"].includes(t.status))
+    return [
+      `${HEADER} task ${task.id} · job ${job.id} · role ${role.id} · model ${model}`,
+      "",
+      d.body,
+      "",
+      entry.writer ? `Files you may change: ${task.files.join(", ")}. Work only in your current directory, a git worktree of its own.` : "Change no files.",
+      entry.writer
+        ? entry.checks.length
+          ? `Checks the plugin runs when you finish: ${entry.checks.join("; ")}`
+          : "No checks were given: test your change yourself as far as you can."
+        : "",
+      others.length ? `Other workers change other files at the same time (not yours): ${others.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
+      "Keys and tokens show as <secret> in what you read; never write <secret> into a file, leave such lines as they are.",
+      skillLine(skills),
+      "",
+      entry.writer
+        ? "When your change is done, call finish_task with a two-line summary. The plugin then runs the checks, commits and merges; if it answers with failures, fix them and call finish_task again. Once it says merged, end with a short report: what you changed, what the checks showed, anything left open, and work you noticed outside your task (follow-ups)."
+        : "End with your findings: they are your result. Add work you noticed that the request needs (follow-ups).",
+    ].filter((line, i, all) => line !== "" || all[i - 1] !== "").join("\n").trim()
+  }
+}
+
+function key(project: string, job: string): string {
+  return `${project}\0${job}`
+}
+
+// "<job>/<task>" from a brief's header line.
+function tokenOf(text: string): string | undefined {
+  const m = text.match(/\[jev-micromanager\] task (T\d+) · job (\S+) ·/)
+  return m ? `${m[2]}/${m[1]}` : undefined
+}
+
+function failText(what: string, failed: readonly GateResult[]): string {
+  return `${what}. Fix them, then call finish_task again:\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}`
+}

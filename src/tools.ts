@@ -5,17 +5,7 @@
 
 import type { Job } from "./state.ts"
 
-export const TOOL_IDS = ["delegate_task", "list_tasks", "answer_task", "plan_job", "plan_questions", "run_job", "job_status", "stop_job"] as const
-
-// What delegate_task takes; every field is a string, as the tool schema is built from read's path field.
-export interface TaskInput {
-  readonly title: string
-  readonly prompt: string
-  readonly files: string // comma separated
-  readonly depends: string // task ids, comma separated
-  readonly priority: string // 1..5, or empty
-  readonly checks: string // shell commands, one per line
-}
+export const TOOL_IDS = ["list_tasks", "plan_job", "plan_questions", "run_job", "job_status", "stop_job"] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
 export interface ToolDraft {
@@ -29,9 +19,7 @@ export interface ToolContext {
 }
 
 export interface Handlers {
-  task(input: TaskInput, ctx: ToolContext): Promise<string>
   tasks(id: string, ctx: ToolContext): Promise<string>
-  answer(task: string, text: string, checks: string, ctx: ToolContext): Promise<string>
   plan(goal: string, ctx: ToolContext): Promise<string>
   questions(job: string, tree: string, ctx: ToolContext): Promise<string>
   run(job: string, note: string, ctx: ToolContext): Promise<string>
@@ -55,30 +43,16 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
       }
     }
   draft.add({
-    id: "delegate_task",
-    name: "delegate_task",
-    description: "Delegate one task to a worker agent; it runs in the background on the session's own git branch, in parallel with other tasks that change other files, and this returns at once with its id. title: short; prompt: everything the worker needs, as it knows nothing else; files: the project paths it may change, comma separated, nothing else (empty for a task that only reads or researches: its report is the result, read it in full with list_tasks and the task id); depends: ids of tasks it must wait for, comma separated; priority: 1 (first) to 5 (last), empty for 3; checks: shell commands only, one per line, that exit 0 when the task is done (e.g. npm test, or node --test test/x.test.js); never a sentence, the plugin runs them as they are. The plugin picks the role, model, skills and rights, runs the checks and merges. You get a report when it ends: do not wait or poll.",
-    input: input("title", "prompt", "files", "depends", "priority", "checks"),
-    execute: guarded(([title, prompt, files, depends, priority, checks], ctx) => handlers.task({ title: title!, prompt: prompt!, files: files!, depends: depends!, priority: priority!, checks: checks! }, ctx), "title", "prompt", "files", "depends", "priority", "checks"),
-  })
-  draft.add({
     id: "list_tasks",
     name: "list_tasks",
-    description: "The tasks you delegated in this session with their status, or with a task id its full report (what the worker did, the checks, its follow-ups).",
+    description: "The tasks you started in this session with their status, worker session and branch, or with a task id its stages (checks, merge) and summary.",
     input: input("id"),
     execute: guarded(([id], ctx) => handlers.tasks(id!, ctx), "id"),
   })
   draft.add({
-    id: "answer_task",
-    name: "answer_task",
-    description: "Start a task again that waits for the user or was given up: text is the user's answer or go in their words, or your correction; checks (optional, shell commands one per line) replace the task's checks when they were wrong, e.g. a wrong path. Leave checks empty to keep them.",
-    input: input("task", "text", "checks"),
-    execute: guarded(([task, text, checks], ctx) => handlers.answer(task!, text!, checks!, ctx), "task", "text", "checks"),
-  })
-  draft.add({
     id: "plan_job",
     name: "plan_job",
-    description: "For a large or unclear job only (most work goes through delegate_task): a planner reads the project and writes a full plan with acceptance points, which the user approves before run_job. With the user's goal: checks it and plans it, or opens a planning session when the user asked to plan it together. With a job id as goal: continues that job. When a plan waits for the user's go and they want changes, call it with their change request as goal: the planner writes the plan again with it. Changes nothing.",
+    description: "For a large or unclear job only (most work goes to workers through the subagent tool): a planner reads the project and writes a full plan with acceptance points, which the user approves before run_job. With the user's goal: checks it and plans it, or opens a planning session when the user asked to plan it together. With a job id as goal: continues that job. When a plan waits for the user's go and they want changes, call it with their change request as goal: the planner writes the plan again with it. Changes nothing.",
     input: input("goal"),
     execute: guarded(([goal], ctx) => handlers.plan(goal!, ctx), "goal"),
   })
@@ -111,6 +85,30 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     execute: guarded(([job], ctx) => handlers.stop(job!, ctx), "job"),
   })
   return [...TOOL_IDS]
+}
+
+// A worker's last step (src/native.ts): the plugin runs the task's checks, commits and merges. Only the sessions of
+// writers the micromanager started may use it; the context hook hides it from every other session.
+export const FINISH_ID = "finish_task"
+
+export function installFinishTool(draft: ToolDraft, finish: (summary: string, ctx: ToolContext) => Promise<string>, writer: (sessionID: string) => boolean): void {
+  const read = draft.get("read")
+  const str = read?.input?.fields?.path
+  if (!read?.input?.mapFields || !str) throw new Error("the built-in read tool has no input schema to build from")
+  draft.add({
+    id: FINISH_ID,
+    name: FINISH_ID,
+    description: "Call this when your change is done: the plugin runs the task's checks in your directory, commits and merges your change. summary: what you changed, in two lines. If it answers with failures, fix them and call it again; once it says merged, end with your short report.",
+    input: read.input.mapFields(() => ({ summary: str })),
+    execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+      if (!ctx?.sessionID || !writer(ctx.sessionID)) return { content: "Only a worker that changes files for the micromanager may use this tool." }
+      try {
+        return { content: await finish(String(args?.summary ?? ""), ctx) }
+      } catch (err) {
+        return { content: `failed: ${err instanceof Error ? err.message : String(err)}` }
+      }
+    },
+  })
 }
 
 // The plan as the micromanager shows it to the user.

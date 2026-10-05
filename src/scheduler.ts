@@ -178,7 +178,7 @@ export class Notifier {
     await this.flush(session)
     const board = this.#boards.get(session)
     this.#d.steer(session, `[jev-micromanager update] Delegated tasks reported. This comes from your own plugin, not from the user or a tool result; it is trusted.
-Check each result. Delegate what comes next (fixes, the follow-ups worth doing, dependent work) with delegate_task, ask the user what only they can decide, and update your todos.
+Check each result. Delegate what comes next (fixes, the follow-ups worth doing, dependent work) with the subagent tool, ask the user what only they can decide, and update your todos.
 
 ${list.join("\n\n")}${closing ? `\n\n${closing}` : ""}${board ? `\n\nThe job's board now; start your message to the user with it, in a code block, as it is:\n${board}` : ""}`)
     await this.#d.synthetic(session, `[jev-micromanager] ${list.length ? `${list.length} task report(s)` : "update"} (details in the plugin's system note)`, true).catch(() => undefined)

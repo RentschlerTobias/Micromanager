@@ -646,6 +646,94 @@ README):
 - The micromanager reaches the plugin's tools through the code-mode `execute` tool; that works, but every call costs
   an extra turn.
 
+### Spike: built-in background subagents in worktrees (2026-10-05)
+The question: can the micromanager use OpenCode's own `subagent` tool (`background: true`: returns at once, the parent
+is notified with the report, the child shows in the TUI) while each worker still runs in its own git worktree?
+Private standalone server, spike plugin in its own `XDG_CONFIG_HOME`, deepseek-v4.1-flash, a throwaway repo with two
+worktrees; the sessions were deleted afterwards.
+
+**Findings:**
+- **The plugin's `ctx.session.create` drops `parentID`.** It passes on only id, title, agent, model, metadata,
+  permissions and location (seen in the binary; `parent_id` stays empty in `session_v2`). So the runner's worker
+  sessions were never real children of the micromanager, although `#plannerSession` and `#workerSession` pass
+  `parentID`.
+- **The `subagent` tool only continues real children:** a session from `ctx.session.create`, passed as `sessionID`,
+  fails with "Session … is not a child of the current session".
+- **The core `Session.create` puts a child in its parent's directory** (`parent.location ?? input.location`).
+- **`ctx.session.move({sessionID, directory})` works.** It queues a move in the session's inbox, ahead of the
+  pending prompt, so the move is applied before the turn runs.
+
+**What works:** the micromanager calls `subagent` as usual. The child is created in the checkout, and the plugin
+moves it in the `session.hook("prompt")` of its first turn (text starts with "You are a subagent spawned by another
+session.") into the task's worktree, before any tool runs.
+- One background worker: `pwd` was the worktree, the branch the task branch, the file landed only there; the
+  parent got the report through OpenCode's own notification.
+- Two background workers in one message, each moved to its own worktree: both isolated (`a.txt` only in the first,
+  `b.txt` only in the second).
+- Continuing the first worker through `subagent` with its `sessionID` stayed in its worktree (it appended to its own
+  file). `parentID` stays set after the move.
+
+**Not tested:** how a moved child looks in the TUI (headless only); a move while the child already runs.
+
+**Consequence:** built-in background subagents and per-task worktrees fit together. The plugin keeps its worktrees,
+checks and merge train; OpenCode runs, shows and reports the workers. The hook needs to know which worktree belongs to
+which call: `execute.before` on `subagent` sees the micromanager's call before the child exists, so it can make the
+worktree and remember it for the next child prompt of that parent.
+
+### Native workers (2026-10-05)
+The micromanager now starts its workers with OpenCode's own `subagent` tool, in the background, and the plugin keeps
+each writer in its own worktree (`src/native.ts`). The micromanager stays free while workers run, the workers show as
+its child sessions, and OpenCode wakes it with each worker's report.
+
+**The flow:**
+1. The micromanager calls `subagent` with a role agent, a title and a prompt ending in `Files:` and `Checks:` lines
+   (readers have neither).
+2. `execute.before` (awaited; a throw becomes the tool's error, which the micromanager reads):
+   - the guards look at the delegation;
+   - the task goes into the session's job (`rolling`);
+   - a writer gets a worktree off the session branch `jev/<job>`;
+   - the prompt becomes the worker's brief, with a header naming task and job;
+   - the routed model goes into the call, and `background` is forced on.
+   Delegations of one message come at the same time; they run one after another per session.
+3. The child's first prompt hook (text starts with "You are a subagent spawned by another session.") finds the task
+   by the header and moves the child into its directory; the watchdog and Jev's permission rules apply to it as to
+   the runner's workers.
+4. A writer ends with `finish_task` (a plugin tool only writers see; workers reach it through code-mode `execute`):
+   the checks run in the worktree. A failure goes back to the worker with the output; a pass commits, and the merge
+   train rebases onto the session branch (checks again when it moved) and fast-forwards it. A conflict goes back to
+   the worker.
+5. On the merge, a quiet note "[jev-micromanager] T… merged into …" goes into the micromanager's session; OpenCode's
+   notification with the worker's report follows and wakes it.
+6. When the worker's run ends (`session.wait`, started from its first context hook): a merged writer's worktree is
+   removed; a writer that did not get through `finish_task` (or was stopped by the watchdog) is reported, its change
+   kept in its worktree. The micromanager continues a worker with `subagent` and its `sessionID`; a merged writer then
+   gets a new task in a fresh worktree at the same place, since the session keeps its directory.
+
+`delegate_task` and `answer_task` are gone; `list_tasks`, `stop_job` (now also for the session's workers) and the
+planned jobs (`plan_job` / `run_job` on the runner) stay. The runner's rolling-job code is no longer used by the
+plugin; it is still tested and can go in a cleanup.
+
+**Not carried over to native workers (yet):** N5's per-task profile (role change, narrowed rights, skills picked by
+Jev), the plugin's fix rounds and model-family fallback, the review stage, the red-test stage for bug fixes,
+`LEARNED` lines for the project memory, and the guard's "sensitive" flag that keeps a task on local models (moot while
+`cloudOnly` is on). The micromanager covers some of it (a reviewer worker, continuing a worker),
+the rest needs its own decision.
+
+**Live** (private `opencode serve`, cloud only, glm-5.3-flash as micromanager, a small Node project; slugify and
+readingTime with tests):
+- The worker was moved into its worktree before its first step, wrote its files, called `finish_task` through
+  `execute`, and the plugin merged it (checks passed). The merge note came before OpenCode's report, and OpenCode
+  woke the micromanager, which went on by itself.
+- Found: two `subagent` calls in one message made the session branch at the same time, and the second failed
+  ("a branch named jev/… already exists"); the micromanager started that task after the first one's merge instead.
+  Fixed: delegations of a session run one after another.
+- Run 2 after the fix (excerpt and wordCount, "in parallel"): both workers started from one message, each in its
+  own worktree. The second to finish was rebased onto the first and its checks ran again; both merged, `npm test` on
+  the branch 10 of 10. The micromanager acknowledged each merge and ended with the summary and `git merge jev/<job>`.
+  Fixed after it: the merge note named the commit from before the rebase.
+- A new worktree's first model turn came about 30 s after the move: the server starts an instance (and the plugin)
+  for each new directory.
+
 ## Verification
 - **Per phase: tests** with a fake Jev:
   - the FSMs refuse illegal jumps;

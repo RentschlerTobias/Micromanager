@@ -23,16 +23,14 @@ import { checkGuards } from "./gate.ts"
 import { Compactor } from "./compact.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
-import { jobId } from "./store.ts"
-import { moveJob, newJob, readyTasks, type Job } from "./state.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
-import { addDelegated, checkProblem, parseFiles } from "./plan.ts"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
-import { Watchdog, type Signal } from "./watchdog.ts"
+import { FINISH_ID, installFinishTool, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
+import { CHILD_PREFIX, DelegationError, Native } from "./native.ts"
+import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
 // What the permission hook "evaluate" gets (opencode 2.0.18): the planned effect can be changed in place.
 interface Evaluation {
@@ -68,6 +66,7 @@ interface Context {
   session: SessionApi & {
     hook(name: string, callback: (input: SessionHookInput) => Promise<void> | void): Promise<unknown>
     synthetic(args: { sessionID: string; text: string; resume: boolean }): Promise<unknown>
+    move(args: { sessionID: string; directory: string }): Promise<unknown>
   }
   permission: { hook(name: string, callback: (evaluation: Evaluation) => Promise<void> | void): Promise<unknown> }
   location?: { directory?: string }
@@ -85,6 +84,7 @@ interface Shared {
   runnerSessions: Set<string> // sessions the runner started: they never ask the user
   watchdog: Watchdog
   stops: Map<string, Signal> // why the watchdog stopped a session
+  native?: Native // the micromanager's workers on OpenCode's subagent tool, made by the first instance
 }
 const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicromanager ??= {
   workerTasks: new Map(),
@@ -149,10 +149,29 @@ export default {
     // they stop and report, and the job asks the user in the micromanager's session.
     const runnerSessions = SHARED.runnerSessions
 
-    await ctx.tool.hook("execute.before", (call) => {
+    // The micromanager's workers run on OpenCode's subagent tool, in the background; writers in worktrees of their own.
+    const native = (SHARED.native ??= new Native({ installedSkills: installedSkills() }))
+    await ctx.tool.hook("execute.before", async (call) => {
+      if (call.tool !== "subagent" || call.agent !== MICROMANAGER.agent || !call.sessionID) return
+      const asked = String(call.input.prompt ?? "")
+      const resumed = String(call.input.sessionID ?? "")
       const routed = routeSubagentCall(call, routing)
-      if (!routed) return
-      tasks.set(String(call.input.agent), String(call.input.prompt ?? ""))
+      if (resumed) {
+        // A worker continued by its session: it stays in its worktree (spike), a merged writer gets a new task.
+        const task = await native.resume(resumed)
+        if (task) log("info", `${task.id} continues in ${resumed}`)
+        return
+      }
+      // A refusal thrown here becomes the tool's error, which the micromanager reads (spike).
+      if (!routed || !project) throw new DelegationError(`Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}).`)
+      const guard = await checkGuards(decider, `${String(call.input.description ?? "")}. ${asked}`)
+      if (guard.flagged.some((g) => g === "injection" || g === "harmful")) {
+        throw new DelegationError(`The local check flagged this task (${guard.flagged.join(", ")}). Ask the user whether it should run before you start it again.`)
+      }
+      const d = await native.delegate(project, call.sessionID, { agent: String(call.input.agent ?? ""), description: String(call.input.description ?? ""), prompt: asked }, routed.model)
+      call.input.prompt = d.prompt
+      ultrawork.has(call.sessionID) && ultrawork.set(call.sessionID, 0)
+      tasks.set(String(call.input.agent), asked)
       // What the router decided, next to the permission decisions, so /flow can show the whole path.
       record({
         kind: "routing",
@@ -164,7 +183,7 @@ export default {
         reason: routed.reason,
         prompt: String(call.input.prompt ?? "").slice(0, 300),
       })
-      log("info", `${routed.role} -> ${routed.model} (${routed.reason})`)
+      log("info", `${d.task.id} ${routed.role} -> ${routed.model} (${routed.reason})${d.task.worktree ? ` in ${d.task.worktree}` : ""}`)
     })
 
     // The micromanager's own agents only: build, plan and every other agent are never touched.
@@ -274,10 +293,8 @@ export default {
         execFile("notify-send", ["-a", "jev-micromanager", title, body], (err) => { if (err) log("info", `no desktop notification: ${err.message}`) })
       },
     })
-    // omo-hybrid: the runner working on a job right now, so a delegation goes into its live job; and the sessions in
-    // ultrawork mode (the user said "ulw"/"ultrawork"), with how often their orchestrator was woken without delegating.
-    const live = new Map<string, Runner>()
-    const rollingIds = new Set(listJobs(project).filter((j) => j.rolling).map((j) => j.id))
+    // The sessions in ultrawork mode (the user said "ulw"/"ultrawork"), with how often their micromanager was woken
+    // without starting a worker.
     const ultrawork = new Map<string, number>()
     const runner = (parentID?: string, job?: string, cancel?: Cancel) =>
       new Runner({
@@ -289,8 +306,7 @@ export default {
         availability: cloudOnly ? undefined : () => probe(registry), // no local servers to ask
         progress: (text, task) => {
           log("info", text)
-          // A rolling job's orchestrator gets task reports instead (live test: one message per fix round was noise).
-          if (job && !rollingIds.has(job)) notifier.progress(parentID, `${job}: ${text}`, task)
+          if (job) notifier.progress(parentID, `${job}: ${text}`, task)
         },
         parentID,
         cancelled: cancel ? () => cancel.cancelled : undefined,
@@ -310,37 +326,11 @@ export default {
         stopped: (sessionID) => stops.get(sessionID),
         skills: SKILLS.filter((s) => s.asked && installed.has(s.name)),
         installedSkills: installed,
-        taskEnded: (j, t) => notifier.report(j.facilitator, taskReport(j, t), `${t.id} ${t.title}: ${t.status}`, board(j, 100)),
       })
     // The job queue: run_job queues, the scheduler runs in the background and the notifier reports the end.
     const scheduler = new Scheduler({
-      run: async (id, cancel, note) => {
-        const r = runner(loadJob(project, id)?.facilitator, id, cancel)
-        live.set(id, r)
-        try {
-          return await r.run(id, note)
-        } finally {
-          live.delete(id)
-        }
-      },
-      finished: (job, session) => {
-        const to = session ?? job.facilitator
-        if (!job.rolling || job.phase !== "execute") return void notifier.finished(to, job.id, ending(job), summary(job))
-        // A rolling job's run ends when nothing is left to start. A delegation that came in at that moment runs it again;
-        // otherwise the orchestrator hears that everything delegated has ended.
-        if (readyTasks(job).length) return void scheduler.enqueue(job.id, to)
-        if (!to) return
-        const wakes = ultrawork.get(to)
-        const waiting = job.tasks.filter((t) => t.status === "blocked" || t.status === "escalated").map((t) => t.id)
-        const closing = [
-          `All delegated tasks have ended${waiting.length ? `; ${waiting.join(", ")} wait for the user or were given up` : ""}. Branch ${job.integrationBranch}.`,
-          wakes !== undefined && wakes < 3
-            ? "Ultrawork is on: go on with your open todos now; delegate the next tasks instead of waiting, and ask the user only what only they can decide. When every todo is done, give the final summary."
-            : `If your todos are done, give the user the final summary: what changed, and how to merge (git merge ${job.integrationBranch}) or discard the branch. Otherwise delegate what is left.`,
-        ].join("\n")
-        if (wakes !== undefined) ultrawork.set(to, wakes + 1)
-        void notifier.flushReports(to, closing)
-      },
+      run: async (id, cancel, note) => runner(loadJob(project, id)?.facilitator, id, cancel).run(id, note),
+      finished: (job, session) => void notifier.finished(session ?? job.facilitator, job.id, ending(job), summary(job)),
       failed: (id, session, err) => {
         log("error", `job ${id} failed: ${String(err)}`)
         void notifier.finished(session, id, "failed", `The run broke off: ${err instanceof Error ? err.message : String(err)}. run_job resumes it.`)
@@ -350,6 +340,15 @@ export default {
     const WEB = /web|fetch/i
     await ctx.tool.hook("execute.after", async (call) => {
       if (!call.sessionID) return
+      if (call.tool === "subagent" && call.agent === MICROMANAGER.agent && !call.input.sessionID) {
+        // A call that failed before its worker took the task drops the task; a started one names it for the micromanager.
+        if (call.error) await native.abandon(String(call.input.prompt ?? "")).catch((err: unknown) => log("warn", `abandon failed: ${String(err)}`))
+        else {
+          const id = String(call.input.prompt ?? "").match(/^\[jev-micromanager\] task (T\d+) · job (\S+) ·/)
+          if (id) rewriteResult(call.result, (text) => `${text}\n[jev-micromanager] This worker is task ${id[1]} of job ${id[2]}${/· role (code|test|visual|write|debug) ·/.test(String(call.input.prompt)) ? `; its change is merged into jev/${id[2]} when its checks pass` : ""}.`)
+        }
+        return
+      }
       if (watchdog.watching(call.sessionID)) {
         const failed = /\b(error|failed|not found|denied|exception|traceback)\b/i.test(resultText(call.result).slice(0, 600))
         const signal = watchdog.onTool(call.sessionID, call.tool, call.input, failed)
@@ -371,58 +370,13 @@ export default {
     // The micromanager's newest job in a session, for the user's turns (planning session, gate answer, pins).
     // The newest planned job of a session, for the planning session's turns; a rolling job takes no planning answers.
     const sessionJob = (sessionID: string) => listJobs(project).find((j) => j.facilitator === sessionID && !j.rolling)
-    // The session's rolling job (omo-hybrid), made at its first delegation; it runs on its own branch until stopped.
-    const rollingJob = (sessionID: string): Job => {
-      const found = listJobs(project).find((j) => j.facilitator === sessionID && j.rolling && !["done", "stopped", "failed"].includes(j.phase))
-      if (found) return found
-      const job = newJob(jobId(), `the delegated tasks of micromanager session ${sessionID}`)
-      for (const p of ["triage", "plan", "plan_gate", "execute"] as const) moveJob(job, p)
-      job.rolling = true
-      job.facilitator = sessionID
-      saveJob(project, job)
-      rollingIds.add(job.id)
-      return job
-    }
-    const words = (text: string) => text.split(/[,\s]+/).map((w) => w.trim()).filter(Boolean)
     const JOB_ID = /^job-\d{8}-\d{6}-[0-9a-f]{1,4}$/
     await ctx.tool.transform((draft) => {
       try {
         installTools(draft, {
-          task: async (input, tctx) => {
-            if (!tctx.sessionID) return "delegate_task needs a session."
-            if (!input.title.trim() || !input.prompt.trim()) return "delegate_task needs a title and a prompt."
-            // The delegation is text a model wrote from the user's words: the local guards look at it first.
-            const guard = await checkGuards(decider, `${input.title}. ${input.prompt}`)
-            if (guard.flagged.some((g) => g === "injection" || g === "harmful")) {
-              return `The local check flagged this task (${guard.flagged.join(", ")}). Ask the user whether it should run before you delegate it again.`
-            }
-            const job = rollingJob(tctx.sessionID)
-            if (guard.flagged.includes("sensitive") && !job.flags?.localOnly && !cloudOnly) job.flags = { ...job.flags, localOnly: true }
-            const d = {
-              title: input.title.trim(),
-              prompt: input.prompt.trim(),
-              files: parseFiles(input.files, project).files,
-              dependsOn: words(input.depends),
-              priority: Number(input.priority) || undefined,
-              checks: input.checks.split(/\n|;;/).map((c) => c.trim()).filter(Boolean),
-            }
-            const fileProblem = parseFiles(input.files, project).problem
-            if (fileProblem) return `Not delegated: ${fileProblem}`
-            const bad = d.checks.map(checkProblem).filter(Boolean)
-            if (bad.length) return `Not delegated: checks must be shell commands that exit 0 when the task is done. ${bad.join("; ")}`
-            const r = live.get(job.id)?.addTask(job.id, d) ?? (() => {
-              const added = addDelegated(job, d)
-              if (added.task) saveJob(project, job)
-              return added
-            })()
-            if (!r.task) return `Not delegated: ${r.errors!.join("; ")}`
-            ultrawork.has(tctx.sessionID) && ultrawork.set(tctx.sessionID, 0)
-            scheduler.enqueue(job.id, tctx.sessionID)
-            return `${r.task.id} delegated${r.task.dependsOn.length ? `, after ${r.task.dependsOn.join(", ")}` : ""} (job ${job.id}, branch jev/${job.id}). You get its report when it ends; go on with other work.`
-          },
           tasks: async (id, tctx) => {
             const job = tctx.sessionID ? listJobs(project).find((j) => j.facilitator === tctx.sessionID && j.rolling) : undefined
-            if (!job) return "No task delegated in this session yet."
+            if (!job) return "No worker started in this session yet."
             const task = id.trim() ? job.tasks.find((t) => t.id === id.trim()) : undefined
             if (id.trim() && !task) return `no task ${id.trim()}`
             if (task) {
@@ -436,20 +390,6 @@ export default {
               return `${taskReport(job, task)}${note ? `\n\n${note.slice(-15000)}` : ""}`
             }
             return [`job ${job.id} on branch ${job.integrationBranch ?? `jev/${job.id}`}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}${t.session ? ` · session ${t.session}` : ""}`), "The user can watch a task's worker with: opencode -s <session>"].join("\n")
-          },
-          answer: async (taskId, text, checksText, tctx) => {
-            const checks = checksText.split(/\n|;;/).map((c) => c.trim()).filter(Boolean)
-            const bad = checks.map(checkProblem).filter(Boolean)
-            if (bad.length) return `Not changed: checks must be shell commands. ${bad.join("; ")}`
-            const job = tctx.sessionID ? listJobs(project).find((j) => j.facilitator === tctx.sessionID && j.rolling) : undefined
-            if (!job) return "No task delegated in this session yet."
-            // A running job takes the answer in memory; one that is not running, in its file.
-            const applied = live.get(job.id)?.answerTask(job.id, taskId.trim(), text.trim(), checks)
-            const err = applied === false || applied === undefined ? Runner.answer(job, taskId.trim(), text.trim(), checks) : applied
-            if (err) return err
-            if (applied === false || applied === undefined) saveJob(project, job)
-            scheduler.enqueue(job.id, tctx.sessionID)
-            return `${taskId.trim()} starts again with the user's answer.`
           },
           plan: async (goal, tctx) => {
             const text = goal.trim()
@@ -494,14 +434,30 @@ export default {
             // The board first: what runs, waits and is done, at a glance (show it to the user as it is).
             return job ? `${queue}\n\n${board(job)}\n\n${job.rolling ? "" : planText(job)}`.trim() : `${queue}\nno job yet`
           },
-          stop: async (id) => {
+          stop: async (id, tctx) => {
             const r = scheduler.stop(id.trim() || undefined)
             if (r.session) await ctx.session.interrupt({ sessionID: r.session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
-            return r.state === "stopping" ? "The running job stops now and pauses; run_job resumes it." : r.state === "dequeued" ? "The job left the queue." : "No such job running or waiting."
+            if (r.state === "stopping") return "The running job stops now and pauses; run_job resumes it."
+            if (r.state === "dequeued") return "The job left the queue."
+            // The session's own workers: interrupted; their changes stay in their worktrees.
+            const workers = !id.trim() && tctx.sessionID ? native.running(tctx.sessionID) : []
+            for (const w of workers) await ctx.session.interrupt({ sessionID: w.session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
+            return workers.length ? `Stopped ${workers.map((w) => w.task).join(", ")}; their changes stay in their worktrees, and the subagent tool with a worker's sessionID continues it.` : "No such job running or waiting."
           },
         }, MICROMANAGER.agent, (sessionID) => runnerSessions.has(sessionID))
       } catch (err) {
         log("error", `micromanager tools not installed: ${String(err)}`)
+      }
+      try {
+        installFinishTool(draft, async (text, tctx) => {
+          const r = await native.finish(tctx.sessionID!, text)
+          // The merge, as a quiet note in the micromanager's session; OpenCode's notification with the report follows.
+          if (r.note && r.parent) await ctx.session.synthetic({ sessionID: r.parent, text: r.note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
+          record({ kind: "finish", sessionID: tctx.sessionID, merged: Boolean(r.note), text: r.text.slice(0, 300) })
+          return r.text
+        }, (sessionID) => native.isWriter(sessionID))
+      } catch (err) {
+        log("error", `finish_task not installed: ${String(err)}`)
       }
     })
 
@@ -509,6 +465,18 @@ export default {
       const sessionID = input.sessionID
       const text = String(input.prompt?.text ?? "")
       if (!sessionID || !text) return
+      if (text.startsWith(CHILD_PREFIX)) {
+        // A worker's first turn: OpenCode made it in the micromanager's directory, so it moves to its task's
+        // worktree now. The move is queued ahead of this prompt and applies before any tool runs (spike).
+        const claimed = native.claim(sessionID, text)
+        if (!claimed) return
+        await ctx.session.move({ sessionID, directory: claimed.dir })
+        runnerSessions.add(sessionID)
+        workerTasks.set(sessionID, claimed.task)
+        watchdog.watch(sessionID, { maxSteps: MAX_STEPS })
+        log("info", `worker ${sessionID} moved to ${claimed.dir}`)
+        return
+      }
       steering.delete(sessionID)
       if (/\b(ulw|ultrawork)\b/i.test(text)) ultrawork.set(sessionID, 0)
       else if (/^\s*stop\b/i.test(text)) ultrawork.delete(sessionID)
@@ -536,6 +504,20 @@ export default {
       // The tools exist for every agent; only the micromanager sees them.
       if (input.agent !== MICROMANAGER.agent) {
         if (input.tools) for (const id of TOOL_IDS) delete input.tools[id]
+        if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[FINISH_ID]
+        // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
+        if (input.sessionID && native.isWorker(input.sessionID)) {
+          const worker = input.sessionID
+          native.watchEnd(worker, () => ctx.session.wait({ sessionID: worker }), () => stops.get(worker)?.detail, (note, parent) => {
+            if (note) void ctx.session.synthetic({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
+            // Ultrawork: when the last worker of the session ended, the micromanager goes on with its todos.
+            const wakes = ultrawork.get(parent)
+            if (wakes !== undefined && wakes < 3 && native.running(parent).length === 0) {
+              ultrawork.set(parent, wakes + 1)
+              steering.set(parent, "[jev-micromanager] Ultrawork is on: go on with your open todos now; start the next workers instead of waiting, and ask the user only what only they can decide. When every todo is done, give the final summary.")
+            }
+          })
+        }
         if (input.sessionID && watchdog.watching(input.sessionID)) {
           const signal = watchdog.onTurn(input.sessionID, input.messages)
           if (signal) stop(input.sessionID, signal)
@@ -551,6 +533,7 @@ export default {
         }
         return
       }
+      if (input.tools) delete input.tools[FINISH_ID]
       if (input.sessionID) {
         const c = await compactor.apply(input.sessionID, input.messages).catch((err: unknown) => {
           log("warn", `compaction failed: ${String(err)}`)
