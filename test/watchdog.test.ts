@@ -19,11 +19,11 @@ test("the local planner's loop: the same directory read again and again", () => 
   const d = w()
   // what ornith-u did in the live test, shortened: read, glob, read the same path
   assert.equal(d.onTool("s", "read", { path: "README.md" }), undefined)
-  assert.equal(d.onTool("s", "read", { path: ".jev-dictator" }), undefined)
+  assert.equal(d.onTool("s", "read", { path: ".jev-micromanager" }), undefined)
   assert.equal(d.onTool("s", "glob", { pattern: "**/*" }), undefined)
-  assert.equal(d.onTool("s", "read", { path: ".jev-dictator/" }), undefined)
-  // ".jev-dictator" and ".jev-dictator/" are the same path: the third read is a loop
-  assert.deepEqual(d.onTool("s", "read", { path: ".jev-dictator" }), { kind: "read_loop", detail: "read .jev-dictator 3x with no write in between" })
+  assert.equal(d.onTool("s", "read", { path: ".jev-micromanager/" }), undefined)
+  // ".jev-micromanager" and ".jev-micromanager/" are the same path: the third read is a loop
+  assert.deepEqual(d.onTool("s", "read", { path: ".jev-micromanager" }), { kind: "read_loop", detail: "read .jev-micromanager 3x with no write in between" })
   const same = w({ readRepeat: 99 })
   for (let i = 0; i < 2; i++) same.onTool("s", "grep", { pattern: "TODO" })
   assert.equal(same.onTool("s", "grep", { pattern: "TODO" })?.kind, "same_call")

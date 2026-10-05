@@ -1,10 +1,10 @@
 ---
 name: code-review
-description: Review a change along two axes, Spec (does it do what the task asked?) and Standards (does it follow the repo's documented standards?). Use when a jev-dictator note starts with "[jev-dictator] review of task".
+description: Review a change along two axes, Spec (does it do what the task asked?) and Standards (does it follow the repo's documented standards?). Use when a jev-micromanager note starts with "[jev-micromanager] review of task".
 license: MIT
 metadata:
   source: https://github.com/mattpocock/skills/blob/24fe0ef7737efae15c87225755e9f6f5965e4888/skills/engineering/code-review/SKILL.md
-  adapted: for a jev-dictator reviewer, which reviews both axes itself; the plugin gives the diff and the spec, and wants JSON
+  adapted: for a jev-micromanager reviewer, which reviews both axes itself; the plugin gives the diff and the spec, and wants JSON
 ---
 
 # Code Review

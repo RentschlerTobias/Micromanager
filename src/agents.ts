@@ -2,7 +2,7 @@
 // created in the plugin (ctx.agent.transform), each copied from the built-in "build" agent so it inherits the
 // user's base rules (external directories, .env files), with the role's rules appended.
 
-import { DICTATOR, ROLES, dictatorSystem, type Rule } from "./roles.ts"
+import { MICROMANAGER, ROLES, micromanagerSystem, type Rule } from "./roles.ts"
 
 export interface AgentInfo {
   id: string
@@ -34,13 +34,13 @@ export function agentsFrom(base: AgentInfo): AgentInfo[] {
   }))
   const micromanager: AgentInfo = {
     ...copy(),
-    id: DICTATOR.agent,
+    id: MICROMANAGER.agent,
     name: "Micromanager",
     mode: "primary",
     hidden: false,
-    description: DICTATOR.description,
-    system: dictatorSystem(),
-    permissions: [...base.permissions, ...DICTATOR.rules],
+    description: MICROMANAGER.description,
+    system: micromanagerSystem(),
+    permissions: [...base.permissions, ...MICROMANAGER.rules],
   }
   return [micromanager, ...roles]
 }

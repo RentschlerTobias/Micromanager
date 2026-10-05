@@ -35,7 +35,7 @@ export function writeMemory(project: string, entries: readonly string[]): void {
   mkdirSync(join(project, ".opencode", "memory"), { recursive: true })
   writeFileSync(memoryPath(project), `---
 label: ${BLOCK}
-description: Lasting facts about this project that jev-dictator's workers learned (commands, layout, conventions, pitfalls). Kept by jev-dictator; one fact per line.
+description: Lasting facts about this project that jev-micromanager's workers learned (commands, layout, conventions, pitfalls). Kept by jev-micromanager; one fact per line.
 limit: ${LIMIT}
 read_only: false
 ---

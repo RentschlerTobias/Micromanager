@@ -1404,7 +1404,7 @@ export function taskReport(job: Job, task: Task): string {
     task.status === "merged" && task.summary ? `  report: ${task.summary.replace(/\s+/g, " ").slice(-400)}` : "",
     follow.length ? `  follow-ups the worker found (yours to decide):\n${follow.join("\n")}` : "",
     task.sessions?.length ? `  sessions: ${task.sessions.join(", ")} (open one with: opencode -s <id>)` : "",
-    `  notes: .jev-dictator/notes/${job.id}/${task.id}.md`,
+    `  notes: .jev-micromanager/notes/${job.id}/${task.id}.md`,
   ].filter(Boolean).join("\n")
 }
 

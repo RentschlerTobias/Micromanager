@@ -1,4 +1,4 @@
-# jev-dictator design: job state, planning session, Jev's decision tree
+# jev-micromanager design: job state, planning session, Jev's decision tree
 
 Status (2026-10-04): design agreed, Phase A spikes done (§17), extended the same day by local vs cloud routing, censored vs uncensored
 guards, decision backends (cloud Jev or local GLiNER) and user overrides (§19–§22). Implementation follows in the phases listed in [plan.md](plan.md). The flow
@@ -15,7 +15,7 @@ What exists today:
 Everything else in this document is design.
 
 ## 1. Why the redesign
-The dictator is a system prompt plus two hooks. Its plan lives only inside the LLM's context: there is no goal,
+The micromanager is a system prompt plus two hooks. Its plan lives only inside the LLM's context: there is no goal,
 complexity, task list, dependency graph or progress that code or Jev could see. So Jev can decide permissions,
 but not:
 - whether the job is clear,
@@ -67,13 +67,13 @@ Decisions (user, 2026-10-03/04):
 ## 3. Roles of the sessions
 | Session | Runs on | Does | Never |
 |---|---|---|---|
-| dictator (main) | the session model the user chose (`facilitatorModel` in the config; may be local) | talks with the user, runs the planning session, shows checkpoints, writes the final summary | edit, write, patch, shell, web (denied by its rules); reading beyond short orientation (README, file list; a read cap in the evaluate hook) |
+| micromanager (main) | the session model the user chose (`facilitatorModel` in the config; may be local) | talks with the user, runs the planning session, shows checkpoints, writes the final summary | edit, write, patch, shell, web (denied by its rules); reading beyond short orientation (README, file list; a read cap in the evaluate hook) |
 | planner (subagent, role `plan`) | routed | writes spec, seams and tasks as JSON | code |
 | workers (roles explore … oracle) | routed per task | one task each, in a worktree when they write | start sub-agents (`subagent` denied) |
 | plugin code | — | state, agenda, gates (runs Verify commands itself), merges, watchdog, journal | decide anything a Jev floor or the user owns |
 
 ## 4. Job state
-The job file `<project>/.jev-dictator/jobs/<id>.json` is the single source of truth (Phase B, `src/store.ts`).
+The job file `<project>/.jev-micromanager/jobs/<id>.json` is the single source of truth (Phase B, `src/store.ts`).
 It is written atomically, readable by the user and the flow pages, and kept out of git through
 `.git/info/exclude`. `ctx.storage` was not used: its API was not verified in Phase A, and a file needs no
 second copy.
@@ -104,7 +104,7 @@ second copy.
                  "skills": ["tdd", "typescript-patterns", "verification-before-completion"],
                  "permissions": "normal", "outputStyle": "caveman" },
     "pipeline": { "id": "P3", "caps": { "fix": 2, "review": 3 } },
-    "stages": [], "notes": ".jev-dictator/notes/job-2026-10-03-a1/T1.md",
+    "stages": [], "notes": ".jev-micromanager/notes/job-2026-10-03-a1/T1.md",
     "session": null, "worktree": null, "baseSha": null, "headSha": null,
     "attempts": 0, "modelSwitches": 0, "signatures": []
   }],
@@ -251,7 +251,7 @@ before it is processed, and the `context` hook sees every provider turn (system 
 
 ## 8. The task loop (tick)
 **When it runs:** on every event (a worker goes idle or fails, a gate finishes, the user answers, a timer fires,
-a `/dictator` command).
+a `/micromanager` command).
 
 **What it does:** reconcile → build the agenda → decide → act → journal.
 
@@ -285,12 +285,12 @@ origin (plan, split, discovered, replan). Among ready tasks, priority comes firs
   scope.
 
 **Background runs (Phase E).**
-- `dictator_run` queues the job with a scheduler in the plugin and returns at once.
-- **Updates.** Progress goes to the dictator's session as quiet synthetic messages (no new turn). When a job ends
-  or needs the user, a synthetic message with `resume` wakes the dictator. The update itself goes in as a system
+- `run_job` queues the job with a scheduler in the plugin and returns at once.
+- **Updates.** Progress goes to the micromanager's session as quiet synthetic messages (no new turn). When a job ends
+  or needs the user, a synthetic message with `resume` wakes the micromanager. The update itself goes in as a system
   block, because a Phase E spike showed that models take synthetic text for an injection. `notify-send` adds a
   desktop notification.
-- **Stop and resume.** `dictator_stop` interrupts the running worker and pauses the job. `dictator_run` with the
+- **Stop and resume.** `stop_job` interrupts the running worker and pauses the job. `run_job` with the
   user's answer as a note resumes it: the note becomes a decision every later brief carries.
 
 ### 8.1 Classification and profile: one Jev request per task (N5 + N5b)
@@ -346,7 +346,7 @@ Rules for these requests:
 
   It uses plain instructions, no caveman.
 - **Report**, written by the worker in caveman style. Code parses it into the task state, and the full text goes
-  to `<project>/.jev-dictator/notes/<job>/<task>.md`. Fields:
+  to `<project>/.jev-micromanager/notes/<job>/<task>.md`. Fields:
   - status: DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED,
   - changed files, evidence, open issues, pointers,
   - `FOLLOWUP` lines (Phase E): work outside the task, for N7.
@@ -445,7 +445,7 @@ endless read loops.
 - **Worker starts are confirmed per batch** ("start T1 and T3 in parallel?"): Jev first, the user when Jev is not
   sure.
 - **The integration branch:**
-  - The job works on the branch `jev/<job>` in its own worktree at `<project>/.jev-dictator/worktrees/<job>`
+  - The job works on the branch `jev/<job>` in its own worktree at `<project>/.jev-micromanager/worktrees/<job>`
     (inside the project, so workers trigger no external_directory ask). The user's checkout is never touched;
     the worktree starts from the last commit, so uncommitted changes of the user are not part of the job.
   - Writers get worktrees off the integration branch.
@@ -459,7 +459,7 @@ endless read loops.
   wait for a slot: `perModel` (default 2) per cloud model, 1 per local model.
 - **Batch confirmation.** N10 asks Jev whether each new task of a batch is independent of the others. A doubted
   task waits for a later batch, and the user is not asked: nobody sits at a background run.
-- **Branches.** Each task works in `.jev-dictator/worktrees/<job>--<task>` on `jev/<job>--<task>`.
+- **Branches.** Each task works in `.jev-micromanager/worktrees/<job>--<task>` on `jev/<job>--<task>`.
 - **The merge train.** Rebase, then the checks again when the job's branch moved, then a fast-forward. A conflict
   sends the task back once, from the newest commit; a second conflict goes to the user.
 - **Done means merged.** A task counts as done only once it is merged.
@@ -476,7 +476,7 @@ endless read loops.
 - **Outcome:** allow / deny / the user, with Jev's guess shown in the question.
 - **Sessions the runner starts never ask the user directly** (Phase D live tests): nobody sits at a worker's
   session, headless or in the TUI. A request outside its directory is denied; any outcome "the user" becomes a
-  deny that tells the worker to report NEEDS_CONTEXT, and the job asks the user in the dictator's session.
+  deny that tells the worker to report NEEDS_CONTEXT, and the job asks the user in the micromanager's session.
 - **Implemented today** in `src/decide.ts` and the plugin's evaluate hook, with the profile's narrowing; without
   cc-safety-net.
 
@@ -510,8 +510,8 @@ Workflow logic lives in the plugin. Workers only get leaf skills: how to do the 
 
 | Skill | Source | Role / stage | Loaded |
 |---|---|---|---|
-| deliberate | ours (vibe-wise `learn` + mattpocock `grilling`) | dictator, planning session | N2 finds open questions |
-| domain-modeling | mattpocock | dictator | the repo has GLOSSARY / ADR |
+| deliberate | ours (vibe-wise `learn` + mattpocock `grilling`) | micromanager, planning session | N2 finds open questions |
+| domain-modeling | mattpocock | micromanager | the repo has GLOSSARY / ADR |
 | prototype (logic) | mattpocock | a plan worker | N2c `needs_prototype` |
 | to-spec, to-tickets | mattpocock, as planner rules | planner | plan mode |
 | research | mattpocock | research | research tasks |
@@ -618,7 +618,7 @@ Floors live next to the question wordings in `src/catalog.ts`, and change only t
   - the loop watchdog;
   - N13 with profile narrowing;
   - batch-confirmed worker starts;
-  - the dictator read cap;
+  - the micromanager read cap;
   - journal, eval harness, dataset export;
   - the model registry with local / cloud routing and live availability (§19);
   - G0 with the four guards, and decision backends per node: typesafe, gliner, rules (§20, §21);
@@ -692,7 +692,7 @@ harness retried such runs; the plugin itself is not involved.
 
 Every local model is configured with a 16k context.
 
-**Registry.** `models` in `jev-dictator.jsonc`. By default it is generated from the providers in `opencode.json`,
+**Registry.** `models` in `jev-micromanager.jsonc`. By default it is generated from the providers in `opencode.json`,
 with fields added by hand. One entry per model:
 - `id`, `provider`;
 - `location` (local | cloud), `device` (cuda | igpu | npu | cloud);
@@ -840,7 +840,7 @@ override > the decision model > the rules fallback.
 **Labels:** every override is journaled as `label_source: user_override`. It is the most valuable label for the
 eval harness, the Open-Jev dataset and GLiNER retraining.
 
-**Commands:** `/dictator set <node> <value>` and `/dictator pins` show and change the policies. The chat
+**Commands:** `/micromanager set <node> <value>` and `/micromanager pins` show and change the policies. The chat
 shortcuts are exact phrases, matched before any model.
 
 ## Sources

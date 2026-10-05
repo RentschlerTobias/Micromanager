@@ -1,4 +1,4 @@
-// ~/.config/opencode/jev-dictator.jsonc: optional overrides of the routing (JSON with // comments).
+// ~/.config/opencode/jev-micromanager.jsonc: optional overrides of the routing (JSON with // comments).
 
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
@@ -13,7 +13,7 @@ import type { NotifyMode } from "./scheduler.ts"
 
 export function configPath(): string {
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config")
-  return join(base, "opencode", "jev-dictator.jsonc")
+  return join(base, "opencode", "jev-micromanager.jsonc")
 }
 
 export function stripComments(text: string): string {

@@ -1,4 +1,4 @@
-// Where jobs live: <project>/.jev-dictator/jobs/<id>.json, one file per job, written atomically.
+// Where jobs live: <project>/.jev-micromanager/jobs/<id>.json, one file per job, written atomically.
 //
 // Inside the project, so workers can read their notes without an external_directory ask; kept out of git through
 // .git/info/exclude, which is local and needs no .gitignore change (design.md §8.2).
@@ -8,7 +8,7 @@ import { dirname, join } from "node:path"
 
 import type { Job } from "./state.ts"
 
-export const DIR = ".jev-dictator"
+export const DIR = ".jev-micromanager"
 
 export function jobsDir(project: string): string {
   return join(project, DIR, "jobs")
@@ -25,7 +25,7 @@ function atomicWrite(path: string, text: string): void {
   renameSync(tmp, path)
 }
 
-// Adds .jev-dictator/ to the repository's local exclude file once; a directory that is no git repository is left alone.
+// Adds .jev-micromanager/ to the repository's local exclude file once; a directory that is no git repository is left alone.
 // The job state and the project memory (.opencode/memory/, opencode-agent-memory's place) stay out of git.
 export function excludeFromGit(project: string): boolean {
   const exclude = join(project, ".git", "info", "exclude")

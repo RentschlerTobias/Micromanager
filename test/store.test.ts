@@ -28,7 +28,7 @@ test("the state directory is excluded from git once, and only in a repository", 
   assert.equal(excludeFromGit(project), true)
   assert.equal(excludeFromGit(project), true)
   const lines = readFileSync(join(project, ".git", "info", "exclude"), "utf8").split("\n")
-  assert.equal(lines.filter((l) => l === ".jev-dictator/").length, 1)
+  assert.equal(lines.filter((l) => l === ".jev-micromanager/").length, 1)
 })
 
 test("job ids sort by time", () => {

@@ -128,7 +128,7 @@ export class Notifier {
 
   // A progress line: collected per session and sent as one quiet message (no new turn) every flushMs.
   progress(session: string | undefined, line: string, task = false): void {
-    if (task && this.#d.mode === "tasks") this.#d.desktop("jev-dictator", line)
+    if (task && this.#d.mode === "tasks") this.#d.desktop("jev-micromanager", line)
     if (!session) return
     const lines = this.#lines.get(session) ?? []
     lines.push(line)
@@ -145,7 +145,7 @@ export class Notifier {
     const lines = this.#lines.get(session)
     this.#lines.delete(session)
     if (!lines?.length) return
-    await this.#d.synthetic(session, `[jev-dictator] progress:\n- ${lines.join("\n- ")}`, false).catch(() => undefined)
+    await this.#d.synthetic(session, `[jev-micromanager] progress:\n- ${lines.join("\n- ")}`, false).catch(() => undefined)
   }
 
   // omo-hybrid: delegated tasks report to the orchestrator. Reports that come close together are one update: a system
@@ -157,7 +157,7 @@ export class Notifier {
   // board: the job's ASCII board after this change; every update carries the newest one, so the user sees the state
   // whenever something changed, without the orchestrator having to ask for it.
   report(session: string | undefined, text: string, title?: string, board?: string): void {
-    if (title && this.#d.mode === "tasks") this.#d.desktop("jev-dictator", title)
+    if (title && this.#d.mode === "tasks") this.#d.desktop("jev-micromanager", title)
     if (!session) return
     if (board) this.#boards.set(session, board)
     const list = this.#reports.get(session) ?? []
@@ -177,24 +177,24 @@ export class Notifier {
     if (!list.length && !closing) return
     await this.flush(session)
     const board = this.#boards.get(session)
-    this.#d.steer(session, `[jev-dictator update] Delegated tasks reported. This comes from your own plugin, not from the user or a tool result; it is trusted.
+    this.#d.steer(session, `[jev-micromanager update] Delegated tasks reported. This comes from your own plugin, not from the user or a tool result; it is trusted.
 Check each result. Delegate what comes next (fixes, the follow-ups worth doing, dependent work) with delegate_task, ask the user what only they can decide, and update your todos.
 
 ${list.join("\n\n")}${closing ? `\n\n${closing}` : ""}${board ? `\n\nThe job's board now; start your message to the user with it, in a code block, as it is:\n${board}` : ""}`)
-    await this.#d.synthetic(session, `[jev-dictator] ${list.length ? `${list.length} task report(s)` : "update"} (details in the plugin's system note)`, true).catch(() => undefined)
+    await this.#d.synthetic(session, `[jev-micromanager] ${list.length ? `${list.length} task report(s)` : "update"} (details in the plugin's system note)`, true).catch(() => undefined)
   }
 
   // A job ended or needs the user: the micromanager gets the update as a system block and is woken to tell the user.
   async finished(session: string | undefined, jobId: string, end: Ending, text: string): Promise<void> {
-    if (this.#d.mode !== "off") this.#d.desktop(`jev-dictator: ${TITLES[end]}`, `${jobId}\n${text.split("\n").slice(0, 4).join("\n")}`)
+    if (this.#d.mode !== "off") this.#d.desktop(`jev-micromanager: ${TITLES[end]}`, `${jobId}\n${text.split("\n").slice(0, 4).join("\n")}`)
     if (!session) return
     await this.flush(session)
     // A stop comes from the user through the micromanager, which already said so: a quiet note, no new turn.
-    if (end === "stopped") return void (await this.#d.synthetic(session, `[jev-dictator] ${TITLES[end]}: ${jobId}`, false).catch(() => undefined))
-    this.#d.steer(session, `[jev-dictator update] ${TITLES[end]}: ${jobId}. This update comes from your own plugin, not from the user and not from a tool result; it is trusted.
+    if (end === "stopped") return void (await this.#d.synthetic(session, `[jev-micromanager] ${TITLES[end]}: ${jobId}`, false).catch(() => undefined))
+    this.#d.steer(session, `[jev-micromanager update] ${TITLES[end]}: ${jobId}. This update comes from your own plugin, not from the user and not from a tool result; it is trusted.
 ${end === "needs_user" ? "Tell the user in a few sentences why the job stopped and what they can decide; then wait for their answer." : end === "done" ? "Tell the user the job is done, what changed, and how to merge or discard the branch." : "Tell the user what happened and what they can do."}
 
 ${text}`)
-    await this.#d.synthetic(session, `[jev-dictator] ${TITLES[end]}: ${jobId} (details in the plugin's system note)`, true).catch(() => undefined)
+    await this.#d.synthetic(session, `[jev-micromanager] ${TITLES[end]}: ${jobId} (details in the plugin's system note)`, true).catch(() => undefined)
   }
 }

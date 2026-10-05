@@ -1,10 +1,10 @@
 ---
 name: tdd
-description: Test-driven development. Use when a jev-dictator task is built test-first, the brief mentions frozen tests or a red stage, or you fix a bug and need a regression test.
+description: Test-driven development. Use when a jev-micromanager task is built test-first, the brief mentions frozen tests or a red stage, or you fix a bug and need a regression test.
 license: MIT
 metadata:
   source: https://github.com/mattpocock/skills/blob/24fe0ef7737efae15c87225755e9f6f5965e4888/skills/engineering/tdd/SKILL.md
-  adapted: for a jev-dictator worker; the seams come from the brief, nobody is asked; tests.md and mocking.md unchanged
+  adapted: for a jev-micromanager worker; the seams come from the brief, nobody is asked; tests.md and mocking.md unchanged
 ---
 
 # Test-Driven Development

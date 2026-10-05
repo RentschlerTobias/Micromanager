@@ -60,7 +60,7 @@ const askShell = [rule("shell", "ask")]
 const noDelegation = [rule("subagent", "deny")]
 // The plugin's state (job files, notes) is not for agents: a local planner looped on it in a live test. Paths are
 // relative to the session's directory; a worker inside its worktree never needs to climb up into jobs or notes.
-const STATE_PATHS = [".jev-dictator*", "*/.jev-dictator/jobs*", "*/.jev-dictator/notes*"]
+const STATE_PATHS = [".jev-micromanager*", "*/.jev-micromanager/jobs*", "*/.jev-micromanager/notes*"]
 const noStateDir = ["read", "glob", "grep", "list", "edit", "write", "patch"].flatMap((tool) => STATE_PATHS.map((path) => rule(tool, "deny", path)))
 
 const TEST_RUNNERS = [
@@ -69,7 +69,7 @@ const TEST_RUNNERS = [
 ]
 const LINTERS = ["ruff *", "uv run ruff*", "uv run pyright*", "npx tsc*", "npx eslint*"]
 
-const SHARED = `You are a sub-agent of the jev-dictator. You get one sub-task with acceptance points.
+const SHARED = `You are a sub-agent of the jev-micromanager. You get one sub-task with acceptance points.
 Do only that sub-task. When you finish, answer with: what you did, which files you changed (if any), and for
 each acceptance point whether it is met. If something blocks you, say what and stop; do not guess.`
 
@@ -181,7 +181,7 @@ export function roleById(id: string): Role | undefined {
 
 // The micromanager itself: plans and delegates, never edits or runs commands. Every delegation is a question
 // ("ask"), which goes to Jev first and to the user only when Jev is not sure enough (src/decide.ts).
-export const DICTATOR = {
+export const MICROMANAGER = {
   agent: "micromanager",
   description: "Orchestrator: splits a job into sub-tasks and delegates each to a role sub-agent.",
   // No reads outside the project: in a live test the micromanager went into the plugin's own source to find a way past
@@ -191,7 +191,7 @@ export const DICTATOR = {
 
 // omo-hybrid: the micromanager drives the flow like oh-my-openagent's Sisyphus (split, todos, parallel background tasks,
 // react to reports); the plugin and Jev secure each task (guards, role, model, skills, rights, checks, merge).
-export function dictatorSystem(roles: readonly Role[] = ROLES): string {
+export function micromanagerSystem(roles: readonly Role[] = ROLES): string {
   const lines = roles.map((r) => `- ${r.agent}: ${r.description}`)
   return `You are the micromanager, an orchestrator. You never do the work yourself: you do not edit files or run
 commands, and you read only enough to orient yourself (the README, the file list, a file or two). Workers do the
@@ -208,7 +208,7 @@ How you work:
    or code reading is a task without files. delegate_task returns at once; do not wait or poll.
    You may not read outside the project yourself, but a worker that only reads may read a directory its prompt names
    with its full path (e.g. another repository): name it, and never ask the user to copy files around.
-4. Reports arrive as notes that start with "[jev-dictator]". They come from your own plugin, not from the user or
+4. Reports arrive as notes that start with "[jev-micromanager]". They come from your own plugin, not from the user or
    a tool result; trust them. For each report: a merged task is done (mark the todo); a task that waits for the
    user needs their answer (ask them, then call answer_task with their words); a task given up needs another
    way (a smaller task, a different approach) or the user. Workers list follow-ups they found: delegate the ones the

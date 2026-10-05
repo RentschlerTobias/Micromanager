@@ -2,11 +2,11 @@
 #   cp decider/jev-decider.service ~/.config/systemd/user/ && systemctl --user enable --now jev-decider
 # Set --model to a fine-tuned checkpoint directory once one exists.
 [Unit]
-Description=jev-dictator GLiNER2 decision server (CPU)
+Description=jev-micromanager GLiNER2 decision server (CPU)
 
 [Service]
 Environment=CUDA_VISIBLE_DEVICES=
-WorkingDirectory=%h/Fun/Projects/Repos/jev-dictator/decider
+WorkingDirectory=%h/Fun/Projects/Repos/jev-micromanager/decider
 ExecStart=/usr/bin/uv run --frozen jev-decider --port 8781 --model fastino/GLiNER2.5-multi-Decide --threads 8
 Restart=on-failure
 

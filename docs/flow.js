@@ -1,8 +1,8 @@
-// jev-dictator flow: how the plugin routes a sub-agent call and how it decides a permission request.
+// jev-micromanager flow: how the plugin routes a sub-agent call and how it decides a permission request.
 //
 // Two lanes, like the oc-voice flow page: the decision chart is static (it mirrors src/routing.ts and
 // src/decide.ts); the highlight and the detail panel come from the decision journal
-// (${XDG_STATE_HOME:-~/.local/state}/jev-dictator/decisions.jsonl), one JSON object per line.
+// (${XDG_STATE_HOME:-~/.local/state}/jev-micromanager/decisions.jsonl), one JSON object per line.
 "use strict";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -12,12 +12,12 @@ const css = (name) => getComputedStyle(document.documentElement).getPropertyValu
 // id: {t: title, s: subtitle, x, y, cat, e: explanation}. x/y are box centers; W x H is the box size.
 const NODES = {
   // model routing (src/routing.ts, src/hooks.ts)
-  subagent: { t: "Subagent call", s: "the dictator delegates", x: 100, y: 110, cat: "entry",
-    e: "The dictator calls the built-in subagent tool for a sub-task. The plugin rewrites the call in place before it runs." },
-  role: { t: "A known role?", s: "dictator-explore …", x: 340, y: 110, cat: "route",
-    e: "Only the ten role agents (dictator-*) are routed. A built-in agent such as explore or general is left exactly as asked." },
+  subagent: { t: "Subagent call", s: "the micromanager delegates", x: 100, y: 110, cat: "entry",
+    e: "The micromanager calls the built-in subagent tool for a sub-task. The plugin rewrites the call in place before it runs." },
+  role: { t: "A known role?", s: "explorer …", x: 340, y: 110, cat: "route",
+    e: "Only the ten role agents (explorer, coder, …) are routed. A built-in agent such as explore or general is left exactly as asked." },
   left: { t: "Left as asked", s: "a built-in agent", x: 820, y: 30, cat: "entry",
-    e: "Not one of the dictator's roles: the model and the prompt stay untouched, and nothing is recorded." },
+    e: "Not one of the micromanager's roles: the model and the prompt stay untouched, and nothing is recorded." },
   needs: { t: "Images needed?", s: "a guess from the prompt", x: 580, y: 110, cat: "route",
     e: "Phase 1 guesses the need from keywords (screenshot, png, …). From Phase 2 Jev answers whether the sub-task needs image input." },
   review: { t: "Review?", s: "another family than the worker", x: 820, y: 220, cat: "route",
@@ -25,11 +25,11 @@ const NODES = {
   model: { t: "Model chosen", s: "vision · other family · first", x: 1060, y: 110, cat: "route",
     e: "The role's first model, the vision model for image input, or — for a review — the first model of another family than the worker's." },
   worker: { t: "Worker runs", s: "foreground session", x: 1300, y: 110, cat: "entry",
-    e: "The sub-agent session runs on the chosen model with the role's rights and the prompt carrying a [jev-dictator] header." },
+    e: "The sub-agent session runs on the chosen model with the role's rights and the prompt carrying a [jev-micromanager] header." },
 
   // permission decision (src/decide.ts, src/plugin.ts)
   ask: { t: "Permission ask", s: "effect = ask · our agents", x: 100, y: 430, cat: "entry",
-    e: "OpenCode asks before a tool call. Only the dictator and its role agents are handled here; every other agent's ask is left to OpenCode." },
+    e: "OpenCode asks before a tool call. Only the micromanager and its role agents are handled here; every other agent's ask is left to OpenCode." },
   hard: { t: "Hard rule?", s: "git push · sudo · .env · install", x: 340, y: 430, cat: "guard",
     e: "Rules Jev can never override: a destructive or irreversible command, installing software into the system, a .env file, or access outside the project. Always the user." },
   deletes: { t: "Deletes files?", s: "what git says about the paths", x: 580, y: 430, cat: "check",
@@ -189,7 +189,7 @@ function label(e) {
 }
 
 const said = (e) => e.kind === "routing"
-  ? `${e.requested ?? e.role}: ${(e.prompt ?? "").replace("[jev-dictator]", "").trim()}`
+  ? `${e.requested ?? e.role}: ${(e.prompt ?? "").replace("[jev-micromanager]", "").trim()}`
   : `${e.agent ?? "?"} · ${e.action ?? "?"}`;
 
 // What a decision touched, for "Used" and for filtering.
@@ -298,12 +298,12 @@ function renderDetail(e) {
   let n = 0;
   const parts = [];
   if (e.kind === "routing") {
-    parts.push(step(++n, "entry", "Delegated", `<div class="big">${esc(truncate((e.prompt ?? "").replace("[jev-dictator]", "").trim(), 400))}</div>
-      <div class="kv">${esc(e.agent ?? "dictator")} → ${esc(e.requested ?? e.role)}</div>`));
+    parts.push(step(++n, "entry", "Delegated", `<div class="big">${esc(truncate((e.prompt ?? "").replace("[jev-micromanager]", "").trim(), 400))}</div>
+      <div class="kv">${esc(e.agent ?? "micromanager")} → ${esc(e.requested ?? e.role)}</div>`));
     parts.push(step(++n, "route", "Routed", `<div>role <b>${esc(e.role)}</b> → ${chip(short(e.model), "route")}</div>
       <div class="kv">${esc(e.reason ?? "")}</div>`));
   } else {
-    parts.push(step(++n, "entry", `Asked by ${e.agent === "dictator" ? "the dictator" : esc(e.agent)}`,
+    parts.push(step(++n, "entry", `Asked by ${e.agent === "micromanager" ? "the micromanager" : esc(e.agent)}`,
       `<div class="big">${esc(e.action)}</div>
        <div class="kv">${esc((e.resources ?? []).join(" | "))}</div>
        ${e.task ? `<div class="kv">sub-task: ${esc(truncate(e.task, 300))}</div>` : ""}

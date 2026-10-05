@@ -2,7 +2,7 @@
 // foreground (sequential in Phase 1), and a header tells the sub-agent its role and model.
 
 import { chooseModel, guessNeeds, type Routing } from "./routing.ts"
-import { DICTATOR, roleByAgent } from "./roles.ts"
+import { MICROMANAGER, roleByAgent } from "./roles.ts"
 
 export interface ToolCall {
   tool: string
@@ -18,11 +18,11 @@ export interface Routed {
   readonly reason: string
 }
 
-export const HEADER = "[jev-dictator]"
+export const HEADER = "[jev-micromanager]"
 
 // Rewrites `call.input` in place; returns what was decided, or undefined when the call is not the micromanager's.
 export function routeSubagentCall(call: ToolCall, routing: Routing, workerModel?: string): Routed | undefined {
-  if (call.tool !== "subagent" || call.agent !== DICTATOR.agent) return undefined
+  if (call.tool !== "subagent" || call.agent !== MICROMANAGER.agent) return undefined
   const role = roleByAgent(String(call.input.agent ?? ""))
   if (!role) return undefined // a built-in agent: left as the micromanager asked
   const prompt = String(call.input.prompt ?? "")

@@ -1,6 +1,6 @@
 # jev-decider
 
-A local decision server for jev-dictator: GLiNER2 on the CPU behind the TypeSafe Jev wire format
+A local decision server for jev-micromanager: GLiNER2 on the CPU behind the TypeSafe Jev wire format
 (`POST /v1/systemone {model, state, questions}`), so the plugin talks to it with the same client as to the cloud
 Jev. It answers choice, noul and score questions; see `decider/server.py` for the mapping. The 4060 stays free
 for llama-swap and the NPU for Whisper.

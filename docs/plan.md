@@ -1,4 +1,4 @@
-# jev-dictator: an OpenCode orchestrator driven by Jev
+# jev-micromanager: an OpenCode orchestrator driven by Jev
 
 Status (2026-10-04): Phase 0 (spike) and Phase 1 done, and Jev on permission requests works (part of the old
 Phases 2 and 3). The design was reworked on 2026-10-03/04: [design.md](design.md) is now the design and
@@ -28,7 +28,7 @@ the oc-voice project (session board, permission phrasing, Jev client) are reused
 dependencies.
 
 Decisions (user, 2026-10-01):
-- **Own OpenCode v2 plugin** in its own repo (`~/Fun/Projects/Repos/jev-dictator`), not OmO itself.
+- **Own OpenCode v2 plugin** in its own repo (`~/Fun/Projects/Repos/jev-micromanager`), not OmO itself.
 - **Models: OpenCode Go only**, for now three: glm-5.3-flash, qwen3.8-flash, deepseek-v4.1-flash (local
   models later).
 - **Worker starts are confirmed by the user** for now (each worker individually, in the TUI); Jev's
@@ -180,14 +180,14 @@ Sources are listed at the end of design.md.
 - **Markdown agents in `~/.config/opencode/agents/` were not loaded** by v2 (agents seen: build, general,
   explore, compaction, title, summary, plan) → the role matrix is defined in code via `ctx.agent.transform`.
 - **A session permission rule `{action: "spike_spawn", effect: "ask"}` did not make the hub ask** → the
-  dictator does not rely on the hub's permission rules for its own tools; it asks the user itself through
+  micromanager does not rely on the hub's permission rules for its own tools; it asks the user itself through
   OpenCode's `question` form when Jev says so (see "Questions and permissions").
 - Sessions on a second server share `~/.local/share/opencode/opencode.db` (the spike's sessions were deleted
   afterwards).
 
 ## Phase A results (spikes against private standalone servers, opencode 2.0.18, 2026-10-04)
 **Setup.**
-- A spike plugin in its own `XDG_CONFIG_HOME`, so neither the jev-dictator plugin nor the user's hub was
+- A spike plugin in its own `XDG_CONFIG_HOME`, so neither the jev-micromanager plugin nor the user's hub was
   touched.
 - `opencode run --standalone` in a throwaway git project.
 - Every session was deleted afterwards.
@@ -296,7 +296,7 @@ and "Layout".
 
 What is implemented (2026-10-04):
 - **The role matrix** as OpenCode agents via `ctx.agent.transform` (`src/roles.ts`, `src/agents.ts`).
-- **Model routing** on the dictator's `subagent` call (`src/routing.ts`, `src/hooks.ts`).
+- **Model routing** on the micromanager's `subagent` call (`src/routing.ts`, `src/hooks.ts`).
 - **The Jev client** (`src/jev.ts`):
   - the key from `JEV_API_KEY` or the keyring,
   - redaction,
@@ -323,15 +323,15 @@ OpenCode permission per tool: allow / ask / deny. Write rights apply only inside
 | review → `reviewer` | check against acceptance points | allow | deny | allow: tests/lint only | deny | allow | another family than the worker: qwen3.8-flash for GLM/DeepSeek, glm-5.3-flash for Qwen |
 | oracle → `oracle` | hard decisions, architecture | allow | deny | deny | ask | allow | qwen3.8-flash → glm-5.3-flash |
 
-- **`dictator`** (primary) plans, classifies through the plugin and delegates. It has no edit or bash: only the
-  dictator tools, read/grep/glob and graphify queries.
+- **`micromanager`** (primary) plans, classifies through the plugin and delegates. It has no edit or bash: only the
+  micromanager tools, read/grep/glob and graphify queries.
 - An "ask" in this table is a question that goes through Jev first (section 2), not straight to the user.
 - The reviewer answers in strict JSON `{verdict: PASS|FAIL, checks: [...], fixes: [...]}`.
 - Prompts come in two variants per model family (lesson from OmO).
 
 ## Phases (each its own small commits, English)
 0. **Spike**: done (results above).
-1. Repo skeleton, role matrix, routing config, the dictator agent, install script: done. Jev client and
+1. Repo skeleton, role matrix, routing config, the micromanager agent, install script: done. Jev client and
    permission decisions: done.
 
 From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
@@ -353,7 +353,7 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - the `deliberate` skill;
   - design tree validation, frontier, N2 / N2b / N2c, shortcuts, question caps, design checkpoint;
   - the facilitator on the session model;
-  - the dictator read cap; the "answer yourself" line removed from the dictator prompt.
+  - the micromanager read cap; the "answer yourself" line removed from the micromanager prompt.
 - **D. Classification and profile: done 2026-10-04** (results below the phase list):
   - N4 split until small;
   - N5+N5b in one request;
@@ -385,7 +385,7 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
 - **H. Extras:** memory plugin, research extras (papers skill, context7, Serena, graphify).
 - **J. Local decision model:** GLiNER shadow mode → retraining on Jev's answers, overrides and outcomes → a
   promotion gate per node, with demotion on rising overrides.
-- **I. Visibility:** design.html / flow.html lanes from the journal, `/dictator status|log|stop`, otel, later
+- **I. Visibility:** design.html / flow.html lanes from the journal, `/micromanager status|log|stop`, otel, later
   wayfinder maps.
 
 ### Phase B results (2026-10-04)
@@ -397,13 +397,13 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
 - `src/backends.ts`: decision backends, shadow mode.
 - `src/dataset.ts`, `eval.ts`, `cli.ts`: the training rows and the eval harness.
 - `src/integration.ts`, `brief.ts`, `runner.ts`, `tools.ts`: the job branch, briefs and reports, the P1 runner,
-  the dictator tools.
+  the micromanager tools.
 - `decider/`: the GLiNER server.
 - Tests: 63 TypeScript tests, 5 Python tests.
 
 **Live, in a throwaway project** (private standalone server with the real plugin, cloud model by preset):
-- The dictator called `dictator_plan`. The planner made 2 tasks with 3 checks.
-- `dictator_run` ran both on `jev/<job>` in `.jev-dictator/worktrees/<job>`. Both checks passed on the first
+- The micromanager called `plan_job`. The planner made 2 tasks with 3 checks.
+- `run_job` ran both on `jev/<job>` in `.jev-micromanager/worktrees/<job>`. Both checks passed on the first
   try, and each task became a commit.
 - The user's checkout stayed untouched, and `npm test` in the worktree passed.
 
@@ -416,7 +416,7 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
   - Still to check in Phase C: how these prompts reach the user in the TUI.
 - **Job state lives in files, not in `ctx.storage`.** `ctx.storage` was not verified; the file is readable and
   needs no copy.
-- **The integration worktree lives inside the project** (`.jev-dictator/worktrees/`), so workers trigger no
+- **The integration worktree lives inside the project** (`.jev-micromanager/worktrees/`), so workers trigger no
   `external_directory` ask. It starts from the last commit, so the user's uncommitted changes are not part of a
   job.
 - **Planners write verify commands** that the plugin runs with `sh -c` at low priority. The planner chose sound
@@ -429,10 +429,10 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
 - `src/session.ts`: the design tree, frontier, one question per turn, shortcuts, caps and checkpoint.
 - **Runner:** `start`, `continueJob`, `questions`, `answer`.
 - **Plugin:**
-  - `dictator_questions`;
+  - `plan_questions`;
   - the prompt hook reads the user's turns and pins;
-  - the context hook adds the dictator's instruction as a system block;
-  - the dictator's reads are capped at 12 per session.
+  - the context hook adds the micromanager's instruction as a system block;
+  - the micromanager's reads are capped at 12 per session.
 - `skills/deliberate` with `install.sh --skills`.
 - `bench/guard_cases.json` and `npm run bench-guards`.
 - Tests: 77 TypeScript tests, 6 Python tests.
@@ -441,7 +441,7 @@ From here on, the phases follow design.md (§16 MVP cut, §17 spikes):
 N1 / N2 / N2b / N2c, workers on a cloud model by preset):
 - G0 ran locally (about 0.5 s) and flagged nothing. N1 gave complexity 3 and open decisions 0.73, so a planning
   session started.
-- The dictator drafted 5 decisions. Over 5 turns it asked one open question each time; the user's words were
+- The micromanager drafted 5 decisions. Over 5 turns it asked one open question each time; the user's words were
   stored as answers, "skip" turned one question into an assumption, and Jev picked the order (N2b).
 - The checkpoint showed the decisions apart from the assumption, which was marked as a proposal. After
   "confirm" the planner wrote 2 tasks with 7 acceptance points carrying every decision, and "go" ran both tasks
@@ -458,8 +458,8 @@ So our own fine-tune is needed before a guard may decide alone (Phase J).
 
 **Fixed during the live test:**
 - **A firm answer was read as "asks for options".** It scored settles 0.93 and asks_options 0.71, and the
-  dictator explained options. A clear decision now wins.
-- **The dictator re-sent the goal mid-session and after "confirm", which started new jobs.** A goal now
+  micromanager explained options. A clear decision now wins.
+- **The micromanager re-sent the goal mid-session and after "confirm", which started new jobs.** A goal now
   continues the session's unfinished job.
 - **The draft listed possible answers inside its questions, and one asked question gave example answers.** The
   draft and ask instructions now forbid options and examples.
@@ -469,7 +469,7 @@ So our own fine-tune is needed before a guard may decide alone (Phase J).
 
 **Open:**
 - **How a worker's permission prompt reaches the user in the TUI.** Headless runs need presets. In the run
-  above, `--auto` also approved the dictator reading files outside the project when it got confused; in the TUI
+  above, `--auto` also approved the micromanager reading files outside the project when it got confused; in the TUI
   that is an ask.
 - **Transliteration:** "Straße" became "strae" (ß dropped). It is consistent with "drop what has no ASCII
   equivalent", but a review stage (Phase E) should question such details.
@@ -503,17 +503,17 @@ So our own fine-tune is needed before a guard may decide alone (Phase J).
   - N4 split nothing.
   - N5 made the bug fix and the new function P3. Both red stages failed before the change, both reviews passed.
     The README task ran as P1. Jev itself moved the verification task from oracle to review (0.79).
-  - The run was cut off once inside T4 (a harness timeout); `dictator_run` resumed it with T4 started again.
+  - The run was cut off once inside T4 (a harness timeout); `run_job` resumed it with T4 started again.
   - Result: 4 commits, 13 tests green, `median` no longer mutates the caller's array, `percentile` throws
     `RangeError` in all three cases.
 
 **Fixed during the live tests:**
 - **Sessions the runner starts never wait on the user.** A worker or reviewer asking for anything outside its
   directory is denied with a note; any request that would go to the user is denied with "report NEEDS_CONTEXT",
-  so the job stops and the dictator asks in its own session. This answers Phase C's open point for the TUI too.
-- **The dictator tried to get past the gate.** G0 flagged the goal as injection (0.59). The dictator called
-  `dictator_plan` with "continue", then `dictator_run`, then read the plugin's own source outside the project,
-  before it asked. The gate's result now says only the user can answer; the dictator is denied
+  so the job stops and the micromanager asks in its own session. This answers Phase C's open point for the TUI too.
+- **The micromanager tried to get past the gate.** G0 flagged the goal as injection (0.59). The micromanager called
+  `plan_job` with "continue", then `run_job`, then read the plugin's own source outside the project,
+  before it asked. The gate's result now says only the user can answer; the micromanager is denied
   `external_directory`.
 - **Shared acceptance points** are marked per task in the brief and the review prompt. A reviewer of the median
   fix had asked for the percentile tests of the next task.
@@ -525,14 +525,14 @@ So our own fine-tune is needed before a guard may decide alone (Phase J).
   next. Phase J's fine-tune and the guard bench need a repeat-run check.
 - **N5 sees the whole job text,** so a new-function task in a job that also fixes a bug was classified as a bug fix
   too. Harmless here (P3 either way); the state could carry the job goal more weakly.
-- **The code-mode `execute` tool** lists every tool, `dictator_run` included, to role agents. Whether its nested
+- **The code-mode `execute` tool** lists every tool, `run_job` included, to role agents. Whether its nested
   calls pass the evaluate hook is not verified; the narrowed-rights deny in the hook is the safety net.
-- **`glob` with `hidden: true`** shows file names under `.jev-dictator/`; reads are denied.
+- **`glob` with `hidden: true`** shows file names under `.jev-micromanager/`; reads are denied.
 
 ### Phase E and F results (2026-10-05)
 **What exists now:**
 - **E0 (spike, private server):**
-  - A tool called through the code-mode `execute` tool carries the caller's agent, so the dictator tools'
+  - A tool called through the code-mode `execute` tool carries the caller's agent, so the micromanager tools'
     agent check refuses role agents. Calls without an agent and calls from runner sessions are refused now too.
   - `tool.execute.after` is awaited, also when async, and can rewrite the result the model sees.
   - `session.synthetic` with `resume` starts a turn in an idle session and is steered into a busy one. Models
@@ -543,11 +543,11 @@ So our own fine-tune is needed before a guard may decide alone (Phase J).
     "later" list;
   - a replan when stalled.
 - **E2 background runs** (`src/scheduler.ts`):
-  - `dictator_run` queues and returns;
+  - `run_job` queues and returns;
   - progress as quiet messages, and the end as a system note plus a wake-up;
   - `notify-send`;
-  - `dictator_stop`;
-  - `dictator_run` with the user's answer as a note.
+  - `stop_job`;
+  - `run_job` with the user's answer as a note.
 - **E2b guardrails:**
   - G0 on follow-ups and workers' permission requests;
   - injection checks on web results and research notes;
@@ -569,16 +569,16 @@ So our own fine-tune is needed before a guard may decide alone (Phase J).
 Jev; GLiNER for G0):
 - **Run 1** (slugify with umlaut transliteration, tests, README; one task at a time, before the parallel and
   follow-up fixes):
-  - "go" returned in 4 s. While the job ran, the dictator answered a status question in 8 s.
+  - "go" returned in 4 s. While the job ran, the micromanager answered a status question in 8 s.
   - All three tasks passed. Counters were exact (49k tokens and 21 requests after three tasks).
   - The two reviewers ran in parallel on glm and qwen.
   - It found two bugs, both fixed (see below).
 - **Run 2** (two independent helpers and a suite check; parallel 3, the new code):
   - N10 confirmed T1 and T2 as independent (0.97 each). They started 0.1 s apart in their own worktrees, and the
     train merged T2, then rebased and merged T1.
-  - "stop" through the dictator paused the job in T3 and removed T3's worktree. "go on" resumed it, and reconcile
+  - "stop" through the micromanager paused the job in T3 and removed T3's worktree. "go on" resumed it, and reconcile
     started T3 again.
-  - The end woke the dictator through the system note. It reported the tasks, the branch and how to merge,
+  - The end woke the micromanager through the system note. It reported the tasks, the branch and how to merge,
     without calling the note an injection.
   - No follow-up was reported twice.
 
@@ -588,7 +588,7 @@ Jev; GLiNER for G0):
 - **The review hang of Phase D:** a reviewer's provider stream started and never completed, so the session waited
   until the 20-minute timeout. Now a session is stalled after 4 minutes without change, and a stalled reviewer
   gets one more try on another family.
-- **A user's stop woke the dictator a second time.** It is a quiet note now.
+- **A user's stop woke the micromanager a second time.** It is a quiet note now.
 - **Found in the code while building F:** a task blocked on NEEDS_CONTEXT could never continue, and the user's
   answer never reached it. A parallel task that stopped an already stopped job broke its resume phase.
 
@@ -603,26 +603,26 @@ Jev; GLiNER for G0):
   works, but the ladder's rung 2 needs the registry to offer more than one family per tier.
 
 ### omo-hybrid (2026-10-05)
-On the user's decision, the dictator moves toward oh-my-openagent: the LLM drives the flow, Jev and the plugin code
+On the user's decision, the micromanager moves toward oh-my-openagent: the LLM drives the flow, Jev and the plugin code
 secure each task. The fully code-driven state stays on `main`, and the day's other work on `e-open`.
 
 **What changed:**
-- **`dictator_task`** delegates one task (title, prompt, files, dependencies, priority, checks) into the session's
+- **`delegate_task`** delegates one task (title, prompt, files, dependencies, priority, checks) into the session's
   rolling job and returns at once. Tasks delegated while the job runs are picked up by the same run; independent
   tasks run in parallel in worktrees, and the merge train brings them onto the session's branch.
-- **Each task's report** (status, checks, the worker's summary, follow-ups) goes to the dictator. Reports close
-  together arrive as one system note and one wake-up. At the end the dictator is woken for the summary; "ulw" or
+- **Each task's report** (status, checks, the worker's summary, follow-ups) goes to the micromanager. Reports close
+  together arrive as one system note and one wake-up. At the end the micromanager is woken for the summary; "ulw" or
   "ultrawork" tells it to go on with its todos.
-- **A task that needs the user** waits without stopping the others; `dictator_answer` passes the answer on, also
-  while the job runs. `dictator_tasks` lists the tasks or shows one task's full report.
-- **The dictator prompt** is Sisyphus-like: split, todos, delegate in parallel, react to reports, short messages.
-  `dictator_plan` / `dictator_run` stay for large jobs.
+- **A task that needs the user** waits without stopping the others; `answer_task` passes the answer on, also
+  while the job runs. `list_tasks` lists the tasks or shows one task's full report.
+- **The micromanager prompt** is Sisyphus-like: split, todos, delegate in parallel, react to reports, short messages.
+  `plan_job` / `run_job` stay for large jobs.
 - **Lighter per task:**
   - P3 only for bug fixes;
   - a review only from risk public_api up, or without checks;
   - the standards axis only for data or security risk.
 - **Opt-in nodes:** N9 (typing an escalation) and N10 (batch confirmation). N7's Jev request is not used for
-  delegated tasks; the dictator decides on follow-ups.
+  delegated tasks; the micromanager decides on follow-ups.
 - **Also on this branch:**
   - routing breaks ties by the role matrix (code goes to glm, plan to qwen);
   - N5 classifies the task without the job's goal (is_bug_fix 0.91 → 0.08 on the Phase D case);
@@ -631,19 +631,19 @@ secure each task. The fully code-driven state stays on `main`, and the day's oth
 **Live** (private `opencode serve`, cloud only, a blog project: slugify with umlauts, readingTime, excerpt, the
 README):
 - **Run 1:**
-  - The dictator delegated four parallel tasks in 35 s, but with prose as checks, which no worker could pass.
-  - The workers said so, and the dictator recognised its own mistake from the reports and set about fixing it.
+  - The micromanager delegated four parallel tasks in 35 s, but with prose as checks, which no worker could pass.
+  - The workers said so, and the micromanager recognised its own mistake from the reports and set about fixing it.
   - Fixed after the run: checks must be shell commands; answers reach a running job; no progress messages in a
     rolling job.
 - **Run 2:**
   - Four parallel tasks with `npm test` as the check, all merged without a fix round (code on glm, the README on
     deepseek). The branch's suite: 13 of 13.
-  - The dictator acknowledged each report briefly, sent a read-only reviewer over the whole branch on its own, and
+  - The micromanager acknowledged each report briefly, sent a read-only reviewer over the whole branch on its own, and
     ended with a summary and `git merge jev/<job>`.
 
 **Open:**
 - A run in the user's TUI on a real repo.
-- The dictator reaches the plugin's tools through the code-mode `execute` tool; that works, but every call costs
+- The micromanager reaches the plugin's tools through the code-mode `execute` tool; that works, but every call costs
   an extra turn.
 
 ## Verification
@@ -664,5 +664,5 @@ README):
   - a sensitive task that never reaches the cloud;
   - a refusal_likely task routed to a local uncensored model, while a harmful one goes to the user;
   - a user override that skips a node and shows up as a label in the journal;
-  - `/dictator stop`;
+  - `/micromanager stop`;
   - no push, worktrees cleaned up.

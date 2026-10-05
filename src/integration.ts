@@ -1,5 +1,5 @@
 // The job's own branch and worktree (design.md §11): workers change files there, never in the user's checkout.
-// The worktree lives inside the project, under .jev-dictator/worktrees/, so workers stay inside the project
+// The worktree lives inside the project, under .jev-micromanager/worktrees/, so workers stay inside the project
 // directory (no external_directory ask) and git ignores it through .git/info/exclude.
 
 import { execFile } from "node:child_process"
@@ -61,7 +61,7 @@ export async function changedFiles(worktree: string, run: Exec = exec): Promise<
 export async function commitTask(worktree: string, subject: string, body: string, run: Exec = exec): Promise<string | undefined> {
   if ((await changedFiles(worktree, run)).length === 0) return undefined
   await run("git", ["add", "-A"], { cwd: worktree })
-  const commit = await run("git", ["-c", "user.name=jev-dictator", "-c", "user.email=jev-dictator@localhost", "commit", "-q", "-m", subject, "-m", body], { cwd: worktree })
+  const commit = await run("git", ["-c", "user.name=jev-micromanager", "-c", "user.email=jev-micromanager@localhost", "commit", "-q", "-m", subject, "-m", body], { cwd: worktree })
   if (commit.code !== 0) throw new IntegrationError(`git commit failed: ${commit.stderr.trim()}`)
   return (await run("git", ["rev-parse", "--short", "HEAD"], { cwd: worktree })).stdout.trim()
 }
@@ -136,7 +136,7 @@ export async function rebaseTask(w: TaskWorktree, integrationBranch: string, run
   const base = (await run("git", ["merge-base", "HEAD", integrationBranch], { cwd: w.worktree })).stdout.trim()
   const tip = (await run("git", ["rev-parse", integrationBranch], { cwd: w.worktree })).stdout.trim()
   if (base === tip) return { ok: true, moved: false }
-  const rebased = await run("git", ["-c", "user.name=jev-dictator", "-c", "user.email=jev-dictator@localhost", "rebase", "-q", integrationBranch], { cwd: w.worktree })
+  const rebased = await run("git", ["-c", "user.name=jev-micromanager", "-c", "user.email=jev-micromanager@localhost", "rebase", "-q", integrationBranch], { cwd: w.worktree })
   if (rebased.code === 0) return { ok: true, moved: true }
   const files = (await run("git", ["diff", "--name-only", "--diff-filter=U"], { cwd: w.worktree })).stdout.trim().split("\n").filter(Boolean)
   await run("git", ["rebase", "--abort"], { cwd: w.worktree })

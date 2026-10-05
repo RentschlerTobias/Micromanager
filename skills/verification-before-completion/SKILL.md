@@ -1,10 +1,10 @@
 ---
 name: verification-before-completion
-description: Use when about to report a jev-dictator task as done, fixed or passing - requires running the verification commands and reading their output before any success claim; evidence before assertions always.
+description: Use when about to report a jev-micromanager task as done, fixed or passing - requires running the verification commands and reading their output before any success claim; evidence before assertions always.
 license: MIT
 metadata:
   source: https://github.com/obra/superpowers/blob/8ca22dba9a94f28898bbce59f2537ff4d87c747d/skills/verification-before-completion/SKILL.md
-  adapted: for a jev-dictator worker; the evidence goes into the report's EVIDENCE line
+  adapted: for a jev-micromanager worker; the evidence goes into the report's EVIDENCE line
 ---
 
 # Verification Before Completion

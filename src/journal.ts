@@ -1,6 +1,6 @@
 // What was decided, one JSON line per entry, so the user can see every answer given on their behalf, the eval
 // harness can replay them and a local Jev can be trained on them:
-// ${XDG_STATE_HOME:-~/.local/state}/jev-dictator/decisions.jsonl
+// ${XDG_STATE_HOME:-~/.local/state}/jev-micromanager/decisions.jsonl
 //
 // Entry kinds: "permission" (src/decide.ts), "routing" (the subagent hook), "decision" (a Jev node through
 // src/backends.ts, with the state object and the questions) and "label" (a later answer for a decision).
@@ -11,7 +11,7 @@ import { dirname, join } from "node:path"
 
 export function journalPath(): string {
   const base = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state")
-  return join(base, "jev-dictator", "decisions.jsonl")
+  return join(base, "jev-micromanager", "decisions.jsonl")
 }
 
 export function record(entry: Record<string, unknown>, path = journalPath()): void {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { DICTATOR, MODELS, ROLES, dictatorSystem, family, roleByAgent } from "../src/roles.ts"
+import { MICROMANAGER, MODELS, ROLES, micromanagerSystem, family, roleByAgent } from "../src/roles.ts"
 
 const ALLOWED = new Set<string>(Object.values(MODELS))
 const effect = (rules: readonly { action: string; resource: string; effect: string }[], action: string, resource = "*") =>
@@ -34,9 +34,9 @@ test("the web is open to research only; code asks before shell commands", () => 
 })
 
 test("the micromanager never edits or runs commands, and every delegation asks the user", () => {
-  for (const tool of ["edit", "write", "patch", "shell"]) assert.equal(effect(DICTATOR.rules, tool), "deny", tool)
-  assert.equal(effect(DICTATOR.rules, "subagent"), "ask")
-  const system = dictatorSystem()
+  for (const tool of ["edit", "write", "patch", "shell"]) assert.equal(effect(MICROMANAGER.rules, tool), "deny", tool)
+  assert.equal(effect(MICROMANAGER.rules, "subagent"), "ask")
+  const system = micromanagerSystem()
   for (const role of ROLES) assert.ok(system.includes(role.agent), role.agent)
 })
 
@@ -51,8 +51,8 @@ test("agent ids never clash with built-in agents, and families are told apart", 
 })
 
 test("no agent may read or change the plugin's state directory", () => {
-  for (const r of [...ROLES.map((x) => x.rules), DICTATOR.rules]) {
-    for (const path of [".jev-dictator/jobs/job-1.json", "proj/.jev-dictator/notes/job-1/T1.md"]) {
+  for (const r of [...ROLES.map((x) => x.rules), MICROMANAGER.rules]) {
+    for (const path of [".jev-micromanager/jobs/job-1.json", "proj/.jev-micromanager/notes/job-1/T1.md"]) {
       const match = [...r].reverse().find((x) => x.action === "read" && new RegExp("^" + x.resource.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$").test(path))
       assert.equal(match?.effect, "deny", path)
     }
@@ -60,5 +60,5 @@ test("no agent may read or change the plugin's state directory", () => {
 })
 
 test("the micromanager never reads outside the project (live test: it searched the plugin's source for a way past the gate)", () => {
-  assert.ok(DICTATOR.rules.some((r) => r.action === "external_directory" && r.effect === "deny" && r.resource === "*"))
+  assert.ok(MICROMANAGER.rules.some((r) => r.action === "external_directory" && r.effect === "deny" && r.resource === "*"))
 })

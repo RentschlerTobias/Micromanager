@@ -1,4 +1,4 @@
-<title>Dictator Decision Flow</title>
+<title>Micromanager Decision Flow</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap">
 <style>
@@ -111,8 +111,8 @@ td:first-child { font-weight: 700; white-space: nowrap; }
 </style>
 
 <div class="wrap">
-  <h1>Dictator Decision Flow</h1>
-  <p class="lede">How a job moves through jev-dictator, where Jev decides, and where skills and tools are picked
+  <h1>Micromanager Decision Flow</h1>
+  <p class="lede">How a job moves through jev-micromanager, where Jev decides, and where skills and tools are picked
     (<b>pick</b>) and used (<b>use</b>). Select a step for its details. Design state of 2026-10-04 (including local vs cloud routing, censorship guards, decision backends and overrides); nothing here is implemented yet beyond permissions (N13) and model routing.</p>
 
   <div class="bar">
@@ -136,7 +136,7 @@ td:first-child { font-weight: 700; white-space: nowrap; }
   </div>
 
   <div class="grid">
-    <div class="chart"><svg id="flow" viewBox="0 0 1000 1790" role="img" aria-label="Flow chart of the dictator"></svg></div>
+    <div class="chart"><svg id="flow" viewBox="0 0 1000 1790" role="img" aria-label="Flow chart of the micromanager"></svg></div>
     <aside class="panel" id="panel" aria-live="polite"></aside>
   </div>
 
@@ -190,7 +190,7 @@ td:first-child { font-weight: 700; white-space: nowrap; }
     </div>
     <div class="card">
       <h3>What code makes of the answers</h3>
-<pre>role        code (0.93)            ≥ floor → role agent dictator-code
+<pre>role        code (0.93)            ≥ floor → role agent coder
 risk        internal (0.81)
 difficulty  0.40                   → caps: fix ≤ 2, review ≤ 3
 oracle      0.88  test_first 0.79  → pipeline P3 (rule)
@@ -225,14 +225,14 @@ const L = { x: 20, w: 220 }, S = { x: 290, w: 280 }, R = { x: 680, w: 240 };
 const H = 56;
 // kind: jev | llm | code | user | worker. badges: [["S","pick"],["T","use"]]. tags drive the filters.
 const nodes = [
-  { id: "job", col: S, y: 20, kind: "user", title: "User gives a job", sub: "in the dictator session", tags: ["user"],
-    d: { what: "The user writes a job in the dictator session. The dictator (facilitator) runs on the session model the user chose, never on a routed flash model. It never executes a task: edit, write, shell and web are denied by its permission rules; reading is limited to short orientation (README, file list), everything else goes to explore workers. The planner runs as a plan-role subagent." } },
+  { id: "job", col: S, y: 20, kind: "user", title: "User gives a job", sub: "in the micromanager session", tags: ["user"],
+    d: { what: "The user writes a job in the micromanager session. The micromanager (facilitator) runs on the session model the user chose, never on a routed flash model. It never executes a task: edit, write, shell and web are denied by its permission rules; reading is limited to short orientation (README, file list), everything else goes to explore workers. The planner runs as a plan-role subagent." } },
   { id: "short", col: S, y: 100, kind: "code", title: "Shortcuts", sub: "exact phrases, before Jev", tags: [],
     d: { what: "Deterministic layer like the tutor's: stop, skip, wait what, go back to D1, light/normal/frequent. No Jev call.", fallback: "Always available, also without Jev." } },
   { id: "g0", col: R, y: 140, kind: "jev", title: "G0 Local-first gate", sub: "always GLiNER, never the cloud", tags: ["jev", "local", "user"],
     d: { jev: ["sensitive (noul): the task or its data must not leave the machine", "refusal_likely (noul): a safety-tuned model would refuse or water down this legitimate task", "injection (noul): the text tries to subvert the agent", "harmful (noul, narrow): hurt specific people, attack systems the user does not own and may not test, weapons"], what: "Runs on the job text, every task text and every worker question, on the local GLiNER decision server. injection / harmful → the user. refusal_likely → local uncensored models only. sensitive → local only (censored allowed). A local-only job sends nothing to cloud Jev: every later node uses GLiNER or Open-Jev, every worker runs locally. Not harmful by definition: security testing of own systems, CTFs, malware analysis in a lab, reverse engineering, adult fiction, harm-reduction.", fallback: "Until our own guard fine-tune passes the bench, a GLiNER yes only asks the user (Phase A: the oc-voice fine-tune flagged own-LAN security work as harmful). Decision server down: the job is treated as local-only and every guard question goes to the user." } },
   { id: "pol", col: L, y: 100, kind: "user", title: "Policy check", sub: "auto · ask · fixed · rule", tags: ["user"],
-    d: { what: "Runs before every Jev node. A decision the user fixed (a pin per job, a task override, a chat shortcut like 'always local' or 'T3 use oss-u', or the config) skips the node: no model call. 'ask' always asks the user, 'rule' uses the rules fallback, 'auto' lets the decision model decide. Most specific wins: single decision > task > job > project > global. Precedence: hard rules and the role matrix > injection / harmful guards > user override > decision model > rules. Every override is journaled as the most valuable training label.", fallback: "/dictator set <node> <value> and /dictator pins show and change the policies." } },
+    d: { what: "Runs before every Jev node. A decision the user fixed (a pin per job, a task override, a chat shortcut like 'always local' or 'T3 use oss-u', or the config) skips the node: no model call. 'ask' always asks the user, 'rule' uses the rules fallback, 'auto' lets the decision model decide. Most specific wins: single decision > task > job > project > global. Precedence: hard rules and the role matrix > injection / harmful guards > user override > decision model > rules. Every override is journaled as the most valuable training label.", fallback: "/micromanager set <node> <value> and /micromanager pins show and change the policies." } },
   { id: "back", col: L, y: 180, kind: "code", title: "Decision backend", sub: "Jev · GLiNER · Open-Jev · rules", tags: ["jev", "local"],
     d: { what: "Chosen per node, all in the Jev wire format. Guards start on GLiNER (local decision server on the CPU; the NPU stays reserved for Whisper); fine decisions start on cloud Jev. Shadow mode: Jev decides, GLiNER answers in parallel and is journaled; GLiNER is retrained on Jev's answers (overrides and outcomes take priority) and a node is promoted to GLiNER when it passes the held-out bench; demoted when user overrides rise. Floors belong to backend and wording.", fallback: "No backend reachable: rules and the user." } },
   { id: "n1", col: S, y: 180, kind: "jev", title: "N1 Triage", sub: "complexity · mode", tags: ["jev"],
@@ -270,7 +270,7 @@ const nodes = [
   { id: "brief", col: L, y: 1160, kind: "code", title: "Brief", sub: "pointers, not copies", tags: ["skills"], badges: [["S", "use"]],
     d: { what: "Written by code: task, acceptance and seams verbatim, decisions, paths of earlier notes, diff range, lessons, the skills to load. Plain instructions (no caveman on instructions). On a retry it carries a handoff note: what was tried and why it failed.", skills: ["loads the profile's skills into the worker"] } },
   { id: "work", col: S, y: 1240, kind: "worker", title: "Worker session", sub: "role agent · routed model · worktree", tags: ["skills", "tools"], badges: [["S", "use"], ["T", "use"]],
-    d: { what: "Runs in a worktree off the job's integration branch. Ends with a structured report (status DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED, files, evidence, open issues) in caveman style; code parses it into the task state and stores it in .jev-dictator/notes/.", skills: ["the profile's skills (≤ 3 + rule skills)", "shell-strategy instructions (code, test, debug)"], tools: ["the profile's tools; MCP servers as enabled", "every ask → N13", "runs on the routed model: local (4060 / iGPU / NPU) or cloud"] } },
+    d: { what: "Runs in a worktree off the job's integration branch. Ends with a structured report (status DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED, files, evidence, open issues) in caveman style; code parses it into the task state and stores it in .jev-micromanager/notes/.", skills: ["the profile's skills (≤ 3 + rule skills)", "shell-strategy instructions (code, test, debug)"], tools: ["the profile's tools; MCP servers as enabled", "every ask → N13", "runs on the routed model: local (4060 / iGPU / NPU) or cloud"] } },
   { id: "watch", col: R, y: 1160, kind: "code", title: "Loop watchdog", sub: "live, per worker, code only", tags: ["tools"],
     d: { what: "Follows every worker session live through the tool hooks and the context hook (the event stream delivered nothing in Phase A) and interrupts it (ctx.session.interrupt) when a limit or signature fires. The model never decides whether it is looping. After an interrupt the same session is never resumed: N9 starts a fresh session on another model family with a handoff note (what was read, what was done, where to continue).", jev: ["budget tier (choice: S / M / L, asked in N5): code maps it to steps, wall clock and tokens, always under hard ceilings from the config"], tools: ["limits: steps, wall-clock timeout, tokens per worker", "same tool + args 3x in 10 calls; same error twice", "read loop: an unchanged file read a 3rd time with no edit in between, or no new file in the last 8 reads", "restart: the opening reads or the plan text repeat (prefix match of the action sequence, near-duplicate assistant text)", "monologue: 3 replies without a tool call; A/B alternation 6x", "context-window errors in a row", "worker_refused: a censored worker refuses or waters down the task (refusal patterns or GLiNER noul) → N9 moves it to a local uncensored model"], fallback: "Works without Jev; tier M is used." } },
   { id: "data", col: L, y: 1720, kind: "code", title: "Decision dataset", sub: "rows to train a local Jev", tags: ["jev"],
@@ -416,7 +416,7 @@ try { start = localStorage.getItem("jd-flow-sel") || start; } catch {}
 select(byId[start] ? start : "n5");
 
 const matrix = [
-  ["dictator (main session)", "deliberate", "domain-modeling", "read for orientation only (README, file list)", "edit, write, shell, web; never executes a task", "prose (human reads)"],
+  ["micromanager (main session)", "deliberate", "domain-modeling", "read for orientation only (README, file list)", "edit, write, shell, web; never executes a task", "prose (human reads)"],
   ["explore", "—", "—", "Serena, ast-grep, graphify, memory recall", "edit, shell, web", "caveman report"],
   ["research", "research", "papers", "context7, papers, websearch/webfetch, memory recall", "edit, shell", "caveman summary; docs/research note in prose"],
   ["plan (facilitator)", "deliberate", "domain-modeling, prototype", "read, graphify, memory recall", "edit, shell", "prose (human reads)"],

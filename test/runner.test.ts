@@ -79,8 +79,8 @@ test("plan -> run: tasks pass their checks one by one and land as commits on the
   assert.match(log, /T2: write notes\nT1: write add.js\ninit/)
   assert.equal(existsSync(join(project, "add.js")), false, "the user's checkout is untouched")
   assert.equal(loadJob(project, job.id)?.phase, "integrate")
-  assert.match(readFileSync(join(project, ".git", "info", "exclude"), "utf8"), /\.jev-dictator\//)
-  assert.match(readFileSync(join(project, ".jev-dictator", "notes", job.id, "T1.md"), "utf8"), /test -f add.js \(exit 0\)/)
+  assert.match(readFileSync(join(project, ".git", "info", "exclude"), "utf8"), /\.jev-micromanager\//)
+  assert.match(readFileSync(join(project, ".jev-micromanager", "notes", job.id, "T1.md"), "utf8"), /test -f add.js \(exit 0\)/)
   // workers run inside the job's worktree, on the routed model, with their role's agent
   const worker = fake.created.find((c) => c.agent === "coder")!
   assert.equal((worker.location as { directory: string }).directory, done.integrationWorktree)
@@ -213,7 +213,7 @@ test("an unclear job goes through the planning session, one question per turn, t
   const fake = fakeSession({ worker: writeFiles })
   const decider = nodeDecider({ G0: CLEAN, N1: { complexity: { type: "score", score: 2, confidence: 0.8, probabilities: {} }, needs_clarification: noul(0.9) }, N2: {}, N2c: { settles_decision: noul(0.9) } })
   const r = runner(project, fake.api, { decider })
-  const started = await r.start("add an add function", "ses_dictator")
+  const started = await r.start("add an add function", "ses_micromanager")
   assert.equal(started.kind, "session")
   assert.match(started.text, /plan_questions/)
   assert.equal(started.job.triage?.complexity, 6)
@@ -311,12 +311,12 @@ test("a worker stopped by the watchdog gets one fresh session with a handoff not
 test("a planner stopped by the watchdog gets one fresh try, then the job fails with the reason", async () => {
   const project = repo()
   const fake = fakeSession({})
-  const ok = runner(project, fake.api, { stopped: (id: string) => (id === "ses_1" ? { kind: "same_call", detail: "read .jev-dictator 3x" } : undefined) })
+  const ok = runner(project, fake.api, { stopped: (id: string) => (id === "ses_1" ? { kind: "same_call", detail: "read .jev-micromanager 3x" } : undefined) })
   assert.equal((await ok.plan("goal")).job.phase, "plan_gate")
-  const bad = runner(repo(), fakeSession({}).api, { stopped: () => ({ kind: "read_loop", detail: "read .jev-dictator 3x" }) })
+  const bad = runner(repo(), fakeSession({}).api, { stopped: () => ({ kind: "read_loop", detail: "read .jev-micromanager 3x" }) })
   const failed = await bad.plan("goal")
   assert.equal(failed.job.phase, "failed")
-  assert.deepEqual(failed.errors, ["the planner was stopped by the loop watchdog: read .jev-dictator 3x"])
+  assert.deepEqual(failed.errors, ["the planner was stopped by the loop watchdog: read .jev-micromanager 3x"])
 })
 
 // --- Phase D: classification, profile and pipelines -----------------------------------------------------------

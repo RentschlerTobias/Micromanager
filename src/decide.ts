@@ -9,7 +9,7 @@ import { existsSync } from "node:fs"
 import { isAbsolute, join } from "node:path"
 
 import type { Decision, Jev, Question } from "./jev.ts"
-import { DICTATOR, roleByAgent } from "./roles.ts"
+import { MICROMANAGER, roleByAgent } from "./roles.ts"
 
 export interface PermissionRequest {
   readonly sessionID: string
@@ -159,7 +159,7 @@ function describe(request: PermissionRequest): string {
   const lines = [
     `A coding agent in OpenCode (agent "${request.agent}") ${what}.`,
     role ? `Its role is "${role.id}": ${role.description}` : "",
-    request.agent === DICTATOR.agent ? `It is the orchestrator: ${DICTATOR.description}` : "",
+    request.agent === MICROMANAGER.agent ? `It is the orchestrator: ${MICROMANAGER.description}` : "",
     request.directory ? `Project directory: ${request.directory}` : "",
     request.task ? `What it is working on:\n${request.task}` : "",
   ]

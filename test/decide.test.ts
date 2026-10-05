@@ -147,7 +147,7 @@ test("the real inspector asks git about tracked and ignored paths", async () => 
   const { mkdtempSync, writeFileSync, mkdirSync } = await import("node:fs")
   const { execFileSync } = await import("node:child_process")
   const { tmpdir } = await import("node:os")
-  const dir = mkdtempSync(`${tmpdir()}/dictator-`)
+  const dir = mkdtempSync(`${tmpdir()}/micromanager-`)
   const git = (...args: string[]) => execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" })
   git("init", "-q")
   writeFileSync(`${dir}/calc.py`, "x = 1\n")

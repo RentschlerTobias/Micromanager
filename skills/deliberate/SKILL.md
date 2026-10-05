@@ -1,6 +1,6 @@
 ---
 name: deliberate
-description: Run a planning discussion with the user, one question at a time and without suggested answers. Use when the jev-dictator plugin opens a planning session or a note starts with "[planning session".
+description: Run a planning discussion with the user, one question at a time and without suggested answers. Use when the jev-micromanager plugin opens a planning session or a note starts with "[planning session".
 ---
 
 # Deliberate
