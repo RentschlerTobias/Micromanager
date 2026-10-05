@@ -78,7 +78,7 @@ test("a run that throws is reported as failed and the queue goes on", async () =
   assert.deepEqual(finished, ["b"])
 })
 
-test("the notifier batches progress quietly and wakes the dictator with a trusted system note at the end", async () => {
+test("the notifier batches progress quietly and wakes the micromanager with a trusted system note at the end", async () => {
   const sent: [string, string, boolean][] = []
   const notes: [string, string][] = []
   const desktop: string[] = []

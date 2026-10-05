@@ -1,9 +1,9 @@
-// Jev compaction of the dictator's context (the user's request after reading about Jev token savings, 2026-10-05).
+// Jev compaction of the micromanager's context (the user's request after reading about Jev token savings, 2026-10-05).
 // The orchestrator is the biggest consumer: in a real session it carried 360k input tokens, its workers 10-40k each,
 // because every turn resends every old tool result (task reports, reads, refused attempts).
 //
 // Before each of its turns, old and large tool results become candidates; Jev answers per candidate whether the
-// dictator still needs it; the ones it does not are replaced by a one-line stub that says how to get them back. The
+// micromanager still needs it; the ones it does not are replaced by a one-line stub that says how to get them back. The
 // context hook's messages are what the provider gets (Phase E spike: a replaced tool result never reached the model),
 // and the hook is awaited, so Jev can answer in time.
 //
@@ -120,7 +120,7 @@ export class Compactor {
     this.#o = { ...DEFAULT_COMPACT, ...options }
   }
 
-  // One turn of the dictator: decides on new candidates when it is worth it, then prunes everything decided so far.
+  // One turn of the micromanager: decides on new candidates when it is worth it, then prunes everything decided so far.
   async apply(sessionID: string, messages: unknown): Promise<{ removed: number; asked: number }> {
     if (!Array.isArray(messages)) return { removed: 0, asked: 0 }
     const msgs = messages as Message[]

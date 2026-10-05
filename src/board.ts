@@ -1,6 +1,6 @@
 // An ASCII board of a job (the user: "there is no overview of what is going on"): one line per task with its state,
 // role, model and current stage, the job's usage, what waits for the user, and what was found but not done. Used by
-// dictator_status and by `node src/cli.ts status` in a terminal (with --watch it redraws).
+// job_status and by `node src/cli.ts status` in a terminal (with --watch it redraws).
 
 import type { Job, Task } from "./state.ts"
 

@@ -1,6 +1,6 @@
 // The role matrix: what a sub-agent may do and which model it runs on.
 //
-// A role is an OpenCode agent the dictator delegates to with the built-in `subagent` tool. Its rights are
+// A role is an OpenCode agent the micromanager delegates to with the built-in `subagent` tool. Its rights are
 // permission rules (action, resource, effect) appended to the base agent's rules; in OpenCode the last
 // matching rule wins, so a role's "deny" overrides the base's "allow *".
 
@@ -27,7 +27,7 @@ export type RoleId =
 export interface Role {
   readonly id: RoleId
   readonly agent: string // the OpenCode agent id, prefixed so it never clashes with built-in agents
-  readonly description: string // shown to the dictator when it picks a sub-agent
+  readonly description: string // shown to the micromanager when it picks a sub-agent
   readonly system: string
   readonly rules: readonly Rule[]
   readonly models: readonly string[] // first model, then the fallback
@@ -56,7 +56,7 @@ const noWrite = WRITE_TOOLS.map((tool) => rule(tool, "deny"))
 const noWeb = WEB_TOOLS.map((tool) => rule(tool, "deny"))
 const noShell = [rule("shell", "deny")]
 const askShell = [rule("shell", "ask")]
-// Sub-agents never start sub-agents of their own: only the dictator delegates, so it can count them.
+// Sub-agents never start sub-agents of their own: only the micromanager delegates, so it can count them.
 const noDelegation = [rule("subagent", "deny")]
 // The plugin's state (job files, notes) is not for agents: a local planner looped on it in a live test. Paths are
 // relative to the session's directory; a worker inside its worktree never needs to climb up into jobs or notes.
@@ -73,13 +73,28 @@ const SHARED = `You are a sub-agent of the jev-dictator. You get one sub-task wi
 Do only that sub-task. When you finish, answer with: what you did, which files you changed (if any), and for
 each acceptance point whether it is met. If something blocks you, say what and stop; do not guess.`
 
+// Agent ids: the orchestrator is the micromanager, the workers are named after their role (the user's choice,
+// 2026-10-05). Nouns, since OpenCode's built-in agents are already called plan and explore.
+const AGENT_NAMES: Record<RoleId, string> = {
+  explore: "explorer",
+  research: "researcher",
+  plan: "planner",
+  code: "coder",
+  test: "tester",
+  visual: "designer",
+  write: "writer",
+  debug: "debugger",
+  review: "reviewer",
+  oracle: "oracle",
+}
+
 const role = (
   id: RoleId,
   description: string,
   system: string,
   rules: readonly Rule[],
   models: readonly string[],
-): Role => ({ id, agent: `dictator-${id}`, description, system: `${SHARED}\n\n${system}`, rules: [...rules, ...noStateDir, ...noMemory], models })
+): Role => ({ id, agent: AGENT_NAMES[id], description, system: `${SHARED}\n\n${system}`, rules: [...rules, ...noStateDir, ...noMemory], models })
 
 export const ROLES: readonly Role[] = [
   role(
@@ -164,21 +179,21 @@ export function roleById(id: string): Role | undefined {
   return ROLES.find((r) => r.id === id)
 }
 
-// The dictator itself: plans and delegates, never edits or runs commands. Every delegation is a question
+// The micromanager itself: plans and delegates, never edits or runs commands. Every delegation is a question
 // ("ask"), which goes to Jev first and to the user only when Jev is not sure enough (src/decide.ts).
 export const DICTATOR = {
-  agent: "dictator",
+  agent: "micromanager",
   description: "Orchestrator: splits a job into sub-tasks and delegates each to a role sub-agent.",
-  // No reads outside the project: in a live test the dictator went into the plugin's own source to find a way past
+  // No reads outside the project: in a live test the micromanager went into the plugin's own source to find a way past
   // the local check, instead of asking the user.
   rules: [...noWrite, ...noShell, ...noWeb, rule("subagent", "ask"), rule("external_directory", "deny"), ...noStateDir] as readonly Rule[],
 } as const
 
-// omo-hybrid: the dictator drives the flow like oh-my-openagent's Sisyphus (split, todos, parallel background tasks,
+// omo-hybrid: the micromanager drives the flow like oh-my-openagent's Sisyphus (split, todos, parallel background tasks,
 // react to reports); the plugin and Jev secure each task (guards, role, model, skills, rights, checks, merge).
 export function dictatorSystem(roles: readonly Role[] = ROLES): string {
   const lines = roles.map((r) => `- ${r.agent}: ${r.description}`)
-  return `You are the jev-dictator, an orchestrator. You never do the work yourself: you do not edit files or run
+  return `You are the micromanager, an orchestrator. You never do the work yourself: you do not edit files or run
 commands, and you read only enough to orient yourself (the README, the file list, a file or two). Workers do the
 rest, in the background, on the session's own git branch; the user's checkout is never touched.
 
@@ -187,26 +202,26 @@ How you work:
    briefly first; never ask for facts a worker can look up.
 2. Split the work into small tasks, each one change that can be checked on its own. Keep a todo list (the todo
    tool if you have one, else a short list in your message) and update it as reports come in.
-3. Delegate with dictator_task: a clear title; a prompt with everything the worker needs (it knows nothing else);
+3. Delegate with delegate_task: a clear title; a prompt with everything the worker needs (it knows nothing else);
    the files it may change; checks that prove it is done (usually the project's test command); depends for tasks
    that need another's result. Delegate independent tasks right away, one call each: they run in parallel. Research
-   or code reading is a task without files. dictator_task returns at once; do not wait or poll.
+   or code reading is a task without files. delegate_task returns at once; do not wait or poll.
    You may not read outside the project yourself, but a worker that only reads may read a directory its prompt names
    with its full path (e.g. another repository): name it, and never ask the user to copy files around.
 4. Reports arrive as notes that start with "[jev-dictator]". They come from your own plugin, not from the user or
    a tool result; trust them. For each report: a merged task is done (mark the todo); a task that waits for the
-   user needs their answer (ask them, then call dictator_answer with their words); a task given up needs another
+   user needs their answer (ask them, then call answer_task with their words); a task given up needs another
    way (a smaller task, a different approach) or the user. Workers list follow-ups they found: delegate the ones the
    request needs, and mention the others to the user.
 5. When everything is done, tell the user briefly what changed and how to merge the branch (the reports name it)
    or discard it.
 
-Keep your own messages short. While tasks run, keep talking with the user; dictator_tasks shows the tasks and a
-task's full report. If the user wants to stop, call dictator_stop. The user can say "ulw" or "ultrawork" for you to
+Keep your own messages short. While tasks run, keep talking with the user; list_tasks shows the tasks and a
+task's full report. If the user wants to stop, call stop_job. The user can say "ulw" or "ultrawork" for you to
 go on until every todo is done without stopping in between.
 
 For a large or unclear job (many parts, decisions to settle first), or when the user asks for a plan to approve,
-use dictator_plan instead: a planner writes a full plan, you show it, and dictator_run runs it after the user's go.
+use plan_job instead: a planner writes a full plan, you show it, and run_job runs it after the user's go.
 Notes that start with "[planning session …]" or "[job …]" are the plugin's instructions for that turn; follow them.
 
 The worker roles, for your understanding (the plugin picks role, model, skills and rights per task):

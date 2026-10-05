@@ -33,27 +33,27 @@ test("the tools are built from the read tool's schema and refuse other agents", 
     stop: async (job) => { calls.push(`stop:${job}`); return "stopping" },
   })
   assert.deepEqual(ids, [...TOOL_IDS])
-  assert.deepEqual(byId(added, "dictator_plan").input, { mapped: { goal: str } })
-  assert.deepEqual(byId(added, "dictator_task").input, { mapped: { title: str, prompt: str, files: str, depends: str, priority: str, checks: str } })
-  const dict = { agent: "dictator" }
-  assert.deepEqual(await byId(added, "dictator_task").run({ title: "add x", prompt: "p", files: "a.js", depends: "", priority: "", checks: "npm test" }, dict), { content: "T1 delegated" })
-  assert.deepEqual(await byId(added, "dictator_plan").run({ goal: "add a flag" }, dict), { content: "planned" })
-  assert.deepEqual(await byId(added, "dictator_questions").run({ job: "job-1", tree: "[]" }, dict), { content: "asked" })
-  assert.deepEqual(await byId(added, "dictator_run").run({ job: "job-1", note: "" }, { agent: "build" }), { content: "Only the dictator agent may use this tool." })
-  assert.deepEqual(await byId(added, "dictator_status").run({ job: "" }, dict), { content: "failed: boom" })
-  assert.deepEqual(await byId(added, "dictator_task").run({ title: "x" }, {}), { content: "Only the dictator agent may use this tool." })
-  assert.deepEqual(await byId(added, "dictator_stop").run({ job: "" }, dict), { content: "stopping" })
+  assert.deepEqual(byId(added, "plan_job").input, { mapped: { goal: str } })
+  assert.deepEqual(byId(added, "delegate_task").input, { mapped: { title: str, prompt: str, files: str, depends: str, priority: str, checks: str } })
+  const dict = { agent: "micromanager" }
+  assert.deepEqual(await byId(added, "delegate_task").run({ title: "add x", prompt: "p", files: "a.js", depends: "", priority: "", checks: "npm test" }, dict), { content: "T1 delegated" })
+  assert.deepEqual(await byId(added, "plan_job").run({ goal: "add a flag" }, dict), { content: "planned" })
+  assert.deepEqual(await byId(added, "plan_questions").run({ job: "job-1", tree: "[]" }, dict), { content: "asked" })
+  assert.deepEqual(await byId(added, "run_job").run({ job: "job-1", note: "" }, { agent: "build" }), { content: "Only the micromanager agent may use this tool." })
+  assert.deepEqual(await byId(added, "job_status").run({ job: "" }, dict), { content: "failed: boom" })
+  assert.deepEqual(await byId(added, "delegate_task").run({ title: "x" }, {}), { content: "Only the micromanager agent may use this tool." })
+  assert.deepEqual(await byId(added, "stop_job").run({ job: "" }, dict), { content: "stopping" })
   assert.deepEqual(calls, ["task:add x:a.js:npm test", "plan:add a flag", "questions:job-1:[]", "stop:"])
   assert.throws(() => installTools({ get: () => undefined, add: () => {} }, noop))
 })
 
-test("a session the runner started is refused even as the dictator agent", async () => {
+test("a session the runner started is refused even as the micromanager agent", async () => {
   const { draft, added } = fakeDraft()
   const ran: string[] = []
-  installTools(draft, { ...noop, run: async (job) => { ran.push(job); return "ran" } }, "dictator", (id) => id === "ses_worker")
-  const run = byId(added, "dictator_run").run
-  assert.deepEqual(await run({ job: "job-1" }, { agent: "dictator", sessionID: "ses_worker" }), { content: "Only the dictator agent may use this tool." })
-  assert.deepEqual(await run({ job: "job-1" }, { agent: "dictator", sessionID: "ses_user" }), { content: "ran" })
+  installTools(draft, { ...noop, run: async (job) => { ran.push(job); return "ran" } }, "micromanager", (id) => id === "ses_worker")
+  const run = byId(added, "run_job").run
+  assert.deepEqual(await run({ job: "job-1" }, { agent: "micromanager", sessionID: "ses_worker" }), { content: "Only the micromanager agent may use this tool." })
+  assert.deepEqual(await run({ job: "job-1" }, { agent: "micromanager", sessionID: "ses_user" }), { content: "ran" })
   assert.deepEqual(ran, ["job-1"])
 })
 

@@ -16,15 +16,15 @@ test("a role's first model, images to the vision model, a review in another fami
   assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.deepseek).model, MODELS.qwen)
 })
 
-test("the dictator's subagent call gets the routed model, runs in the foreground, carries a header", () => {
+test("the micromanager's subagent call gets the routed model, runs in the foreground, carries a header", () => {
   const call = {
     tool: "subagent",
-    agent: "dictator",
-    input: { agent: "dictator-code", model: "opencode-go/kimi-k3", prompt: "Add a --verbose flag.", background: true },
+    agent: "micromanager",
+    input: { agent: "coder", model: "opencode-go/kimi-k3", prompt: "Add a --verbose flag.", background: true },
   }
   const routed = routeSubagentCall(call, DEFAULT_ROUTING)
   assert.deepEqual(routed, { role: "code", model: MODELS.glm, reason: "first model for code" })
-  assert.equal(call.input.model, MODELS.glm) // the model the dictator asked for is overridden
+  assert.equal(call.input.model, MODELS.glm) // the model the micromanager asked for is overridden
   assert.equal(call.input.background, false)
   assert.ok(String(call.input.prompt).startsWith(`${HEADER} role: code · model: ${MODELS.glm}\n\nAdd a --verbose flag.`))
   routeSubagentCall(call, DEFAULT_ROUTING)
@@ -32,12 +32,12 @@ test("the dictator's subagent call gets the routed model, runs in the foreground
 })
 
 test("other agents' calls and built-in sub-agents are left alone", () => {
-  const fromBuild = { tool: "subagent", agent: "build", input: { agent: "dictator-code", prompt: "x" } }
+  const fromBuild = { tool: "subagent", agent: "build", input: { agent: "coder", prompt: "x" } }
   assert.equal(routeSubagentCall(fromBuild, DEFAULT_ROUTING), undefined)
-  const builtIn = { tool: "subagent", agent: "dictator", input: { agent: "explore", prompt: "x", model: "a/b" } }
+  const builtIn = { tool: "subagent", agent: "micromanager", input: { agent: "explore", prompt: "x", model: "a/b" } }
   assert.equal(routeSubagentCall(builtIn, DEFAULT_ROUTING), undefined)
   assert.equal(builtIn.input.model, "a/b")
-  const read = { tool: "read", agent: "dictator", input: { path: "." } }
+  const read = { tool: "read", agent: "micromanager", input: { path: "." } }
   assert.equal(routeSubagentCall(read, DEFAULT_ROUTING), undefined)
 })
 

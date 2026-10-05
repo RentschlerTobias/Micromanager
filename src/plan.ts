@@ -413,6 +413,6 @@ export function parseFiles(text: string, project: string): { files: string[]; pr
   const prefix = project.replace(/\/+$/, "") + "/"
   const files = words.map((w) => (w.startsWith(prefix) ? w.slice(prefix.length) : w)).map((w) => w.replace(/^\.\//, ""))
   const outside = files.filter((f) => f.startsWith("/") || f.startsWith("..") || f.startsWith("~"))
-  if (outside.length) return { files: [], problem: `files must be inside the project: ${outside.join(", ")}. A task that only reads reports what it found; you read it with dictator_tasks.` }
+  if (outside.length) return { files: [], problem: `files must be inside the project: ${outside.join(", ")}. A task that only reads reports what it found; you read it with list_tasks.` }
   return { files }
 }

@@ -25,24 +25,24 @@ export function agentsFrom(base: AgentInfo): AgentInfo[] {
   const roles = ROLES.map((role) => ({
     ...copy(),
     id: role.agent,
-    name: `Dictator ${role.id}`,
+    name: role.agent[0]!.toUpperCase() + role.agent.slice(1), // "Coder", "Reviewer", …
     mode: "subagent" as const,
-    hidden: true, // only the dictator delegates to them; build and plan never see them
+    hidden: true, // only the micromanager delegates to them; build and plan never see them
     description: role.description,
     system: role.system,
     permissions: [...base.permissions, ...role.rules],
   }))
-  const dictator: AgentInfo = {
+  const micromanager: AgentInfo = {
     ...copy(),
     id: DICTATOR.agent,
-    name: "Dictator",
+    name: "Micromanager",
     mode: "primary",
     hidden: false,
     description: DICTATOR.description,
     system: dictatorSystem(),
     permissions: [...base.permissions, ...DICTATOR.rules],
   }
-  return [dictator, ...roles]
+  return [micromanager, ...roles]
 }
 
 export function installAgents(draft: AgentDraft): string[] {

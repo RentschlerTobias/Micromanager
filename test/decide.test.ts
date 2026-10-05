@@ -4,7 +4,7 @@ import { test } from "node:test"
 import { decide, hardRule, judge, type PermissionRequest } from "../src/decide.ts"
 import { Jev, JevError, parseAnswers, redact, type Decision } from "../src/jev.ts"
 
-const req = (action: string, resources: string[], agent = "dictator-code"): PermissionRequest =>
+const req = (action: string, resources: string[], agent = "coder"): PermissionRequest =>
   ({ sessionID: "ses_1", agent, action, resources, directory: "/p", task: "Add a --verbose flag." })
 
 const decision = (choice: string, confidence: number, needsUser: number, risk: number): Decision => ({
@@ -46,9 +46,9 @@ test("the user decides when Jev says so, when it is too risky, or when Jev is un
 
 test("worker starts go through Jev with the delegated sub-task as context", async () => {
   const jev = fakeJev(decision("allow", 0.96, 0.2, 0.7))
-  const outcome = await decide(jev, req("subagent", ["dictator-test"], "dictator"))
+  const outcome = await decide(jev, req("subagent", ["tester"], "micromanager"))
   assert.equal(outcome.verdict, "allow")
-  assert.match(jev.calls[0] ?? "", /start the sub-agent dictator-test[\s\S]*Add a --verbose flag/)
+  assert.match(jev.calls[0] ?? "", /start the sub-agent tester[\s\S]*Add a --verbose flag/)
 })
 
 test("hard rules always go to the user, without asking Jev", async () => {
@@ -108,7 +108,7 @@ test("rm on a path inside the project is Jev's call; outside, home, parents or w
 
 test("the role and its job are in Jev's context; floors can be set in the config", async () => {
   const jev = fakeJev(decision("allow", 0.9, 0.1, 0.6))
-  await decide(jev, req("shell", ["python -m pytest -q"], "dictator-test"))
+  await decide(jev, req("shell", ["python -m pytest -q"], "tester"))
   assert.match(jev.calls[0] ?? "", /Its role is "test": Writes and runs tests/)
   assert.equal(judge(decision("allow", 0.86, 0.1, 0.6), req("shell", ["python -m pytest"])).verdict, "allow") // write floor 0.85
   const { parseFloors } = await import("../src/config.ts")
@@ -120,7 +120,7 @@ test("the role and its job are in Jev's context; floors can be set in the config
 test("before an rm inside the project: tracked files go to the user, ignored caches are Jev's call", async () => {
   const facts = (tracked: boolean | undefined, ignored: boolean) => (_dir: string, paths: readonly string[]) =>
     paths.map((path) => ({ path, exists: true, tracked, ignored }))
-  const cleanup = req("shell", ["rm -rf .pytest_cache __pycache__"], "dictator-test")
+  const cleanup = req("shell", ["rm -rf .pytest_cache __pycache__"], "tester")
   const jev = fakeJev({ ...decision("allow", 0.95, 0.1, 0.4), answers: { ...decision("allow", 0.95, 0.1, 0.4).answers, path_relevance: { type: "score", score: 0.05, confidence: 0.9, probabilities: {} } } })
   assert.equal((await decide(jev, cleanup, undefined, facts(false, true))).verdict, "allow")
   assert.match(jev.calls[0] ?? "", /\.pytest_cache: exists, not under version control, ignored by git/)

@@ -1,11 +1,11 @@
-// The job queue and the updates to the user (Phase E). dictator_run hands a job to the scheduler and returns at
-// once, so the dictator's session stays free while workers run; the scheduler works the queue in the background,
+// The job queue and the updates to the user (Phase E). run_job hands a job to the scheduler and returns at
+// once, so the micromanager's session stays free while workers run; the scheduler works the queue in the background,
 // one job at a time per plugin process (Phase F runs a job's tasks in parallel), and the notifier reports to the
-// job's dictator session and the desktop.
+// job's micromanager session and the desktop.
 //
-// How an update reaches the dictator (Phase E spike): a synthetic message with resume starts a turn of an idle
+// How an update reaches the micromanager (Phase E spike): a synthetic message with resume starts a turn of an idle
 // session and is steered into a busy one, but models take its text for an injection. So the synthetic message only
-// wakes the dictator; the update itself goes in as a system block through the context hook, which models follow
+// wakes the micromanager; the update itself goes in as a system block through the context hook, which models follow
 // (Phase A, A1).
 
 import type { Job } from "./state.ts"
@@ -93,7 +93,7 @@ export type NotifyMode = "jobs" | "tasks" | "off"
 
 export interface NotifierDeps {
   synthetic(session: string, text: string, resume: boolean): Promise<unknown>
-  steer(session: string, note: string): void // a system block for the dictator's next turns
+  steer(session: string, note: string): void // a system block for the micromanager's next turns
   desktop(title: string, body: string): void
   mode: NotifyMode
   flushMs?: number
@@ -178,18 +178,18 @@ export class Notifier {
     await this.flush(session)
     const board = this.#boards.get(session)
     this.#d.steer(session, `[jev-dictator update] Delegated tasks reported. This comes from your own plugin, not from the user or a tool result; it is trusted.
-Check each result. Delegate what comes next (fixes, the follow-ups worth doing, dependent work) with dictator_task, ask the user what only they can decide, and update your todos.
+Check each result. Delegate what comes next (fixes, the follow-ups worth doing, dependent work) with delegate_task, ask the user what only they can decide, and update your todos.
 
 ${list.join("\n\n")}${closing ? `\n\n${closing}` : ""}${board ? `\n\nThe job's board now; start your message to the user with it, in a code block, as it is:\n${board}` : ""}`)
     await this.#d.synthetic(session, `[jev-dictator] ${list.length ? `${list.length} task report(s)` : "update"} (details in the plugin's system note)`, true).catch(() => undefined)
   }
 
-  // A job ended or needs the user: the dictator gets the update as a system block and is woken to tell the user.
+  // A job ended or needs the user: the micromanager gets the update as a system block and is woken to tell the user.
   async finished(session: string | undefined, jobId: string, end: Ending, text: string): Promise<void> {
     if (this.#d.mode !== "off") this.#d.desktop(`jev-dictator: ${TITLES[end]}`, `${jobId}\n${text.split("\n").slice(0, 4).join("\n")}`)
     if (!session) return
     await this.flush(session)
-    // A stop comes from the user through the dictator, which already said so: a quiet note, no new turn.
+    // A stop comes from the user through the micromanager, which already said so: a quiet note, no new turn.
     if (end === "stopped") return void (await this.#d.synthetic(session, `[jev-dictator] ${TITLES[end]}: ${jobId}`, false).catch(() => undefined))
     this.#d.steer(session, `[jev-dictator update] ${TITLES[end]}: ${jobId}. This update comes from your own plugin, not from the user and not from a tool result; it is trusted.
 ${end === "needs_user" ? "Tell the user in a few sentences why the job stopped and what they can decide; then wait for their answer." : end === "done" ? "Tell the user the job is done, what changed, and how to merge or discard the branch." : "Tell the user what happened and what they can do."}

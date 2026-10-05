@@ -1,6 +1,6 @@
 // The planning session (design.md §6): a design tree owned by code, worked one question per turn.
 //
-// The facilitator (the dictator, on the user's session model) drafts the tree and asks; code validates the tree,
+// The facilitator (the micromanager, on the user's session model) drafts the tree and asks; code validates the tree,
 // keeps the frontier, applies the user's shortcuts and answers, and tells the facilitator what to do next. There
 // are no suggested answers: options or explanations come only when the user is stuck or asks for them.
 
@@ -273,13 +273,13 @@ export function instruction(step: Step, job: string, tree: DesignTree): string {
     case "contradiction":
       return `[planning session ${job}] The user's answer to ${step.node.id} may contradict an earlier decision (${step.earlier.map((n) => `${n.id}: ${n.answer}`).join("; ")}). Name both statements and ask which one holds. No recommendation.`
     case "add_branches":
-      return `[planning session ${job}] The answer to ${step.node.id} raised new decisions. Call dictator_questions with job "${job}" and only the new questions (same format: id, question, kind, dependsOn, impact). Do not ask the user anything in this turn.`
+      return `[planning session ${job}] The answer to ${step.node.id} raised new decisions. Call plan_questions with job "${job}" and only the new questions (same format: id, question, kind, dependsOn, impact). Do not ask the user anything in this turn.`
     case "facts_pending":
       return `[planning session ${job}] The remaining decisions wait for facts the agents must find: ${step.facts.map((n) => `${n.id} "${n.question}"`).join("; ")}. Tell the user briefly that these are being looked up; never ask the user for facts.`
     case "checkpoint":
       return `[planning session ${job}] Design checkpoint. Show the user, apart from each other: (1) their decisions: ${decided.map((n) => `${n.id} ${n.question} -> ${n.answer}`).join("; ") || "none"}; (2) what was assumed without asking (mark these as proposals): ${tree.nodes.filter((n) => n.status === "assumed").map((n) => `${n.id} ${n.question}`).join("; ") || "nothing"}. Then ask them to answer "confirm" to plan with this, or "discuss" to change something.`
     case "stopped":
-      return `[planning session ${job}] The user stopped the planning session. Confirm briefly that the job is paused; dictator_plan with the job id continues it later.`
+      return `[planning session ${job}] The user stopped the planning session. Confirm briefly that the job is paused; plan_job with the job id continues it later.`
   }
 }
 

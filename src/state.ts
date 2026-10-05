@@ -158,7 +158,7 @@ export interface Job {
   flags?: JobFlags // set by the G0 gate and the user's answer to it
   triage?: { complexity?: number; clarification?: number; session: boolean; reason: string }
   designTree?: DesignTree // the planning session
-  facilitator?: string // the dictator session that runs this job's planning session
+  facilitator?: string // the micromanager session that runs this job's planning session
   pins?: PolicySet // job-level policies from the user's shortcuts ("always local", "pipeline P1", …)
   taskPins?: Record<string, PolicySet> // task-level ones ("T3 use llamaswap/oss-u")
   budget: {
@@ -174,7 +174,7 @@ export interface Job {
   counters: { turns: number; stalls: number; replans: number; tokens?: number; requests?: number; cost?: number }
   lessons: string[]
   later?: Later[] // follow-ups that did not become tasks
-  rolling?: boolean // a dictator session's job: the orchestrator delegates tasks into it while it runs (omo-hybrid)
+  rolling?: boolean // a micromanager session's job: the orchestrator delegates tasks into it while it runs (omo-hybrid)
   created: string
   updated: string
 }

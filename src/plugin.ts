@@ -43,7 +43,7 @@ interface Evaluation {
   message?: string
 }
 
-// The dictator reads only to orient itself (README, file list); past this many reads per session it is refused
+// The micromanager reads only to orient itself (README, file list); past this many reads per session it is refused
 // and told to let the agents explore (design.md §3).
 const DICTATOR_READ_CAP = 12
 const READS = new Set(["read", "glob", "grep", "list"])
@@ -136,7 +136,7 @@ export default {
     const jev = key ? new Jev(key) : undefined
     if (!jev) log("warn", "no Jev key (JEV_API_KEY or the keyring entry service=typesafe key=jev): every question goes to the user")
 
-    // The sub-task each agent works on, for Jev's context: the dictator's last delegation per role agent, and
+    // The sub-task each agent works on, for Jev's context: the micromanager's last delegation per role agent, and
     // the task of each worker session the runner started.
     const tasks = new Map<string, string>()
     const workerTasks = SHARED.workerTasks
@@ -145,7 +145,7 @@ export default {
     const workerRules = SHARED.workerRules
     // Sessions the runner started (planner, workers, reviewers, readers). Nobody sits at them: a question there would
     // wait until the worker times out (live tests, headless and with --auto). So they never ask the user directly;
-    // they stop and report, and the job asks the user in the dictator's session.
+    // they stop and report, and the job asks the user in the micromanager's session.
     const runnerSessions = SHARED.runnerSessions
 
     await ctx.tool.hook("execute.before", (call) => {
@@ -166,10 +166,10 @@ export default {
       log("info", `${routed.role} -> ${routed.model} (${routed.reason})`)
     })
 
-    // The dictator's own agents only: build, plan and every other agent are never touched.
+    // The micromanager's own agents only: build, plan and every other agent are never touched.
     const ours = new Set([DICTATOR.agent, ...ROLES.map((role) => role.agent)])
 
-    // Every question of the dictator and its sub-agents goes to Jev first: it answers itself when sure enough,
+    // Every question of the micromanager and its sub-agents goes to Jev first: it answers itself when sure enough,
     // else the user is asked as usual.
     const dictatorReads = new Map<string, number>()
     await ctx.permission.hook("evaluate", async (evaluation) => {
@@ -185,8 +185,8 @@ export default {
         dictatorReads.set(evaluation.sessionID, reads)
         if (reads > DICTATOR_READ_CAP) {
           evaluation.effect = "deny"
-          evaluation.message = "The dictator only orients itself; let the agents explore (dictator_plan starts a planner that reads the project)."
-          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: `dictator read cap (${DICTATOR_READ_CAP})` })
+          evaluation.message = "The micromanager only orients itself; let the agents explore (plan_job starts a planner that reads the project)."
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: `micromanager read cap (${DICTATOR_READ_CAP})` })
           return
         }
       }
@@ -238,10 +238,10 @@ export default {
       log("info", `${evaluation.action} ${evaluation.resources.join(" | ").slice(0, 120)}: ${outcome.verdict} (${outcome.reason})`)
     })
 
-    // Jobs: the dictator plans and runs them through its tools; the plugin drives the loop (Phase B, C).
+    // Jobs: the micromanager plans and runs them through its tools; the plugin drives the loop (Phase B, C).
     const project = ctx.location?.directory
     if (!project) {
-      log("warn", "no project directory: the dictator tools are not installed")
+      log("warn", "no project directory: the micromanager tools are not installed")
       return
     }
     const backends = { ...DEFAULT_BACKENDS, cloudOnly }
@@ -262,7 +262,7 @@ export default {
     // Skills are read once per start, like the agents: install.sh --skills and a restart make new ones known.
     const installed = installedSkills()
     log("info", `skills for workers: ${[...installed].join(", ") || "none (./install.sh --skills)"}`)
-    // What the dictator must do in its next turn, per session; set from the user's turn or a job update, used by
+    // What the micromanager must do in its next turn, per session; set from the user's turn or a job update, used by
     // every provider turn of that answer (steering through a system block, Phase A1), replaced at the user's next turn.
     const steering = new Map<string, string>()
     const notifier = new Notifier({
@@ -311,7 +311,7 @@ export default {
         installedSkills: installed,
         taskEnded: (j, t) => notifier.report(j.facilitator, taskReport(j, t), `${t.id} ${t.title}: ${t.status}`, board(j, 100)),
       })
-    // The job queue: dictator_run queues, the scheduler runs in the background and the notifier reports the end.
+    // The job queue: run_job queues, the scheduler runs in the background and the notifier reports the end.
     const scheduler = new Scheduler({
       run: async (id, cancel, note) => {
         const r = runner(loadJob(project, id)?.facilitator, id, cancel)
@@ -342,7 +342,7 @@ export default {
       },
       failed: (id, session, err) => {
         log("error", `job ${id} failed: ${String(err)}`)
-        void notifier.finished(session, id, "failed", `The run broke off: ${err instanceof Error ? err.message : String(err)}. dictator_run resumes it.`)
+        void notifier.finished(session, id, "failed", `The run broke off: ${err instanceof Error ? err.message : String(err)}. run_job resumes it.`)
       },
     })
     // Web content that runner sessions fetch, a common way in for indirect injection.
@@ -366,14 +366,14 @@ export default {
       }
       if (rewriteResult(call.result, redact)) record({ kind: "redacted", sessionID: call.sessionID, tool: call.tool })
     })
-    // The dictator's newest job in a session, for the user's turns (planning session, gate answer, pins).
+    // The micromanager's newest job in a session, for the user's turns (planning session, gate answer, pins).
     // The newest planned job of a session, for the planning session's turns; a rolling job takes no planning answers.
     const sessionJob = (sessionID: string) => listJobs(project).find((j) => j.facilitator === sessionID && !j.rolling)
     // The session's rolling job (omo-hybrid), made at its first delegation; it runs on its own branch until stopped.
     const rollingJob = (sessionID: string): Job => {
       const found = listJobs(project).find((j) => j.facilitator === sessionID && j.rolling && !["done", "stopped", "failed"].includes(j.phase))
       if (found) return found
-      const job = newJob(jobId(), `the delegated tasks of dictator session ${sessionID}`)
+      const job = newJob(jobId(), `the delegated tasks of micromanager session ${sessionID}`)
       for (const p of ["triage", "plan", "plan_gate", "execute"] as const) moveJob(job, p)
       job.rolling = true
       job.facilitator = sessionID
@@ -387,8 +387,8 @@ export default {
       try {
         installTools(draft, {
           task: async (input, tctx) => {
-            if (!tctx.sessionID) return "dictator_task needs a session."
-            if (!input.title.trim() || !input.prompt.trim()) return "dictator_task needs a title and a prompt."
+            if (!tctx.sessionID) return "delegate_task needs a session."
+            if (!input.title.trim() || !input.prompt.trim()) return "delegate_task needs a title and a prompt."
             // The delegation is text a model wrote from the user's words: the local guards look at it first.
             const guard = await checkGuards(decider, `${input.title}. ${input.prompt}`)
             if (guard.flagged.some((g) => g === "injection" || g === "harmful")) {
@@ -451,9 +451,9 @@ export default {
           },
           plan: async (goal, tctx) => {
             const text = goal.trim()
-            if (!text) return "dictator_plan needs the goal in the user's words, or a job id to continue."
-            // One job at a time per dictator session: until a job is finished, stopped or failed, a goal continues it
-            // instead of starting another (live test: the dictator re-sent the goal mid-session and after confirm).
+            if (!text) return "plan_job needs the goal in the user's words, or a job id to continue."
+            // One job at a time per micromanager session: until a job is finished, stopped or failed, a goal continues it
+            // instead of starting another (live test: the micromanager re-sent the goal mid-session and after confirm).
             const active = tctx.sessionID ? sessionJob(tctx.sessionID) : undefined
             // A job that runs or waits in the queue is not in planning: a new goal becomes the next job.
             const planning = active && !["done", "stopped", "failed", "integrate", "wrap", "execute", "replan", "verify"].includes(active.phase) &&
@@ -495,11 +495,11 @@ export default {
           stop: async (id) => {
             const r = scheduler.stop(id.trim() || undefined)
             if (r.session) await ctx.session.interrupt({ sessionID: r.session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
-            return r.state === "stopping" ? "The running job stops now and pauses; dictator_run resumes it." : r.state === "dequeued" ? "The job left the queue." : "No such job running or waiting."
+            return r.state === "stopping" ? "The running job stops now and pauses; run_job resumes it." : r.state === "dequeued" ? "The job left the queue." : "No such job running or waiting."
           },
         }, DICTATOR.agent, (sessionID) => runnerSessions.has(sessionID))
       } catch (err) {
-        log("error", `dictator tools not installed: ${String(err)}`)
+        log("error", `micromanager tools not installed: ${String(err)}`)
       }
     })
 
@@ -528,10 +528,10 @@ export default {
       }
     })
 
-    // Jev drops the dictator's old tool results it no longer needs before each of its turns (src/compact.ts).
+    // Jev drops the micromanager's old tool results it no longer needs before each of its turns (src/compact.ts).
     const compactor = new Compactor(decider, record)
     await ctx.session.hook("context", async (input) => {
-      // The tools exist for every agent; only the dictator sees them.
+      // The tools exist for every agent; only the micromanager sees them.
       if (input.agent !== DICTATOR.agent) {
         if (input.tools) for (const id of TOOL_IDS) delete input.tools[id]
         if (input.sessionID && watchdog.watching(input.sessionID)) {
@@ -545,7 +545,7 @@ export default {
           log("warn", `compaction failed: ${String(err)}`)
           return undefined
         })
-        if (c?.asked) log("info", `compaction: ${c.removed} characters dropped from the dictator's context`)
+        if (c?.asked) log("info", `compaction: ${c.removed} characters dropped from the micromanager's context`)
       }
       const note = input.sessionID ? steering.get(input.sessionID) : undefined
       if (note && Array.isArray(input.system)) input.system.push({ type: "text", text: note })

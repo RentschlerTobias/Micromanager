@@ -22,36 +22,36 @@ Restart the OpenCode server afterwards (plugins load at start). Requires opencod
 
 ## Use
 
-Pick the agent **dictator** in OpenCode and tell it what you want. It works like oh-my-openagent's orchestrator, with
+Pick the agent **micromanager** in OpenCode and tell it what you want. It works like oh-my-openagent's orchestrator, with
 Jev and the plugin securing every task:
 
-1. **The dictator orchestrates.** It splits your request into small tasks, keeps a todo list and delegates each
-   task with `dictator_task`: title, prompt, the files it may change, checks such as `npm test`, dependencies and a
+1. **The micromanager orchestrates.** It splits your request into small tasks, keeps a todo list and delegates each
+   task with `delegate_task`: title, prompt, the files it may change, checks such as `npm test`, dependencies and a
    priority. The call returns at once. Independent tasks (no shared files) run in parallel in the background, each
    in its own worktree under `.jev-dictator/worktrees/`. A merge train brings them one at a time onto the session's
    branch `jev/<job>`. Your checkout is never touched.
 2. **Jev and the plugin decide per task:**
    - **Guards.** A local check (G0, GLiNER on the CPU) looks at each delegation, at web content and at workers'
      permission requests. Keys and tokens are masked.
-   - **The profile (N5).** One Jev request per task sets the role (`dictator-code`, `-test`, `-write`, …), the
+   - **The profile (N5).** One Jev request per task sets the role (`coder`, `-test`, `-write`, …), the
      difficulty and so the model, the risk, the skills, and rights that can only narrow the role's.
    - **Permissions (N13).** Workers' permission requests go to Jev first and to you only when Jev is not sure.
    - **Quality.** The plugin runs the checks itself, with fix rounds and, for a task that keeps failing, a fresh
      session on another model family. A review by another model family runs for risky or unchecked tasks, and
      tests first for bug fixes.
    - **Limits.** Loops and stalled models are stopped, and budgets cap tokens and requests.
-3. **Reports come back.** When a task merges, is given up or needs you, its report goes to the dictator: status,
-   checks, the worker's summary and its follow-ups. Reports close together arrive as one. The dictator decides what
-   comes next, asks you what only you can decide (`dictator_answer` passes your answer on) and, at the end, tells you
+3. **Reports come back.** When a task merges, is given up or needs you, its report goes to the micromanager: status,
+   checks, the worker's summary and its follow-ups. Reports close together arrive as one. The micromanager decides what
+   comes next, asks you what only you can decide (`answer_task` passes your answer on) and, at the end, tells you
    how to merge or discard the branch. Say "ulw" or "ultrawork" and it goes on until every todo is done.
-   `notify-send` adds desktop notifications. `dictator_tasks` shows the tasks and their reports, and `dictator_stop`
+   `notify-send` adds desktop notifications. `list_tasks` shows the tasks and their reports, and `stop_job`
    pauses the work.
-4. **Large or unclear jobs.** `dictator_plan` lets a planner write a full plan with acceptance points, optionally
-   after a planning session with you. You approve it, and `dictator_run` runs it.
+4. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
+   after a planning session with you. You approve it, and `run_job` runs it.
 
 Jobs and task notes live in `.jev-dictator/`, kept out of git through `.git/info/exclude`.
 
-**Overview.** `dictator_status` shows an ASCII board of the job: each task with its state, role, model and what it does
+**Overview.** `job_status` shows an ASCII board of the job: each task with its state, role, model and what it does
 or waits for, plus tokens, requests and cost. In a terminal, in the project:
 
 ```bash

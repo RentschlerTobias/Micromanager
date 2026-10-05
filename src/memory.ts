@@ -1,6 +1,6 @@
 // Project memory (the user's decision, 2026-10-05): what workers learn about a project lasts beyond the job. The
 // store is a block in opencode-agent-memory's format (Markdown with YAML frontmatter in .opencode/memory/), so with
-// that plugin installed the dictator sees it and can tend it; workers never write it themselves.
+// that plugin installed the micromanager sees it and can tend it; workers never write it themselves.
 //
 // Jev decides the two points that plugin leaves to the LLM:
 // - saving: a worker's LEARNED line is kept when Jev calls it lasting for this project and not known yet;

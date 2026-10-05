@@ -63,7 +63,7 @@ export interface RunnerDeps {
   readonly exec?: Exec
   readonly journal?: (entry: Record<string, unknown>) => void
   readonly progress?: (text: string, task?: boolean) => void // task: a task finished or was added
-  readonly parentID?: string // the dictator session; workers show up as its children
+  readonly parentID?: string // the micromanager session; workers show up as its children
   readonly onWorker?: (sessionID: string, task: string, rules: readonly Rule[]) => void // a worker's task and narrowed rights, for permissions
   readonly workerTimeoutMs?: number
   readonly stallMs?: number // a session whose messages do not change this long is stalled (default 4 min)
@@ -77,7 +77,7 @@ export interface RunnerDeps {
   readonly cloudOnly?: boolean // local models are switched off (the user's choice for now): nothing may need them
   readonly skills?: readonly Skill[] // the skills the decision model may pick per task (design.md §13.1)
   readonly installedSkills?: ReadonlySet<string> // the skills a brief may name: linked into OpenCode by install.sh
-  readonly cancelled?: () => boolean // the user stopped the job (dictator_stop); checked around every session turn
+  readonly cancelled?: () => boolean // the user stopped the job (stop_job); checked around every session turn
   readonly budget?: { tokens?: number; requests?: number; cost?: number } // per job, from the config (design.md §10.2)
   readonly parallel?: number // tasks of a job at the same time (Phase F); 1 runs them one after another in the job's worktree
   readonly perModel?: number // sessions of one cloud model at the same time; a local model serves one at a time
@@ -98,7 +98,7 @@ interface Work {
 
 const REVIEW_ROUNDS = 3
 
-// What a step of the dictator's tools ends with: text for the dictator to act on.
+// What a step of the micromanager's tools ends with: text for the micromanager to act on.
 export interface Outcome {
   readonly kind: "gate" | "session" | "plan" | "failed" | "info"
   readonly job: Job
@@ -341,7 +341,7 @@ export class Runner {
     return r.plan
   }
 
-  // A new job from the dictator: the local gate, triage, then a planning session or the planner (design.md §6).
+  // A new job from the micromanager: the local gate, triage, then a planning session or the planner (design.md §6).
   async start(goal: string, facilitator?: string): Promise<Outcome> {
     const job = newJob(jobId(), goal)
     job.facilitator = facilitator
@@ -359,9 +359,9 @@ export class Runner {
     return this.#triage(job)
   }
 
-  // dictator_plan with a job id: go on from wherever the job stands.
+  // plan_job with a job id: go on from wherever the job stands.
   // feedback: what the user wants changed in a plan at the plan gate. It becomes a decision, and the planner writes
-  // the plan again (live test: the dictator asked eight times for a fuller plan and always got the old one back).
+  // the plan again (live test: the micromanager asked eight times for a fuller plan and always got the old one back).
   async continueJob(id: string, feedback?: string): Promise<Outcome> {
     const job = loadJob(this.#d.project, id)
     if (!job) return { kind: "failed", job: newJob(id, ""), text: `no job ${id}` }
@@ -471,8 +471,8 @@ export class Runner {
     return instruction(step, job.id, job.designTree!)
   }
 
-  // One user turn in the dictator session: the gate answer, a planning-session answer, or the checkpoint reply.
-  // Returns the instruction for the dictator's next turn, or undefined when the turn is not about this job.
+  // One user turn in the micromanager session: the gate answer, a planning-session answer, or the checkpoint reply.
+  // Returns the instruction for the micromanager's next turn, or undefined when the turn is not about this job.
   async answer(id: string, text: string): Promise<string | undefined> {
     const job = loadJob(this.#d.project, id)
     if (!job) return undefined
@@ -487,7 +487,7 @@ export class Runner {
       job.flags = { ...job.flags, ...reply }
       moveJob(job, "triage")
       saveJob(this.#d.project, job)
-      return `[job ${id}] The user answered the local check${reply.uncensored ? ": local uncensored models only" : reply.localOnly ? ": everything stays local" : ""}. Call dictator_plan with goal "${id}" to continue.`
+      return `[job ${id}] The user answered the local check${reply.uncensored ? ": local uncensored models only" : reply.localOnly ? ": everything stays local" : ""}. Call plan_job with goal "${id}" to continue.`
     }
     const tree = job.designTree
     if (job.phase === "design_checkpoint" && tree) {
@@ -496,7 +496,7 @@ export class Runner {
         job.decisions = tree.nodes.filter((n) => n.status === "settled").map((n) => ({ id: n.id, text: `${n.question} -> ${n.answer}`, origin: n.origin === "fact" ? "fact" : "user" }))
         moveJob(job, "plan")
         saveJob(this.#d.project, job)
-        return `[job ${id}] The user confirmed the design. Call dictator_plan with goal "${id}" to plan it now.`
+        return `[job ${id}] The user confirmed the design. Call plan_job with goal "${id}" to plan it now.`
       }
       moveJob(job, "planning_session")
       saveJob(this.#d.project, job)
@@ -1276,7 +1276,7 @@ export class Runner {
     const s = await this.#d.session.create({
       ...(this.#d.parentID ? { parentID: this.#d.parentID } : {}),
       title: `${task.id} ${role === task.role ? "" : `${role} `}${task.title}`,
-      agent: roleById(role)?.agent ?? "dictator-code",
+      agent: roleById(role)?.agent ?? "coder",
       model: toModel(model),
       location: { directory: this.#dir(job, task) },
       ...(rules.length ? { permissions: rules } : {}),
@@ -1421,11 +1421,11 @@ export function summary(job: Job): string {
 // The instruction to draft the design tree; the format is the one parseTree reads.
 export function draftInstruction(job: Job): string {
   return `[planning session ${job.id}] Before planning, the user's open decisions are settled in a planning session.
-Draft the design questions this job leaves open and send them with dictator_questions (job "${job.id}", tree as a
+Draft the design questions this job leaves open and send them with plan_questions (job "${job.id}", tree as a
 JSON list): [{ "id": "D1", "question": "...", "kind": "decision" | "fact" | "assumption", "dependsOn": [], "impact":
 "low" | "medium" | "high" }]. Decisions are what only the user can decide (behaviour, scope, interfaces, trade-offs);
 facts are what agents can look up; at most 25. Write every question open: never list possible answers or examples
-of answers in it. Do not ask the user anything in this turn, and do not call dictator_plan again.`
+of answers in it. Do not ask the user anything in this turn, and do not call plan_job again.`
 }
 
 // The project's top-level entries, as cheap context for triage.
@@ -1437,12 +1437,12 @@ function topLevel(project: string): string[] {
   }
 }
 
-// A goal the same session failed to plan a short while ago: the dictator reports that instead of starting the
+// A goal the same session failed to plan a short while ago: the micromanager reports that instead of starting the
 // same job again (live test: a looping local planner made it restart three times). "retry: <goal>" overrides.
 export function recentFailure(job: Job | undefined, goal: string, now = Date.now(), windowMs = 30 * 60_000): string | undefined {
   if (!job || job.phase !== "failed" || /^retry:/i.test(goal.trim())) return undefined
   const same = job.goal.trim().toLowerCase() === goal.trim().toLowerCase()
   if (!same || now - Date.parse(job.updated) > windowMs) return undefined
   const why = job.lessons.at(-1) ?? "unknown reason"
-  return `Job ${job.id} with this goal failed ${Math.round((now - Date.parse(job.updated)) / 60_000)} min ago (${why}). Tell the user and do not start it again by yourself; if the user wants another try, call dictator_plan with goal "retry: <goal>".`
+  return `Job ${job.id} with this goal failed ${Math.round((now - Date.parse(job.updated)) / 60_000)} min ago (${why}). Tell the user and do not start it again by yourself; if the user wants another try, call plan_job with goal "retry: <goal>".`
 }

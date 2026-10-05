@@ -85,7 +85,7 @@ export function parseRegistry(text: string): ModelEntry[] {
 }
 
 // "notify": desktop notifications when a job needs the user or ends ("jobs", the default), also per task ("tasks"),
-// or never ("off"). Updates in the dictator's session come either way.
+// or never ("off"). Updates in the micromanager's session come either way.
 export function parseNotify(text: string): NotifyMode {
   const raw = (JSON.parse(stripComments(text)) as { notify?: unknown }).notify ?? "jobs"
   if (raw !== "jobs" && raw !== "tasks" && raw !== "off") throw new Error('notify must be "jobs", "tasks" or "off"')

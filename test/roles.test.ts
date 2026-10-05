@@ -33,7 +33,7 @@ test("the web is open to research only; code asks before shell commands", () => 
   assert.equal(effect(ROLES.find((r) => r.id === "test")!.rules, "shell", "python -m pytest*"), "allow")
 })
 
-test("the dictator never edits or runs commands, and every delegation asks the user", () => {
+test("the micromanager never edits or runs commands, and every delegation asks the user", () => {
   for (const tool of ["edit", "write", "patch", "shell"]) assert.equal(effect(DICTATOR.rules, tool), "deny", tool)
   assert.equal(effect(DICTATOR.rules, "subagent"), "ask")
   const system = dictatorSystem()
@@ -42,7 +42,7 @@ test("the dictator never edits or runs commands, and every delegation asks the u
 
 test("agent ids never clash with built-in agents, and families are told apart", () => {
   for (const role of ROLES) {
-    assert.ok(role.agent.startsWith("dictator-"))
+    assert.ok(!["build", "plan", "explore", "general", "compaction", "title", "summary"].includes(role.agent), role.agent)
     assert.equal(roleByAgent(role.agent), role)
   }
   assert.equal(family(MODELS.glm), "glm")
@@ -59,6 +59,6 @@ test("no agent may read or change the plugin's state directory", () => {
   }
 })
 
-test("the dictator never reads outside the project (live test: it searched the plugin's source for a way past the gate)", () => {
+test("the micromanager never reads outside the project (live test: it searched the plugin's source for a way past the gate)", () => {
   assert.ok(DICTATOR.rules.some((r) => r.action === "external_directory" && r.effect === "deny" && r.resource === "*"))
 })

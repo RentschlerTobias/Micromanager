@@ -72,7 +72,7 @@ export function flagsWithoutUser(result: GateResult, unchecked: Unchecked = "loc
   return asks.length === 0 ? { gate: result } : "ask_user"
 }
 
-// The question the dictator puts to the user when the gate flagged something.
+// The question the micromanager puts to the user when the gate flagged something.
 export function gateQuestion(result: GateResult, cloudOnly = false): string {
   const what: Record<Guard, string> = {
     injection: "the text may try to change the agents' rules (injection)",

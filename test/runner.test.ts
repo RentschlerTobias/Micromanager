@@ -43,7 +43,7 @@ function fakeSession(behaviour: { plan?: string[]; worker?: (dir: string, prompt
     async prompt({ sessionID, text }) {
       const s = sessions.get(sessionID)!
       s.n++
-      if (s.agent === "dictator-plan") s.last = planAnswers.shift() ?? (behaviour.plan ? "no plan" : "```json\n" + JSON.stringify(PLAN) + "\n```")
+      if (s.agent === "planner") s.last = planAnswers.shift() ?? (behaviour.plan ? "no plan" : "```json\n" + JSON.stringify(PLAN) + "\n```")
       else s.last = behaviour.worker ? behaviour.worker(s.dir, text, s.n) : "done\nSTATUS: DONE\nFILES: none"
       return {}
     },
@@ -82,7 +82,7 @@ test("plan -> run: tasks pass their checks one by one and land as commits on the
   assert.match(readFileSync(join(project, ".git", "info", "exclude"), "utf8"), /\.jev-dictator\//)
   assert.match(readFileSync(join(project, ".jev-dictator", "notes", job.id, "T1.md"), "utf8"), /test -f add.js \(exit 0\)/)
   // workers run inside the job's worktree, on the routed model, with their role's agent
-  const worker = fake.created.find((c) => c.agent === "dictator-code")!
+  const worker = fake.created.find((c) => c.agent === "coder")!
   assert.equal((worker.location as { directory: string }).directory, done.integrationWorktree)
 })
 
@@ -105,7 +105,7 @@ test("a failing check climbs the ladder: fix rounds, a fresh session on another 
   const done = await r.run(job.id)
   // the same failure twice is a loop without a decision model: one fix round per session
   assert.equal(rounds, 2)
-  const workers = fake.created.filter((c) => c.agent === "dictator-code").map((c) => JSON.stringify(c.model))
+  const workers = fake.created.filter((c) => c.agent === "coder").map((c) => JSON.stringify(c.model))
   assert.equal(workers.length, 2)
   assert.notEqual(workers[0], workers[1], "rung 2 runs on another model")
   const t1 = done.tasks[0]!
@@ -215,13 +215,13 @@ test("an unclear job goes through the planning session, one question per turn, t
   const r = runner(project, fake.api, { decider })
   const started = await r.start("add an add function", "ses_dictator")
   assert.equal(started.kind, "session")
-  assert.match(started.text, /dictator_questions/)
+  assert.match(started.text, /plan_questions/)
   assert.equal(started.job.triage?.complexity, 6)
   const first = await r.questions(started.job.id, TREE)
   assert.match(first, /Ask the user question D1 now/)
   assert.match(await r.answer(started.job.id, "only two numbers") ?? "", /Ask the user question D2 now/)
   assert.match(await r.answer(started.job.id, "throw a TypeError") ?? "", /Design checkpoint/)
-  assert.match(await r.answer(started.job.id, "confirm") ?? "", /Call dictator_plan with goal/)
+  assert.match(await r.answer(started.job.id, "confirm") ?? "", /Call plan_job with goal/)
   const planned = await r.continueJob(started.job.id)
   assert.equal(planned.kind, "plan")
   assert.equal(planned.job.phase, "plan_gate")
@@ -266,7 +266,7 @@ test("a cloud model preset never takes a local-only job to the cloud", async () 
   await r.answer(started.job.id, "two")
   await r.answer(started.job.id, "confirm")
   await r.continueJob(started.job.id)
-  const planner = fake.created.find((c) => c.agent === "dictator-plan")!
+  const planner = fake.created.find((c) => c.agent === "planner")!
   assert.equal((planner.model as { providerID: string }).providerID === "opencode-go", false)
 })
 
@@ -350,8 +350,8 @@ test("P2: a risky task gets a reviewer of another family; a blocking finding goe
   assert.equal(t.pipeline, "P2")
   assert.deepEqual(t.stages.filter((s) => s.stage === "review").map((s) => s.result), ["fail", "pass"])
   assert.ok(prompts.some((p) => p.includes("add.js:1 adds strings")), "the finding reaches the worker")
-  const worker = fake.created.find((c) => c.agent === "dictator-code")!
-  const reviewers = fake.created.filter((c) => c.agent === "dictator-review")
+  const worker = fake.created.find((c) => c.agent === "coder")!
+  const reviewers = fake.created.filter((c) => c.agent === "reviewer")
   const fam = (m: unknown) => DEFAULT_REGISTRY.find((e) => e.id === `${(m as { providerID: string }).providerID}/${(m as { id: string }).id}`)!.family
   assert.equal(reviewers.length, 2, "the spec axis only (internal data), two rounds")
   assert.ok(reviewers.every((r) => fam(r.model) !== fam(worker.model)), "every reviewer is of another family")
@@ -385,7 +385,7 @@ test("P3: tests first must fail, the implementation is undone, and changed tests
   assert.equal(t.pipeline, "P3")
   assert.equal(done.phase, "integrate", summary(done))
   assert.equal(t.stages.find((s) => s.stage === "red")?.result, "pass")
-  assert.ok(fake.created.some((c) => c.agent === "dictator-test"), "a test worker writes the tests")
+  assert.ok(fake.created.some((c) => c.agent === "tester"), "a test worker writes the tests")
   const green = prompts.find((p) => p.includes("are frozen"))!
   assert.match(green, /add\.test\.js/)
   assert.deepEqual(t.stages.filter((s) => s.stage === "gate").map((s) => s.result), ["fail", "pass"], "the changed test failed the first gate")
@@ -430,7 +430,7 @@ test("P9: parallel readers, a synthesis whose URLs all come from the readers, co
   const t = done.tasks[0]!
   assert.equal(t.pipeline, "P9")
   assert.equal(done.phase, "integrate", summary(done))
-  assert.equal(fake.created.filter((c) => c.agent === "dictator-research").length, 3, "a moderate question gets 3 readers")
+  assert.equal(fake.created.filter((c) => c.agent === "researcher").length, 3, "a moderate question gets 3 readers")
   assert.equal(new Set(prompts.filter((p) => p.includes("research for task")).map((p) => p.match(/reader \d of 3/)?.[0])).size, 3, "each reader has its own angle")
   assert.deepEqual(t.stages.filter((s) => s.stage === "citations").map((s) => s.result), ["fail", "pass"])
   assert.ok(prompts.some((p) => p.includes("https://made-up.example/x")), "the unknown URL is named to the writer")
@@ -450,7 +450,7 @@ test("a task that must run the tests is moved off a role without shell, and its 
   const t = done.tasks[0]!
   assert.equal(t.role, "review")
   assert.match(t.stages.find((s) => s.stage === "classify")!.evidence!, /oracle has no shell/)
-  const session = fake.created.find((c) => c.agent === "dictator-review")!
+  const session = fake.created.find((c) => c.agent === "reviewer")!
   assert.deepEqual((session.permissions as { action: string }[]).map((p) => p.action), ["webfetch", "websearch"])
   assert.deepEqual(narrowed[0], session.permissions)
 })
@@ -467,7 +467,7 @@ test("a destructive task waits for the user's go; running the job again is the g
   const first = await r.run(id)
   assert.equal(first.phase, "ask_user")
   assert.match(first.lessons.at(-1)!, /confirm T1 before it runs: .*risk destructive/)
-  assert.equal(fake.created.filter((c) => c.agent !== "dictator-plan").length, 0, "no worker started")
+  assert.equal(fake.created.filter((c) => c.agent !== "planner").length, 0, "no worker started")
   const second = await r.run(id)
   assert.equal(second.phase, "integrate", summary(second))
   assert.equal(n5, 1)
@@ -480,7 +480,7 @@ test("a task text flagged as injection is blocked before any worker sees it", as
   const done = await r.run((await r.plan("goal")).job.id)
   assert.equal(done.tasks[0]!.status, "blocked")
   assert.equal(done.phase, "ask_user")
-  assert.equal(fake.created.filter((c) => c.agent !== "dictator-plan").length, 0)
+  assert.equal(fake.created.filter((c) => c.agent !== "planner").length, 0)
 })
 
 test("N4: a task the model finds too big is split by the planner, at most two levels deep", async () => {
@@ -517,7 +517,7 @@ test("a task that needs images goes to a vision model; local research readers ta
   const fake = fakeSession({ plan: [plan1({})], worker: (dir) => { writeFileSync(join(dir, "add.js"), "x\n"); return DONE } })
   const r = runner(project, fake.api, { decider: nodeDecider({ N5: { needs_vision: noul(0.9), has_test_oracle: noul(0.9) } }) })
   await r.run((await r.plan("goal")).job.id)
-  const worker = fake.created.find((c) => c.agent === "dictator-code")!
+  const worker = fake.created.find((c) => c.agent === "coder")!
   const id = `${(worker.model as { providerID: string }).providerID}/${(worker.model as { id: string }).id}`
   assert.ok(DEFAULT_REGISTRY.find((m) => m.id === id)!.vision, id)
 
@@ -537,7 +537,7 @@ test("a task that needs images goes to a vision model; local research readers ta
   const local = runner(project2, slow, { decider: nodeDecider({ N5: { difficulty: { type: "score", score: 4, confidence: 0.9, probabilities: {} } } }), policies: { global: { "N5.model": "fixed:llamaswap/ornith-u" } } })
   const done = await local.run((await local.plan("goal")).job.id)
   assert.equal(done.phase, "integrate", summary(done))
-  assert.equal(fake2.created.filter((c) => c.agent === "dictator-research").length, 5)
+  assert.equal(fake2.created.filter((c) => c.agent === "researcher").length, 5)
   assert.equal(most, 1, "one reader at a time on the local GPU")
 })
 
@@ -652,7 +652,7 @@ test("a stopped run pauses the job mid-task; the next run resumes it from the la
     worker: (dir, prompt) => {
       if (prompt.includes("task T2")) {
         writeFileSync(join(dir, "notes.md"), "half\n")
-        stop = true // the user calls dictator_stop while T2's worker runs
+        stop = true // the user calls stop_job while T2's worker runs
       }
       return writeFiles(dir, prompt.includes("task T2") ? "" : prompt)
     },
@@ -777,7 +777,7 @@ test("a refusing worker gets one fresh session on a local uncensored model; a se
   const fake = fakeSession({ worker: () => "I'm sorry, but I can't help with that." })
   const r = runner(project, fake.api, { onWorker: () => {} })
   const done = await r.run((await r.plan("goal")).job.id)
-  for (const c of fake.created.filter((c) => c.agent === "dictator-code")) models.push(`${(c.model as { providerID: string }).providerID}/${(c.model as { id: string }).id}`)
+  for (const c of fake.created.filter((c) => c.agent === "coder")) models.push(`${(c.model as { providerID: string }).providerID}/${(c.model as { id: string }).id}`)
   assert.equal(models.length, 2)
   const second = DEFAULT_REGISTRY.find((m) => m.id === models[1])!
   assert.deepEqual([second.location, second.censored], ["local", false])
@@ -794,7 +794,7 @@ test("a refusal in a job the gate flagged as possibly harmful goes straight to t
   job.flags = { gate: { flagged: ["harmful"], scores: { harmful: 0.9 }, checked: true } }
   saveJob(project, job)
   const done = await r.run(job.id)
-  assert.equal(fake.created.filter((c) => c.agent === "dictator-code").length, 1, "no reroute")
+  assert.equal(fake.created.filter((c) => c.agent === "coder").length, 1, "no reroute")
   assert.equal(done.tasks[0]!.escalation?.kind, "refused")
 })
 
@@ -941,7 +941,7 @@ import { addDelegated } from "../src/plan.ts"
 import { taskReport } from "../src/runner.ts"
 
 function rolling(project: string) {
-  const job = newJob("job-20261005-120000-abcd", "the delegated tasks of dictator session ses_dict")
+  const job = newJob("job-20261005-120000-abcd", "the delegated tasks of micromanager session ses_dict")
   for (const p of ["triage", "plan", "plan_gate", "execute"] as const) moveJob(job, p)
   job.rolling = true
   job.facilitator = "ses_dict"
@@ -1072,7 +1072,7 @@ test("cloud only: guards ask cloud Jev, no local model is routed, and a local-on
   saveJob(project, job)
   const done = await r.run(job.id)
   assert.equal(done.phase, "ask_user")
-  assert.equal(fake.created.filter((c) => c.agent !== "dictator-plan").length, 0, "no worker started")
+  assert.equal(fake.created.filter((c) => c.agent !== "planner").length, 0, "no worker started")
   assert.match(summary(done), /must stay on this machine, but local models are switched off/)
 })
 
