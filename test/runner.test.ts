@@ -1112,3 +1112,14 @@ test("cloud only: a local-only flag from an unchecked goal is dropped; one the u
   assert.equal(done.phase, "integrate", summary(done))
   assert.equal(done.flags?.localOnly, false)
 })
+
+test("delegated files are project paths; prose and paths outside are refused", async () => {
+  const { parseFiles } = await import("../src/plan.ts")
+  const p = "/home/u/repo"
+  assert.deepEqual(parseFiles("src/a.js, test/a.test.js", p), { files: ["src/a.js", "test/a.test.js"] })
+  assert.deepEqual(parseFiles("/home/u/repo/src/a.js ./README.md", p), { files: ["src/a.js", "README.md"] })
+  assert.deepEqual(parseFiles("none", p), { files: [] })
+  assert.deepEqual(parseFiles("", p), { files: [] })
+  assert.match(parseFiles("none (read-only; only /tmp/opencode/x.md may be written)", p).problem!, /must be paths in the project/)
+  assert.match(parseFiles("/tmp/x.md", p).problem!, /inside the project/)
+})

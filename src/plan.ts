@@ -400,3 +400,19 @@ export function checkProblem(check: string): string | undefined {
   if (/[.!?]$/.test(c) && /\s\w+\s\w+\s\w+\s/.test(c)) return `"${c.slice(0, 80)}" reads like a sentence: give a shell command, e.g. npm test`
   return undefined
 }
+
+// The files of a delegation: project-relative paths, comma or space separated; "none" or empty for a reader. Returns
+// why not otherwise (live test: "none (read-only; only /tmp/... may be written)" became six pseudo-files, and two
+// readers that shared the file "none" could not run side by side).
+export function parseFiles(text: string, project: string): { files: string[]; problem?: string } {
+  const t = text.trim()
+  if (!t || /^(none|-|n\/a|no files?)$/i.test(t)) return { files: [] }
+  const words = t.split(/[,\s]+/).filter(Boolean)
+  const bad = words.filter((w) => !/^[\w./@+-]+$/.test(w) || /^(none|read-only|only|may|be|written)$/i.test(w))
+  if (bad.length) return { files: [], problem: `files must be paths in the project, comma separated, or empty for a task that changes nothing (not: ${bad.slice(0, 4).join(" ")})` }
+  const prefix = project.replace(/\/+$/, "") + "/"
+  const files = words.map((w) => (w.startsWith(prefix) ? w.slice(prefix.length) : w)).map((w) => w.replace(/^\.\//, ""))
+  const outside = files.filter((f) => f.startsWith("/") || f.startsWith("..") || f.startsWith("~"))
+  if (outside.length) return { files: [], problem: `files must be inside the project: ${outside.join(", ")}. A task that only reads reports what it found; you read it with dictator_tasks.` }
+  return { files }
+}

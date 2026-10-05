@@ -25,7 +25,7 @@ import { moveJob, newJob, readyTasks, type Job } from "./state.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
-import { addDelegated, checkProblem } from "./plan.ts"
+import { addDelegated, checkProblem, parseFiles } from "./plan.ts"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
@@ -397,11 +397,13 @@ export default {
             const d = {
               title: input.title.trim(),
               prompt: input.prompt.trim(),
-              files: words(input.files),
+              files: parseFiles(input.files, project).files,
               dependsOn: words(input.depends),
               priority: Number(input.priority) || undefined,
               checks: input.checks.split(/\n|;;/).map((c) => c.trim()).filter(Boolean),
             }
+            const fileProblem = parseFiles(input.files, project).problem
+            if (fileProblem) return `Not delegated: ${fileProblem}`
             const bad = d.checks.map(checkProblem).filter(Boolean)
             if (bad.length) return `Not delegated: checks must be shell commands that exit 0 when the task is done. ${bad.join("; ")}`
             const r = live.get(job.id)?.addTask(job.id, d) ?? (() => {
@@ -426,7 +428,8 @@ export default {
               } catch {
                 // no note yet
               }
-              return `${taskReport(job, task)}${note ? `\n\n${note.slice(-3000)}` : ""}`
+              // A reader's report is its result, so the whole note (up to a limit) comes back.
+              return `${taskReport(job, task)}${note ? `\n\n${note.slice(-15000)}` : ""}`
             }
             return [`job ${job.id} on branch ${job.integrationBranch ?? `jev/${job.id}`}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}`)].join("\n")
           },
