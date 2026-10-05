@@ -7,9 +7,14 @@ import { join } from "node:path"
 
 import { buildAgenda, nextProposal } from "./agenda.ts"
 import { Decider, RulesBackend } from "./backends.ts"
-import { ANSWER, CHOICE_FLOOR, complexityOf, followUpQuestions, NOUL_FLOOR, nextQuestionChoice, splitQuestions, TRIAGE } from "./catalog.ts"
+import { createHash } from "node:crypto"
+
+import {
+  ANSWER, CHOICE_FLOOR, complexityOf, ESCALATE, ESCALATION, followUpQuestions, NOUL_FLOOR, nextQuestionChoice, PROGRESS, splitQuestions, TRIAGE,
+  type EscalationKind,
+} from "./catalog.ts"
 import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, injected, injectionScore, type Unchecked } from "./gate.ts"
-import { brief, fixPrompt, lastAssistantText, parseReport, skillLine, taskAcceptance, usage } from "./brief.ts"
+import { brief, fixPrompt, handoffText, lastAssistantText, parseReport, skillLine, taskAcceptance, usage } from "./brief.ts"
 import { changedFiles, commitTask, exec as defaultExec, hashFiles, prepareIntegration, revertFiles, runGate, workingDiff, type Exec, type GateResult } from "./integration.ts"
 import { redact } from "./jev.ts"
 import { record } from "./journal.ts"
@@ -33,7 +38,7 @@ import {
 import { discoveredCap, isDone, moveJob, moveTask, newJob, promoteReady, stage, type FollowUp, type Job, type JobPhase, type Later, type Task } from "./state.ts"
 import { skillsFor, type Stage } from "./skills.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
-import { handoffNote, TIER_STEPS, type Signal } from "./watchdog.ts"
+import { handoffNote, TIER_STEPS, TIER_TOKENS, type Signal } from "./watchdog.ts"
 
 // The part of ctx.session the runner needs (argument shapes as seen in Phase A).
 export interface SessionApi {
@@ -65,6 +70,7 @@ export interface RunnerDeps {
   readonly skills?: readonly Skill[] // the skills the decision model may pick per task (design.md §13.1)
   readonly installedSkills?: ReadonlySet<string> // the skills a brief may name: linked into OpenCode by install.sh
   readonly cancelled?: () => boolean // the user stopped the job (dictator_stop); checked around every session turn
+  readonly budget?: { tokens?: number; requests?: number; cost?: number } // per job, from the config (design.md §10.2)
 }
 
 // Thrown out of a session turn when the user stopped the job; run() pauses the job, and the next run resumes it.
@@ -98,6 +104,9 @@ export class Runner {
   readonly #journal: (entry: Record<string, unknown>) => void
 
   readonly #decider: Decider
+  #job?: Job // the job this runner works on; its counters take every session's usage
+  readonly #seen = new Map<string, { tokens: number; cost: number; requests: number }>() // usage per session so far
+  readonly #tokenCaps = new Map<string, number>() // N5's budget tier per worker session
 
   constructor(deps: RunnerDeps) {
     this.#d = deps
@@ -154,7 +163,34 @@ export class Runner {
     }
     if (timedOut) await this.#d.session.interrupt({ sessionID }).catch(() => undefined)
     if (this.#d.cancelled?.()) throw new Cancelled()
-    return { text: lastAssistantText(await this.#d.session.context({ sessionID })), timedOut, stopped: this.#d.stopped?.(sessionID) }
+    const messages = await this.#d.session.context({ sessionID })
+    const used = this.#count(sessionID, messages)
+    const cap = this.#tokenCaps.get(sessionID)
+    const stopped = this.#d.stopped?.(sessionID) ?? (cap && used.tokens > cap ? { kind: "tokens" as const, detail: `${used.tokens} tokens in one session, over the task's ${cap}` } : undefined)
+    return { text: lastAssistantText(messages), timedOut, stopped }
+  }
+
+  // A session's usage so far; what is new since the last turn goes to the job's counters.
+  #count(sessionID: string, messages: unknown): { tokens: number; cost: number; requests: number } {
+    const now = { ...usage(messages), requests: Array.isArray(messages) ? (messages as { type?: string }[]).filter((m) => m.type === "assistant").length : 0 }
+    const before = this.#seen.get(sessionID) ?? { tokens: 0, cost: 0, requests: 0 }
+    this.#seen.set(sessionID, now)
+    const c = this.#job?.counters
+    if (c) {
+      c.tokens = (c.tokens ?? 0) + Math.max(0, now.tokens - before.tokens)
+      c.cost = (c.cost ?? 0) + Math.max(0, now.cost - before.cost)
+      c.requests = (c.requests ?? 0) + Math.max(0, now.requests - before.requests)
+    }
+    return now
+  }
+
+  // The first budget the job has used up, as a reason; checked before every start (design.md §10.2).
+  #overBudget(job: Job): string | undefined {
+    const { budget: b, counters: c } = job
+    if (b.tokensMax && (c.tokens ?? 0) >= b.tokensMax) return `token budget of ${b.tokensMax} used up (${c.tokens})`
+    if (b.requestsMax && (c.requests ?? 0) >= b.requestsMax) return `request budget of ${b.requestsMax} used up (${c.requests})`
+    if (b.costMax && (c.cost ?? 0) >= b.costMax) return `cost budget of ${b.costMax} used up (${(c.cost ?? 0).toFixed(2)})`
+    return undefined
   }
 
   // Goal -> validated plan, waiting at the plan gate for the user's go.
@@ -424,6 +460,10 @@ export class Runner {
       moveJob(job, "execute")
     }
     if (job.phase !== "execute") throw new Error(`job ${id} is in phase ${job.phase}, not ready to run`)
+    this.#job = job
+    job.budget.tokensMax ??= this.#d.budget?.tokens
+    job.budget.requestsMax ??= this.#d.budget?.requests
+    job.budget.costMax ??= this.#d.budget?.cost
     if (!job.integrationWorktree) {
       const integration = await prepareIntegration(this.#d.project, job.id, this.#exec)
       job.integrationBranch = integration.branch
@@ -435,6 +475,11 @@ export class Runner {
       while (job.phase === "execute") {
         if (++job.counters.turns > job.budget.turnsMax) {
           this.#stop(job, `turn budget of ${job.budget.turnsMax} used up`)
+          break
+        }
+        const over = this.#overBudget(job)
+        if (over) {
+          this.#stop(job, `budget: ${over}; raise it in the config or with a pin, then run the job again`)
           break
         }
         promoteReady(job)
@@ -523,16 +568,28 @@ export class Runner {
     work = await this.#untilGreen(job, task, work, checks, frozen)
     if (!work) return
     const review = (pipeline.id === "P2" || pipeline.id === "P3") && resolvePolicy("N6.review", this.#policies(job, task.id)).policy.kind !== "fixed"
+    let lastIssues = ""
     for (let round = 1; review; round++) {
       moveTask(task, "reviewing")
       const r = await this.#review(job, task, work.model.id)
       stage(task, "review", r.blocking.length ? "fail" : "pass", r.error ?? (r.blocking.length ? r.blocking.map((c) => `${c.point}: ${c.evidence}`).join("; ").slice(0, 500) : `verdict ${r.verdict ?? "none"}, nothing blocking`))
       if (r.blocking.length === 0) break
-      if (round >= REVIEW_ROUNDS) return this.#escalate(job, task, `the review still finds unmet points after ${REVIEW_ROUNDS} rounds: ${r.blocking.map((c) => c.point).join(", ")}`)
-      moveTask(task, "fixing")
-      moveTask(task, "running")
-      this.#say(`${task.id}: the review found ${r.blocking.length} unmet point(s), round ${round + 1}`)
-      work.answer = await this.#ask(work.s.id, [reviewFixPrompt(r), skillLine(this.#skills("review_fix", task))].filter(Boolean).join("\n\n"))
+      // N8 signature: the same unmet points as the last round mean this session is not getting there.
+      const issues = r.blocking.map((c) => c.point).sort().join(",")
+      const repeated = issues === lastIssues
+      lastIssues = issues
+      if (round >= REVIEW_ROUNDS || repeated) {
+        const why = repeated ? `the review found the same unmet points twice: ${issues}` : `the review still finds unmet points after ${REVIEW_ROUNDS} rounds: ${issues}`
+        work = await this.#nextRung(job, task, work, frozen, why, r.blocking.map((c) => `- ${c.point}: ${c.evidence}`).join("\n"), "conflicting_review")
+        if (!work) return
+        round = 0
+        lastIssues = ""
+      } else {
+        moveTask(task, "fixing")
+        moveTask(task, "running")
+        this.#say(`${task.id}: the review found ${r.blocking.length} unmet point(s), round ${round + 1}`)
+        work.answer = await this.#ask(work.s.id, [reviewFixPrompt(r), skillLine(this.#skills("review_fix", task))].filter(Boolean).join("\n\n"))
+      }
       work = await this.#untilGreen(job, task, work, checks, frozen)
       if (!work) return
     }
@@ -648,34 +705,30 @@ export class Runner {
     return profile
   }
 
-  // Worker turns until the task's checks pass: the watchdog's stops, the report, the gate, at most fixRounds fixes.
-  // Returns undefined when the task went to the user (escalated or blocked); the status is then "gating", passed.
+  // Worker turns until the task's checks pass: the watchdog's stops, the report, the gate, at most fixRounds fixes,
+  // then the N9 ladder. Returns undefined when the task went to the user or was given up (escalated or blocked).
   async #untilGreen(job: Job, task: Task, work: Work, checks: readonly string[], frozen: ReadonlyMap<string, string>): Promise<Work | undefined> {
     const worktree = job.integrationWorktree!
+    let lastDiff: string | undefined
+    let lastFailure: string | undefined
     for (;;) {
       const answer = work.answer
       if (answer.stopped) {
-        // The watchdog stopped it: never resume that session. One fresh session, on another model family when no
-        // preset pins the model, told what was already done; a second stop goes to the user.
+        // The watchdog stopped it: never resume that session.
         stage(task, "implement", "fail", `loop watchdog: ${answer.stopped.detail}`)
-        if (work.fresh) {
-          this.#escalate(job, task, `stopped twice by the loop watchdog: ${answer.stopped.detail}`)
-          return undefined
-        }
-        const model = await this.#model(job, task.role, task.profile?.difficulty ?? 0.5, task.id, [this.#family(work.model.id)], task.profile?.vision)
-        task.model = model.id
-        this.#say(`${task.id}: stopped by the loop watchdog (${answer.stopped.detail}), fresh session on ${model.id}`)
-        const s = await this.#workerSession(job, task, model.id)
-        const text = `${brief(job, task, model.id, worktree, this.#skills("implement", task))}\n\n${frozen.size ? `${greenNote([...frozen.keys()])}\n\n` : ""}${handoffNote(answer.stopped, await changedFiles(worktree, this.#exec))}`
-        work = { s, model, answer: await this.#ask(s.id, text), fresh: true }
+        const next = await this.#nextRung(job, task, work, frozen, `stopped by the loop watchdog: ${answer.stopped.detail}`, handoffNote(answer.stopped, []).split("\n").at(-1)!)
+        if (!next) return undefined
+        ;[work, lastDiff, lastFailure] = [next, undefined, undefined]
         continue
       }
       const report = parseReport(answer.text)
       collectFollowUps(task, report.followUps)
       stage(task, "implement", answer.timedOut ? "fail" : "pass", answer.timedOut ? "timed out" : `status ${report.status ?? "missing"}`)
       if (answer.timedOut) {
-        this.#escalate(job, task, "the worker timed out")
-        return undefined
+        const next = await this.#nextRung(job, task, work, frozen, "the worker timed out", "")
+        if (!next) return undefined
+        ;[work, lastDiff, lastFailure] = [next, undefined, undefined]
+        continue
       }
       if (report.status === "BLOCKED" || report.status === "NEEDS_CONTEXT") {
         moveTask(task, "blocked")
@@ -691,16 +744,57 @@ export class Runner {
       stage(task, "gate", failed.length ? "fail" : "pass", results.length ? results.map((r) => `${r.command}: exit ${r.code}`).join("; ") : "no checks defined")
       saveNote(this.#d.project, job.id, task.id, noteText(task, report.text, results, outside))
       if (failed.length === 0) return work
+      // N8: the same diff as the last round (the worker changed nothing) is a loop; the same failure is one when the
+      // decision model says so, or without one. A loop skips the remaining fix rounds.
+      const diff = createHash("sha1").update(await workingDiff(worktree, this.#exec)).digest("hex").slice(0, 12)
+      const failure = failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output.slice(-1500)}`).join("\n\n")
+      const loop = diff === lastDiff || (failure === lastFailure && (await this.#inLoop(job, task, lastFailure, failure)))
+      task.signatures.push(`diff:${diff}`)
+      ;[lastDiff, lastFailure] = [diff, failure]
       task.attempts++
-      if (task.attempts > (this.#d.fixRounds ?? 2)) {
-        this.#escalate(job, task, `checks still fail after ${task.attempts - 1} fix round(s): ${failed.map((f) => f.command).join(", ")}`)
-        return undefined
+      if (loop || task.attempts > (this.#d.fixRounds ?? 2)) {
+        const why = loop ? `it kept failing the same way: ${failed.map((f) => f.command).join(", ")}` : `checks still fail after ${task.attempts - 1} fix round(s): ${failed.map((f) => f.command).join(", ")}`
+        const next = await this.#nextRung(job, task, work, frozen, why, failure)
+        if (!next) return undefined
+        ;[work, lastDiff, lastFailure] = [next, undefined, undefined]
+        continue
       }
       moveTask(task, "fixing")
       this.#say(`${task.id}: ${failed.length} check(s) failed, fix round ${task.attempts}`)
       moveTask(task, "running")
       work.answer = await this.#ask(work.s.id, fixPrompt(failed))
     }
+  }
+
+  // N8 with the decision model: is a failure that came back unchanged a loop? Without an answer, yes.
+  async #inLoop(job: Job, task: Task, before: string, now: string): Promise<boolean> {
+    const asked = await this.#decider.ask("N8", { task: `${task.id} ${task.title}`, previous: before.slice(-1500), now: now.slice(-1500) }, PROGRESS, { localOnly: job.flags?.localOnly, job: job.id, task: task.id })
+    const a = asked.decision.answers.in_loop
+    return a?.type === "noul" ? a.noul >= NOUL_FLOOR : true
+  }
+
+  // N9 (design.md §10.2): rung 1 is the fix rounds in the same session; rung 2 a fresh session on another model family
+  // with a handoff note; rung 3 the escalation. A budget that is used up skips rung 2.
+  async #nextRung(job: Job, task: Task, work: Work, frozen: ReadonlyMap<string, string>, reason: string, details: string, hint: EscalationKind = "too_hard"): Promise<Work | undefined> {
+    const over = this.#overBudget(job)
+    if (work.fresh || over) {
+      await this.#escalate(job, task, over ?? reason, details, over ? "budget" : hint)
+      return undefined
+    }
+    const model = await this.#model(job, task.role, task.profile?.difficulty ?? 0.5, task.id, [this.#family(work.model.id)], task.profile?.vision)
+    task.model = model.id
+    toRunning(task)
+    task.attempts = 0
+    stage(task, "escalate", "skip", `rung 2: fresh session on ${model.id} after: ${reason}`)
+    this.#say(`${task.id}: ${reason}; fresh session on ${model.id}`)
+    const s = await this.#workerSession(job, task, model.id)
+    const worktree = job.integrationWorktree!
+    const text = [
+      brief(job, task, model.id, worktree, this.#skills("implement", task)),
+      frozen.size ? greenNote([...frozen.keys()]) : "",
+      handoffText(reason, details, await changedFiles(worktree, this.#exec)),
+    ].filter(Boolean).join("\n\n")
+    return { s, model, answer: await this.#ask(s.id, text), fresh: true }
   }
 
   // P3's red stage: a test worker writes the tests first, and they must fail before anything is built. Returns the
@@ -714,7 +808,7 @@ export class Runner {
     const answer = await this.#ask(s.id, `${brief(job, task, model.id, worktree, this.#skills("red", task))}\n\n${redPrompt(task, testFiles)}`)
     if (answer.stopped || answer.timedOut) {
       stage(task, "red", "fail", answer.stopped ? `loop watchdog: ${answer.stopped.detail}` : "timed out")
-      this.#escalate(job, task, `the tests-first worker ${answer.stopped ? "was stopped by the loop watchdog" : "timed out"}`)
+      await this.#escalate(job, task, `the tests-first worker ${answer.stopped ? "was stopped by the loop watchdog" : "timed out"}`)
       return undefined
     }
     const changed = await changedFiles(worktree, this.#exec)
@@ -780,13 +874,13 @@ export class Runner {
       }
     }
     stage(task, "readers", notes.length ? "pass" : "fail", `${notes.length} of ${n} readers answered`)
-    if (notes.length === 0) return this.#escalate(job, task, "no research reader came back with findings")
+    if (notes.length === 0) return await this.#escalate(job, task, "no research reader came back with findings")
     const path = researchPath(task)
     const writerModel = await this.#model(job, "write", task.profile?.difficulty ?? 0.5, task.id)
     const s = await this.#workerSession(job, task, writerModel.id, "write")
     let answer = await this.#ask(s.id, synthesisPrompt(job, task, path, notes))
     for (let round = 0; ; round++) {
-      if (answer.stopped || answer.timedOut) return this.#escalate(job, task, `the synthesis ${answer.stopped ? "was stopped by the loop watchdog" : "timed out"}`)
+      if (answer.stopped || answer.timedOut) return await this.#escalate(job, task, `the synthesis ${answer.stopped ? "was stopped by the loop watchdog" : "timed out"}`)
       let doc = ""
       try {
         doc = readFileSync(join(worktree, path), "utf8")
@@ -796,13 +890,13 @@ export class Runner {
       const check = citationCheck(doc, notes)
       stage(task, "citations", check.ok ? "pass" : "fail", doc ? `${check.cited} cited${check.unknown.length ? `, not from a reader: ${check.unknown.join(" ")}` : ""}` : `${path} was not written`)
       if (check.ok) break
-      if (round >= 1) return this.#escalate(job, task, `the research synthesis fails the citation check: ${doc ? (check.unknown.length ? `${check.unknown.length} URL(s) not from a reader` : "no citations") : `${path} missing`}`)
+      if (round >= 1) return await this.#escalate(job, task, `the research synthesis fails the citation check: ${doc ? (check.unknown.length ? `${check.unknown.length} URL(s) not from a reader` : "no citations") : `${path} missing`}`)
       answer = await this.#ask(s.id, `${HEADER} ${doc ? (check.unknown.length ? `These URLs are not in any reader's notes: ${check.unknown.join(" ")}. Remove them or the claims they support.` : "The document cites nothing. Cite every claim with a URL from the readers' notes.") : `Write ${path} as asked.`}`)
     }
     moveTask(task, "gating")
     const checks = [...new Set(taskAcceptance(job, task).map((a) => a.verify).filter((v): v is string => Boolean(v)))]
     const failed = (await runGate(worktree, checks, this.#exec)).filter((r) => !r.passed)
-    if (failed.length) return this.#escalate(job, task, `checks fail after the research: ${failed.map((f) => f.command).join(", ")}`)
+    if (failed.length) return await this.#escalate(job, task, `checks fail after the research: ${failed.map((f) => f.command).join(", ")}`)
     moveTask(task, "passed")
     task.summary = `research written to ${path}`
     const commit = await commitTask(worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nResearch: ${n} reader(s) on ${model}, synthesis by ${writerModel.id}, pipeline P9`, this.#exec)
@@ -841,16 +935,38 @@ export class Runner {
     task.session = s.id
     this.#d.onWorker?.(s.id, `${task.id} ${task.title}: ${task.description}`, rules)
     this.#d.watch?.(s.id, steps ?? TIER_STEPS[task.profile?.budget ?? "M"])
+    this.#tokenCaps.set(s.id, TIER_TOKENS[task.profile?.budget ?? "M"])
     saveJob(this.#d.project, job)
     return s
   }
 
 
-  // Phase B's escalation ladder ends at the user; other families and best-of-N come in Phase E.
-  #escalate(job: Job, task: Task, reason: string): void {
+  // N9 rung 3: the task stops, with a typed reason. A task that is too hard as planned does not stop the job: other
+  // tasks go on and the job replans around it (stalls, design.md §10.2). Everything else needs the user.
+  async #escalate(job: Job, task: Task, reason: string, details = "", hint: EscalationKind = "too_hard"): Promise<void> {
+    let kind = hint
+    let decision: string | undefined
+    if (hint !== "budget") {
+      const asked = await this.#decider.ask(
+        "N9",
+        { goal: job.goal, task: `${task.id} ${task.title}: ${task.description}`, acceptance: taskAcceptance(job, task).map((a) => a.text), reason, details: details.slice(-2000), stages: task.stages.slice(-6).map((s) => `${s.stage} ${s.result}${s.evidence ? `: ${s.evidence.slice(0, 200)}` : ""}`) },
+        { reason: ESCALATE },
+        { localOnly: job.flags?.localOnly, job: job.id, task: task.id },
+      )
+      decision = asked.id
+      const c = asked.decision.answers.reason
+      if (c?.type === "choice" && c.confidence >= CHOICE_FLOOR && c.choice in ESCALATION) kind = c.choice as EscalationKind
+    }
     moveTask(task, "escalated")
+    task.escalation = { kind, detail: reason }
     job.counters.stalls++
-    this.#stop(job, `${task.id}: ${reason}`)
+    this.#journal({ kind: "escalation", job: job.id, task: task.id, reason, type: kind, decision })
+    if (kind === "too_hard") {
+      job.lessons.push(`${task.id} given up as planned: ${reason}`)
+      this.#say(`${task.id} given up as planned (${reason}); the job goes on and replans around it`, true)
+      return
+    }
+    this.#stop(job, `${task.id} (${kind.replace(/_/g, " ")}): ${reason}`)
   }
 
   async #verify(job: Job): Promise<void> {
@@ -882,6 +998,12 @@ Verify commands run from the project root in a fresh checkout of the current com
 work there, such as the project's own test script.
 
 ${PLAN_FORMAT}`
+}
+
+// Back to running from wherever a task's last stage left it, for a fresh session (N9 rung 2).
+function toRunning(task: Task): void {
+  if (task.status === "gating" || task.status === "reviewing") moveTask(task, "fixing")
+  if (task.status !== "running") moveTask(task, "running")
 }
 
 // A worker's follow-ups over all its reports in this task, without repeats.

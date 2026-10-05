@@ -69,6 +69,16 @@ export function skillLine(skills: readonly string[]): string {
   return skills.length ? `Load these skills before you start: ${skills.join(", ")}.` : ""
 }
 
+// What a fresh session on another model is told after the previous one failed (N9 rung 2, design.md §8.2).
+export function handoffText(reason: string, details: string, changed: readonly string[]): string {
+  return [
+    `A previous attempt at this task, by another model, failed: ${reason}.`,
+    details ? `What it ran into:\n${details.slice(0, 3000)}` : "",
+    changed.length ? `Files it already changed in this directory: ${changed.join(", ")}. Check them: keep what is right, fix what is wrong, and do not start over blindly.` : "It changed no file.",
+    "Try another way than the previous attempt if its way kept failing.",
+  ].filter(Boolean).join("\n\n")
+}
+
 export function fixPrompt(failures: readonly { command: string; code: number; output: string }[]): string {
   const parts = failures.map((f) => `$ ${f.command}  (exit ${f.code})\n${f.output}`)
   return `${HEADER} The checks of your task failed:\n\n${parts.join("\n\n")}\n\nFix the cause in your task's files, then report again in the same format.`

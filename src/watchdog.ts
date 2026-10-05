@@ -6,7 +6,7 @@
 // The signatures come from real failures: Kimi restarting its task, Gemini's read loops, and a local planner
 // that read the same directory sixty times in this project's own test.
 
-export type SignalKind = "steps" | "same_call" | "read_loop" | "no_new_files" | "restart" | "monologue" | "repeat_text"
+export type SignalKind = "steps" | "same_call" | "read_loop" | "no_new_files" | "restart" | "monologue" | "repeat_text" | "tokens"
 
 export interface Signal {
   readonly kind: SignalKind
@@ -27,6 +27,8 @@ export const DEFAULT_LIMITS: Limits = { maxSteps: 60, sameCall: 3, window: 10, r
 
 // The budget tier the decision model picks (design.md §8.1) maps to step limits; code keeps the ceiling.
 export const TIER_STEPS = { S: 30, M: 60, L: 120 } as const
+// ... and to tokens per session (input + output over all turns), checked after each turn by the runner.
+export const TIER_TOKENS = { S: 250_000, M: 600_000, L: 1_500_000 } as const
 
 const READS = new Set(["read", "list"])
 const WRITES = new Set(["edit", "write", "patch", "multiedit", "apply_patch"])

@@ -92,7 +92,32 @@ export function parseNotify(text: string): NotifyMode {
   return raw
 }
 
+// "budget": per job, { "tokens": 4000000, "requests": 800, "cost": 5 }; the defaults below, capped by hard ceilings
+// so a typo cannot make a job unbounded (design.md §10.2).
+export interface Budget {
+  readonly tokens?: number
+  readonly requests?: number
+  readonly cost?: number
+}
+
+export const DEFAULT_BUDGET: Budget = { tokens: 4_000_000, requests: 800 }
+const CEILINGS = { tokens: 50_000_000, requests: 5000, cost: 1000 } as const
+
+export function parseBudget(text: string): Budget {
+  const raw = (JSON.parse(stripComments(text)) as { budget?: unknown }).budget
+  if (raw === undefined) return DEFAULT_BUDGET
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("budget must be an object")
+  const out: Record<string, number> = { ...DEFAULT_BUDGET }
+  for (const [key, value] of Object.entries(raw)) {
+    if (!(key in CEILINGS)) throw new Error(`unknown budget ${JSON.stringify(key)}`)
+    if (typeof value !== "number" || value <= 0) throw new Error(`budget.${key} must be a positive number`)
+    out[key] = Math.min(value, CEILINGS[key as keyof typeof CEILINGS])
+  }
+  return out
+}
+
 export interface Settings {
+  readonly budget: Budget
   readonly notify: NotifyMode
   readonly routing: Routing
   readonly floors: Floors
@@ -105,11 +130,11 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
+    return { budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
+    return { budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
   } catch (err) {
-    return { notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
+    return { budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }
 }

@@ -75,7 +75,7 @@ const TASK_ALLOWED: Record<TaskStatus, readonly TaskStatus[]> = {
   planned: ["running"],
   running: ["gating", "escalated"],
   gating: ["reviewing", "passed", "fixing", "escalated"],
-  reviewing: ["passed", "fixing"],
+  reviewing: ["passed", "fixing", "escalated"],
   fixing: ["running", "escalated"],
   escalated: ["running", "pending"],
   passed: ["merged"],
@@ -138,6 +138,7 @@ export interface Task {
   priority?: number // 1 (first) .. 5 (last); 3 when the planner gave none
   origin?: TaskOrigin
   followUps?: FollowUp[] // what the task's worker reported as work outside its task
+  escalation?: { kind: string; detail: string } // why the task stopped (N9 rung 3)
 }
 
 export interface Job {
@@ -156,8 +157,17 @@ export interface Job {
   facilitator?: string // the dictator session that runs this job's planning session
   pins?: PolicySet // job-level policies from the user's shortcuts ("always local", "pipeline P1", …)
   taskPins?: Record<string, PolicySet> // task-level ones ("T3 use llamaswap/oss-u")
-  budget: { workersMax: number; workersUsed: number; turnsMax: number; replansMax: number; discoveredMax?: number }
-  counters: { turns: number; stalls: number; replans: number }
+  budget: {
+    workersMax: number
+    workersUsed: number
+    turnsMax: number
+    replansMax: number
+    discoveredMax?: number
+    tokensMax?: number // input + output tokens over every session of the job
+    requestsMax?: number // provider turns over every session of the job
+    costMax?: number // in the providers' currency, when they report a cost
+  }
+  counters: { turns: number; stalls: number; replans: number; tokens?: number; requests?: number; cost?: number }
   lessons: string[]
   later?: Later[] // follow-ups that did not become tasks
   created: string
@@ -246,7 +256,7 @@ export function newJob(id: string, goal: string, now = new Date()): Job {
     acceptance: [],
     decisions: [],
     tasks: [],
-    budget: { workersMax: 6, workersUsed: 0, turnsMax: 40, replansMax: 2 },
+    budget: { workersMax: 20, workersUsed: 0, turnsMax: 80, replansMax: 2 },
     counters: { turns: 0, stalls: 0, replans: 0 },
     lessons: [],
     created: at,

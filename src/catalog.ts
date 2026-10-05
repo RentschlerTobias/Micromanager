@@ -165,3 +165,21 @@ export function followUpQuestions(items: readonly { what: string; why: string; f
   })
   return out
 }
+
+// --- N8 / N9: progress and escalation (design.md §10.2) ------------------------------------------------------
+export const PROGRESS: Record<string, Question> = {
+  making_progress: { type: "noul", instructions: "Between the two attempts the worker got closer to passing: fewer or different failures, not the same ones." },
+  in_loop: { type: "noul", instructions: "The worker keeps trying the same thing and gets the same failure; more rounds in this session will not help." },
+}
+
+// Why a task could not be finished: what decides whether the user is asked or the job replans around it.
+export const ESCALATION = {
+  spec_ambiguous: "the task or its acceptance points are unclear or contradict each other, so only the user can say what is wanted",
+  external_dependency: "it needs something outside the project: a service, a key, a package, access, or someone else's decision",
+  conflicting_review: "the reviewer and the checks disagree, or the reviewer asks for something outside the task",
+  too_hard: "the workers tried and failed; the task needs another approach or smaller steps",
+} as const
+
+export type EscalationKind = keyof typeof ESCALATION | "budget"
+
+export const ESCALATE: Question = { type: "choice", instructions: "Why could this task not be finished?", criteria: ESCALATION }

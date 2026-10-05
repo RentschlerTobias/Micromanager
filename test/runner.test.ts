@@ -86,17 +86,69 @@ test("plan -> run: tasks pass their checks one by one and land as commits on the
   assert.equal((worker.location as { directory: string }).directory, done.integrationWorktree)
 })
 
-test("a failing check gets fix rounds, then the task escalates to the user", async () => {
+test("a failing check climbs the ladder: fix rounds, a fresh session on another family, then the task is given up", async () => {
   const project = repo()
   let rounds = 0
-  const fake = fakeSession({ worker: (_dir, prompt) => { if (prompt.includes("checks of your task failed")) rounds++; return "STATUS: DONE\nFILES: none" } })
+  let n = 0
+  const fake = fakeSession({
+    // the worker changes add.js every round (no diff loop), but the check looks for a file it never writes
+    worker: (dir, prompt) => {
+      if (prompt.includes("checks of your task failed")) rounds++
+      writeFileSync(join(dir, "add.js"), `// try ${++n}\n`)
+      return "STATUS: DONE\nFILES: add.js"
+    },
+  })
+  const plan = { ...PLAN, acceptance: [{ id: "A1", text: "add.js exists", verify: "test -f other.js" }, PLAN.acceptance[1]] }
+  fake.setPlan(["```json\n" + JSON.stringify(plan) + "\n```", "no plan", "no plan"])
   const r = runner(project, fake.api, { fixRounds: 2 })
   const { job } = await r.plan("goal")
   const done = await r.run(job.id)
+  // the same failure twice is a loop without a decision model: one fix round per session
   assert.equal(rounds, 2)
+  const workers = fake.created.filter((c) => c.agent === "dictator-code").map((c) => JSON.stringify(c.model))
+  assert.equal(workers.length, 2)
+  assert.notEqual(workers[0], workers[1], "rung 2 runs on another model")
+  const t1 = done.tasks[0]!
+  assert.deepEqual([t1.status, t1.escalation?.kind], ["escalated", "too_hard"])
+  assert.ok(t1.stages.some((s) => s.stage === "escalate" && /rung 2/.test(s.evidence ?? "")))
+  // too hard as planned: the job replans around it; here the planner fails, so the user is asked
   assert.equal(done.phase, "ask_user")
-  assert.equal(done.tasks[0]!.status, "escalated")
-  assert.match(summary(done), /why: T1: checks still fail after 2 fix round\(s\): test -f add.js/)
+  assert.match(done.lessons.join("\n"), /T1 given up as planned: it kept failing the same way: test -f other.js[\s\S]*the replan failed/)
+})
+
+test("a worker that changes nothing between rounds is a loop: no more fix rounds in that session", async () => {
+  const project = repo()
+  let rounds = 0
+  const fake = fakeSession({ worker: (_dir, prompt) => { if (prompt.includes("checks of your task failed")) rounds++; return "STATUS: DONE\nFILES: none" } })
+  const r = runner(project, fake.api, { fixRounds: 5 })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(rounds, 2, "one fix round per session, then the same diff ends it")
+  assert.match(done.lessons.join("\n"), /kept failing the same way/)
+})
+
+test("the decision model types an escalation; a vague spec stops the job for the user", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: () => "STATUS: DONE\nFILES: none" })
+  const asker: Asker = {
+    ask: async (_s, questions) => ({ answers: "reason" in questions ? { reason: { type: "choice", choice: "spec_ambiguous", confidence: 0.9, probabilities: {} } } : {}, model: "fake", latencyMs: 1 }) as never,
+  }
+  const decider = new Decider({ ...DEFAULT_BACKENDS, default: "typesafe" }, { typesafe: asker }, () => {})
+  const r = runner(project, fake.api, { decider })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "ask_user")
+  assert.equal(done.tasks[0]!.escalation?.kind, "spec_ambiguous")
+  assert.match(summary(done), /why: T1 \(spec ambiguous\):/)
+})
+
+test("a used-up token budget stops the job before the next start, and skips rung 2", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles }) // every turn reports 15 tokens
+  const r = runner(project, fake.api, { budget: { tokens: 10 } })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "ask_user")
+  assert.deepEqual(done.tasks.map((t) => t.status), ["merged", "pending"])
+  assert.equal(done.counters.tokens, 15)
+  assert.match(summary(done), /why: budget: token budget of 10 used up/)
 })
 
 test("a blocked worker stops the job and says what it needs", async () => {
@@ -253,7 +305,7 @@ test("a worker stopped by the watchdog gets one fresh session with a handoff not
   const always = runner(repo(), fakeSession({ worker: writeFiles }).api, { stopped: (id: string) => (id === "ses_1" ? undefined : { kind: "steps", detail: "more than 60 steps" }) })
   const stuck = await always.run((await always.plan("goal")).job.id)
   assert.equal(stuck.tasks[0]!.status, "escalated")
-  assert.match(stuck.lessons.at(-1)!, /stopped twice by the loop watchdog/)
+  assert.match(stuck.lessons.join("\n"), /T1 given up as planned: stopped by the loop watchdog: more than 60 steps/)
 })
 
 test("a planner stopped by the watchdog gets one fresh try, then the job fails with the reason", async () => {
@@ -636,4 +688,28 @@ test("a follow-up the injection guard flags goes to later; every prompt is sent 
   assert.deepEqual(done.later?.map((l) => l.reason), ["flagged"])
   assert.ok(prompts.length > 0 && prompts.every((p) => !p.includes("sk-live")), "briefs carry <secret> instead of the key")
   assert.ok(prompts.some((p) => p.includes("<secret>")))
+})
+
+test("budget and notify settings: defaults, ceilings and bad values", async () => {
+  const { parseBudget, parseNotify, DEFAULT_BUDGET } = await import("../src/config.ts")
+  assert.deepEqual(parseBudget("{}"), DEFAULT_BUDGET)
+  assert.deepEqual(parseBudget('{"budget": {"tokens": 1e12, "cost": 3}}'), { ...DEFAULT_BUDGET, tokens: 50_000_000, cost: 3 })
+  assert.throws(() => parseBudget('{"budget": {"tokns": 5}}'), /unknown budget/)
+  assert.throws(() => parseBudget('{"budget": {"tokens": -1}}'), /positive/)
+  assert.equal(parseNotify("{}"), "jobs")
+  assert.equal(parseNotify('{"notify": "tasks"}'), "tasks")
+  assert.throws(() => parseNotify('{"notify": "loud"}'))
+})
+
+test("when the decision model sees progress, a repeated failure keeps its fix rounds", async () => {
+  const project = repo()
+  let rounds = 0
+  const fake = fakeSession({ worker: (dir, prompt) => { if (prompt.includes("checks of your task failed")) rounds++; writeFileSync(join(dir, "x.js"), `${rounds}\n`); return "STATUS: DONE\nFILES: x.js" } })
+  const asker: Asker = { ask: async (_s, q) => ({ answers: "in_loop" in q ? { in_loop: { type: "noul", noul: 0.1 }, making_progress: { type: "noul", noul: 0.8 } } : {}, model: "fake", latencyMs: 1 }) as never }
+  const decider = new Decider({ ...DEFAULT_BACKENDS, default: "typesafe" }, { typesafe: asker }, () => {})
+  const plan = { ...PLAN, acceptance: [{ id: "A1", text: "add.js exists", verify: "test -f other.js" }, PLAN.acceptance[1]] }
+  fake.setPlan(["```json\n" + JSON.stringify(plan) + "\n```"])
+  const r = runner(project, fake.api, { decider, fixRounds: 2 })
+  await r.run((await r.plan("goal")).job.id)
+  assert.equal(rounds, 4, "two fix rounds in each of the two sessions")
 })

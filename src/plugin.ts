@@ -79,7 +79,7 @@ export default {
   id: "jev-dictator",
   setup: async (ctx: Context): Promise<void> => {
     const log = logger(ctx)
-    const { notify, routing, floors, decisions, registry, error } = loadSettings()
+    const { budget, notify, routing, floors, decisions, registry, error } = loadSettings()
     if (error) log("warn", `config ignored, defaults used: ${error}`)
 
     await ctx.agent.transform((draft) => {
@@ -236,6 +236,7 @@ export default {
         },
         parentID,
         cancelled: cancel ? () => cancel.cancelled : undefined,
+        budget,
         onWorker: (sessionID, task, rules) => {
           workerTasks.set(sessionID, task)
           if (rules.length) workerRules.set(sessionID, rules)
