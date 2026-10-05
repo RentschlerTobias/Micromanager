@@ -602,6 +602,50 @@ Jev; GLiNER for G0):
 - **Routing:** with every task on one family (deepseek won every worker role here), "another family" for review
   works, but the ladder's rung 2 needs the registry to offer more than one family per tier.
 
+### omo-hybrid (2026-10-05)
+On the user's decision, the dictator moves toward oh-my-openagent: the LLM drives the flow, Jev and the plugin code
+secure each task. The fully code-driven state stays on `main`, and the day's other work on `e-open`.
+
+**What changed:**
+- **`dictator_task`** delegates one task (title, prompt, files, dependencies, priority, checks) into the session's
+  rolling job and returns at once. Tasks delegated while the job runs are picked up by the same run; independent
+  tasks run in parallel in worktrees, and the merge train brings them onto the session's branch.
+- **Each task's report** (status, checks, the worker's summary, follow-ups) goes to the dictator. Reports close
+  together arrive as one system note and one wake-up. At the end the dictator is woken for the summary; "ulw" or
+  "ultrawork" tells it to go on with its todos.
+- **A task that needs the user** waits without stopping the others; `dictator_answer` passes the answer on, also
+  while the job runs. `dictator_tasks` lists the tasks or shows one task's full report.
+- **The dictator prompt** is Sisyphus-like: split, todos, delegate in parallel, react to reports, short messages.
+  `dictator_plan` / `dictator_run` stay for large jobs.
+- **Lighter per task:**
+  - P3 only for bug fixes;
+  - a review only from risk public_api up, or without checks;
+  - the standards axis only for data or security risk.
+- **Opt-in nodes:** N9 (typing an escalation) and N10 (batch confirmation). N7's Jev request is not used for
+  delegated tasks; the dictator decides on follow-ups.
+- **Also on this branch:**
+  - routing breaks ties by the role matrix (code goes to glm, plan to qwen);
+  - N5 classifies the task without the job's goal (is_bug_fix 0.91 → 0.08 on the Phase D case);
+  - the N7 bench (`npm run bench-n7`).
+
+**Live** (private `opencode serve`, cloud only, a blog project: slugify with umlauts, readingTime, excerpt, the
+README):
+- **Run 1:**
+  - The dictator delegated four parallel tasks in 35 s, but with prose as checks, which no worker could pass.
+  - The workers said so, and the dictator recognised its own mistake from the reports and set about fixing it.
+  - Fixed after the run: checks must be shell commands; answers reach a running job; no progress messages in a
+    rolling job.
+- **Run 2:**
+  - Four parallel tasks with `npm test` as the check, all merged without a fix round (code on glm, the README on
+    deepseek). The branch's suite: 13 of 13.
+  - The dictator acknowledged each report briefly, sent a read-only reviewer over the whole branch on its own, and
+    ended with a summary and `git merge jev/<job>`.
+
+**Open:**
+- A run in the user's TUI on a real repo.
+- The dictator reaches the plugin's tools through the code-mode `execute` tool; that works, but every call costs
+  an extra turn.
+
 ## Verification
 - **Per phase: tests** with a fake Jev:
   - the FSMs refuse illegal jumps;
