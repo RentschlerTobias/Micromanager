@@ -79,7 +79,7 @@ export default {
   id: "jev-dictator",
   setup: async (ctx: Context): Promise<void> => {
     const log = logger(ctx)
-    const { budget, notify, routing, floors, decisions, registry, error } = loadSettings()
+    const { parallel, perModel, budget, notify, routing, floors, decisions, registry, error } = loadSettings()
     if (error) log("warn", `config ignored, defaults used: ${error}`)
 
     await ctx.agent.transform((draft) => {
@@ -237,6 +237,8 @@ export default {
         parentID,
         cancelled: cancel ? () => cancel.cancelled : undefined,
         budget,
+        parallel,
+        perModel,
         onWorker: (sessionID, task, rules) => {
           workerTasks.set(sessionID, task)
           if (rules.length) workerRules.set(sessionID, rules)
@@ -252,7 +254,7 @@ export default {
       })
     // The job queue: dictator_run queues, the scheduler runs in the background and the notifier reports the end.
     const scheduler = new Scheduler({
-      run: (id, cancel) => runner(loadJob(project, id)?.facilitator, id, cancel).run(id),
+      run: (id, cancel, note) => runner(loadJob(project, id)?.facilitator, id, cancel).run(id, note),
       finished: (job, session) => void notifier.finished(session ?? job.facilitator, job.id, ending(job), summary(job)),
       failed: (id, session, err) => {
         log("error", `job ${id} failed: ${String(err)}`)
@@ -308,7 +310,7 @@ export default {
             return out.kind === "plan" ? planText(out.job) : out.text
           },
           questions: async (job, tree, tctx) => runner(tctx.sessionID).questions(job.trim(), tree),
-          run: async (id, tctx) => {
+          run: async (id, note, tctx) => {
             const job = loadJob(project, id.trim())
             if (!job) return `no job ${id.trim()}`
             const ready = job.phase === "plan_gate" || job.phase === "execute" || ((job.phase === "paused" || job.phase === "ask_user") && job.resumePhase === "execute")
@@ -317,7 +319,7 @@ export default {
               job.facilitator = tctx.sessionID
               saveJob(project, job)
             }
-            const place = scheduler.enqueue(job.id, job.facilitator ?? tctx.sessionID)
+            const place = scheduler.enqueue(job.id, job.facilitator ?? tctx.sessionID, note.trim() || undefined)
             return place === 0
               ? `job ${job.id} runs now in the background. Updates arrive as [jev-dictator] notes; tell the user and end your turn.`
               : `job ${job.id} is queued at place ${place}; it starts when the jobs before it end. Tell the user and end your turn.`

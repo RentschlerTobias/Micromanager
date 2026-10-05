@@ -116,7 +116,21 @@ export function parseBudget(text: string): Budget {
   return out
 }
 
+// "parallel": tasks of one job at the same time (default 3, at most 6); 1 runs them one after another.
+// "perModel": sessions of one cloud model at the same time (default 2, at most 4); a local model serves one.
+export function parseParallel(text: string): { parallel: number; perModel: number } {
+  const raw = JSON.parse(stripComments(text)) as { parallel?: unknown; perModel?: unknown }
+  const int = (v: unknown, name: string, def: number, max: number) => {
+    if (v === undefined) return def
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Error(`${name} must be a whole number from 1`)
+    return Math.min(v, max)
+  }
+  return { parallel: int(raw.parallel, "parallel", 3, 6), perModel: int(raw.perModel, "perModel", 2, 4) }
+}
+
 export interface Settings {
+  readonly parallel: number
+  readonly perModel: number
   readonly budget: Budget
   readonly notify: NotifyMode
   readonly routing: Routing
@@ -130,11 +144,11 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
+    return { parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
+    return { ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
   } catch (err) {
-    return { budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
+    return { parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }
 }

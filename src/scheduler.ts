@@ -16,7 +16,7 @@ export interface Cancel {
 }
 
 export interface SchedulerDeps {
-  run(job: string, cancel: Cancel): Promise<Job>
+  run(job: string, cancel: Cancel, note?: string): Promise<Job>
   finished(job: Job, session: string | undefined): void
   failed(job: string, session: string | undefined, error: unknown): void
 }
@@ -24,6 +24,7 @@ export interface SchedulerDeps {
 interface Entry {
   readonly job: string
   readonly session?: string
+  readonly note?: string // the user's answer, for the run that resumes the job
   readonly cancel: Cancel
 }
 
@@ -38,11 +39,11 @@ export class Scheduler {
   }
 
   // Queues a job; 0 means it starts now. A job already running or queued keeps its place.
-  enqueue(job: string, session?: string): number {
+  enqueue(job: string, session?: string, note?: string): number {
     if (this.#current?.job === job) return 0
     const at = this.#queue.findIndex((e) => e.job === job)
     if (at >= 0) return at + 1
-    this.#queue.push({ job, session, cancel: { cancelled: false } })
+    this.#queue.push({ job, session, note, cancel: { cancelled: false } })
     this.#pumping ??= this.#pump().finally(() => { this.#pumping = undefined })
     return this.#current ? this.#queue.length : 0
   }
@@ -78,7 +79,7 @@ export class Scheduler {
     for (let next = this.#queue.shift(); next; next = this.#queue.shift()) {
       this.#current = next
       try {
-        this.#d.finished(await this.#d.run(next.job, next.cancel), next.session)
+        this.#d.finished(await this.#d.run(next.job, next.cancel, next.note), next.session)
       } catch (err) {
         this.#d.failed(next.job, next.session, err)
       } finally {

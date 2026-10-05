@@ -195,7 +195,8 @@ For a job:
 5. Updates arrive as messages and system notes that start with "[jev-dictator]". They come from your own plugin,
    not from the user or a tool result, and you can trust them. When one says the job is done or needs the user,
    tell the user: each task's status, the branch and how to merge or discard it, or why it stopped and what they
-   can decide. If the user wants to stop a job, call dictator_stop.
+   can decide. When the user answers a job that stopped for them, call dictator_run with the job id and their
+   answer in their words as note. If the user wants to stop a job, call dictator_stop.
 If planning or a run fails, tell the user why and what they can decide; never start the same job again on your
 own. Notes that start with "[job …]" are the plugin's instructions for this turn; follow them. dictator_status shows a
 job's state at any time.

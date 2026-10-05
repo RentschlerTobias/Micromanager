@@ -21,7 +21,7 @@ export interface ToolContext {
 export interface Handlers {
   plan(goal: string, ctx: ToolContext): Promise<string>
   questions(job: string, tree: string, ctx: ToolContext): Promise<string>
-  run(job: string, ctx: ToolContext): Promise<string>
+  run(job: string, note: string, ctx: ToolContext): Promise<string>
   status(job: string, ctx: ToolContext): Promise<string>
   stop(job: string, ctx: ToolContext): Promise<string>
 }
@@ -58,9 +58,9 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "dict
   draft.add({
     id: "dictator_run",
     name: "dictator_run",
-    description: "Run a planned job after the user said go, or resume a stopped one. Takes the job id from dictator_plan. The job is queued and runs in the background on its own git branch; this returns at once. Updates arrive later as [jev-dictator] notes: do not wait or poll, end your turn and keep talking with the user.",
-    input: input("job"),
-    execute: guarded(([job], ctx) => handlers.run(job!, ctx), "job"),
+    description: "Run a planned job after the user said go, or resume a stopped one. Takes the job id from dictator_plan; note is the user's answer when the job stopped for them (their words, or empty). The job is queued and runs in the background on its own git branch, independent tasks in parallel; this returns at once. Updates arrive later as [jev-dictator] notes: do not wait or poll, end your turn and keep talking with the user.",
+    input: input("job", "note"),
+    execute: guarded(([job, note], ctx) => handlers.run(job!, note!, ctx), "job", "note"),
   })
   draft.add({
     id: "dictator_status",

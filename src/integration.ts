@@ -104,3 +104,47 @@ export async function revertFiles(worktree: string, files: readonly string[], ru
     if (restored.code !== 0) await run("git", ["clean", "-q", "-f", "--", f], { cwd: worktree })
   }
 }
+
+// --- Phase F: parallel writers and the merge train (design.md §11) ------------------------------------------
+
+export interface TaskWorktree {
+  readonly branch: string
+  readonly worktree: string
+}
+
+// A task of a parallel batch works in its own worktree, on a branch off the job's branch at its current commit.
+// "jev/<job>--<task>", since "jev/<job>/<task>" cannot sit next to the branch "jev/<job>" in git's refs.
+export async function prepareTaskWorktree(project: string, jobId: string, taskId: string, from: string, run: Exec = exec): Promise<TaskWorktree> {
+  const branch = `jev/${jobId}--${taskId}`
+  const worktree = join(project, DIR, "worktrees", `${jobId}--${taskId}`)
+  await removeTaskWorktree(project, { branch, worktree }, run) // a leftover of an interrupted run
+  const added = await run("git", ["worktree", "add", "-q", "-b", branch, worktree, from], { cwd: project })
+  if (added.code !== 0) throw new IntegrationError(`git worktree add failed: ${added.stderr.trim()}`)
+  return { branch, worktree }
+}
+
+export async function removeTaskWorktree(project: string, w: TaskWorktree, run: Exec = exec): Promise<void> {
+  await run("git", ["worktree", "remove", "--force", w.worktree], { cwd: project })
+  await run("git", ["branch", "-D", w.branch], { cwd: project })
+}
+
+export type TrainStep = { readonly ok: true; readonly moved: boolean } | { readonly ok: false; readonly conflict: string }
+
+// The first half of a merge train step: the task's branch is rebased onto the job's branch when that moved on since
+// the task started. moved tells the caller to run the task's checks again before the fast-forward.
+export async function rebaseTask(w: TaskWorktree, integrationBranch: string, run: Exec = exec): Promise<TrainStep> {
+  const base = (await run("git", ["merge-base", "HEAD", integrationBranch], { cwd: w.worktree })).stdout.trim()
+  const tip = (await run("git", ["rev-parse", integrationBranch], { cwd: w.worktree })).stdout.trim()
+  if (base === tip) return { ok: true, moved: false }
+  const rebased = await run("git", ["-c", "user.name=jev-dictator", "-c", "user.email=jev-dictator@localhost", "rebase", "-q", integrationBranch], { cwd: w.worktree })
+  if (rebased.code === 0) return { ok: true, moved: true }
+  const files = (await run("git", ["diff", "--name-only", "--diff-filter=U"], { cwd: w.worktree })).stdout.trim().split("\n").filter(Boolean)
+  await run("git", ["rebase", "--abort"], { cwd: w.worktree })
+  return { ok: false, conflict: files.length ? `conflict in ${files.join(", ")}` : rebased.stderr.trim().slice(-500) }
+}
+
+// The second half: the job's branch moves forward to the task's commits; nothing else is ever merged into it.
+export async function fastForward(integrationWorktree: string, taskBranch: string, run: Exec = exec): Promise<TrainStep> {
+  const ff = await run("git", ["merge", "-q", "--ff-only", taskBranch], { cwd: integrationWorktree })
+  return ff.code === 0 ? { ok: true, moved: false } : { ok: false, conflict: ff.stderr.trim().slice(-500) }
+}

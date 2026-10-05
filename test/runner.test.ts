@@ -146,7 +146,7 @@ test("a used-up token budget stops the job before the next start, and skips rung
   const r = runner(project, fake.api, { budget: { tokens: 10 } })
   const done = await r.run((await r.plan("goal")).job.id)
   assert.equal(done.phase, "ask_user")
-  assert.deepEqual(done.tasks.map((t) => t.status), ["merged", "pending"])
+  assert.deepEqual(done.tasks.map((t) => t.status), ["merged", "ready"])
   assert.equal(done.counters.tokens, 15)
   assert.match(summary(done), /why: budget: token budget of 10 used up/)
 })
@@ -796,4 +796,124 @@ test("a refusal in a job the gate flagged as possibly harmful goes straight to t
   const done = await r.run(job.id)
   assert.equal(fake.created.filter((c) => c.agent === "dictator-code").length, 1, "no reroute")
   assert.equal(done.tasks[0]!.escalation?.kind, "refused")
+})
+
+// --- Phase F: parallel tasks, worktrees and the merge train ----------------------------------------------------
+
+const PARALLEL_PLAN = {
+  acceptance: [
+    { id: "A1", text: "a.js", verify: "test -f a.js" },
+    { id: "A2", text: "b.js", verify: "test -f b.js" },
+    { id: "A3", text: "c.js", verify: "test -f a.js && test -f b.js && test -f c.js" },
+  ],
+  tasks: [
+    { id: "T1", title: "write a", description: "", role: "code", acceptance: ["A1"], dependsOn: [], files: ["a.js"] },
+    { id: "T2", title: "write b", description: "", role: "code", acceptance: ["A2"], dependsOn: [], files: ["b.js"] },
+    { id: "T3", title: "write c", description: "", role: "code", acceptance: ["A3"], dependsOn: ["T1", "T2"], files: ["c.js"] },
+  ],
+}
+
+// A fake whose workers finish only when the test lets them, to see what runs at the same time.
+function parallelFake(write: (dir: string, task: string) => void) {
+  const live = new Set<string>()
+  let most = 0
+  const fake = fakeSession({
+    plan: ["```json\n" + JSON.stringify(PARALLEL_PLAN) + "\n```"],
+    worker: (dir, prompt) => {
+      const task = prompt.match(/task (T\d)\b/)?.[1] ?? "?"
+      write(dir, task)
+      return "STATUS: DONE\nFILES: x"
+    },
+  })
+  const wait = fake.api.wait
+  fake.api.wait = async (args) => {
+    live.add(args.sessionID)
+    most = Math.max(most, live.size)
+    await new Promise((r) => setTimeout(r, 30))
+    live.delete(args.sessionID)
+    return wait(args)
+  }
+  return { fake, most: () => most }
+}
+
+test("parallel: independent tasks run at the same time in their own worktrees and merge one by one", async () => {
+  const project = repo()
+  const dirs: Record<string, string> = {}
+  const { fake, most } = parallelFake((dir, task) => {
+    dirs[task] = dir
+    writeFileSync(join(dir, `${task === "T1" ? "a" : task === "T2" ? "b" : "c"}.js`), `// ${task}\n`)
+  })
+  const r = runner(project, fake.api, { parallel: 3, policies: { global: { "N5.model": "fixed:opencode-go/deepseek-v4.1-flash" } } })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.equal(most(), 2, "T1 and T2 at the same time, T3 after both")
+  assert.notEqual(dirs.T1, dirs.T2)
+  assert.ok(dirs.T1!.endsWith("--T1") && dirs.T2!.endsWith("--T2"), "each in its own worktree")
+  const log = execFileSync("git", ["-C", project, "log", "--format=%s", done.integrationBranch!]).toString().trim().split("\n")
+  assert.equal(log.length, 4)
+  assert.deepEqual(new Set(log.slice(1, 3)), new Set(["T1: write a", "T2: write b"]))
+  assert.equal(log[0], "T3: write c")
+  assert.equal(existsSync(dirs.T1!), false, "task worktrees are removed after the merge")
+  assert.match(execFileSync("git", ["-C", project, "branch"]).toString(), /^(?![\s\S]*--T)/, "and their branches")
+})
+
+test("parallel: a task that changed a file outside its scope conflicts once, starts again from the newest commit, then merges", async () => {
+  const project = repo()
+  let t2Runs = 0
+  const { fake } = parallelFake((dir, task) => {
+    if (task === "T1") writeFileSync(join(dir, "a.js"), "// T1\n")
+    if (task === "T1") writeFileSync(join(dir, "shared.js"), "// from T1\n")
+    if (task === "T2") {
+      t2Runs++
+      writeFileSync(join(dir, "b.js"), "// T2\n")
+      if (t2Runs === 1) writeFileSync(join(dir, "shared.js"), "// from T2\n") // outside its files: conflicts with T1
+    }
+    if (task === "T3") writeFileSync(join(dir, "c.js"), "// T3\n")
+  })
+  const r = runner(project, fake.api, { parallel: 3 })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  const conflicted = done.tasks.find((t) => t.conflicts === 1)!
+  assert.ok(conflicted, "one of the two conflicted")
+  assert.ok(conflicted.stages.some((s) => s.stage === "merge" && s.result === "fail" && /shared.js/.test(s.evidence ?? "")))
+  assert.match(done.lessons.join("\n"), /did not merge \(conflict in shared.js\); it starts again from the newest commit/)
+})
+
+test("parallel: tasks on one local model take turns", async () => {
+  const write = (dir: string, task: string) => writeFileSync(join(dir, `${task === "T1" ? "a" : task === "T2" ? "b" : "c"}.js`), "x\n")
+  const local = parallelFake(write)
+  const r = runner(repo(), local.fake.api, { parallel: 3, policies: { global: { "N5.model": "fixed:llamaswap/ornith-u-s" } } })
+  assert.equal((await r.run((await r.plan("goal")).job.id)).phase, "integrate")
+  assert.equal(local.most(), 1)
+})
+
+test("parallel: the decision model can hold a task back from a batch", async () => {
+  const project = repo()
+  const { fake, most } = parallelFake((dir, task) => writeFileSync(join(dir, `${task === "T1" ? "a" : task === "T2" ? "b" : "c"}.js`), "x\n"))
+  const asker: Asker = { ask: async (_s, q) => ({ answers: Object.fromEntries(Object.keys(q).filter((k) => k.startsWith("independent.")).map((k) => [k, { type: "noul", noul: 0.1 }])), model: "fake", latencyMs: 1 }) as never }
+  const decider = new Decider({ ...DEFAULT_BACKENDS, default: "typesafe" }, { typesafe: asker }, () => {})
+  const r = runner(project, fake.api, { parallel: 3, decider })
+  const done = await r.run((await r.plan("goal")).job.id)
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.equal(most(), 1, "held back: one at a time")
+})
+
+test("a blocked task starts again after the user's answer, which reaches its brief", async () => {
+  const project = repo()
+  const prompts: string[] = []
+  let first = true
+  const fake = fakeSession({
+    worker: (dir, prompt) => {
+      prompts.push(prompt)
+      if (first) { first = false; return "STATUS: NEEDS_CONTEXT\nFILES: none\nOPEN: which file name?" }
+      return writeFiles(dir, prompt)
+    },
+  })
+  const r = runner(project, fake.api)
+  const { job } = await r.plan("goal")
+  const stopped = await r.run(job.id)
+  assert.equal(stopped.tasks[0]!.status, "blocked")
+  const done = await r.run(job.id, "use add.js")
+  assert.equal(done.phase, "integrate", summary(done))
+  assert.match(prompts.at(-2)!, /Decisions that apply: use add.js/)
 })

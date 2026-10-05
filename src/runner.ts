@@ -10,12 +10,15 @@ import { Decider, RulesBackend } from "./backends.ts"
 import { createHash } from "node:crypto"
 
 import {
-  ANSWER, CHOICE_FLOOR, complexityOf, ESCALATE, ESCALATION, followUpQuestions, NOUL_FLOOR, nextQuestionChoice, PROGRESS, splitQuestions, TRIAGE,
+  ANSWER, batchQuestions, CHOICE_FLOOR, complexityOf, ESCALATE, ESCALATION, followUpQuestions, NOUL_FLOOR, nextQuestionChoice, PROGRESS, splitQuestions, TRIAGE,
   type EscalationKind,
 } from "./catalog.ts"
 import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, injected, injectionScore, type Unchecked } from "./gate.ts"
 import { brief, fixPrompt, handoffText, lastAssistantText, parseReport, refused, skillLine, taskAcceptance, usage } from "./brief.ts"
-import { changedFiles, commitTask, exec as defaultExec, hashFiles, prepareIntegration, revertFiles, runGate, workingDiff, type Exec, type GateResult } from "./integration.ts"
+import {
+  changedFiles, commitTask, exec as defaultExec, fastForward, hashFiles, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, revertFiles,
+  runGate, workingDiff, type Exec, type GateResult,
+} from "./integration.ts"
 import { redact } from "./jev.ts"
 import { record } from "./journal.ts"
 import { HEADER } from "./hooks.ts"
@@ -35,7 +38,7 @@ import {
   addNodes, applyAnswer, applyShortcut, decisionsText, frontier, instruction, matchSessionShortcut, nextStep, parseTree, settle,
   type AnswerReading, type DesignTree, type Step,
 } from "./session.ts"
-import { discoveredCap, isDone, moveJob, moveTask, newJob, promoteReady, stage, type FollowUp, type Job, type JobPhase, type Later, type Task } from "./state.ts"
+import { discoveredCap, isDone, parallelSafe, moveJob, moveTask, newJob, promoteReady, stage, type FollowUp, type Job, type JobPhase, type Later, type Task } from "./state.ts"
 import { skillsFor, type Stage } from "./skills.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
 import { handoffNote, TIER_STEPS, TIER_TOKENS, type Signal } from "./watchdog.ts"
@@ -71,6 +74,8 @@ export interface RunnerDeps {
   readonly installedSkills?: ReadonlySet<string> // the skills a brief may name: linked into OpenCode by install.sh
   readonly cancelled?: () => boolean // the user stopped the job (dictator_stop); checked around every session turn
   readonly budget?: { tokens?: number; requests?: number; cost?: number } // per job, from the config (design.md §10.2)
+  readonly parallel?: number // tasks of a job at the same time (Phase F); 1 runs them one after another in the job's worktree
+  readonly perModel?: number // sessions of one cloud model at the same time; a local model serves one at a time
 }
 
 // Thrown out of a session turn when the user stopped the job; run() pauses the job, and the next run resumes it.
@@ -108,6 +113,9 @@ export class Runner {
   #job?: Job // the job this runner works on; its counters take every session's usage
   readonly #seen = new Map<string, { tokens: number; cost: number; requests: number }>() // usage per session so far
   readonly #tokenCaps = new Map<string, number>() // N5's budget tier per worker session
+  readonly #sessionModel = new Map<string, string>() // for the per-model limit
+  readonly #slots = new Map<string, { used: number; waiting: (() => void)[] }>()
+  #train: Promise<void> = Promise.resolve() // the merge train: one task's branch at a time
 
   constructor(deps: RunnerDeps) {
     this.#d = deps
@@ -152,18 +160,21 @@ export class Runner {
 
   async #ask(sessionID: string, text: string): Promise<{ text: string; timedOut: boolean; stopped?: Signal }> {
     if (this.#d.cancelled?.()) throw new Cancelled()
-    // Briefs, handoff notes, check output and review diffs may quote a key; no model needs one (E2b).
-    await this.#d.session.prompt({ sessionID, text: redact(text) })
+    const model = this.#sessionModel.get(sessionID)
+    const release = model ? await this.#acquire(model) : () => {}
     const timeoutMs = this.#d.workerTimeoutMs ?? 20 * 60_000
     let timer: ReturnType<typeof setTimeout> | undefined
     let timedOut: boolean
     try {
+      // Briefs, handoff notes, check output and review diffs may quote a key; no model needs one (E2b).
+      await this.#d.session.prompt({ sessionID, text: redact(text) })
       timedOut = await Promise.race([
         this.#d.session.wait({ sessionID }).then(() => false),
         new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), timeoutMs) }),
       ])
     } finally {
       clearTimeout(timer) // also when wait() fails, or the timer keeps the process alive for the whole timeout
+      release()
     }
     if (timedOut) await this.#d.session.interrupt({ sessionID }).catch(() => undefined)
     if (this.#d.cancelled?.()) throw new Cancelled()
@@ -172,6 +183,19 @@ export class Runner {
     const cap = this.#tokenCaps.get(sessionID)
     const stopped = this.#d.stopped?.(sessionID) ?? (cap && used.tokens > cap ? { kind: "tokens" as const, detail: `${used.tokens} tokens in one session, over the task's ${cap}` } : undefined)
     return { text: lastAssistantText(messages), timedOut, stopped }
+  }
+
+  // A turn on a model waits for a free slot: 2 sessions per cloud model, 1 per local one (design.md §11).
+  async #acquire(model: string): Promise<() => void> {
+    const cap = this.#d.registry.find((m) => m.id === model)?.location === "local" ? 1 : (this.#d.perModel ?? 2)
+    const slot = this.#slots.get(model) ?? { used: 0, waiting: [] }
+    this.#slots.set(model, slot)
+    while (slot.used >= cap) await new Promise<void>((resolve) => slot.waiting.push(resolve))
+    slot.used++
+    return () => {
+      slot.used--
+      slot.waiting.shift()?.()
+    }
   }
 
   // A session's usage so far; what is new since the last turn goes to the job's counters.
@@ -453,7 +477,9 @@ export class Runner {
   }
 
   // The user said go: work the plan on the job's branch until it is done or needs the user.
-  async run(id: string): Promise<Job> {
+  // note: the user's answer when the job stopped for them; it becomes a decision every later brief carries, and a
+  // blocked task starts again with it.
+  async run(id: string, note?: string): Promise<Job> {
     const job = loadJob(this.#d.project, id)
     if (!job) throw new Error(`no job ${id}`)
     if (job.phase === "plan_gate") moveJob(job, "execute")
@@ -461,8 +487,10 @@ export class Runner {
     else if (job.phase === "ask_user" && job.resumePhase === "execute") {
       // Running the job again after "confirm Tn before it runs" is the user's go for those tasks.
       for (const t of job.tasks) if (t.confirmed === false) t.confirmed = true
+      for (const t of job.tasks) if (t.status === "blocked") moveTask(t, "pending")
       moveJob(job, "execute")
     }
+    if (note?.trim()) job.decisions.push({ id: `U${job.decisions.length + 1}`, text: note.trim(), origin: "user" })
     if (job.phase !== "execute") throw new Error(`job ${id} is in phase ${job.phase}, not ready to run`)
     this.#job = job
     job.budget.tokensMax ??= this.#d.budget?.tokens
@@ -475,36 +503,150 @@ export class Runner {
       this.#say(`working on branch ${integration.branch}`)
     } else await this.#reconcile(job)
     saveJob(this.#d.project, job)
+    // Tasks run as promises; with parallel 1 one at a time, as before Phase F. A task that stops the job lets the
+    // others finish what they are doing; a stop by the user cuts them all.
+    const running = new Map<string, Promise<void>>()
+    let cancelled = false
+    let failure: unknown
+    const start = (task: Task) => {
+      const p = this.#dispatch(job, task)
+        .catch((err: unknown) => { if (err instanceof Cancelled) cancelled = true; else failure ??= err })
+        .finally(() => { running.delete(task.id); saveJob(this.#d.project, job) })
+      running.set(task.id, p)
+    }
+    const settle = () => Promise.race(running.values())
     try {
-      while (job.phase === "execute") {
+      for (;;) {
+        if (failure) throw failure
+        if (cancelled || job.phase !== "execute") {
+          if (running.size) await settle()
+          else break
+          continue
+        }
+        promoteReady(job)
+        const agenda = buildAgenda(job).filter((p) => !p.taskId || !running.has(p.taskId))
+        const next = nextProposal(agenda)
+        if (!next || (next.action !== "dispatch" && running.size)) {
+          // verify, replan and asking the user wait until every running task has finished
+          if (running.size) await settle()
+          else break
+          continue
+        }
         if (++job.counters.turns > job.budget.turnsMax) {
           this.#stop(job, `turn budget of ${job.budget.turnsMax} used up`)
-          break
+          continue
         }
         const over = this.#overBudget(job)
         if (over) {
           this.#stop(job, `budget: ${over}; raise it in the config or with a pin, then run the job again`)
-          break
+          continue
         }
-        promoteReady(job)
-        const next = nextProposal(buildAgenda(job))
-        if (!next) break
-        if (next.action === "dispatch" && next.taskId) await this.#runTask(job, job.tasks.find((t) => t.id === next.taskId)!)
-        else if (next.action === "verify") await this.#verify(job)
+        if (next.action === "dispatch") {
+          const batch = await this.#batch(job, agenda, running)
+          if (batch.length === 0) await settle()
+          for (const t of batch) start(t)
+          if ((this.#d.parallel ?? 1) <= 1) while (running.size) await settle()
+        } else if (next.action === "verify") await this.#verify(job)
         else if (next.action === "replan") await this.#replan(job)
         else this.#stop(job, next.label)
         saveJob(this.#d.project, job)
       }
+      if (failure) throw failure
+      if (cancelled) throw new Cancelled()
     } catch (err) {
       if (!(err instanceof Cancelled)) throw err
-      // The task in progress is cut; the next run's reconcile starts it again from the last commit.
+      // The tasks in progress are cut; the next run's reconcile starts them again from the last commit.
       if ((job.phase as JobPhase) === "replan") moveJob(job, "execute")
       job.lessons.push("stopped by the user")
-      moveJob(job, "paused")
+      const phase = job.phase as JobPhase
+      if (phase === "ask_user") moveJob(job, job.resumePhase ?? "execute") // a task had stopped it: pause the run itself
+      if ((job.phase as JobPhase) !== "paused") moveJob(job, "paused")
       this.#say("stopped by the user; run the job again to resume")
     }
     saveJob(this.#d.project, job)
     return job
+  }
+
+  // The next ready tasks that may run next to the running ones: disjoint files, within the job's limit. Two or more
+  // new ones are a batch the decision model confirms (N10); one it doubts waits for a later batch.
+  async #batch(job: Job, agenda: readonly { action: string; taskId?: string }[], running: ReadonlyMap<string, unknown>): Promise<Task[]> {
+    const limit = Math.max(1, this.#d.parallel ?? 1)
+    const busy = job.tasks.filter((t) => running.has(t.id))
+    const batch: Task[] = []
+    for (const p of agenda) {
+      if (p.action !== "dispatch" || !p.taskId || busy.length + batch.length >= limit) continue
+      const t = job.tasks.find((x) => x.id === p.taskId)!
+      if ([...busy, ...batch].every((o) => parallelSafe(o, t))) batch.push(t)
+    }
+    if (batch.length + busy.length < 2 || batch.length === 0) return batch
+    const all = [...busy, ...batch]
+    const others = (id: string) => all.filter((t) => t.id !== id).map((t) => `${t.id} ("${t.title}")`).join(", ")
+    const asked = await this.#decider.ask("N10", { goal: job.goal, tasks: all.map((t) => `${t.id} ${t.title}: ${t.description.slice(0, 300)} (files: ${t.files.join(", ") || "none"})`) }, batchQuestions(batch, others), { localOnly: job.flags?.localOnly, job: job.id })
+    const a = asked.decision.answers
+    // The first new task always goes when nothing runs; the others need the model's yes when it answered.
+    const kept = batch.filter((t, i) => {
+      const p = a[`independent.${t.id}`]
+      return (i === 0 && busy.length === 0) || p?.type !== "noul" || p.noul >= NOUL_FLOOR
+    })
+    if (kept.length > 1 || busy.length) this.#say(`starting ${kept.map((t) => t.id).join(", ")} in parallel${busy.length ? ` with ${busy.map((t) => t.id).join(", ")}` : ""}`)
+    return kept
+  }
+
+  // One task: in the job's worktree when tasks run one at a time, else in its own worktree, then the merge train.
+  async #dispatch(job: Job, task: Task): Promise<void> {
+    if ((this.#d.parallel ?? 1) <= 1) return this.#runTask(job, task)
+    const w = await prepareTaskWorktree(this.#d.project, job.id, task.id, job.integrationBranch!, this.#exec)
+    task.worktree = w.worktree
+    task.branch = w.branch
+    try {
+      await this.#runTask(job, task)
+      if (task.status === "passed") {
+        const step = this.#train.then(() => this.#merge(job, task))
+        this.#train = step.catch(() => undefined)
+        await step
+      }
+    } finally {
+      if (task.worktree && task.status !== "blocked") await this.#dropWorktree(task)
+    }
+  }
+
+  async #dropWorktree(task: Task): Promise<void> {
+    if (!task.worktree || !task.branch) return
+    await removeTaskWorktree(this.#d.project, { worktree: task.worktree, branch: task.branch }, this.#exec)
+    task.worktree = undefined
+    task.branch = undefined
+  }
+
+  // The merge train (design.md §11): rebase onto the job's branch, the task's checks again when that moved, then a
+  // fast-forward. A conflict sends the task back to start again from the newest commit once; the second goes to the
+  // user.
+  async #merge(job: Job, task: Task): Promise<void> {
+    const w = { worktree: task.worktree!, branch: task.branch! }
+    let step = await rebaseTask(w, job.integrationBranch!, this.#exec)
+    if (step.ok && step.moved) {
+      const checks = [...new Set(taskAcceptance(job, task).map((a) => a.verify).filter((v): v is string => Boolean(v)))]
+      const failed = (await runGate(w.worktree, checks, this.#exec)).filter((r) => !r.passed)
+      if (failed.length) step = { ok: false, conflict: `checks fail on top of the newer commits: ${failed.map((f) => f.command).join(", ")}` }
+    }
+    if (step.ok) step = await fastForward(job.integrationWorktree!, w.branch, this.#exec)
+    if (step.ok) {
+      moveTask(task, "merged")
+      stage(task, "merge", "pass", `merged into ${job.integrationBranch}`)
+      this.#say(`${task.id} merged into ${job.integrationBranch}`, true)
+      await this.#dropWorktree(task)
+      await this.#discover(job, task)
+      return
+    }
+    task.conflicts = (task.conflicts ?? 0) + 1
+    stage(task, "merge", "fail", step.conflict)
+    await this.#dropWorktree(task)
+    if (task.conflicts === 1) {
+      moveTask(task, "pending")
+      job.lessons.push(`${task.id} did not merge (${step.conflict}); it starts again from the newest commit`)
+      this.#say(`${task.id}: ${step.conflict}; it starts again from the newest commit`)
+      return
+    }
+    await this.#escalate(job, task, `it did not merge twice: ${step.conflict}`, "", "merge_conflict")
   }
 
   // A run that ended in the middle of a task (the server stopped, a crash) leaves it running with half a change in
@@ -517,8 +659,10 @@ export class Runner {
       gating: ["escalated", "pending"],
       reviewing: ["fixing", "escalated", "pending"],
       fixing: ["escalated", "pending"],
+      passed: ["pending"], // passed in its own worktree, but the train had not merged it yet
     }
     const cut = job.tasks.filter((t) => PATH[t.status])
+    for (const t of cut) await this.#dropWorktree(t)
     if (cut.length === 0) return
     for (const t of cut) {
       for (const to of PATH[t.status]!) moveTask(t, to)
@@ -532,13 +676,14 @@ export class Runner {
 
   #stop(job: Job, reason: string): void {
     job.lessons.push(reason)
-    moveJob(job, "ask_user")
+    // A parallel task may stop a job another task already stopped; the job keeps the phase it returns to.
+    if (job.phase !== "ask_user" && job.phase !== "paused") moveJob(job, "ask_user")
     this.#say(`stopped: ${reason}`)
   }
 
   async #runTask(job: Job, task: Task): Promise<void> {
     if (job.budget.workersUsed >= job.budget.workersMax) return this.#stop(job, `worker budget of ${job.budget.workersMax} used up`)
-    const worktree = job.integrationWorktree!
+    const worktree = this.#dir(job, task)
     const profile = task.profile ?? (await this.#classify(job, task))
     if (profile.injection) {
       moveTask(task, "blocked")
@@ -601,8 +746,9 @@ export class Runner {
     task.summary = work.answer.text.slice(-500)
     const outside = (await changedFiles(worktree, this.#exec)).filter((f) => task.files.length > 0 && !task.files.includes(f) && !frozen.has(f))
     const commit = await commitTask(worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${work.model.id} (${task.role}), pipeline ${pipeline.id}${outside.length ? `\nOutside the declared files: ${outside.join(", ")}` : ""}`, this.#exec)
-    moveTask(task, "merged")
     job.counters.stalls = Math.max(0, job.counters.stalls - 1)
+    if (task.worktree) return this.#say(`${task.id} passed${commit ? ` (${commit})` : ", nothing to commit"}; waiting for the merge train`)
+    moveTask(task, "merged")
     this.#say(`${task.id} passed${commit ? ` (${commit})` : ", nothing to commit"}`, true)
     await this.#discover(job, task)
   }
@@ -727,7 +873,7 @@ export class Runner {
   // Worker turns until the task's checks pass: the watchdog's stops, the report, the gate, at most fixRounds fixes,
   // then the N9 ladder. Returns undefined when the task went to the user or was given up (escalated or blocked).
   async #untilGreen(job: Job, task: Task, work: Work, checks: readonly string[], frozen: ReadonlyMap<string, string>): Promise<Work | undefined> {
-    const worktree = job.integrationWorktree!
+    const worktree = this.#dir(job, task)
     let lastDiff: string | undefined
     let lastFailure: string | undefined
     for (;;) {
@@ -826,7 +972,7 @@ export class Runner {
     stage(task, "escalate", "skip", `rung 2: fresh session on ${model.id} after: ${reason}`)
     this.#say(`${task.id}: ${reason}; fresh session on ${model.id}`)
     const s = await this.#workerSession(job, task, model.id)
-    const worktree = job.integrationWorktree!
+    const worktree = this.#dir(job, task)
     const text = [
       brief(job, task, model.id, worktree, this.#skills("implement", task)),
       frozen.size ? greenNote([...frozen.keys()]) : "",
@@ -839,7 +985,7 @@ export class Runner {
   // frozen test files with their hashes (empty: no red could be shown, the task goes on as P2), or undefined when
   // the task went to the user.
   async #red(job: Job, task: Task, checks: readonly string[]): Promise<Map<string, string> | undefined> {
-    const worktree = job.integrationWorktree!
+    const worktree = this.#dir(job, task)
     const model = await this.#model(job, "test", task.profile?.difficulty ?? 0.5, task.id)
     const s = await this.#workerSession(job, task, model.id, "test")
     const testFiles = task.files.filter((f) => TEST_FILE.test(f))
@@ -874,7 +1020,7 @@ export class Runner {
   // they saw outside the task becomes a follow-up. A reviewer whose answer is not JSON after one reminder blocks
   // nothing.
   async #review(job: Job, task: Task, workerModel: string): Promise<Review> {
-    const worktree = job.integrationWorktree!
+    const worktree = this.#dir(job, task)
     const diff = await workingDiff(worktree, this.#exec)
     const worker = this.#family(workerModel)
     const specModel = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [worker], task.profile?.vision)
@@ -906,7 +1052,7 @@ export class Runner {
 
   // P9: parallel readers, one synthesis written to docs/research/, and a citation check by code.
   async #research(job: Job, task: Task, model: string): Promise<void> {
-    const worktree = job.integrationWorktree!
+    const worktree = this.#dir(job, task)
     const n = readerCount(task.profile?.difficulty ?? 0.5)
     const read = async (i: number) => {
       const s = await this.#workerSession(job, task, model, "research")
@@ -960,6 +1106,11 @@ export class Runner {
     this.#say(`${task.id} researched${commit ? ` (${commit})` : ""}: ${path}`, true)
   }
 
+  // Where a task works: its own worktree in a parallel batch, else the job's.
+  #dir(job: Job, task: Task): string {
+    return task.worktree ?? job.integrationWorktree!
+  }
+
   #skills(stage: Stage, task: Task): string[] {
     return skillsFor(stage, task.profile, task.pipeline, this.#d.installedSkills ?? new Set())
   }
@@ -985,10 +1136,11 @@ export class Runner {
       title: `${task.id} ${role === task.role ? "" : `${role} `}${task.title}`,
       agent: roleById(role)?.agent ?? "dictator-code",
       model: toModel(model),
-      location: { directory: job.integrationWorktree! },
+      location: { directory: this.#dir(job, task) },
       ...(rules.length ? { permissions: rules } : {}),
     })
     task.session = s.id
+    this.#sessionModel.set(s.id, model)
     this.#d.onWorker?.(s.id, `${task.id} ${task.title}: ${task.description}`, rules)
     this.#d.watch?.(s.id, steps ?? TIER_STEPS[task.profile?.budget ?? "M"])
     this.#tokenCaps.set(s.id, TIER_TOKENS[task.profile?.budget ?? "M"])

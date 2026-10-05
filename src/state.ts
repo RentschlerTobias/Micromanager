@@ -78,9 +78,9 @@ const TASK_ALLOWED: Record<TaskStatus, readonly TaskStatus[]> = {
   reviewing: ["passed", "fixing", "escalated"],
   fixing: ["running", "escalated"],
   escalated: ["running", "pending"],
-  passed: ["merged"],
+  passed: ["merged", "pending", "escalated"], // in a parallel batch: merged by the train, or back after a conflict
   merged: [],
-  blocked: ["running", "planned"],
+  blocked: ["running", "planned", "pending"], // pending: the user answered, the task starts again
   cancelled: [],
 }
 
@@ -139,6 +139,9 @@ export interface Task {
   origin?: TaskOrigin
   followUps?: FollowUp[] // what the task's worker reported as work outside its task
   escalation?: { kind: string; detail: string } // why the task stopped (N9 rung 3)
+  worktree?: string // its own worktree while it runs in a parallel batch (Phase F)
+  branch?: string
+  conflicts?: number // merge train conflicts so far
 }
 
 export interface Job {
@@ -206,8 +209,10 @@ export function moveTask(task: Task, to: TaskStatus): void {
 
 const DONE = new Set<TaskStatus>(["passed", "merged"])
 
+// A task that passed in its own worktree (a parallel batch) is done only once the merge train merged it: tasks after
+// it start from the job's branch and need its commits there.
 export function isDone(task: Task): boolean {
-  return DONE.has(task.status)
+  return DONE.has(task.status) && !(task.status === "passed" && task.worktree)
 }
 
 // Pending tasks whose dependencies all passed; derived, never stored as a decision.

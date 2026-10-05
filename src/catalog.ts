@@ -181,6 +181,11 @@ export const ESCALATION = {
   too_hard: "the workers tried and failed; the task needs another approach or smaller steps",
 } as const
 
-export type EscalationKind = keyof typeof ESCALATION | "budget" | "refused"
+export type EscalationKind = keyof typeof ESCALATION | "budget" | "refused" | "merge_conflict"
+
+// --- N10: may these tasks run at the same time? (design.md §11, batch confirmation) --------------------------
+export function batchQuestions(tasks: readonly { id: string; title: string }[], others: (id: string) => string): Record<string, Question> {
+  return Object.fromEntries(tasks.map((t) => [`independent.${t.id}`, { type: "noul", instructions: `Task ${t.id} ("${t.title}") can be done at the same time as ${others(t.id)}, without needing their results.` } satisfies Question]))
+}
 
 export const ESCALATE: Question = { type: "choice", instructions: "Why could this task not be finished?", criteria: ESCALATION }

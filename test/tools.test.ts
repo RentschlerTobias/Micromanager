@@ -20,7 +20,7 @@ test("the tools are built from the read tool's schema and refuse other agents", 
   const ids = installTools(draft, {
     plan: async (goal) => { calls.push(`plan:${goal}`); return "planned" },
     questions: async (job, tree) => { calls.push(`questions:${job}:${tree}`); return "asked" },
-    run: async (job) => { calls.push(`run:${job}`); return "ran" },
+    run: async (job, note) => { calls.push(`run:${job}:${note}`); return "ran" },
     status: async () => { throw new Error("boom") },
     stop: async (job) => { calls.push(`stop:${job}`); return "stopping" },
   })
