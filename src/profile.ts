@@ -64,9 +64,11 @@ export function classifyQuestions(task: Task, skills: readonly Skill[]): Record<
   }
 }
 
-export function classifyState(goal: string, task: Task, acceptance: readonly Acceptance[]): Record<string, unknown> {
+// The task alone, not the job (Phase D: a new function in a job that also fixed a bug was classified as a bug fix).
+// Probe on that case: is_bug_fix 0.91 with the goal, 0.84 with it as background, 0.08 without it, while the bug fix
+// task itself stays at 0.94. The planner writes each task's description for a worker that knows nothing else.
+export function classifyState(_goal: string, task: Task, acceptance: readonly Acceptance[]): Record<string, unknown> {
   return {
-    job: goal,
     task: { id: task.id, title: task.title, description: task.description, files: task.files, plannerRole: task.role },
     acceptance: acceptance.map((a) => `${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}`),
   }
