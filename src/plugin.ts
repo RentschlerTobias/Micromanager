@@ -10,7 +10,7 @@ import { installAgents, type AgentDraft } from "./agents.ts"
 import { cloudRegistry, loadSettings } from "./config.ts"
 import { decide, forbiddenOutside, inJobArea, taskNamesPath, type PermissionRequest } from "./decide.ts"
 import { injected, injectionScore } from "./gate.ts"
-import { notRouted, resultText, rewriteResult, routeSubagentCall, type ToolCall } from "./hooks.ts"
+import { backstop, DELEGATION_TOOLS, delegationRole, notRouted, resultText, rewriteResult, routeDelegation, unownedDelegation, type ChildSession, type ToolCall } from "./hooks.ts"
 import { Jev, apiKey, redact } from "./jev.ts"
 import { record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
@@ -27,9 +27,9 @@ import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, reconcileJob, saveJob } from "./store.ts"
 import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "./state.ts"
-import { exec, type Exec } from "./integration.ts"
+import { exec, repoRel, type Exec } from "./integration.ts"
 import { readFileSync } from "node:fs"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import { FINISH_ID, GRAPH_ID, installFinishTool, installGraphTool, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 import { CHILD_PREFIX, DelegationError, Native } from "./native.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
@@ -69,10 +69,35 @@ interface Context {
     hook(name: string, callback: (input: SessionHookInput) => Promise<void> | void): Promise<unknown>
     synthetic(args: { sessionID: string; text: string; resume: boolean }): Promise<unknown>
     move(args: { sessionID: string; directory: string }): Promise<unknown>
+    // OpenCode's own session record. The plugin needs parentID from it (the SDK's Session type), which is the one
+    // signal that tells a delegated child from a session the user opened; read in the bundled server, the plugin
+    // context's session domain is the client session API with get/switchAgent/switchModel/prompt on it.
+    get(args: { sessionID: string }): Promise<unknown>
   }
   permission: { hook(name: string, callback: (evaluation: Evaluation) => Promise<void> | void): Promise<unknown> }
   location?: { directory?: string }
   app?: { log?(entry: { level: string; message: string }): unknown }
+}
+
+// What Session.get answers with: only the fields the backstop reads, and the directory under both names because the
+// internal record carries it as location.directory while the SDK type says directory.
+interface SessionRecord {
+  parentID?: string
+  agent?: string
+  directory?: string
+  location?: { directory?: string }
+}
+
+// The plugin's own version, read from its package.json so the journal can never claim a version the manifest does not
+// carry. "unknown" rather than a throw: a version this install cannot read must not stop the plugin from loading, and
+// the setup record exists precisely so an operator can see when it looks wrong.
+function version(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version?: string }
+    return pkg.version ?? "unknown"
+  } catch {
+    return "unknown"
+  }
 }
 
 // What the plugin knows about the sessions the runner started, shared by every instance of the plugin in one server.
@@ -111,6 +136,14 @@ export function namedInTask(task: string | undefined, resources: readonly string
   return resources.length > 0 && resources.every((path) => taskNamesPath(task, path.replace(/\/\*+$/, "")))
 }
 
+// The plugin's log line. Where it goes on this host is worth writing down, because a security layer that cannot be
+// audited is not operable and the reason is not obvious from the call: the bundled server builds the plugin context
+// as `{app: a.app, location: a.location, options: …}` from the server's own info, and that `app` is
+// `{name, version, channel}` — it has no log method at all. So `ctx.app.log` is `undefined`, the optional call below
+// silently does nothing, and nothing the plugin logs as "info" reaches opencode.log (verified: the string
+// "[jev-micromanager]" appears in that file only inside a shell command's own arguments, including one the plugin
+// never wrote). The call stays, because a host that does expose a log gets the lines; the journal is the channel the
+// plugin actually relies on.
 function logger(ctx: Context) {
   return (level: "info" | "warn" | "error", message: string): void => {
     try {
@@ -118,6 +151,7 @@ function logger(ctx: Context) {
     } catch {
       // logging must never break the hub
     }
+    // warn and error also go to the server's stderr, which is the one place an operator sees them without the journal.
     if (level !== "info") console.error(`[jev-micromanager] ${message}`)
   }
 }
@@ -350,10 +384,33 @@ export default {
       return id && project ? loadJob(project, id) : undefined
     }
     await ctx.tool.hook("execute.before", async (call) => {
-      if (call.tool !== "subagent" || call.agent !== MICROMANAGER.agent || !call.sessionID) return
+      // A delegation the plugin cannot isolate. From the micromanager this is still a refusal that names the name it
+      // could not find (a live run asked for OpenCode's own `explore` and then looked for an `explore` role agent
+      // that does not exist); from any other agent the call is deliberately left exactly as its caller wrote it,
+      // because turning another agent's delegation into a refusal would break the user's own work. Either way it is
+      // written down: a delegation that reached neither the routing nor a refusal is how a live run of 2026-10-06
+      // wrote into the user's checkout without one word of it.
+      if (unownedDelegation(call)) {
+        const micromanager = call.agent === MICROMANAGER.agent
+        record({
+          kind: "delegation-unrecognised",
+          sessionID: call.sessionID,
+          tool: call.tool,
+          agent: call.agent,
+          requested: String(call.input.agent ?? ""),
+          reason: micromanager ? "not a role agent of this plugin" : "not a role agent of this plugin; another agent's delegation is left alone, so no task and no worktree",
+        })
+        log("warn", `delegation to "${String(call.input.agent ?? "") || "no agent"}" from ${call.agent ?? "an unknown agent"} was not routed: no task and no worktree`)
+        if (micromanager && call.sessionID) throw new DelegationError(notRouted(call) ?? `Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}).`)
+        return
+      }
+      // A delegation to one of this plugin's own role agents, whoever made it (src/hooks.ts delegationRole: the
+      // caller used to have to be the micromanager, and a user switching the session's agent lost every worktree on
+      // that one check). Nothing else is a delegation and nothing else is touched.
+      if (!delegationRole(call) || !call.sessionID) return
       const asked = String(call.input.prompt ?? "")
       const resumed = String(call.input.sessionID ?? "")
-      const routed = routeSubagentCall(call, routing)
+      const routed = routeDelegation(call, routing)
       if (resumed) {
         // A worker continued by its session: it stays in its worktree (spike), a merged writer gets a new task.
         const task = await native.resume(resumed)
@@ -366,8 +423,16 @@ export default {
       // own `explore`). notRouted names the name it could not find.
       // A role agent that is named but cannot be started means the plugin itself is not running here (no project
       // directory, so it installed no agents); that is a different problem from the name, and the message says so.
-      if (!project) throw new DelegationError(`Not started: the plugin found no project directory in this session, so it installed none of its agents (${ROLES.map((r) => r.agent).join(", ")}). This is a jev-micromanager setup problem, not the agent's name.`)
-      if (!routed) throw new DelegationError(notRouted(call) ?? `Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}).`)
+      // Only the micromanager is refused: another agent's delegation is journalled above and left alone, because a
+      // DelegationError here would be a refusal of the user's own work rather than of the plugin's.
+      if (!project) {
+        if (call.agent !== MICROMANAGER.agent) return
+        throw new DelegationError(`Not started: the plugin found no project directory in this session, so it installed none of its agents (${ROLES.map((r) => r.agent).join(", ")}). This is a jev-micromanager setup problem, not the agent's name.`)
+      }
+      if (!routed) {
+        if (call.agent !== MICROMANAGER.agent) return
+        throw new DelegationError(notRouted(call) ?? `Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}).`)
+      }
       const guard = await checkGuards(decider, `${String(call.input.description ?? "")}. ${asked}`)
       if (guard.flagged.some((g) => g === "injection" || g === "harmful")) {
         throw new DelegationError(`The local check flagged this task (${guard.flagged.join(", ")}). Ask the user whether it should run before you start it again.`)
@@ -376,7 +441,9 @@ export default {
       call.input.prompt = d.prompt
       ultrawork.has(call.sessionID) && ultrawork.set(call.sessionID, 0)
       tasks.set(String(call.input.agent), asked)
-      // What the router decided, next to the permission decisions, so /flow can show the whole path.
+      // What the router decided, next to the permission decisions, so /flow can show the whole path. `agent` is the
+      // caller, which is not always the micromanager: that is how an operator sees, from the journal alone, which
+      // session's delegations were isolated and which agent made them.
       record({
         kind: "routing",
         sessionID: call.sessionID,
@@ -393,10 +460,68 @@ export default {
     // The micromanager's own agents only: build, plan and every other agent are never touched.
     const ours = new Set([MICROMANAGER.agent, ...ROLES.map((role) => role.agent)])
 
+    // Who started this session, and whether this plugin owns the one that did. Resolved once per session: the
+    // permission hook runs on every single tool call, and Session.get is a round trip to the host.
+    const parents = new Map<string, ChildSession | undefined>()
+    const childOf = async (sessionID: string): Promise<ChildSession | undefined> => {
+      if (parents.has(sessionID)) return parents.get(sessionID)
+      const facts = await (async (): Promise<ChildSession | undefined> => {
+        const child = (await ctx.session.get({ sessionID }).catch(() => undefined)) as SessionRecord | undefined
+        const parent = child?.parentID
+        if (!parent) return undefined // a root session: the user's own, or the micromanager's — never a delegated child
+        const owner = (await ctx.session.get({ sessionID: parent }).catch(() => undefined)) as SessionRecord | undefined
+        // A parent is the plugin's when it runs the micromanager agent, or when it is the facilitator of one of the
+        // project's jobs. The second test carries the live run this backstop exists for on its own: the user had
+        // switched that session off the micromanager agent and it kept the job, so the agent name would not have
+        // caught it and the job did.
+        const job = project ? listJobs(project).find((j) => j.facilitator === parent) : undefined
+        const parentIsMicromanager = owner?.agent === MICROMANAGER.agent || Boolean(job)
+        if (!parentIsMicromanager) return undefined
+        return { sessionID, parent, job: job?.id, parentIsMicromanager, directory: child?.location?.directory ?? child?.directory }
+      })().catch(() => undefined)
+      parents.set(sessionID, facts)
+      return facts
+    }
+    // One journal line per session, however many writes it goes on to attempt: the record is the alarm, and an alarm
+    // that repeats itself every tool call is one nobody reads.
+    const deniedSessions = new Set<string>()
+
     // Every question of the micromanager and its sub-agents goes to Jev first: it answers itself when sure enough,
     // else the user is asked as usual.
     const micromanagerReads = new Map<string, number>()
     await ctx.permission.hook("evaluate", async (evaluation) => {
+      // The backstop, before every other rule, because it is the one that must hold when the delegation hook above did
+      // not engage. A session that is a child of a micromanager session but is not a worker the plugin claimed and
+      // moved into its worktree has no task, no checks and no merge train — so it is not allowed to change the tree,
+      // and the refusal is journalled with the job, the session, its directory and the fact that isolation did not
+      // engage. Reads are left alone: nothing has been damaged, and refusing them would only make the run harder to
+      // diagnose.
+      if (!runnerSessions.has(evaluation.sessionID) && !native.isWorker(evaluation.sessionID)) {
+        const facts = await childOf(evaluation.sessionID)
+        const denial = facts && backstop(facts, evaluation.action, false)
+        if (denial) {
+          if (!deniedSessions.has(evaluation.sessionID)) {
+            deniedSessions.add(evaluation.sessionID)
+            record({
+              kind: "isolation-denied",
+              sessionID: evaluation.sessionID,
+              parent: facts!.parent,
+              job: facts!.job,
+              directory: facts!.directory,
+              agent: evaluation.agent,
+              action: evaluation.action,
+              verdict: "deny",
+              reason: denial.reason,
+            })
+            log("error", `isolation did not engage for ${evaluation.sessionID} (${evaluation.action}): a child of micromanager session ${facts!.parent}${facts!.job ? ` of job ${facts!.job}` : ""} that is not a claimed worker, in ${facts!.directory ?? "an unknown directory"}`)
+          }
+          if (evaluation.effect !== "deny") {
+            evaluation.effect = "deny"
+            evaluation.message = denial.message
+          }
+          return
+        }
+      }
       const narrowed = workerRules.get(evaluation.sessionID)?.find((r) => r.effect === "deny" && r.action === evaluation.action && r.resource === "*")
       if (narrowed && evaluation.effect !== "deny") {
         evaluation.effect = "deny"
@@ -477,6 +602,25 @@ export default {
 
     // Jobs: the micromanager plans and runs them through its tools; the plugin drives the loop (Phase B, C).
     const project = ctx.location?.directory
+    // The plugin's own footprint, written once per instance before anything else can fail. `log()` cannot be audited
+    // on this host (see logger above), and a security layer nobody can read back is not operable: after this line
+    // exists, a field operator can always answer "is the plugin loaded here, and what does it think it is doing?" out
+    // of the journal alone — before a job, a delegation or a denial is involved.
+    {
+      const rel = project ? await repoRel(project, exec).catch(() => "") : ""
+      record({
+        kind: "plugin",
+        version: version(),
+        directory: project,
+        // The repository the project sits in and the offset inside it: together they say which worktree a worker's
+        // directory is, which is the question the isolation-denied records below cannot answer on their own.
+        repository: project ? (rel ? resolve(project, ...rel.split("/")) : project) : undefined,
+        rel,
+        micromanager: MICROMANAGER.agent,
+        delegationTools: [...DELEGATION_TOOLS],
+        delegationAgents: ROLES.map((role) => role.agent),
+      })
+    }
     if (!project) {
       log("warn", "no project directory: the micromanager tools are not installed")
       return
@@ -568,8 +712,10 @@ export default {
     const WEB = /web|fetch/i
     await ctx.tool.hook("execute.after", async (call) => {
       if (!call.sessionID) return
-      if (call.tool === "subagent" && call.agent === MICROMANAGER.agent && !call.input.sessionID) {
+      if (delegationRole(call) && !call.input.sessionID) {
         // A call that failed before its worker took the task drops the task; a started one names it for the micromanager.
+        // Keyed on the same set as the hook above, not on the caller: it is the hook above that made the task, so a
+        // delegation that made one and then failed has to drop it, whichever agent made it.
         if (call.error) await native.abandon(String(call.input.prompt ?? "")).catch((err: unknown) => log("warn", `abandon failed: ${String(err)}`))
         else {
           const id = String(call.input.prompt ?? "").match(/^\[jev-micromanager\] task (T\d+) · job (\S+) ·/)

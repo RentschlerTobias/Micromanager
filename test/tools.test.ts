@@ -20,6 +20,8 @@ function fakeDraft() {
 }
 
 const ok = async () => "ok"
+// The user's own checkout, the directory the stand-in host below reports: what a worker must never be able to write.
+const PROJECT = "/home/t1dde/Fun/Projects/Repos/jev-micromanager"
 const noop = { tasks: ok, plan: ok, questions: ok, run: ok, status: ok, stop: ok, steer: ok, stopTask: ok, merge: ok, discard: ok, access: ok }
 const byId = (added: Record<string, unknown>[], id: string) => {
   const tool = added.find((t) => t.id === id)!
@@ -346,4 +348,117 @@ test("request_access refuses a hard-denied path whatever the reason, and vouches
   assert.match(vouchAccess("/proj", j, "", "x").text, /needs path/)
   assert.match(vouchAccess("/proj", j, "/somewhere", "  ").text, /needs why/)
   assert.match(vouchAccess("/proj", undefined, "/somewhere", "x").text, /No job of this session/)
+})
+
+// The plugin loaded against a stand-in OpenCode host, so the things an operator has to check after a restart are
+// checked here: the setup record that says the plugin is loaded and what it thinks it is doing, and the backstop that
+// stops an unisolated delegation from writing. The journal is the only channel that persists on this host (logger()
+// in src/plugin.ts explains why), so the test reads the journal rather than any log.
+//
+// XDG_STATE_HOME is redirected for the whole test, not just the setup call: the plugin records from the hooks long
+// after setup has returned, and a test that let those records land in the operator's real journal would be worse than
+// no test at all.
+async function loadedPlugin(t: { after(fn: () => void): void }, sessions: Record<string, Record<string, unknown>>) {
+  const { mkdtempSync } = await import("node:fs")
+  const { tmpdir } = await import("node:os")
+  const { readJournal } = await import("../src/journal.ts")
+  const plugin = (await import("../src/plugin.ts")).default
+  const hooks: Record<string, ((arg: never) => Promise<void>)[]> = {}
+  const noop = async () => undefined
+  const draft = { list: () => [], get: () => undefined, namespace: () => {}, add: () => {}, update: () => {}, remove: () => {} }
+  const take = (n: string) => hooks[n]?.[0] as ((arg: never) => Promise<void>) | undefined
+  const ctx = {
+    location: { directory: PROJECT },
+    app: {}, // the real context carries no log method on this host, which is the point
+    agent: { transform: async (cb: (d: unknown) => void) => cb(draft) },
+    tool: { hook: async (n: string, cb: (a: never) => Promise<void>) => { (hooks[n] ??= []).push(cb) }, transform: async (cb: (d: unknown) => void) => cb(draft) },
+    permission: { hook: async (n: string, cb: (a: never) => Promise<void>) => { (hooks[`perm:${n}`] ??= []).push(cb) } },
+    session: {
+      hook: async (n: string, cb: (a: never) => Promise<void>) => { (hooks[`sess:${n}`] ??= []).push(cb) },
+      get: async ({ sessionID }: { sessionID: string }) => sessions[sessionID],
+      synthetic: noop, move: noop, create: noop, prompt: noop, wait: noop, context: noop, interrupt: noop,
+    },
+  }
+  const before = process.env.XDG_STATE_HOME
+  process.env.XDG_STATE_HOME = mkdtempSync(`${tmpdir()}/jev-setup-`)
+  // The stand-in host has no built-in read tool, so setup reports that it installed nothing. That is the expected
+  // answer here, and it proves the logger's stderr fallback is live, but it is noise in a test run: the journal is
+  // what these tests read.
+  const stderr = console.error
+  console.error = () => {}
+  t.after(() => {
+    console.error = stderr
+    if (before === undefined) delete process.env.XDG_STATE_HOME
+    else process.env.XDG_STATE_HOME = before
+  })
+  await plugin.setup(ctx as never)
+  const journal = () => readJournal(`${process.env.XDG_STATE_HOME}/jev-micromanager/decisions.jsonl`)
+  const evaluate = take("perm:evaluate")!
+  const run = async (sessionID: string, agent: string, action: string) => {
+    const e = { sessionID, agent, action, resources: ["x"], effect: "allow", message: undefined as string | undefined }
+    await evaluate(e as never)
+    return e
+  }
+  return { journal, run, delegationHook: take("execute.before")! }
+}
+
+test("the plugin says it is loaded, and what it thinks it is doing", async (t) => {
+  const { journal } = await loadedPlugin(t, {})
+  const setup = journal().find((e) => e.kind === "plugin")!
+  assert.equal(setup.version, "0.1.0", "the version comes from package.json, so it cannot drift from the manifest")
+  assert.equal(setup.directory, PROJECT)
+  assert.equal(setup.repository, PROJECT, "the repository root this project sits in")
+  assert.equal(setup.rel, "", "the project's offset inside it")
+  assert.equal(setup.micromanager, "micromanager")
+  // The tool names the delegation hook recognises: an operator can read off the journal what it is looking at.
+  assert.deepEqual(setup.delegationTools, ["subagent"])
+  assert.ok(Array.isArray(setup.delegationAgents) && setup.delegationAgents.includes("coder"))
+  assert.equal(journal()[0]?.kind, "plugin", "it is the first thing written, before any job or delegation exists")
+})
+
+test("a child of a micromanager session that no worktree got is denied its writes and written down", async (t) => {
+  const micro = { agent: "micromanager", location: { directory: PROJECT } }
+  const { journal, run } = await loadedPlugin(t, {
+    ses_micro: micro,
+    // The live run's shape: a child of the micromanager session with no task, no worktree and no claim.
+    ses_child: { parentID: "ses_micro", agent: "coder", location: { directory: PROJECT } },
+    // And the case that must not regress: a role agent the user picked by hand, in their own checkout.
+    ses_user: { agent: "build", location: { directory: PROJECT } },
+    ses_byhand: { parentID: "ses_user", agent: "coder", location: { directory: PROJECT } },
+  })
+  const denied = await run("ses_child", "coder", "shell")
+  assert.equal(denied.effect, "deny")
+  assert.match(denied.message ?? "", /never put you in a worktree/)
+  assert.match(denied.message ?? "", /STATUS: NEEDS_CONTEXT/)
+  const entry = journal().find((e) => e.kind === "isolation-denied")!
+  assert.equal(entry.sessionID, "ses_child")
+  assert.equal(entry.parent, "ses_micro")
+  assert.equal(entry.directory, PROJECT)
+  assert.equal(entry.action, "shell")
+  assert.match(String(entry.reason), /isolation did not engage/)
+  assert.match(String(entry.reason), /not a claimed worker/, "greppable, and it says which rule fired")
+  // A read cannot damage the checkout, and a role agent picked by hand is not a delegated child: both keep working.
+  assert.equal((await run("ses_child", "coder", "read")).effect, "allow")
+  assert.equal((await run("ses_byhand", "coder", "shell")).effect, "allow")
+  assert.equal((await run("ses_user", "build", "shell")).effect, "allow")
+  assert.equal(journal().filter((e) => e.kind === "isolation-denied").length, 1, "one alarm per session, not one per tool call")
+})
+
+test("a delegation the hook cannot route is written down, and one that merely says subagent is not touched", async (t) => {
+  const { journal, delegationHook } = await loadedPlugin(t, { ses_micro: { agent: "micromanager" } })
+  // A built-in agent, aimed by an agent the plugin does not own: left exactly as its caller wrote it, and recorded,
+  // because a delegation that reaches neither the routing nor a refusal is how a live run wrote into the checkout.
+  const builtIn = { tool: "subagent", agent: "build", sessionID: "ses_micro", input: { agent: "explore", prompt: "look around" } }
+  await delegationHook(builtIn as never)
+  assert.deepEqual(builtIn.input, { agent: "explore", prompt: "look around" }, "the call is not touched")
+  const entry = journal().find((e) => e.kind === "delegation-unrecognised")!
+  assert.equal(entry.tool, "subagent")
+  assert.equal(entry.requested, "explore")
+  assert.equal(entry.agent, "build")
+  assert.match(String(entry.reason), /not a role agent of this plugin/)
+  // A call that merely mentions a subagent is not a delegation: nothing is recorded and nothing is hijacked.
+  const mentions = { tool: "shell", agent: "build", sessionID: "ses_micro", input: { command: "grep -rn subagent src/" } }
+  await delegationHook(mentions as never)
+  assert.equal(mentions.input.command, "grep -rn subagent src/")
+  assert.equal(journal().filter((e) => e.kind === "delegation-unrecognised").length, 1)
 })

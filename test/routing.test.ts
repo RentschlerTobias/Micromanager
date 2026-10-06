@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { parseRouting, stripComments } from "../src/config.ts"
-import { HEADER, notRouted, routeSubagentCall } from "../src/hooks.ts"
+import { backstop, DELEGATION_TOOLS, delegationRole, HEADER, notRouted, routeDelegation, routeSubagentCall, unownedDelegation, type ChildSession } from "../src/hooks.ts"
 import { MODELS, roleById } from "../src/roles.ts"
 import { DEFAULT_ROUTING, chooseModel, guessNeeds } from "../src/routing.ts"
 
@@ -39,6 +39,81 @@ test("other agents' calls and built-in sub-agents are left alone", () => {
   assert.equal(builtIn.input.model, "a/b")
   const read = { tool: "read", agent: "micromanager", input: { path: "." } }
   assert.equal(routeSubagentCall(read, DEFAULT_ROUTING), undefined)
+})
+
+test("a delegation is recognised by what it delegates to, not by who asked", () => {
+  // The live run of 2026-10-06 lost every worktree on one check: the caller had to be the micromanager agent, the
+  // user switched the parent session off it to `build`, and ten delegations to coder/tester/explorer/oracle were
+  // skipped in silence. The agent is a property of the session the user sits in, so the target is the discriminator.
+  assert.deepEqual(DELEGATION_TOOLS, ["subagent"])
+  for (const tool of DELEGATION_TOOLS) {
+    assert.equal(delegationRole({ tool, agent: "build", input: { agent: "coder", prompt: "x" } })?.id, "code")
+    assert.equal(delegationRole({ tool, agent: "micromanager", input: { agent: "tester", prompt: "x" } })?.id, "test")
+  }
+  // Conservative by construction: only a tool of ours, aimed at an agent of ours. A built-in agent and every other
+  // tool are not delegations here, so nothing is ever routed on their behalf.
+  assert.equal(delegationRole({ tool: "subagent", agent: "build", input: { agent: "explore", prompt: "x" } }), undefined)
+  assert.equal(delegationRole({ tool: "subagent", agent: "build", input: { agent: "general", prompt: "x" } }), undefined)
+  assert.equal(delegationRole({ tool: "subagent", agent: "build", input: { prompt: "x" } }), undefined)
+  assert.equal(delegationRole({ tool: "read", agent: "micromanager", input: { agent: "coder", prompt: "x" } }), undefined)
+  assert.equal(delegationRole({ tool: "execute", agent: "micromanager", input: { code: "tools.coder()" } }), undefined)
+  // A call that merely mentions a subagent is not one: nothing is hijacked.
+  const mentions = { tool: "bash", agent: "build", input: { command: "grep -rn subagent src/" } }
+  assert.equal(delegationRole(mentions), undefined)
+  assert.equal(unownedDelegation(mentions), false)
+})
+
+test("a delegation from another agent produces the same task and worktree as the micromanager's", () => {
+  const ask: Record<string, unknown> = { agent: "coder", description: "Add a --verbose flag", prompt: "Add a --verbose flag." }
+  const direct = { tool: "subagent", agent: "micromanager", input: { ...ask } }
+  const alternate = { tool: "subagent", agent: "build", input: { ...ask } }
+  // Both route to the same role and the same model, and both rewrite the call the same way — so one delegation still
+  // makes one task and one worktree, whichever agent made it.
+  assert.deepEqual(routeDelegation(direct, DEFAULT_ROUTING), routeDelegation(alternate, DEFAULT_ROUTING))
+  assert.equal(direct.input.model, MODELS.glm)
+  assert.equal(alternate.input.model, MODELS.glm)
+  assert.equal(direct.input.background, true)
+  assert.equal(alternate.input.background, true)
+  assert.equal(String(alternate.input.prompt), String(direct.input.prompt))
+  // The narrow entry point still refuses it: what the plugin does with it is the plugin's decision, not the hook's.
+  assert.equal(routeSubagentCall(alternate, DEFAULT_ROUTING), undefined)
+  // Nothing but the delegation tool is ever routed.
+  assert.equal(routeDelegation({ tool: "read", agent: "build", input: { agent: "coder", prompt: "x" } }, DEFAULT_ROUTING), undefined)
+  // And a delegation the plugin cannot isolate is named as such, so the plugin can say it did not route it.
+  assert.equal(unownedDelegation(direct), false)
+  assert.equal(unownedDelegation(alternate), false)
+  assert.equal(unownedDelegation({ tool: "subagent", agent: "build", input: { agent: "explore", prompt: "x" } }), true)
+  assert.equal(unownedDelegation({ tool: "subagent", agent: "build", input: { prompt: "x" } }), true)
+})
+
+test("an unclaimed child of a micromanager session cannot write; every other session can", () => {
+  const checkout = "/home/t1dde/Fun/Projects/Repos/jev-micromanager"
+  // The live run: a child of the micromanager session with no task, no worktree, no claim and no move, writing into
+  // the user's checkout while nothing complained.
+  const unclaimed: ChildSession = { sessionID: "ses_child", parent: "ses_micro", parentIsMicromanager: true, job: "job-1", directory: checkout }
+  for (const action of ["shell", "edit", "write", "patch", "execute"]) {
+    const denial = backstop(unclaimed, action, false)
+    assert.ok(denial, `${action} must be refused`)
+    assert.match(denial.reason, /isolation did not engage/)
+    assert.match(denial.message, /never put you in a worktree/)
+    assert.match(denial.message, /STATUS: NEEDS_CONTEXT/)
+    assert.match(denial.message, new RegExp(checkout.replace(/[/.]/g, "\\$&"))) // it names where it would have written
+    assert.match(denial.message, /ses_micro/)
+    assert.match(denial.message, /job-1/)
+  }
+  // A read cannot damage the checkout, so it is left alone: refusing it would only make the run harder to diagnose.
+  assert.equal(backstop(unclaimed, "read", false), undefined)
+  assert.equal(backstop(unclaimed, "glob", false), undefined)
+  assert.equal(backstop(unclaimed, "external_directory", false), undefined)
+  // A worker the plugin claimed and moved is the case this exists for not to touch.
+  assert.equal(backstop(unclaimed, "shell", true), undefined)
+  // A session the user opened has no parent at all: the micromanager's own session, and the user's.
+  assert.equal(backstop({ sessionID: "ses_user", parentIsMicromanager: false }, "shell", false), undefined)
+  // A role agent picked by hand, working in the user's own checkout: it is not a delegated child of a micromanager
+  // session, so the rule never reaches it and the user keeps working normally.
+  assert.equal(backstop({ sessionID: "ses_byhand", parent: "ses_user_build", parentIsMicromanager: false, directory: checkout }, "shell", false), undefined)
+  // A parent the plugin does not own is not a micromanager parent, whatever the child's agent is called.
+  assert.equal(backstop({ sessionID: "ses_child", parent: "ses_other", parentIsMicromanager: false }, "edit", false), undefined)
 })
 
 test("a call that was not routed says which name was the problem", () => {
