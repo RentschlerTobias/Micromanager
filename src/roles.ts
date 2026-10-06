@@ -67,6 +67,18 @@ const TEST_RUNNERS = [
   "pytest*", "python -m pytest*", "python3 -m pytest*", "uv run pytest*", "uv run python -m pytest*",
   "npm test*", "npx vitest*", "node --test*", "cargo test*", "go test*",
 ]
+// What an explorer may run: git history and the file tree, nothing that changes anything (live test: without them a
+// worker spent ten turns reading .git/ files to piece the history together). OpenCode passes each command of a chain
+// as its own resource, so "git log*" does not let "git log; rm" through.
+const READ_COMMANDS = [
+  "git log*", "git show*", "git status*", "git diff*", "git branch*", "git ls-files*", "git grep*",
+  "ls", "ls *", "tree", "tree *", "wc *",
+  // Structural search; the code graph has its own tool (code_graph, src/graph.ts).
+  "ast-grep run *",
+]
+// ast-grep run rewrites files with these; the last matching rule wins, so they beat the allow above. "sg" stays out:
+// on Linux it is also the group command of shadow-utils.
+const AST_GREP_WRITES = ["ast-grep * -U*", "ast-grep * --update-all*", "ast-grep * -r *", "ast-grep * --rewrite*", "ast-grep * -i*", "ast-grep * --interactive*"]
 const LINTERS = ["ruff *", "uv run ruff*", "uv run pyright*", "npx tsc*", "npx eslint*"]
 
 const SHARED = `You are a sub-agent of the jev-micromanager. You get one sub-task with acceptance points.
@@ -100,8 +112,13 @@ export const ROLES: readonly Role[] = [
   role(
     "explore",
     "Read-only: find code, map structure, answer where/how questions about the codebase.",
-    "Search and read the codebase. Report paths and short excerpts. Change nothing.",
-    [...noWrite, ...noShell, ...noWeb, ...noDelegation],
+    `Search and read the codebase. Report paths and short excerpts. Change nothing.
+Be quick: when you have the code_graph tool, ask it who calls or uses what before you grep; read many files at once
+(several read, glob and grep calls in one step), prefer grep and the file tree to reading whole files, use git log and git show for history, and stop as soon as the question is answered; a summary of
+what you saw beats reading every file.
+The shell runs only these, one command per call, in your current directory (no cd, no && chains, no pipes into other
+tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) => all.indexOf(c) === i).join(", ")}. Use glob and grep for the rest.`,
+    [...noWrite, ...noShell, ...READ_COMMANDS.map((cmd) => rule("shell", "allow", cmd)), ...AST_GREP_WRITES.map((cmd) => rule("shell", "deny", cmd)), ...noWeb, ...noDelegation],
     [MODELS.deepseek, MODELS.qwen],
   ),
   role(
@@ -209,6 +226,10 @@ How you work:
      Files: the project paths it may change, comma separated
      Checks: a shell command that exits 0 when the task is done (usually the project's test command)
    A worker that only reads (explore, research, plan, review, oracle) has neither line; its report is the result.
+   To get to know a whole repository, start several explorers at once, each on one part (e.g. one per top-level
+   package, one for tests and CI), each asked for a short overview; never ask one worker to read everything. A
+   question about particular code (who calls X, what breaks if Y changes) goes to one explorer: it has a code graph
+   that answers such questions in a few calls.
    Start independent tasks right away, several subagent calls in one message: each writer works in a git worktree
    of its own and they run in parallel. Start a task that needs another's result only after that one's report.
    You may not read outside the project yourself, but a worker that only reads may read a directory its prompt names

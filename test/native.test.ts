@@ -124,7 +124,7 @@ test("a conflict on the merge train goes back to the worker, its change kept", a
 
 test("a reader works on the session branch and ends with its findings", async () => {
   const project = repo()
-  const native = new Native()
+  const native = new Native({ graphs: { get: async () => undefined } })
   const d = await native.delegate(project, "ses_mm", { agent: "explorer", description: "find the router", prompt: "Where is the router?" }, MODEL)
   assert.match(d.prompt, /Change no files\./)
   assert.doesNotMatch(d.prompt, /finish_task/)
@@ -134,6 +134,36 @@ test("a reader works on the session branch and ends with its findings", async ()
   assert.match((await native.finish("ses_r", "")).text, /^You only read/)
   assert.deepEqual(await native.ended("ses_r"), { note: undefined, parent: "ses_mm" })
   assert.equal(loadJob(project, d.job.id)!.tasks[0]!.status, "passed")
+})
+
+test("an explorer's brief points it at the code graph of its directory; other readers get none", async () => {
+  const project = repo()
+  const asked: string[] = []
+  const native = new Native({ graphs: { get: async (dir) => (asked.push(dir), { commit: "abc1234" }) } })
+  const d = await native.delegate(project, "ses_mm", { agent: "explorer", description: "map it", prompt: "How do the modules hang together?" }, MODEL)
+  assert.deepEqual(asked, [d.job.integrationWorktree])
+  assert.match(d.prompt, /How do the modules hang together\?\n\nA code graph of this directory \(commit abc1234\) is ready\./)
+  assert.match(d.prompt, /ask the code_graph tool first/)
+  const p = await native.delegate(project, "ses_mm", { agent: "planner", description: "plan it", prompt: "Plan the split." }, MODEL)
+  assert.doesNotMatch(p.prompt, /code_graph/)
+  assert.equal(asked.length, 1)
+
+  native.claim("ses_x", child(d.prompt))
+  native.claim("ses_p", child(p.prompt))
+  assert.ok(native.hasGraph("ses_x"))
+  assert.ok(!native.hasGraph("ses_p"), "a planner has no graph tool")
+  assert.equal(await native.askGraph("ses_p", "explain", "main", ""), "This session has no code graph.")
+  assert.match(await native.askGraph("ses_x", "teleport", "main", ""), /^Unknown action "teleport"/)
+})
+
+test("without a graph the explorer's brief has no graph lines", async () => {
+  const project = repo()
+  const native = new Native({ graphs: { get: async () => undefined } })
+  const d = await native.delegate(project, "ses_mm", { agent: "explorer", description: "find it", prompt: "Where is the router?" }, MODEL)
+  assert.doesNotMatch(d.prompt, /code_graph/)
+  assert.match(d.prompt, /Where is the router\?\n\nChange no files\./)
+  native.claim("ses_x", child(d.prompt))
+  assert.ok(!native.hasGraph("ses_x"))
 })
 
 test("what is not a valid delegation is refused with a reason", async () => {

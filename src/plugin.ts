@@ -28,7 +28,7 @@ import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, saveJob } from "./store.ts"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { FINISH_ID, installFinishTool, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
+import { FINISH_ID, GRAPH_ID, installFinishTool, installGraphTool, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 import { CHILD_PREFIX, DelegationError, Native } from "./native.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
@@ -459,6 +459,15 @@ export default {
       } catch (err) {
         log("error", `finish_task not installed: ${String(err)}`)
       }
+      try {
+        installGraphTool(draft, async (a, tctx) => {
+          const text = await native.askGraph(tctx.sessionID!, a.action, a.symbol, a.to)
+          record({ kind: "graph", sessionID: tctx.sessionID, action: a.action, symbol: a.symbol.slice(0, 100), chars: text.length })
+          return text
+        }, (sessionID) => native.hasGraph(sessionID))
+      } catch (err) {
+        log("error", `code_graph not installed: ${String(err)}`)
+      }
     })
 
     await ctx.session.hook("prompt", async (input) => {
@@ -505,6 +514,7 @@ export default {
       if (input.agent !== MICROMANAGER.agent) {
         if (input.tools) for (const id of TOOL_IDS) delete input.tools[id]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[FINISH_ID]
+        if (input.tools && !(input.sessionID && native.hasGraph(input.sessionID))) delete input.tools[GRAPH_ID]
         // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
         if (input.sessionID && native.isWorker(input.sessionID)) {
           const worker = input.sessionID
@@ -533,7 +543,10 @@ export default {
         }
         return
       }
-      if (input.tools) delete input.tools[FINISH_ID]
+      if (input.tools) {
+        delete input.tools[FINISH_ID]
+        delete input.tools[GRAPH_ID]
+      }
       if (input.sessionID) {
         const c = await compactor.apply(input.sessionID, input.messages).catch((err: unknown) => {
           log("warn", `compaction failed: ${String(err)}`)

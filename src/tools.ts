@@ -111,6 +111,30 @@ export function installFinishTool(draft: ToolDraft, finish: (summary: string, ct
   })
 }
 
+// An explorer's code graph (src/graph.ts): who calls, uses or imports what, from the syntax tree. Only explorers the
+// micromanager started with a graph may use it; the context hook hides it from every other session.
+export const GRAPH_ID = "code_graph"
+
+export function installGraphTool(draft: ToolDraft, ask: (args: { action: string; symbol: string; to: string }, ctx: ToolContext) => Promise<string>, allowed: (sessionID: string) => boolean): void {
+  const read = draft.get("read")
+  const str = read?.input?.fields?.path
+  if (!read?.input?.mapFields || !str) throw new Error("the built-in read tool has no input schema to build from")
+  draft.add({
+    id: GRAPH_ID,
+    name: GRAPH_ID,
+    description: "Ask the code graph of your directory, built from the syntax tree of every file. action: explain (a symbol: where it is defined, what calls it, what it calls), affected (what depends on a symbol, two levels deep), path (how symbol reaches to), query (symbols whose names match the words in symbol). symbol: a function, class, method or file name, e.g. instruction_language or server.py. to: the second symbol for path, else empty. Use it before grep for any who-calls or what-uses question.",
+    input: read.input.mapFields(() => ({ action: str, symbol: str, to: str })),
+    execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+      if (!ctx?.sessionID || !allowed(ctx.sessionID)) return { content: "Only an explorer of the micromanager may use this tool." }
+      try {
+        return { content: await ask({ action: String(args?.action ?? ""), symbol: String(args?.symbol ?? ""), to: String(args?.to ?? "") }, ctx) }
+      } catch (err) {
+        return { content: `failed: ${err instanceof Error ? err.message : String(err)}` }
+      }
+    },
+  })
+}
+
 // The plan as the micromanager shows it to the user.
 export function planText(job: Job): string {
   const acceptance = job.acceptance.map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (check: ${a.verify})` : ""}`)

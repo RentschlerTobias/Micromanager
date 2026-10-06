@@ -13,6 +13,7 @@
 //
 // Every plugin instance of one server shares this state (a moved worker is served by the instance of its worktree).
 
+import { Graphs, graphBrief, queryGraph, type Graph } from "./graph.ts"
 import { HEADER } from "./hooks.ts"
 import {
   commitTask, exec as defaultExec, fastForward, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, runGate,
@@ -72,11 +73,13 @@ interface Entry {
   removed?: boolean // the writer's worktree was removed after its merge
   session?: string // the child session, once claimed
   checks: string[]
+  graph?: boolean // an explorer with a code graph of its directory (the code_graph tool)
 }
 
 export interface NativeDeps {
   readonly exec?: Exec
   readonly installedSkills?: ReadonlySet<string>
+  readonly graphs?: Pick<Graphs, "get"> // the code graph an explorer starts from
 }
 
 export interface Delegated {
@@ -88,6 +91,7 @@ export interface Delegated {
 export class Native {
   readonly #exec: Exec
   readonly #skills: ReadonlySet<string>
+  readonly #graphs: Pick<Graphs, "get">
   readonly #entries = new Map<string, Entry>() // "<job>/<task>" -> entry
   readonly #bySession = new Map<string, string>() // child session -> its entry's key
   readonly #jobs = new Map<string, Job>() // "<project>\0<job>" -> the live job
@@ -98,6 +102,7 @@ export class Native {
   constructor(deps: NativeDeps = {}) {
     this.#exec = deps.exec ?? defaultExec
     this.#skills = deps.installedSkills ?? new Set()
+    this.#graphs = deps.graphs ?? new Graphs(this.#exec)
   }
 
   // The micromanager session's job: made at its first delegation, kept until the session ends.
@@ -160,9 +165,11 @@ export class Native {
       task.worktree = w.worktree
       task.branch = w.branch
     }
+    const graph = role.id === "explore" ? await this.#graphs.get(entry.dir) : undefined
+    entry.graph = Boolean(graph)
     this.#entries.set(`${job.id}/${task.id}`, entry)
     saveJob(project, job)
-    return { task, job, prompt: this.#brief(job, task, role, model, d, entry) }
+    return { task, job, prompt: this.#brief(job, task, role, model, d, entry, graph) }
   }
 
   // The subagent call failed before its child took the task (refused, an unknown agent): the task is dropped.
@@ -242,6 +249,19 @@ export class Native {
 
   isWriter(session: string): boolean {
     return this.#entry(session)?.writer ?? false
+  }
+
+  hasGraph(session: string): boolean {
+    return this.#entry(session)?.graph ?? false
+  }
+
+  // The code_graph tool: one question to the graph of the explorer's directory, rebuilt first when the session
+  // branch moved on (a writer merged) since the last build.
+  async askGraph(session: string, action: string, symbol: string, to: string): Promise<string> {
+    const entry = this.#entry(session)
+    if (!entry?.graph) return "This session has no code graph."
+    if (!(await this.#graphs.get(entry.dir))) return "The code graph could not be built; use grep and read instead."
+    return queryGraph(entry.dir, action, symbol, to, this.#exec)
   }
 
   // finish_task: the checks in the worker's worktree, then the commit and the merge train. The text goes back to the
@@ -374,13 +394,15 @@ export class Native {
     }
   }
 
-  #brief(job: Job, task: Task, role: Role, model: string, d: Delegation, entry: Entry): string {
+  #brief(job: Job, task: Task, role: Role, model: string, d: Delegation, entry: Entry, graph?: Graph): string {
     const skills = [...(entry.writer ? ["verification-before-completion"] : []), ...(role.id === "research" ? ["research"] : [])].filter((s) => this.#skills.has(s))
     const others = job.tasks.filter((t) => t.id !== task.id && ["running", "gating", "fixing"].includes(t.status))
     return [
       `${HEADER} task ${task.id} · job ${job.id} · role ${role.id} · model ${model}`,
       "",
       d.body,
+      "",
+      graph ? graphBrief(graph) : "",
       "",
       entry.writer ? `Files you may change: ${task.files.join(", ")}. Work only in your current directory, a git worktree of its own.` : "Change no files.",
       entry.writer
