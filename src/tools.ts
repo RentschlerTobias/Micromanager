@@ -2,10 +2,18 @@
 // agent may use them; every other agent gets a refusal, and the context hook hides them from other agents.
 // A role agent can still reach them through the code-mode execute tool; the nested call carries the caller's
 // agent (Phase E spike), so the same check refuses it. A call without an agent is refused too.
+//
+// The descriptions here are also how the orchestrator learns what it may do: the micromanager's own system prompt
+// (src/roles.ts micromanagerSystem) names stop_job and plan_job only, so every control below carries its own rule
+// (when to use it, what it refuses, what it leaves behind) in the line the model always sees.
 
 import type { Job } from "./state.ts"
 
-export const TOOL_IDS = ["list_tasks", "plan_job", "plan_questions", "run_job", "job_status", "stop_job"] as const
+export const TOOL_IDS = [
+  "list_tasks", "plan_job", "plan_questions", "run_job", "job_status", "stop_job",
+  // The controls a run showed were missing: one task at a time, the job branch, the worktrees behind it, and a vouch.
+  "steer_task", "stop_task", "merge_job", "discard_job", "request_access",
+] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
 export interface ToolDraft {
@@ -25,6 +33,11 @@ export interface Handlers {
   run(job: string, note: string, ctx: ToolContext): Promise<string>
   status(job: string, ctx: ToolContext): Promise<string>
   stop(job: string, ctx: ToolContext): Promise<string>
+  steer(id: string, text: string, ctx: ToolContext): Promise<string>
+  stopTask(id: string, ctx: ToolContext): Promise<string>
+  merge(job: string, ack: string, ctx: ToolContext): Promise<string>
+  discard(job: string, ack: string, ctx: ToolContext): Promise<string>
+  access(path: string, why: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -83,6 +96,41 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     description: "Stop a job when the user asks: the running worker is interrupted, and the job pauses; run_job resumes it later. A waiting job leaves the queue. An empty job id stops the running job.",
     input: input("job"),
     execute: guarded(([job], ctx) => handlers.stop(job!, ctx), "job"),
+  })
+  draft.add({
+    id: "steer_task",
+    name: "steer_task",
+    description: "Send a note to a worker that is still running, without interrupting it: id is a task id (list_tasks), text is what the worker should know, in a sentence. The note reaches it as a system block at its next turn, so it finishes what it is doing first. Use it when the user changes their mind about a task, or when a report tells you what to fix next. A worker that already ended cannot be steered: the answer then names its sessionID to continue it with the subagent tool.",
+    input: input("id", "text"),
+    execute: guarded(([id, text], ctx) => handlers.steer(id!, text!, ctx), "id", "text"),
+  })
+  draft.add({
+    id: "stop_task",
+    name: "stop_task",
+    description: "Stop one task's worker and leave the rest of the job running; use it when the user says one worker is stuck, wrong or not needed any more. Its worktree and whatever it wrote stay exactly where they are, and the answer names them, so nothing is lost. When it was the last running task, the job ends like a stopped one.",
+    input: input("id"),
+    execute: guarded(([id], ctx) => handlers.stopTask(id!, ctx), "id"),
+  })
+  draft.add({
+    id: "merge_job",
+    name: "merge_job",
+    description: "Bring a finished job's branch into the user's checkout, the one write you may make there. It shows the commits that would land, refuses a checkout with uncommitted changes and a job with unfinished or failed tasks (ack then carries the user's own words that this is fine), and merges fast-forward only. It never forces, resets or throws work away: without a fast-forward it says so and leaves the checkout as it was. Afterwards discard_job drops the branch and its worktrees.",
+    input: input("job", "ack"),
+    execute: guarded(([job, ack], ctx) => handlers.merge(job!, ack!, ctx), "job", "ack"),
+  })
+  draft.add({
+    id: "discard_job",
+    name: "discard_job",
+    description: "Give a job's branch and worktrees back to git: git worktree remove --force and git branch -D for each of them. Without ack it only lists what it would delete; with the user's words in ack it deletes that and reports what went and what stayed. Your checkout and every file in it are never touched. Use it when the user does not want the job's work any more, or after merge_job.",
+    input: input("job", "ack"),
+    execute: guarded(([job, ack], ctx) => handlers.discard(job!, ack!, ctx), "job", "ack"),
+  })
+  draft.add({
+    id: "request_access",
+    name: "request_access",
+    description: "Vouch that a worker of this job legitimately needs a path outside the project: path with its full path, why in one sentence for the user. From then on a worker that only reads may read it without asking again; writing there still goes to the user. It cannot open the user's keys, credentials, config or home directory, the system directories or another job's worktrees, whatever the reason: for those, ask the user.",
+    input: input("path", "why"),
+    execute: guarded(([path, why], ctx) => handlers.access(path!, why!, ctx), "path", "why"),
   })
   return [...TOOL_IDS]
 }

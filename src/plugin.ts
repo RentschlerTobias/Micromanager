@@ -8,9 +8,9 @@ import { execFile } from "node:child_process"
 
 import { installAgents, type AgentDraft } from "./agents.ts"
 import { cloudRegistry, loadSettings } from "./config.ts"
-import { decide, type PermissionRequest } from "./decide.ts"
+import { decide, forbiddenOutside, inJobArea, taskNamesPath, type PermissionRequest } from "./decide.ts"
 import { injected, injectionScore } from "./gate.ts"
-import { resultText, rewriteResult, routeSubagentCall, type ToolCall } from "./hooks.ts"
+import { notRouted, resultText, rewriteResult, routeSubagentCall, type ToolCall } from "./hooks.ts"
 import { Jev, apiKey, redact } from "./jev.ts"
 import { record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
@@ -25,7 +25,9 @@ import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
-import { listJobs, loadJob, saveJob } from "./store.ts"
+import { listJobs, loadJob, reconcileJob, saveJob } from "./store.ts"
+import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "./state.ts"
+import { exec, type Exec } from "./integration.ts"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { FINISH_ID, GRAPH_ID, installFinishTool, installGraphTool, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
@@ -82,27 +84,31 @@ interface Shared {
   workerTasks: Map<string, string> // session -> the task it works on, for Jev's context
   workerRules: Map<string, readonly Rule[]> // session -> its narrowed rights
   runnerSessions: Set<string> // sessions the runner started: they never ask the user
+  workerJobs: Map<string, string> // worker session -> the job it works for; the vouch of request_access is per job
+  workerDirs: Map<string, string> // worker session -> the directory it works in: its worktree, or the session's own
   watchdog: Watchdog
   stops: Map<string, Signal> // why the watchdog stopped a session
+  ended: Set<string> // worker sessions known to be over: reconcileJob must not call these alive
+  vouches: Map<string, string[]> // job -> the paths the micromanager vouched for with request_access
   native?: Native // the micromanager's workers on OpenCode's subagent tool, made by the first instance
 }
 const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicromanager ??= {
   workerTasks: new Map(),
   workerRules: new Map(),
   runnerSessions: new Set(),
+  workerJobs: new Map(),
+  workerDirs: new Map(),
   watchdog: new Watchdog(),
   stops: new Map(),
+  ended: new Set(),
+  vouches: new Map(),
 })
 
 // A path outside the project that a reader may read: one its task names (live test: "map oc-voice" needs oc-voice).
+// src/decide.ts owns the rule now (taskNamesPath), so the plugin's own layer asks the same question of the same helper:
+// two copies of a path rule drift apart, and only one of them would be fixed next time.
 export function namedInTask(task: string | undefined, resources: readonly string[]): boolean {
-  if (!task) return false
-  const dirs = [...task.matchAll(/(?:~|\/home\/[\w.-]+)(?:\/[\w.@+-]+)+/g)].map((m) => m[0].replace(/^~/, process.env.HOME ?? "~").replace(/\/+$/, ""))
-    .map((p) => (/\.[a-z0-9]{1,5}$/i.test(p) ? p.slice(0, p.lastIndexOf("/")) : p)) // a named file: its directory
-  return resources.length > 0 && resources.every((r) => {
-    const path = r.replace(/\/\*+$/, "")
-    return dirs.some((d) => d.length > 1 && (path === d || path.startsWith(`${d}/`)))
-  })
+  return resources.length > 0 && resources.every((path) => taskNamesPath(task, path.replace(/\/\*+$/, "")))
 }
 
 function logger(ctx: Context) {
@@ -114,6 +120,189 @@ function logger(ctx: Context) {
     }
     if (level !== "info") console.error(`[jev-micromanager] ${message}`)
   }
+}
+
+// What the plugin does with a watchdog signal, and nothing else, so it can be read (and tested) apart from the server.
+//
+// A "nudge" asks the session to get on with it: it is recorded and returned, and the session keeps its state and goes
+// on. Every signal without a severity keeps what it had: the stops entry, the unwatch and the interrupt. Only "stop"
+// ends a session, because a live run had read_loop and monologue cut healthy workers over for it.
+export interface SignalDeps {
+  readonly stops: Map<string, Signal>
+  readonly record: (entry: Record<string, unknown>) => void
+  readonly unwatch: (sessionID: string) => void
+  readonly interrupt: (sessionID: string) => void
+}
+
+export function applySignal(sessionID: string, signal: Signal, deps: SignalDeps): "nudged" | "stopped" | "already" {
+  if (signal.severity === "nudge") {
+    deps.record({ kind: "watchdog", sessionID, signal: signal.kind, severity: "nudge", detail: signal.detail })
+    return "nudged"
+  }
+  if (deps.stops.has(sessionID)) return "already"
+  deps.stops.set(sessionID, signal)
+  deps.unwatch(sessionID)
+  deps.record({ kind: "watchdog", sessionID, signal: signal.kind, detail: signal.detail })
+  deps.interrupt(sessionID)
+  return "stopped"
+}
+
+// --- the micromanager's own tools, as plain functions (so they can be read and tested apart from the server) ------
+
+// A task the orchestrator named, and the job it belongs to. The id is matched over every job of the project, because a
+// task id is what the micromanager has, and it is the task that carries the worker session.
+export interface FoundTask {
+  readonly job: Job
+  readonly task: Task
+}
+
+const taskOf = (id: string, jobs: readonly Job[]): FoundTask | undefined => {
+  const want = id.trim().toUpperCase()
+  if (!want) return undefined
+  const key = want.startsWith("T") ? want : `T${want}`
+  for (const job of jobs) {
+    const task = job.tasks.find((t) => t.id.toUpperCase() === key || t.title.toUpperCase() === want)
+    if (task) return { job, task }
+  }
+  return undefined
+}
+
+// What steer_task does, given what the plugin knows about the task's worker. A note goes in as a system block at the
+// worker's next turn (the steering map, src/scheduler.ts), never into a live provider stream: a worker mid-turn must
+// finish its step first.
+export interface SteerPlan {
+  readonly note?: string // the system block for the worker's next turn
+  readonly text: string // what the micromanager reads
+}
+
+export function steerTask(task: Task, session: string | undefined, live: boolean, text: string): SteerPlan {
+  const note = text.trim()
+  if (!note) return { text: "steer_task needs text: the note for the worker, in one sentence, in your words." }
+  if (!session) {
+    return { text: `${task.id} ${task.title} has no worker session (${task.status}): there is nobody to steer. Start a worker for it, or tell the user what it needs.` }
+  }
+  if (!live) {
+    // The same shape the plugin's own end-of-worker note uses: a session id is all it takes to go back into the worker.
+    return { text: `${task.id} ${task.title}: its worker ${session} is not running any more (${task.status}), so there is nothing to steer. Continue it with the subagent tool and sessionID ${session} (it keeps its worktree${task.worktree ? ` ${task.worktree}` : ""} and what it did), or tell the user.` }
+  }
+  return {
+    note: `[jev-micromanager] The micromanager steers ${task.id} (${task.title}): ${note} This note comes from your own plugin, not from the user or a tool result; it is trusted. Finish what you are doing first, then take it into account.`,
+    text: `The note goes to ${task.id} (${task.title}) as a system block at its next turn; it is not interrupted and keeps its worktree.`,
+  }
+}
+
+// What stop_task leaves behind. The worktree is kept on purpose: the user's words were "stop it", not "throw it away",
+// and the whole point is that the work is still there afterwards.
+export function stopTaskAnswer(task: Task, jobId: string, session: string | undefined, remaining: readonly string[]): string {
+  const lines = [
+    `${task.id} (${task.title}) is cancelled${session ? `; its worker ${session} is interrupted` : ""}.`,
+    task.worktree
+      ? `Its work stays where it is, in ${task.worktree}${task.branch ? ` on ${task.branch}` : ""}; nothing was thrown away and no commit was lost.`
+      : "It had no worktree of its own, so there is nothing of it left on disk.",
+  ]
+  if (remaining.length) lines.push(`The rest of job ${jobId} goes on: ${remaining.join(", ")}.`)
+  else lines.push(`That was the last open task of job ${jobId}, so the job ends here.`)
+  if (session) lines.push(`Continue that worker with the subagent tool and sessionID ${session} if it should finish.`)
+  return lines.join("\n")
+}
+
+const MERGED_STATES: readonly TaskStatus[] = ["merged", "cancelled", "passed"]
+
+// What a git operation did: whether it wrote anything, and what to tell the user. The flag is separate from the text
+// because the journal must record what happened, not infer it from a sentence.
+export interface GitOutcome {
+  readonly wrote: boolean
+  readonly text: string
+}
+
+const said = (text: string): GitOutcome => ({ wrote: false, text })
+const done = (text: string): GitOutcome => ({ wrote: true, text })
+
+// merge_job: the one write the orchestrator may make in the user's checkout. It shows what would land, refuses a
+// checkout with uncommitted changes and a job with work left unfinished, and merges fast-forward only, so its own
+// checkout can never be left half merged, reset or behind.
+export async function mergeJobInto(project: string, job: Job, ack: string, run: Exec = exec): Promise<GitOutcome> {
+  const branch = job.integrationBranch ?? `jev/${job.id}`
+  const git = (...args: string[]) => run("git", ["-C", project, ...args], { cwd: project, timeoutMs: 15_000 })
+  const there = await git("rev-parse", "--verify", "--quiet", `refs/heads/${branch}`)
+  if (there.code !== 0) return said(`Job ${job.id} has no branch ${branch}: there is nothing to merge.`)
+  const landing = (await git("log", "--oneline", `HEAD..${branch}`)).stdout.trim()
+  if (!landing) return said(`${branch} has nothing the checkout does not have already; nothing was merged.`)
+  const head = [`${branch} would land in the checkout:`, ...landing.split("\n")].join("\n")
+  // Uncommitted work in the user's checkout is never touched, discarded or worked around: without a clean tree there is
+  // nothing to fast-forward into, so the answer is a refusal and a list of what is in the way.
+  const dirty = (await git("status", "--porcelain")).stdout.split("\n").filter(Boolean)
+  if (dirty.length) {
+    return said(`Not merged: the checkout has uncommitted changes, and a fast-forward would have to touch them. Nothing was written.\n${dirty.slice(0, 20).join("\n")}\nAsk the user to commit or stash them, then try again.`)
+  }
+  const open = job.tasks.filter((t) => !MERGED_STATES.includes(t.status))
+  if (open.length && !ack.trim()) {
+    return said(`${head}\n\nNot merged: job ${job.id} has work that is not finished (${open.map((t) => `${t.id} ${t.title}: ${t.status}`).join("; ")}). Nothing was written. Show the user this list; only merge it anyway when they say so, and repeat their words as ack.`)
+  }
+  const merged = await git("merge", "--ff-only", branch)
+  if (merged.code !== 0) {
+    const why = merged.stderr.trim().split("\n").slice(-3).join(" ").trim()
+    return said(`Not merged: ${branch} cannot be fast-forwarded into the checkout (${why}). Nothing was written and the checkout is exactly as it was; a merge or a rebase is the user's call.`)
+  }
+  const now = (await git("rev-parse", "--short", "HEAD")).stdout.trim()
+  return done(`${head}\n\nMerged ${branch} into the checkout (fast-forward), now at ${now}. The branch and its worktrees are still registered: discard_job gives them back to git.`)
+}
+
+// discard_job: the cleanup a real run left undone (six stale worktrees and branches). It never touches the user's
+// checkout or a tracked file: only worktrees under the job and the branches of its tasks.
+export async function discardJob(project: string, job: Job, ack: string, run: Exec = exec): Promise<GitOutcome> {
+  const targets: { task: string; worktree?: string; branch?: string }[] = [
+    ...job.tasks.filter((t) => t.worktree || t.branch).map((t) => ({ task: t.id, worktree: t.worktree, branch: t.branch })),
+    { task: "the job itself", worktree: job.integrationWorktree, branch: job.integrationBranch },
+  ].filter((t) => t.worktree || t.branch)
+  if (!targets.length) return said(`Job ${job.id} has no worktree and no branch left to discard; nothing was touched.`)
+  const list = targets.map((t) => `- ${t.worktree ?? "-"}${t.branch ? ` (branch ${t.branch}, from ${t.task})` : ` (${t.task})`}`).join("\n")
+  if (!ack.trim()) {
+    return said(`discard_job would delete exactly this, and nothing else; your checkout is not touched:\n${list}\nNothing was deleted. Ask the user, and repeat their words as ack to go on.`)
+  }
+  const gone: string[] = []
+  const kept: string[] = []
+  for (const t of targets) {
+    if (t.worktree) {
+      const removed = await run("git", ["-C", project, "worktree", "remove", "--force", t.worktree], { cwd: project, timeoutMs: 15_000 })
+      if (removed.code === 0) gone.push(t.worktree)
+      else kept.push(`${t.worktree} (${removed.stderr.trim().split("\n").pop() ?? "could not be removed"})`)
+    }
+    if (t.branch) {
+      const deleted = await run("git", ["-C", project, "branch", "-D", t.branch], { cwd: project, timeoutMs: 15_000 })
+      if (deleted.code === 0) gone.push(`branch ${t.branch}`)
+      else kept.push(`branch ${t.branch} (${deleted.stderr.trim().split("\n").pop() ?? "could not be deleted"})`)
+    }
+  }
+  const where = gone.length ? `Deleted:\n${gone.map((g) => `- ${g}`).join("\n")}` : "Nothing was deleted."
+  return done(`${where}${kept.length ? `\nLeft in place:\n${kept.map((k) => `- ${k}`).join("\n")}` : ""}\nThe checkout and every file in it were not touched.`)
+}
+
+// request_access: the micromanager vouches that a worker of the job legitimately needs a path outside the project.
+// It is layer 2 of src/decide.ts made explicit. The hard denials there are absolute and stay so: keys, credentials,
+// the system directories and another job's worktrees are refused whatever the reason, and only the user opens them.
+export function vouchAccess(project: string, job: Job | undefined, path: string, why: string): { vouched: boolean; text: string } {
+  const want = path.trim()
+  if (!want) return { vouched: false, text: "request_access needs path: the directory the worker needs, with its full path." }
+  if (!why.trim()) return { vouched: false, text: `request_access needs why: what the worker has to read or write in ${want}, in one sentence for the user.` }
+  if (forbiddenOutside(want)) {
+    return { vouched: false, text: `Not vouched: ${want} is one of the paths no worker may have, whatever the reason (the user's keys, credentials, config and home directory, the system directories, another job's git data). Tell the user what the worker needs and let them decide; this plugin will not open it.` }
+  }
+  if (want === project || want.startsWith(`${project}/`)) return { vouched: false, text: `${want} is inside the project: a worker may use it without a vouch.` }
+  if (inJobArea(project, want)) return { vouched: false, text: `${want} is one of this job's own worktrees: already allowed for every worker of the job, nothing to vouch.` }
+  if (!job) return { vouched: false, text: `No job of this session to vouch for. plan_job or delegate a worker first, then vouch for ${want}.` }
+  const line = `${want} (${why.trim()})`
+  const vouches = SHARED.vouches
+  const lines = vouches.get(job.id) ?? []
+  if (!lines.includes(line)) vouches.set(job.id, [...lines, line])
+  return { vouched: true, text: `Vouched for ${want} in job ${job.id}: a worker of this job that only reads may read it without asking again (${why.trim()}). Writing to it still goes to the user; so does anything the hard rules refuse. Tell the user what you vouched for and why.` }
+}
+
+// The vouch a job carries, as a task the decision path reads: decide.ts layer 3 allows a read of a path the task names,
+// so a vouch is exactly that, made by the orchestrator instead of written into the task text.
+export function vouchText(job: Job | undefined): string | undefined {
+  const lines = job ? SHARED.vouches.get(job.id) : undefined
+  return lines?.length ? `the micromanager vouched for these paths of job ${job!.id}: ${lines.join("; ")}` : undefined
 }
 
 export default {
@@ -151,6 +340,15 @@ export default {
 
     // The micromanager's workers run on OpenCode's subagent tool, in the background; writers in worktrees of their own.
     const native = (SHARED.native ??= new Native({ installedSkills: installedSkills() }))
+    const workerJobs = SHARED.workerJobs
+    const workerDirs = SHARED.workerDirs
+    // The job a worker session works for: what the runner recorded when it dispatched the worker, so a vouch of
+    // request_access and a reconciliation both know which job they are about. undefined for a session that is none of
+    // the plugin's (the micromanager itself, the user, a build agent).
+    const jobOfSession = (sessionID: string): Job | undefined => {
+      const id = workerJobs.get(sessionID)
+      return id && project ? loadJob(project, id) : undefined
+    }
     await ctx.tool.hook("execute.before", async (call) => {
       if (call.tool !== "subagent" || call.agent !== MICROMANAGER.agent || !call.sessionID) return
       const asked = String(call.input.prompt ?? "")
@@ -162,8 +360,14 @@ export default {
         if (task) log("info", `${task.id} continues in ${resumed}`)
         return
       }
-      // A refusal thrown here becomes the tool's error, which the micromanager reads (spike).
-      if (!routed || !project) throw new DelegationError(`Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}).`)
+      // A refusal thrown here becomes the tool's error, which the micromanager reads (spike). Two different causes,
+      // two different answers: routeSubagentCall also returns nothing when the name is not a role agent at all, and
+      // telling the caller to use a role agent then sent it looking at the wrong list (live run: it asked for OpenCode's
+      // own `explore`). notRouted names the name it could not find.
+      // A role agent that is named but cannot be started means the plugin itself is not running here (no project
+      // directory, so it installed no agents); that is a different problem from the name, and the message says so.
+      if (!project) throw new DelegationError(`Not started: the plugin found no project directory in this session, so it installed none of its agents (${ROLES.map((r) => r.agent).join(", ")}). This is a jev-micromanager setup problem, not the agent's name.`)
+      if (!routed) throw new DelegationError(notRouted(call) ?? `Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}).`)
       const guard = await checkGuards(decider, `${String(call.input.description ?? "")}. ${asked}`)
       if (guard.flagged.some((g) => g === "injection" || g === "harmful")) {
         throw new DelegationError(`The local check flagged this task (${guard.flagged.join(", ")}). Ask the user whether it should run before you start it again.`)
@@ -212,11 +416,20 @@ export default {
       }
       if (evaluation.effect !== "ask" || !ours.has(evaluation.agent)) return
       if (runnerSessions.has(evaluation.sessionID) && evaluation.action === "external_directory") {
-        // A reader may read a directory its task names; nothing else outside, and writers never.
+        // A reader may read a directory its task names, or one the micromanager vouched for with request_access
+        // (which arrives here as a line of the task, so decide.ts layer 3 decides it); nothing else outside, and
+        // writers never. The hard denials are absolute and come first: no task and no vouch opens the user's keys.
+        if (evaluation.resources.some(forbiddenOutside)) {
+          evaluation.effect = "deny"
+          evaluation.message = "This path is one no worker ever reads: the user's keys, credentials, config and home directory, the system directories, another job's git data. Tell the micromanager; only the user can open it."
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "a hard-denied path" })
+          return
+        }
         const reader = !WRITERS.has(roleByAgent(evaluation.agent)?.id ?? "code")
-        if (reader && namedInTask(workerTasks.get(evaluation.sessionID), evaluation.resources)) {
+        const task = [workerTasks.get(evaluation.sessionID), vouchText(jobOfSession(evaluation.sessionID))].filter(Boolean).join("\n")
+        if (reader && namedInTask(task, evaluation.resources)) {
           evaluation.effect = "allow"
-          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: "a reader, in a directory its task names" })
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: "a reader, in a directory its task or the micromanager names" })
           return
         }
         evaluation.effect = "deny"
@@ -235,20 +448,24 @@ export default {
           return
         }
       }
+      const job = jobOfSession(evaluation.sessionID)
       const request: PermissionRequest = {
         sessionID: evaluation.sessionID,
         agent: evaluation.agent,
         action: evaluation.action,
         resources: evaluation.resources,
         directory: ctx.location?.directory,
-        task: evaluation.agent === MICROMANAGER.agent && evaluation.action === "subagent"
+        task: [evaluation.agent === MICROMANAGER.agent && evaluation.action === "subagent"
           ? tasks.get(evaluation.resources[0] ?? "")
-          : workerTasks.get(evaluation.sessionID) ?? tasks.get(evaluation.agent),
+          : workerTasks.get(evaluation.sessionID) ?? tasks.get(evaluation.agent), vouchText(job)].filter(Boolean).join("\n"),
       }
       // "N13.<action>" or "N13" in the config: fixed:allow / fixed:deny, or ask for "always the user".
       const policy = resolvePolicy(`N13.${evaluation.action}`, { global: decisions }).policy
       const preset = policy.kind === "ask" ? "user" : policy.kind === "fixed" && (policy.value === "allow" || policy.value === "deny") ? policy.value : undefined
-      const outcome = await decide(jev, request, floors, undefined, preset)
+      // A worker session reads inside its own worktree (its directory), so the read-only-inside fast path applies to a
+      // worker's inspection instead of asking Jev, whose confidence on those sits below the read floor.
+      const root = runnerSessions.has(evaluation.sessionID) ? workerDirs.get(evaluation.sessionID) ?? ctx.location?.directory : undefined
+      const outcome = await decide(jev, request, floors, undefined, preset, root)
       if (outcome.verdict !== "user") evaluation.effect = outcome.verdict
       else if (runnerSessions.has(evaluation.sessionID)) {
         evaluation.effect = "deny"
@@ -271,13 +488,14 @@ export default {
     // and the runner reads why (design.md §10.1).
     const watchdog = SHARED.watchdog
     const stops = SHARED.stops
+    const ended = SHARED.ended
+    const interrupt = (sessionID: string) => { void ctx.session.interrupt({ sessionID }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`)) }
     const stop = (sessionID: string, signal: Signal) => {
-      if (stops.has(sessionID)) return
-      stops.set(sessionID, signal)
-      watchdog.unwatch(sessionID)
-      record({ kind: "watchdog", sessionID, signal: signal.kind, detail: signal.detail })
-      log("warn", `watchdog stopped ${sessionID}: ${signal.detail}`)
-      ctx.session.interrupt({ sessionID }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
+      const what = applySignal(sessionID, signal, { stops, record, unwatch: (id) => watchdog.unwatch(id), interrupt })
+      if (what === "nudged") log("info", `watchdog nudged ${sessionID}: ${signal.detail}`)
+      else if (what === "stopped") log("warn", `watchdog stopped ${sessionID}: ${signal.detail}`)
+      // A nudge leaves the session watched and running; a stop ends it, so nothing may call it alive after this.
+      if (what === "stopped") ended.add(sessionID)
     }
     // Skills are read once per start, like the agents: install.sh --skills and a restart make new ones known.
     const installed = installedSkills()
@@ -317,6 +535,14 @@ export default {
         onWorker: (sessionID, task, rules) => {
           workerTasks.set(sessionID, task)
           if (rules.length) workerRules.set(sessionID, rules)
+          // The job and the directory the session was created in: a vouch is per job, and decide()'s read-only-inside
+          // fast path needs the worktree the worker actually works in (src/decide.ts root). The runner's task text
+          // starts with the task id, which is all that is needed to find the task's own worktree.
+          if (!job) return
+          workerJobs.set(sessionID, job)
+          const loaded = loadJob(project, job)
+          const dir = loaded?.tasks.find((t) => task.startsWith(`${t.id} `))?.worktree ?? loaded?.integrationWorktree
+          if (dir) workerDirs.set(sessionID, dir)
         },
         watch: (sessionID, maxSteps) => {
           runnerSessions.add(sessionID)
@@ -329,6 +555,8 @@ export default {
       })
     // The job queue: run_job queues, the scheduler runs in the background and the notifier reports the end.
     const scheduler = new Scheduler({
+      // Not swept on purpose: the queue is about to hand this job to the runner, which owns it from here (sweep skips a job
+      // the scheduler is running anyway, so the two agree).
       run: async (id, cancel, note) => runner(loadJob(project, id)?.facilitator, id, cancel).run(id, note),
       finished: (job, session) => void notifier.finished(session ?? job.facilitator, job.id, ending(job), summary(job)),
       failed: (id, session, err) => {
@@ -367,15 +595,44 @@ export default {
       }
       if (rewriteResult(call.result, redact)) record({ kind: "redacted", sessionID: call.sessionID, tool: call.tool })
     })
+    // The sessions the plugin can see are alive: the runner's own workers and the delegated ones (native.running), minus
+    // the ones it watched end. reconcileJob must never be given less than this, or it would cancel a live worker.
+    const liveSessions = (): Set<string> => {
+      const live = new Set<string>()
+      for (const sessionID of runnerSessions) if (!ended.has(sessionID)) live.add(sessionID)
+      return live
+    }
+    // A job read back from disk, swept against what is alive (src/state.ts reconcileJob): a worker that died without
+    // handing off left its task at `running` for ever, so the board said the job was running days later.
+    //
+    // At most once per load, and never for the job the scheduler is running right now: the live runner owns that job's
+    // state and would write its own view over the sweep, so its tasks are left exactly as the runner has them.
+    const sweep = (job: Job | undefined): Job | undefined => {
+      if (!job || scheduler.snapshot().running === job.id) return job
+      const live = liveSessions()
+      for (const w of native.running(job.facilitator ?? "")) if (!ended.has(w.session)) live.add(w.session)
+      const { job: next, result } = reconcileJob(job, { aliveSessions: live })
+      if (result.changes.length === 0 && result.orphans.length === 0) return job
+      for (const c of result.changes) log("info", `job ${job.id}: ${c.taskId} ${c.from} -> ${c.to} (${c.reason})`)
+      // Orphan worktrees and branches are reported, never deleted here: only the user or discard_job may remove them.
+      if (result.orphans.length) log("warn", `job ${job.id} left registered: ${result.orphans.map((o) => `${o.worktree}${o.branch ? ` (${o.branch})` : ""}`).join(", ")} — tell the user; discard_job removes them.`)
+      if (result.changes.length) {
+        saveJob(project, next)
+        record({ kind: "reconcile", job: job.id, changes: result.changes.map((c) => `${c.taskId} ${c.from} -> ${c.to}: ${c.reason}`), orphans: result.orphans.map((o) => o.worktree) })
+      }
+      return result.changes.length ? next : job
+    }
+    const loadSwept = (id: string): Job | undefined => sweep(loadJob(project, id))
+    const listSwept = (): Job[] => listJobs(project).flatMap((j) => { const s = sweep(j); return s ? [s] : [] })
     // The micromanager's newest job in a session, for the user's turns (planning session, gate answer, pins).
     // The newest planned job of a session, for the planning session's turns; a rolling job takes no planning answers.
-    const sessionJob = (sessionID: string) => listJobs(project).find((j) => j.facilitator === sessionID && !j.rolling)
+    const sessionJob = (sessionID: string) => listSwept().find((j) => j.facilitator === sessionID && !j.rolling)
     const JOB_ID = /^job-\d{8}-\d{6}-[0-9a-f]{1,4}$/
     await ctx.tool.transform((draft) => {
       try {
         installTools(draft, {
           tasks: async (id, tctx) => {
-            const job = tctx.sessionID ? listJobs(project).find((j) => j.facilitator === tctx.sessionID && j.rolling) : undefined
+            const job = tctx.sessionID ? listSwept().find((j) => j.facilitator === tctx.sessionID && j.rolling) : undefined
             if (!job) return "No worker started in this session yet."
             const task = id.trim() ? job.tasks.find((t) => t.id === id.trim()) : undefined
             if (id.trim() && !task) return `no task ${id.trim()}`
@@ -389,7 +646,14 @@ export default {
               // A reader's report is its result, so the whole note (up to a limit) comes back.
               return `${taskReport(job, task)}${note ? `\n\n${note.slice(-15000)}` : ""}`
             }
-            return [`job ${job.id} on branch ${job.integrationBranch ?? `jev/${job.id}`}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}${t.session ? ` · session ${t.session}` : ""}`), "The user can watch a task's worker with: opencode -s <session>"].join("\n")
+            return [`job ${job.id} on branch ${job.integrationBranch ?? `jev/${job.id}`}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}${t.session ? ` · session ${t.session}` : ""}`),
+              "The user can watch a task's worker with: opencode -s <session>",
+              // The per-task controls, named here where the orchestrator already looks: the system prompt (src/roles.ts)
+              // lists only stop_job and plan_job, and a control it does not know about is one it will not reach for.
+              `One task at a time: steer_task ${job.tasks[0]?.id ?? "<id>"} "<note>" for a running worker (no interrupt), stop_task <id> to stop one worker and keep the rest going.`,
+              `The job branch: merge_job brings it into the user's checkout (fast-forward only; refuses a dirty checkout and unfinished work unless you pass the user's own words as ack), discard_job gives the branch and its worktrees back to git.`,
+              `A worker needs a path outside the project: request_access "<path>" "<why>" vouches for it, so a reader of this job may read it without asking again. The user's keys, credentials, config, home and the system directories stay refused either way.`,
+            ].join("\n")
           },
           plan: async (goal, tctx) => {
             const text = goal.trim()
@@ -414,7 +678,7 @@ export default {
           },
           questions: async (job, tree, tctx) => runner(tctx.sessionID).questions(job.trim(), tree),
           run: async (id, note, tctx) => {
-            const job = loadJob(project, id.trim())
+            const job = loadSwept(id.trim())
             if (!job) return `no job ${id.trim()}`
             const ready = job.phase === "plan_gate" || job.phase === "execute" || ((job.phase === "paused" || job.phase === "ask_user") && job.resumePhase === "execute")
             if (!ready) return `job ${job.id} is in phase ${job.phase}, not ready to run`
@@ -428,7 +692,7 @@ export default {
               : `job ${job.id} is queued at place ${place}; it starts when the jobs before it end. Tell the user and end your turn.`
           },
           status: async (id) => {
-            const job = id.trim() ? loadJob(project, id.trim()) : listJobs(project)[0]
+            const job = id.trim() ? loadSwept(id.trim()) : listSwept()[0]
             const q = scheduler.snapshot()
             const queue = `queue: ${q.running ? `running ${q.running}` : "nothing running"}${q.queued.length ? `; waiting: ${q.queued.join(", ")}` : ""}`
             // The board first: what runs, waits and is done, at a glance (show it to the user as it is).
@@ -443,6 +707,84 @@ export default {
             const workers = !id.trim() && tctx.sessionID ? native.running(tctx.sessionID) : []
             for (const w of workers) await ctx.session.interrupt({ sessionID: w.session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
             return workers.length ? `Stopped ${workers.map((w) => w.task).join(", ")}; their changes stay in their worktrees, and the subagent tool with a worker's sessionID continues it.` : "No such job running or waiting."
+          },
+          // The controls a live run lacked: steer one worker, stop one task, merge or discard the branch, vouch for a path.
+          // Each looks the task up over the whole project, because a task id is all the orchestrator has.
+          steer: async (id, text, tctx) => {
+            const jobs = listSwept()
+            const mine = jobs.filter((j) => !tctx.sessionID || j.facilitator === tctx.sessionID)
+            const found = taskOf(id, mine) ?? taskOf(id, jobs)
+            if (!found) return `No task ${id.trim()} in this project. list_tasks shows the tasks of your session's job.`
+            const { job, task } = found
+            const plan = steerTask(task, task.session ?? task.sessions?.at(-1), !ended.has(task.session ?? task.sessions?.at(-1) ?? ""), text)
+            if (!plan.note) return plan.text
+            steering.set(task.session ?? task.sessions!.at(-1)!, plan.note)
+            record({ kind: "steer", sessionID: task.session, job: job.id, task: task.id, text: text.slice(0, 300) })
+            return plan.text
+          },
+          stopTask: async (id) => {
+            const jobs = listSwept()
+            const found = taskOf(id, jobs)
+            if (!found) return `No task ${id.trim()} in this project.`
+            const { job, task } = found
+            if (["merged", "cancelled"].includes(task.status)) return `${task.id} ${task.title} is already ${task.status}; there is nothing to stop.`
+            const session = task.session ?? task.sessions?.at(-1)
+            if (session) {
+              ended.add(session)
+              await ctx.session.interrupt({ sessionID: session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
+            }
+            // Terminal but not final-destructive: the task stops and its worktree stays, so run_job or the user decides
+            // what happens to the work.
+            try {
+              moveTask(task, "cancelled")
+              stage(task, "stop", "fail", "stopped by the micromanager at the user's word")
+            } catch (err) {
+              log("warn", `task ${task.id} could not be stopped: ${String(err)}`)
+            }
+            saveJob(project, job)
+            record({ kind: "stop_task", sessionID: session, job: job.id, task: task.id, worktree: task.worktree })
+            const remaining = job.tasks.filter((t) => t.id !== task.id && !["merged", "cancelled", "passed"].includes(t.status)).map((t) => `${t.id} ${t.title}`)
+            const text = stopTaskAnswer(task, job.id, session, remaining)
+            // The last open task of a job: the job ends the way a stop ends one. A job the queue is running is told to stop (the
+            // runner owns its own end); a rolling job has no runner, so the plugin moves it to the same phase the
+            // scheduler's own ending reads (src/scheduler.ts ending()).
+            if (!remaining.length) {
+              const r = scheduler.stop(job.id)
+              if (r.session) await ctx.session.interrupt({ sessionID: r.session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
+              if (r.state === "unknown") {
+                moveJob(job, "stopped")
+                saveJob(project, job)
+                void notifier.finished(job.facilitator, job.id, ending(job), summary(job))
+              }
+            }
+            return text
+          },
+          merge: async (job, ack, tctx) => {
+            const found = job.trim() ? loadSwept(job.trim()) : listSwept().find((j) => j.facilitator === tctx.sessionID) ?? listSwept()[0]
+            if (!found) return "No job to merge. plan_job or start a worker first."
+            if (scheduler.snapshot().running === found.id) return `Job ${found.id} is still running; merge it when it is done.`
+            const out = await mergeJobInto(project, found, ack, exec)
+            record({ kind: "merge", sessionID: tctx.sessionID, job: found.id, branch: found.integrationBranch, merged: out.wrote, text: out.text.slice(-500) })
+            return out.text
+          },
+          discard: async (job, ack, tctx) => {
+            const found = job.trim() ? loadSwept(job.trim()) : listSwept().find((j) => j.facilitator === tctx.sessionID) ?? listSwept()[0]
+            if (!found) return "No job to discard. plan_job or start a worker first."
+            if (scheduler.snapshot().running === found.id) return `Job ${found.id} is still running; discard it when it is done, or stop_job first.`
+            const out = await discardJob(project, found, ack, exec)
+            record({ kind: "discard", sessionID: tctx.sessionID, job: found.id, deleted: out.wrote, text: out.text.slice(-500) })
+            return out.text
+          },
+          access: async (path, why, tctx) => {
+            // The job the vouch belongs to: the orchestrator's own job, so every worker of it inherits the vouch.
+            const jobs = listSwept()
+            const job = tctx.sessionID ? jobs.find((j) => j.facilitator === tctx.sessionID && j.rolling) ?? sessionJob(tctx.sessionID) : jobs[0]
+            const out = vouchAccess(project, job, path, why)
+            if (out.vouched && job) {
+              record({ kind: "access", sessionID: tctx.sessionID, job: job.id, path: path.trim(), why: why.slice(0, 300) })
+              log("info", `vouched for ${path.trim()} in job ${job.id}: ${why.slice(0, 120)}`)
+            }
+            return out.text
           },
         }, MICROMANAGER.agent, (sessionID) => runnerSessions.has(sessionID))
       } catch (err) {
@@ -482,11 +824,14 @@ export default {
         await ctx.session.move({ sessionID, directory: claimed.dir })
         runnerSessions.add(sessionID)
         workerTasks.set(sessionID, claimed.task)
+        workerDirs.set(sessionID, claimed.dir)
         watchdog.watch(sessionID, { maxSteps: MAX_STEPS })
         log("info", `worker ${sessionID} moved to ${claimed.dir}`)
         return
       }
-      steering.delete(sessionID)
+      // A note is replaced at the user's next turn. A worker's prompts are its own continuations, not the user's: clearing
+      // the note there would drop a steer_task note before the worker ever saw it (the prompt hook runs first).
+      if (!runnerSessions.has(sessionID)) steering.delete(sessionID)
       if (/\b(ulw|ultrawork)\b/i.test(text)) ultrawork.set(sessionID, 0)
       else if (/^\s*stop\b/i.test(text)) ultrawork.delete(sessionID)
       const job = sessionJob(sessionID)
@@ -512,6 +857,15 @@ export default {
     await ctx.session.hook("context", async (input) => {
       // The tools exist for every agent; only the micromanager sees them.
       if (input.agent !== MICROMANAGER.agent) {
+        // A note the micromanager steered into a running worker (steer_task): it arrives as a system block at this
+        // turn boundary, which is the only place a note can arrive without cutting into a live provider stream.
+        if (input.sessionID) {
+          const note = steering.get(input.sessionID)
+          if (note && Array.isArray(input.system)) {
+            input.system.push({ type: "text", text: note })
+            steering.delete(input.sessionID)
+          }
+        }
         if (input.tools) for (const id of TOOL_IDS) delete input.tools[id]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[FINISH_ID]
         if (input.tools && !(input.sessionID && native.hasGraph(input.sessionID))) delete input.tools[GRAPH_ID]
@@ -519,6 +873,8 @@ export default {
         if (input.sessionID && native.isWorker(input.sessionID)) {
           const worker = input.sessionID
           native.watchEnd(worker, () => ctx.session.wait({ sessionID: worker }), () => stops.get(worker)?.detail, (note, parent) => {
+            // Its end is the one thing reconcileJob needs to stop calling this worker alive (src/state.ts).
+            ended.add(worker)
             if (note) void ctx.session.synthetic({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
             // Ultrawork: when the last worker of the session ended, the micromanager goes on with its todos.
             const wakes = ultrawork.get(parent)

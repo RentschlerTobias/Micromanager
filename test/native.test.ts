@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
@@ -16,6 +16,18 @@ function repo(): string {
   git("add", "-A")
   git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
   return dir
+}
+
+// A project that is a subdirectory of its repository: git materialises a worktree of the ROOT, so the plugin has to
+// keep the offset (the live run that found this: a session three levels below the worktree it was moved to).
+function subRepo(): { root: string; project: string } {
+  const root = repo()
+  const project = join(root, "DFG_SPP2335", "2026", "H")
+  mkdirSync(project, { recursive: true })
+  writeFileSync(join(project, "references.bib"), "@article{a,\n")
+  git(root, "add", "-A")
+  git(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "sub")
+  return { root, project }
 }
 
 const git = (dir: string, ...args: string[]) => execFileSync("git", ["-C", dir, ...args]).toString().trim()
@@ -223,4 +235,49 @@ test("a merged writer continued by its session gets a new task in a fresh worktr
   assert.match((await native.finish("ses_w", "a2")).text, /^Merged/)
   assert.deepEqual(native.running("ses_mm"), [])
   assert.deepEqual(loadJob(project, d.job.id)!.tasks.map((t) => `${t.id}:${t.status}`), ["T1:merged", "T2:merged"])
+})
+
+test("a project below the repository root: the worker and its checks stay in the project directory", async () => {
+  const { root, project } = subRepo()
+  const native = new Native()
+  // The check names a file of the project, as a task's Checks line does; against the worktree root it does not exist.
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "tidy the bib", prompt: "Add an entry.\nFiles: references.bib\nChecks: grep -c '^@' references.bib" }, MODEL)
+  assert.equal(d.job.integrationRel, "DFG_SPP2335/2026/H", "the offset is on the job, so it survives a restart")
+  assert.match(d.notes.join("\n"), /DFG_SPP2335\/2026\/H/, "and it is said out loud")
+  assert.match(d.prompt, /references\.bib/, "the brief still names the worker's own paths")
+
+  const claimed = native.claim("ses_w", child(d.prompt))!
+  assert.equal(claimed.dir, join(d.task.worktree!, "DFG_SPP2335/2026/H"), "the worker works in the project directory")
+  assert.equal(d.task.worktreeRel, "DFG_SPP2335/2026/H")
+  assert.equal(git(claimed.dir, "rev-parse", "--show-toplevel"), d.task.worktree, "and it is a git worktree, of the repository root")
+  assert.ok(existsSync(join(d.task.worktree!, "README.md")), "the worktree holds the whole repository, three levels up")
+  assert.equal(readFileSync(join(d.task.worktree!, "DFG_SPP2335/2026/H/references.bib"), "utf8"), "@article{a,\n")
+
+  writeFileSync(join(claimed.dir, "references.bib"), "@article{a,\n@article{b,\n")
+  const green = await native.finish("ses_w", "two entries")
+  assert.match(green.text, /^Merged/, `the check ran where references.bib is: ${green.text}`)
+  assert.equal(readFileSync(join(d.job.integrationWorktree!, "DFG_SPP2335/2026/H/references.bib"), "utf8"), "@article{a,\n@article{b,\n")
+  assert.ok(!existsSync(join(root, "references.bib")), "the user's checkout is untouched")
+
+  // A failing check says which directory it ran in: that was the one diagnostic missing in the live run, where the file
+  // existed three levels up and the check said "No such file or directory".
+  const second = await native.delegate(project, "ses_mm", { agent: "coder", description: "b", prompt: "x\nFiles: notes.md\nChecks: grep -c '^@' notes.md" }, MODEL)
+  const dir2 = native.claim("ses_w2", child(second.prompt))!.dir
+  writeFileSync(join(dir2, "notes.md"), "n\n")
+  const red = await native.finish("ses_w2", "no bib here")
+  assert.match(red.text, /\$ grep -c '\^@' notes\.md \(exit 1\)/)
+  assert.match(red.text, new RegExp(`The checks ran in ${dir2.replace(/[/.]/g, "\\$&")}`))
+})
+
+test("a reader in a worktree is moved to the project directory too, and uncommitted work is named", async () => {
+  const { project } = subRepo()
+  writeFileSync(join(project, "uncommitted.md"), "draft\n") // not committed: no worktree will have it
+  const native = new Native({ graphs: { get: async () => undefined } })
+  const d = await native.delegate(project, "ses_mm", { agent: "explorer", description: "read", prompt: "What is here?" }, MODEL)
+  assert.equal(d.job.integrationDirty, "DFG_SPP2335/2026/H/uncommitted.md")
+  assert.match(d.notes.join("\n"), /uncommitted paths no worker will see/)
+  assert.match(d.prompt, /uncommitted changes that this worktree does not have/)
+  const claimed = native.claim("ses_r", child(d.prompt))!
+  assert.equal(claimed.dir, join(d.job.integrationWorktree!, "DFG_SPP2335/2026/H"))
+  assert.ok(!existsSync(join(claimed.dir, "uncommitted.md")), "the worktree is a checkout of the last commit")
 })

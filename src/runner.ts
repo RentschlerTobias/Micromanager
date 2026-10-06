@@ -18,7 +18,7 @@ import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, injected, inje
 import { brief, fixPrompt, handoffText, lastAssistantText, parseReport, refused, skillLine, taskAcceptance, usage } from "./brief.ts"
 import {
   changedFiles, commitTask, exec as defaultExec, fastForward, hashFiles, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, revertFiles,
-  runGate, workingDiff, type Exec, type GateResult,
+  runGate, taskDir, workingDiff, type Exec, type GateResult,
 } from "./integration.ts"
 import { redact } from "./jev.ts"
 import { learnQuestions, readMemory, RECALL_MAX, writeMemory } from "./memory.ts"
@@ -196,17 +196,29 @@ export class Runner {
   }
 
   // A provider stream that stops mid-answer leaves a session waiting with no hook firing (live test: a reviewer's
-  // message started streaming and never completed). The session's messages are looked at every pollMs; when nothing
-  // changed for stallMs, it is stalled and treated like a watchdog stop: a fresh session on another family.
+  // message started streaming and never completed). The session is looked at every pollMs; when nothing changed for
+  // stallMs, it is stalled and treated like a watchdog stop: a fresh session on another family.
+  //
+  // "Did anything change?" is answered by the message bookkeeping, not by the messages: JSON.stringify over the
+  // whole history of a session in the hundreds of thousands of tokens cost megabytes per poll, per active session,
+  // to learn nothing. The fingerprint is the number of messages plus the last one's id and updated time, all of it
+  // monotonic and O(1) to read.
   async #stall(sessionID: string, finished: () => boolean): Promise<Signal | undefined> {
     const pollMs = this.#d.pollMs ?? 20_000
     const stallMs = this.#d.stallMs ?? 4 * 60_000
+    const fingerprint = (messages: unknown): string => {
+      if (!Array.isArray(messages)) return ""
+      const last = messages[messages.length - 1] as { id?: unknown; time?: { created?: unknown; updated?: unknown } } | undefined
+      return `${messages.length}:${String(last?.id ?? "")}:${String(last?.time?.updated ?? last?.time?.created ?? "")}`
+    }
     let last = ""
     let since = Date.now()
     while (!finished()) {
       await new Promise<void>((resolve) => { const t = setTimeout(resolve, pollMs); t.unref?.() })
       if (finished()) return undefined
-      const now = JSON.stringify(await this.#d.session.context({ sessionID }).catch(() => last))
+      // A context call that fails counts as no change, as before: an unreadable session is not a moving one.
+      const seen = await this.#d.session.context({ sessionID }).catch(() => undefined)
+      const now = seen === undefined ? last : fingerprint(seen)
       if (now !== last) [last, since] = [now, Date.now()]
       else if (Date.now() - since >= stallMs) {
         await this.#d.session.interrupt({ sessionID }).catch(() => undefined)
@@ -557,7 +569,14 @@ export class Runner {
       const integration = await prepareIntegration(this.#d.project, job.id, this.#exec)
       job.integrationBranch = integration.branch
       job.integrationWorktree = integration.worktree
+      // A git worktree is a checkout of the repository ROOT, so a project below it keeps an offset: without it every
+      // worker and every check would work three levels above its own files.
+      job.integrationRel = integration.rel
+      job.integrationBase = integration.base
+      job.integrationDirty = integration.dirty ? integration.dirtySummary : ""
       this.#say(`working on branch ${integration.branch}`)
+      if (integration.rel) this.#say(`the project is ${integration.rel} below the repository root, so the worktree holds the whole repository; the tasks work in ${taskDir(integration.worktree, integration.rel)}`)
+      if (integration.dirty) this.#say(`the working tree has uncommitted paths no worker will see (${integration.dirtySummary}); this job starts from ${integration.base.slice(0, 7)}`)
     } else await this.#reconcile(job)
     saveJob(this.#d.project, job)
     // Tasks run as promises; with parallel 1 one at a time, as before Phase F. A task that stops the job lets the
@@ -659,8 +678,9 @@ export class Runner {
   // One task: in the job's worktree when tasks run one at a time, else in its own worktree, then the merge train.
   async #dispatch(job: Job, task: Task): Promise<void> {
     if ((this.#d.parallel ?? 1) <= 1) return this.#runTask(job, task)
-    const w = await prepareTaskWorktree(this.#d.project, job.id, task.id, job.integrationBranch!, this.#exec)
+    const w = await prepareTaskWorktree(this.#d.project, job.id, task.id, job.integrationBranch!, this.#exec, undefined, job.integrationRel ?? "")
     task.worktree = w.worktree
+    task.worktreeRel = w.rel
     task.branch = w.branch
     try {
       await this.#runTask(job, task)
@@ -689,8 +709,8 @@ export class Runner {
     let step = await rebaseTask(w, job.integrationBranch!, this.#exec)
     if (step.ok && step.moved) {
       const checks = [...new Set(taskAcceptance(job, task).map((a) => a.verify).filter((v): v is string => Boolean(v)))]
-      const failed = (await runGate(w.worktree, checks, this.#exec)).filter((r) => !r.passed)
-      if (failed.length) step = { ok: false, conflict: `checks fail on top of the newer commits: ${failed.map((f) => f.command).join(", ")}` }
+      const failed = (await runGate(w.worktree, checks, this.#exec, undefined, this.#dir(job, task))).filter((r) => !r.passed)
+      if (failed.length) step = { ok: false, conflict: `checks fail on top of the newer commits (in ${this.#dir(job, task)}): ${failed.map((f) => f.command).join(", ")}` }
     }
     if (step.ok) step = await fastForward(job.integrationWorktree!, w.branch, this.#exec)
     if (step.ok) {
@@ -794,7 +814,8 @@ export class Runner {
 
   async #runTask(job: Job, task: Task): Promise<void> {
     if (job.budget.workersUsed >= job.budget.workersMax) return this.#stop(job, `worker budget of ${job.budget.workersMax} used up`)
-    const worktree = this.#dir(job, task)
+    const worktree = this.#worktree(job, task) // git commands run in the worktree root
+    const dir = this.#dir(job, task) // the worker and its checks work in the project directory
     const profile = task.profile ?? (await this.#classify(job, task))
     if (profile.injection) {
       moveTask(task, "blocked")
@@ -827,7 +848,7 @@ export class Runner {
       frozen = red
     }
     const s = await this.#workerSession(job, task, model.id)
-    const first = [brief(job, task, model.id, worktree, this.#skills("implement", task)), frozen.size ? greenNote([...frozen.keys()]) : ""].filter(Boolean).join("\n\n")
+    const first = [brief(job, task, model.id, dir, this.#skills("implement", task)), frozen.size ? greenNote([...frozen.keys()]) : ""].filter(Boolean).join("\n\n")
     let work: Work | undefined = { s, model, answer: await this.#ask(s.id, first), fresh: false }
     work = await this.#untilGreen(job, task, work, checks, frozen)
     if (!work) return
@@ -1003,7 +1024,8 @@ export class Runner {
   // Worker turns until the task's checks pass: the watchdog's stops, the report, the gate, at most fixRounds fixes,
   // then the N9 ladder. Returns undefined when the task went to the user or was given up (escalated or blocked).
   async #untilGreen(job: Job, task: Task, work: Work, checks: readonly string[], frozen: ReadonlyMap<string, string>): Promise<Work | undefined> {
-    const worktree = this.#dir(job, task)
+    const worktree = this.#worktree(job, task) // git work
+    const dir = this.#dir(job, task) // the checks name the worker's own paths
     let lastDiff: string | undefined
     let lastFailure: string | undefined
     for (;;) {
@@ -1054,7 +1076,7 @@ export class Runner {
         return undefined
       }
       moveTask(task, "gating")
-      const results = [...(await runGate(worktree, checks, this.#exec)), ...(await frozenCheck(worktree, frozen, this.#exec))]
+      const results = [...(await runGate(worktree, checks, this.#exec, undefined, dir)), ...(await frozenCheck(worktree, frozen, this.#exec))]
       const failed = results.filter((r) => !r.passed)
       const changed = await changedFiles(worktree, this.#exec)
       const outside = task.files.length ? changed.filter((f) => !task.files.includes(f) && !frozen.has(f)) : changed
@@ -1064,7 +1086,9 @@ export class Runner {
       // N8: the same diff as the last round (the worker changed nothing) is a loop; the same failure is one when the
       // decision model says so, or without one. A loop skips the remaining fix rounds.
       const diff = createHash("sha1").update(await workingDiff(worktree, this.#exec)).digest("hex").slice(0, 12)
-      const failure = failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output.slice(-1500)}`).join("\n\n")
+      // The directory the checks ran in travels with the failure: a check naming a file of the project says "No such
+      // file or directory" without it, and the worker has no way to tell which tree it was run against.
+      const failure = failed.map((f) => `$ ${f.command} (exit ${f.code}) [in ${dir}]\n${f.output.slice(-1500)}`).join("\n\n")
       const loop = diff === lastDiff || (failure === lastFailure && (await this.#inLoop(job, task, lastFailure, failure)))
       task.signatures.push(`diff:${diff}`)
       ;[lastDiff, lastFailure] = [diff, failure]
@@ -1079,7 +1103,8 @@ export class Runner {
       moveTask(task, "fixing")
       this.#say(`${task.id}: ${failed.length} check(s) failed, fix round ${task.attempts}`)
       moveTask(task, "running")
-      work.answer = await this.#ask(work.s.id, fixPrompt(failed))
+      // fixPrompt is brief.ts's, and it takes the failures as they are; the directory goes in as part of the output.
+      work.answer = await this.#ask(work.s.id, fixPrompt(failed.map((f) => ({ ...f, output: `checked in ${dir}\n${f.output}` }))))
     }
   }
 
@@ -1109,11 +1134,10 @@ export class Runner {
     stage(task, "escalate", "skip", `rung 2: fresh session on ${model.id} after: ${reason}`)
     this.#say(`${task.id}: ${reason}; fresh session on ${model.id}`)
     const s = await this.#workerSession(job, task, model.id)
-    const worktree = this.#dir(job, task)
     const text = [
-      brief(job, task, model.id, worktree, this.#skills("implement", task)),
+      brief(job, task, model.id, this.#dir(job, task), this.#skills("implement", task)),
       frozen.size ? greenNote([...frozen.keys()]) : "",
-      handoffText(reason, details, await changedFiles(worktree, this.#exec)),
+      handoffText(reason, details, await changedFiles(this.#worktree(job, task), this.#exec)),
     ].filter(Boolean).join("\n\n")
     return { s, model, answer: await this.#ask(s.id, text), fresh: true, uncensored }
   }
@@ -1122,11 +1146,12 @@ export class Runner {
   // frozen test files with their hashes (empty: no red could be shown, the task goes on as P2), or undefined when
   // the task went to the user.
   async #red(job: Job, task: Task, checks: readonly string[]): Promise<Map<string, string> | undefined> {
-    const worktree = this.#dir(job, task)
+    const worktree = this.#worktree(job, task)
+    const dir = this.#dir(job, task)
     const model = await this.#model(job, "test", task.profile?.difficulty ?? 0.5, task.id)
     const s = await this.#workerSession(job, task, model.id, "test")
     const testFiles = task.files.filter((f) => TEST_FILE.test(f))
-    const answer = await this.#ask(s.id, `${brief(job, task, model.id, worktree, this.#skills("red", task))}\n\n${redPrompt(task, testFiles)}`)
+    const answer = await this.#ask(s.id, `${brief(job, task, model.id, dir, this.#skills("red", task))}\n\n${redPrompt(task, testFiles)}`)
     if (answer.stopped || answer.timedOut) {
       stage(task, "red", "fail", answer.stopped ? `loop watchdog: ${answer.stopped.detail}` : "timed out")
       await this.#escalate(job, task, `the tests-first worker ${answer.stopped ? "was stopped by the loop watchdog" : "timed out"}`)
@@ -1142,7 +1167,7 @@ export class Runner {
       this.#say(`${task.id}: no red stage (${tests.length === 0 ? "no tests written" : "no checks"}), going on as P2`)
       return new Map()
     }
-    const results = await runGate(worktree, checks, this.#exec)
+    const results = await runGate(worktree, checks, this.#exec, undefined, dir)
     if (results.every((r) => r.passed)) {
       stage(task, "red", "skip", "the new tests pass before the change, so they do not show the missing behaviour")
       this.#say(`${task.id}: the tests pass before the change; not frozen, going on as P2`)
@@ -1157,8 +1182,7 @@ export class Runner {
   // they saw outside the task becomes a follow-up. A reviewer whose answer is not JSON after one reminder blocks
   // nothing.
   async #review(job: Job, task: Task, workerModel: string): Promise<Review> {
-    const worktree = this.#dir(job, task)
-    const diff = await workingDiff(worktree, this.#exec)
+    const diff = await workingDiff(this.#worktree(job, task), this.#exec)
     const worker = this.#family(workerModel)
     const specModel = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [worker], task.profile?.vision)
     const standardsModel = await this.#model(job, "review", task.profile?.difficulty ?? 0.5, task.id, [worker, this.#family(specModel.id)], task.profile?.vision)
@@ -1200,7 +1224,8 @@ export class Runner {
 
   // P9: parallel readers, one synthesis written to docs/research/, and a citation check by code.
   async #research(job: Job, task: Task, model: string): Promise<void> {
-    const worktree = this.#dir(job, task)
+    const worktree = this.#worktree(job, task)
+    const dir = this.#dir(job, task)
     const n = readerCount(task.profile?.difficulty ?? 0.5)
     const read = async (i: number) => {
       const s = await this.#workerSession(job, task, model, "research")
@@ -1233,7 +1258,7 @@ export class Runner {
       if (answer.stopped || answer.timedOut) return await this.#escalate(job, task, `the synthesis ${answer.stopped ? "was stopped by the loop watchdog" : "timed out"}`)
       let doc = ""
       try {
-        doc = readFileSync(join(worktree, path), "utf8")
+        doc = readFileSync(join(dir, path), "utf8") // the writer worked in the project directory, so the doc is there
       } catch {
         // checked below: no file means no citations
       }
@@ -1245,8 +1270,8 @@ export class Runner {
     }
     moveTask(task, "gating")
     const checks = [...new Set(taskAcceptance(job, task).map((a) => a.verify).filter((v): v is string => Boolean(v)))]
-    const failed = (await runGate(worktree, checks, this.#exec)).filter((r) => !r.passed)
-    if (failed.length) return await this.#escalate(job, task, `checks fail after the research: ${failed.map((f) => f.command).join(", ")}`)
+    const failed = (await runGate(worktree, checks, this.#exec, undefined, dir)).filter((r) => !r.passed)
+    if (failed.length) return await this.#escalate(job, task, `checks fail after the research (in ${dir}): ${failed.map((f) => f.command).join(", ")}`)
     moveTask(task, "passed")
     task.summary = `research written to ${path}`
     const commit = await commitTask(worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nResearch: ${n} reader(s) on ${model}, synthesis by ${writerModel.id}, pipeline P9`, this.#exec)
@@ -1254,9 +1279,16 @@ export class Runner {
     this.#say(`${task.id} researched${commit ? ` (${commit})` : ""}: ${path}`, true)
   }
 
-  // Where a task works: its own worktree in a parallel batch, else the job's.
-  #dir(job: Job, task: Task): string {
+  // The git worktree root of a task: its own in a parallel batch, else the job's. Git commands run here; a worktree is
+  // always a checkout of the repository root, whatever the project is.
+  #worktree(job: Job, task: Task): string {
     return task.worktree ?? job.integrationWorktree!
+  }
+
+  // Where a task works: the worktree root plus the project's offset inside it, because the worker's paths, its tools and
+  // its checks are all relative to the project directory, not to the repository root.
+  #dir(job: Job, task: Task): string {
+    return taskDir(this.#worktree(job, task), task.worktreeRel ?? job.integrationRel ?? "")
   }
 
   #skills(stage: Stage, task: Task): string[] {
@@ -1331,7 +1363,7 @@ export class Runner {
   async #verify(job: Job): Promise<void> {
     moveJob(job, "verify")
     const checks = [...new Set(job.acceptance.map((a) => a.verify).filter((v): v is string => Boolean(v)))]
-    const results = await runGate(job.integrationWorktree!, checks, this.#exec)
+    const results = await runGate(job.integrationWorktree!, checks, this.#exec, undefined, taskDir(job.integrationWorktree!, job.integrationRel ?? ""))
     const failed = results.filter((r) => !r.passed)
     if (failed.length > 0) {
       moveJob(job, "execute")

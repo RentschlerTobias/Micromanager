@@ -275,3 +275,105 @@ export function newJob(id: string, goal: string, now = new Date()): Job {
 export function stage(task: Task, name: string, result: Stage["result"], evidence?: string, now = new Date()): void {
   task.stages.push({ stage: name, result, evidence, at: now.toISOString() })
 }
+
+// Reconciles a job read back from disk with what is actually alive (design.md §5, the gap the first real run hit).
+//
+// A worker that died without calling finish_task left its task at `running` forever, because nothing moved a task that
+// no session was working on. This sweep is that missing step, and it only runs where a caller can see live sessions.
+//
+// The pure logic lives here next to the state machines it uses; store.ts re-exports it so callers keep one import.
+export const RECONCILE_STAGE = "reconcile"
+
+export interface ReconcileOptions {
+  /** Session ids that are still alive (still running or waiting). Without it no task is touched: a sweep that guesses
+   * which sessions are alive would kill live workers. */
+  readonly aliveSessions?: ReadonlySet<string>
+  /** Absolute paths that still exist on disk, when the caller already knows them. A worktree that is already gone is
+   * not reported as an orphan, because there is nothing left to clean up. */
+  readonly existingPaths?: ReadonlySet<string>
+}
+
+export interface Reconciled {
+  readonly taskId: string
+  readonly from: string
+  readonly to: string
+  readonly reason: string
+}
+
+export interface Orphan {
+  readonly taskId: string
+  readonly worktree: string
+  readonly branch?: string
+}
+
+export interface ReconcileResult {
+  readonly changes: readonly Reconciled[]
+  readonly orphans: readonly Orphan[]
+}
+
+// A task at a terminal state with a worktree or a branch of its own: registered with git, never removed by the job.
+// Six of these were left behind by a real run, so they are reported for a caller that knows how to reclaim them.
+const ORPHAN_STATES = new Set<TaskStatus>(["merged", "cancelled"])
+
+// The terminal state a stale running task goes to. `cancelled` is reachable from every live task (TASK_ANYWHERE) and is
+// final, so the job can finish and the user sees an outcome instead of a task that runs for ever; `blocked` would keep
+// the job open, which is the defect being fixed. It is reached through moveTask, so the table still guards the move.
+const RECONCILED_STATUS = "cancelled"
+
+// Copies the job so a sweep over an old file never changes what the caller still holds. structuredClone is exact and
+// keeps undefined fields; the JSON round trip is the fallback for a shape structuredClone refuses (a function value).
+function copyJob(job: Job): Job {
+  try {
+    return structuredClone(job)
+  } catch {
+    return JSON.parse(JSON.stringify(job)) as Job
+  }
+}
+
+// A job file written by an older version can hold a status this table does not know; it is left as it is.
+const KNOWN_STATUS = new Set(Object.keys(TASK_ALLOWED))
+
+// One defensive pass over a task read from disk: an old or hand-edited file may have no status and no id.
+function normalize(task: Task): TaskStatus | undefined {
+  const status = (task as { status?: unknown }).status
+  return typeof status === "string" && KNOWN_STATUS.has(status) ? (status as TaskStatus) : undefined
+}
+
+export function reconcileJob(job: Job, options: ReconcileOptions = {}, now = new Date()): { job: Job; result: ReconcileResult } {
+  const next = copyJob(job)
+  const changes: Reconciled[] = []
+  const orphans: Orphan[] = []
+  const alive = options.aliveSessions
+  const tasks: readonly unknown[] = Array.isArray(next.tasks) ? next.tasks : []
+  for (const raw of tasks) {
+    if (!raw || typeof raw !== "object") continue
+    const task = raw as Task
+    const taskId = typeof task.id === "string" ? task.id : "(unnamed)"
+    const status = normalize(task)
+    if (status === "running") {
+      const session = typeof task.session === "string" ? task.session : ""
+      // A task without a session id is provably stale: the runner always records the session it dispatches. A task with
+      // one is only stale when the caller says its session is not alive: without the list nobody knows, and a sweep that
+      // guesses would kill a live worker.
+      const stale = session === "" || (alive !== undefined && !alive.has(session))
+      const reason = session === ""
+        ? "no worker session was ever started"
+        : `the worker session ${session} ended without handing off`
+      if (stale && canMoveTask(status, RECONCILED_STATUS)) {
+        moveTask(task, RECONCILED_STATUS)
+        // attempts was never incremented, so a retry looked like the first try; now every recovered task shows it.
+        task.attempts = (typeof task.attempts === "number" ? task.attempts : 0) + 1
+        task.stages = Array.isArray(task.stages) ? task.stages : []
+        stage(task, RECONCILE_STAGE, "fail", reason, now)
+        changes.push({ taskId, from: status, to: RECONCILED_STATUS, reason })
+      }
+    }
+    const current = normalize(task) // re-read: a task reconciled above is now terminal, so its worktree counts
+    if (current !== undefined && ORPHAN_STATES.has(current) && (task.worktree || task.branch)) {
+      const gone = options.existingPaths !== undefined && typeof task.worktree === "string" && !options.existingPaths.has(task.worktree)
+      if (!gone) orphans.push({ taskId, worktree: typeof task.worktree === "string" ? task.worktree : "", ...(task.branch ? { branch: task.branch } : {}) })
+    }
+  }
+  next.updated = now.toISOString()
+  return { job: next, result: { changes, orphans } }
+}

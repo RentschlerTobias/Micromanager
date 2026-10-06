@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { parseRouting, stripComments } from "../src/config.ts"
-import { HEADER, routeSubagentCall } from "../src/hooks.ts"
+import { HEADER, notRouted, routeSubagentCall } from "../src/hooks.ts"
 import { MODELS, roleById } from "../src/roles.ts"
 import { DEFAULT_ROUTING, chooseModel, guessNeeds } from "../src/routing.ts"
 
@@ -39,6 +39,23 @@ test("other agents' calls and built-in sub-agents are left alone", () => {
   assert.equal(builtIn.input.model, "a/b")
   const read = { tool: "read", agent: "micromanager", input: { path: "." } }
   assert.equal(routeSubagentCall(read, DEFAULT_ROUTING), undefined)
+})
+
+test("a call that was not routed says which name was the problem", () => {
+  // The live run asked for OpenCode's own `explore` and was told to use a role agent, so it looked for an `explore`
+  // role agent that does not exist. The message names the name it could not find instead.
+  const builtIn = { tool: "subagent", agent: "micromanager", input: { agent: "explore", prompt: "x" } }
+  assert.equal(routeSubagentCall(builtIn, DEFAULT_ROUTING), undefined)
+  assert.match(notRouted(builtIn) ?? "", /^"explore" is not a role agent, so nothing was started\./)
+  assert.match(notRouted(builtIn) ?? "", /explorer, researcher/, "the list of role agents is still there")
+  const typo = { tool: "subagent", agent: "micromanager", input: { agent: "codr", prompt: "x" } }
+  assert.match(notRouted(typo) ?? "", /"codr" is not a role agent/)
+  const none = { tool: "subagent", agent: "micromanager", input: { prompt: "x" } }
+  assert.match(notRouted(none) ?? "", /^No agent was named/)
+  // A role agent is never the problem with its own name, and neither is a call of another agent.
+  assert.equal(notRouted({ tool: "subagent", agent: "micromanager", input: { agent: "coder", prompt: "x" } }), undefined)
+  assert.equal(notRouted({ tool: "subagent", agent: "build", input: { agent: "explore", prompt: "x" } }), undefined)
+  assert.equal(notRouted({ tool: "read", agent: "micromanager", input: { path: "." } }), undefined)
 })
 
 test("the config overrides chains and rejects unknown roles or bad models", () => {

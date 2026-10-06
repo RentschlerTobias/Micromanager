@@ -16,7 +16,7 @@
 import { Graphs, graphBrief, queryGraph, type Graph } from "./graph.ts"
 import { HEADER } from "./hooks.ts"
 import {
-  commitTask, exec as defaultExec, fastForward, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, runGate,
+  commitTask, exec as defaultExec, fastForward, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, repoRel, runGate, taskDir,
   type Exec, type GateResult,
 } from "./integration.ts"
 import { addDelegated, checkProblem, parseFiles } from "./plan.ts"
@@ -68,7 +68,9 @@ interface Entry {
   taskId: string
   readonly parent: string // the micromanager session
   readonly writer: boolean
-  dir: string // where the worker works: its own worktree (writer) or the session branch's (reader)
+  dir: string // where the worker works: its own worktree (writer) or the session branch's (reader), at the project offset
+  worktree: string // the git worktree root of dir: what git commands need
+  rel: string // the project directory's offset inside worktree; "" when the project is the repository root
   branch?: string // a writer's task branch
   removed?: boolean // the writer's worktree was removed after its merge
   session?: string // the child session, once claimed
@@ -86,6 +88,7 @@ export interface Delegated {
   readonly task: Task
   readonly job: Job
   readonly prompt: string // the worker's brief
+  readonly notes: readonly string[] // what the plugin logs at info level: the project offset, uncommitted state
 }
 
 export class Native {
@@ -149,7 +152,15 @@ export class Native {
       const integration = await prepareIntegration(project, job.id, this.#exec)
       job.integrationBranch = integration.branch
       job.integrationWorktree = integration.worktree
+      // The offset and the uncommitted state are kept on the job: a worker session outlives this process, and a
+      // project below the repository root (or a task that needs an uncommitted file) must not depend on this call.
+      job.integrationRel = integration.rel
+      job.integrationBase = integration.base
+      job.integrationDirty = integration.dirty ? integration.dirtySummary : ""
     }
+    // A job file written before the offset was tracked has none: git is asked once, so a job that predates this does
+    // not keep sending its workers to the worktree root.
+    const rel = job.integrationRel ?? (job.integrationWorktree ? await repoRel(project, this.#exec) : "")
     const added = addDelegated(job, { title: input.description.trim() || d.body.split("\n")[0]!, prompt: d.body, files: parsed.files, dependsOn: [], checks: d.checks })
     if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
     const task = added.task
@@ -157,19 +168,27 @@ export class Native {
     task.model = model
     for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
     stage(task, "delegate", "pass", `${role.agent} on ${model}`)
-    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: job.integrationWorktree!, checks: d.checks }
+    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: taskDir(job.integrationWorktree!, rel), worktree: job.integrationWorktree!, rel, checks: d.checks }
     if (writer) {
-      const w = await prepareTaskWorktree(project, job.id, task.id, job.integrationBranch!, this.#exec)
-      entry.dir = w.worktree
+      const w = await prepareTaskWorktree(project, job.id, task.id, job.integrationBranch!, this.#exec, undefined, rel)
+      entry.dir = w.dir
+      entry.worktree = w.worktree
       entry.branch = w.branch
       task.worktree = w.worktree
+      task.worktreeRel = w.rel
       task.branch = w.branch
     }
     const graph = role.id === "explore" ? await this.#graphs.get(entry.dir) : undefined
     entry.graph = Boolean(graph)
     this.#entries.set(`${job.id}/${task.id}`, entry)
     saveJob(project, job)
-    return { task, job, prompt: this.#brief(job, task, role, model, d, entry, graph) }
+    // A project below the repository root and an uncommitted working tree are both invisible from the inside: the
+    // worktree holds the whole repository, and no worker can see what the user has not committed.
+    const notes = [
+      rel !== "" ? `job ${job.id}: the project is ${rel} inside the repository, so its worktrees hold the repository root; the task works in the project directory ${entry.dir}` : "",
+      job.integrationDirty ? `job ${job.id}: starts from commit ${job.integrationBase?.slice(0, 7) ?? "HEAD"} on ${job.integrationBranch}, and the working tree has uncommitted paths no worker will see (${job.integrationDirty})` : "",
+    ].filter(Boolean)
+    return { task, job, prompt: this.#brief(job, task, role, model, d, entry, graph), notes }
   }
 
   // The subagent call failed before its child took the task (refused, an unknown agent): the task is dropped.
@@ -232,11 +251,15 @@ export class Native {
       moveTask(task, "running")
     }
     if (entry.writer && entry.removed) {
-      // The session keeps its directory, so the worktree comes back where it was.
-      const w = await prepareTaskWorktree(entry.project, job.id, entry.taskId, job.integrationBranch!, this.#exec, entry.dir)
+      // The session keeps its directory, so the worktree comes back where it was: the worktree root, which is what git
+      // registers, not the project directory inside it.
+      const w = await prepareTaskWorktree(entry.project, job.id, entry.taskId, job.integrationBranch!, this.#exec, entry.worktree, entry.rel)
+      entry.worktree = w.worktree
+      entry.dir = w.dir
       entry.branch = w.branch
       entry.removed = false
       task.worktree = w.worktree
+      task.worktreeRel = w.rel
       task.branch = w.branch
     }
     saveJob(entry.project, job)
@@ -276,16 +299,18 @@ export class Native {
     if (task.status === "escalated") moveTask(task, "running")
     moveTask(task, "gating")
     task.summary = summary.trim().slice(0, 2000) || task.summary
-    const failed = (await runGate(entry.dir, entry.checks, this.#exec)).filter((r) => !r.passed)
+    // The checks run where the worker's files are, not in the worktree root: a project below the repository root lives
+    // that far down, and a check naming one of its files finds nothing above it.
+    const failed = (await runGate(entry.worktree, entry.checks, this.#exec, undefined, entry.dir)).filter((r) => !r.passed)
     if (failed.length) {
       moveTask(task, "fixing")
       moveTask(task, "running")
       stage(task, "gate", "fail", failed.map((f) => f.command).join(", "))
       saveJob(entry.project, job)
-      return { text: failText("The checks fail in your directory", failed) }
+      return { text: failText("The checks fail in your directory", failed, entry.dir) }
     }
     stage(task, "gate", "pass", entry.checks.length ? entry.checks.join(", ") : "no checks given")
-    const commit = await commitTask(entry.dir, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${task.model ?? "?"} (${task.role}), session ${session}${task.summary ? `\n\n${task.summary}` : ""}`, this.#exec)
+    const commit = await commitTask(entry.worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${task.model ?? "?"} (${task.role}), session ${session}${task.summary ? `\n\n${task.summary}` : ""}`, this.#exec)
     moveTask(task, "passed")
     const train = this.#trains.get(job.id) ?? Promise.resolve()
     const step = train.then(() => this.#merge(entry, job, task))
@@ -294,7 +319,7 @@ export class Native {
     saveJob(entry.project, job)
     if (!merged.ok) return { text: merged.text }
     // The commit as merged: a rebase onto other tasks' commits gave it a new id (live test).
-    const head = commit && (await this.#exec("git", ["rev-parse", "--short", "HEAD"], { cwd: entry.dir })).stdout.trim()
+    const head = commit && (await this.#exec("git", ["rev-parse", "--short", "HEAD"], { cwd: entry.worktree })).stdout.trim()
     const checks = entry.checks.length ? `checks passed: ${entry.checks.join("; ")}` : "no checks were given"
     return {
       text: `Merged into ${job.integrationBranch}${head ? ` as ${head}` : " (nothing to commit)"}; ${checks}. Now end with your short report.`,
@@ -305,7 +330,7 @@ export class Native {
 
   // Rebase onto the session branch, the checks again when it moved, then the fast-forward.
   async #merge(entry: Entry, job: Job, task: Task): Promise<{ ok: true } | { ok: false; text: string }> {
-    const w = { worktree: entry.dir, branch: entry.branch! }
+    const w = { worktree: entry.worktree, branch: entry.branch! }
     const step = await rebaseTask(w, job.integrationBranch!, this.#exec)
     if (!step.ok) {
       moveTask(task, "escalated")
@@ -313,11 +338,11 @@ export class Native {
       return { ok: false, text: `Your commit does not apply on top of ${job.integrationBranch}, which other tasks moved on meanwhile (${step.conflict}). Run git rebase ${job.integrationBranch} in your directory, resolve the conflict keeping both changes, run the checks, and call finish_task again.` }
     }
     if (step.moved) {
-      const failed = (await runGate(entry.dir, entry.checks, this.#exec)).filter((r) => !r.passed)
+      const failed = (await runGate(entry.worktree, entry.checks, this.#exec, undefined, entry.dir)).filter((r) => !r.passed)
       if (failed.length) {
         moveTask(task, "escalated")
         stage(task, "merge", "fail", `checks fail on top of the newer commits: ${failed.map((f) => f.command).join(", ")}`)
-        return { ok: false, text: failText(`Your change is rebased onto ${job.integrationBranch}, which other tasks moved on meanwhile, and there the checks fail`, failed) }
+        return { ok: false, text: failText(`Your change is rebased onto ${job.integrationBranch}, which other tasks moved on meanwhile, and there the checks fail`, failed, entry.dir) }
       }
     }
     const ff = await fastForward(job.integrationWorktree!, entry.branch!, this.#exec)
@@ -386,7 +411,7 @@ export class Native {
 
   async #dropWorktree(entry: Entry, task?: Task): Promise<void> {
     if (!entry.writer || entry.removed || !entry.branch) return
-    await removeTaskWorktree(entry.project, { worktree: entry.dir, branch: entry.branch }, this.#exec)
+    await removeTaskWorktree(entry.project, { worktree: entry.worktree, branch: entry.branch }, this.#exec)
     entry.removed = true
     if (task) {
       task.worktree = undefined
@@ -405,6 +430,10 @@ export class Native {
       graph ? graphBrief(graph) : "",
       "",
       entry.writer ? `Files you may change: ${task.files.join(", ")}. Work only in your current directory, a git worktree of its own.` : "Change no files.",
+      // A worktree is a checkout of the repository root, so a project that is a subdirectory sits below it. Saying so
+      // keeps a worker from concluding its premise is false when a path of its own does not resolve at the top.
+      entry.rel ? `Your directory ${entry.dir} is the project directory inside the worktree ${entry.worktree}; the worktree holds the whole repository (${entry.rel} below its root). Every path you read or write is relative to your own directory, never to the worktree root.` : "",
+      dirtyNote(job, entry.writer),
       entry.writer
         ? entry.checks.length
           ? `Checks the plugin runs when you finish: ${entry.checks.join("; ")}`
@@ -425,12 +454,23 @@ function key(project: string, job: string): string {
   return `${project}\0${job}`
 }
 
+// A worktree starts from the last commit, so the user's uncommitted work is not in it. A worker told this fails far more
+// gracefully than one that spends a session discovering its premise cannot hold.
+function dirtyNote(job: Job, writer: boolean): string {
+  if (!job.integrationDirty) return ""
+  return writer
+    ? `The working tree of the project has uncommitted changes that this worktree does not have (${job.integrationDirty}); the worktree is a checkout of the last commit. Do not try to read them: say so in your report if your task depends on them.`
+    : `The working tree of the project has uncommitted changes that this worktree does not have (${job.integrationDirty}); what you read here is the last commit. Say so if your question depends on them.`
+}
+
 // "<job>/<task>" from a brief's header line.
 function tokenOf(text: string): string | undefined {
   const m = text.match(/\[jev-micromanager\] task (T\d+) · job (\S+) ·/)
   return m ? `${m[2]}/${m[1]}` : undefined
 }
 
-function failText(what: string, failed: readonly GateResult[]): string {
-  return `${what}. Fix them, then call finish_task again:\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}`
+// The directory is in the text: a check that says "No such file or directory" only makes sense next to the cwd it ran
+// in, and that was the one diagnostic missing when a worker hunted for a file three directories up.
+function failText(what: string, failed: readonly GateResult[], dir: string): string {
+  return `${what}. Fix them, then call finish_task again:\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}\n\nThe checks ran in ${dir}; a path in them is relative to that directory.`
 }

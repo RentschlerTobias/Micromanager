@@ -23,7 +23,7 @@ test("the local planner's loop: the same directory read again and again", () => 
   assert.equal(d.onTool("s", "glob", { pattern: "**/*" }), undefined)
   assert.equal(d.onTool("s", "read", { path: ".jev-micromanager/" }), undefined)
   // ".jev-micromanager" and ".jev-micromanager/" are the same path: the third read is a loop
-  assert.deepEqual(d.onTool("s", "read", { path: ".jev-micromanager" }), { kind: "read_loop", detail: "read .jev-micromanager 3x with no write in between" })
+  assert.deepEqual(d.onTool("s", "read", { path: ".jev-micromanager" }), { kind: "read_loop", severity: "nudge", detail: "read .jev-micromanager 3x in a row with no write in between" })
   const same = w({ readRepeat: 99 })
   for (let i = 0; i < 2; i++) same.onTool("s", "grep", { pattern: "TODO" })
   assert.equal(same.onTool("s", "grep", { pattern: "TODO" })?.kind, "same_call")
@@ -73,6 +73,79 @@ test("the handoff note names the reason and the files already changed", () => {
   const note = handoffNote({ kind: "read_loop", detail: "read a.ts 3x with no write in between" }, ["a.ts"])
   assert.match(note, /stopped by the loop watchdog: read a.ts 3x/)
   assert.match(note, /Files already changed in this directory: a.ts/)
+  const nudged = handoffNote({ kind: "read_loop", severity: "nudge", detail: "read a.ts 3x in a row" }, [])
+  assert.match(nudged, /drew a nudge from the loop watchdog, not a stop: read a.ts 3x in a row/)
+})
+
+test("three identical reads far apart in a session are not a read loop; three close together are", () => {
+  const d = w({ sameCall: 99, restartLength: 99 })
+  const read = () => d.onTool("s", "read", { path: "config.json" })
+  for (let i = 0; i < 3; i++) {
+    assert.equal(read(), undefined, `read ${i + 1}`)
+    // 30 calls of other work in between: reading the same config file again is what a worker does
+    for (let j = 0; j < 30; j++) d.onTool("s", "grep", { pattern: `needle${i}-${j}` })
+  }
+  const close = w({ sameCall: 99 })
+  assert.equal(close.onTool("s", "read", { path: "config.json" }), undefined)
+  assert.equal(close.onTool("s", "read", { path: "config.json" }), undefined)
+  assert.equal(close.onTool("s", "read", { path: "config.json" })?.kind, "read_loop")
+})
+
+test("any progress clears the read count, a `git commit` through the shell included", () => {
+  const d = w({ sameCall: 99 })
+  const read = () => d.onTool("s", "read", { path: "a.ts", offset: 0 })
+  read()
+  assert.equal(d.onTool("s", "shell", { command: "git commit -m 'wip'" }), undefined)
+  read()
+  assert.equal(read(), undefined, "two reads since the commit")
+  assert.equal(read()?.kind, "read_loop")
+  assert.equal(d.progress("s")?.writes, 1, "the shell commit counts as a write like the edit tools do")
+  const added = w({ sameCall: 99 })
+  added.onTool("s", "read", { path: "b.ts" })
+  added.onTool("s", "shell", { command: "git add b.ts" })
+  assert.equal(added.onTool("s", "read", { path: "b.ts" }), undefined)
+})
+
+test("searching is progress: nine greps in a row are no stall, eight plain reads are", () => {
+  const searching = w({ sameCall: 99 })
+  for (let i = 0; i < 9; i++) assert.equal(searching.onTool("s", "grep", { pattern: `p${i}` }), undefined, `grep ${i}`)
+  const d = w({ sameCall: 99, readRepeat: 99, restartLength: 99 }) // restartLength: eight identical calls are a start-over, not a stall run
+  d.onTool("s", "read", { path: "a.ts" })
+  for (let i = 0; i < 7; i++) assert.equal(d.onTool("s", "read", { path: "a.ts" }), undefined, `read ${i}`)
+  assert.equal(d.onTool("s", "read", { path: "a.ts" })?.kind, "no_new_files")
+  assert.equal(w({ sameCall: 99 }).onTool("s", "glob", { pattern: "**/*.ts" }), undefined)
+  assert.equal(d.onTool("s", "grep", { pattern: "x" }), undefined, "a search resets the run")
+})
+
+test("a read loop and a monologue nudge; the tight loops still stop; untouched kinds carry no severity", () => {
+  const d = w({ sameCall: 99 })
+  d.onTool("s", "read", { path: "a.ts" })
+  d.onTool("s", "read", { path: "a.ts" })
+  assert.equal(d.onTool("s", "read", { path: "a.ts" })?.severity, "nudge")
+  const talk = (text: string, tool = false) => ({ role: "assistant", content: [{ type: "text", text }, ...(tool ? [{ type: "tool-call" }] : [])] })
+  assert.equal(d.onTurn("s", [talk("a", true), talk("b"), talk("c"), talk("d")])?.severity, "nudge")
+  const same = w()
+  same.onTool("s", "shell", { command: "npm test" })
+  same.onTool("s", "shell", { command: "npm test" })
+  assert.equal(same.onTool("s", "shell", { command: "npm test" })?.severity, "stop")
+  const files = w({ sameCall: 99, readRepeat: 99, restartLength: 99 })
+  files.onTool("s", "read", { path: "a.ts" })
+  for (let i = 0; i < 8; i++) files.onTool("s", "read", { path: "a.ts" })
+  assert.equal(files.onTool("s", "read", { path: "a.ts" })?.severity, "stop")
+  // a kind this change did not touch keeps the old shape: no severity field at all, so every caller behaves as before
+  const steps = w({ maxSteps: 0 })
+  const signal = steps.onTurn("s", [])
+  assert.equal(signal?.kind, "steps")
+  assert.equal("severity" in (signal as object), false)
+  const restart = w({ sameCall: 99, restartLength: 2 })
+  restart.onTool("s", "read", { path: "a.ts" })
+  restart.onTool("s", "glob", { pattern: "*" })
+  restart.onTool("s", "edit", { path: "x.ts" })
+  let again
+  restart.onTool("s", "read", { path: "a.ts" })
+  again = restart.onTool("s", "glob", { pattern: "*" }) ?? again
+  assert.equal(again?.kind, "restart")
+  assert.equal("severity" in (again as object), false)
 })
 
 test("reading one long file in parts is no read loop; the same part three times is", () => {

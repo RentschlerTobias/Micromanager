@@ -2,7 +2,7 @@
 // background (OpenCode notifies the micromanager when the worker ends; src/native.ts keeps writers in worktrees).
 
 import { chooseModel, guessNeeds, type Routing } from "./routing.ts"
-import { MICROMANAGER, roleByAgent } from "./roles.ts"
+import { MICROMANAGER, ROLES, roleByAgent } from "./roles.ts"
 
 export interface ToolCall {
   tool: string
@@ -34,6 +34,22 @@ export function routeSubagentCall(call: ToolCall, routing: Routing, workerModel?
     call.input.prompt = `${HEADER} role: ${role.id} · model: ${choice.model}\n\n${prompt}`
   }
   return { role: role.id, model: choice.model, reason: choice.reason }
+}
+
+// Why a call of the micromanager was not routed, when it is about the agent name at all; undefined for every other
+// reason routeSubagentCall returns nothing (a call that is not the micromanager's, or one it already routed).
+//
+// routeSubagentCall leaves a built-in agent alone on purpose (it routes nothing it does not own), so the caller got
+// "Not started: use one of the role agents (coder, …)" for `explore` and looked for a `explore` role agent that does
+// not exist. The two cases need different fixes: rename the agent, or install the plugin's agents.
+export function notRouted(call: ToolCall): string | undefined {
+  if (call.tool !== "subagent" || call.agent !== MICROMANAGER.agent) return undefined
+  const asked = String(call.input.agent ?? "").trim()
+  if (roleByAgent(asked)) return undefined // a role agent: routed, or nothing to say about the name
+  if (asked) {
+    return `"${asked}" is not a role agent, so nothing was started. Use one of this plugin's role agents (${ROLES.map((r) => r.agent).join(", ")}); OpenCode's own agents (explore, general, …) are not role agents here.`
+  }
+  return `No agent was named, so nothing was started. Name one of this plugin's role agents (${ROLES.map((r) => r.agent).join(", ")}).`
 }
 
 // The text of a tool result as the model sees it: result.content[] text parts, plus string fields of result.output

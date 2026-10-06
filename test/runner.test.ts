@@ -935,6 +935,42 @@ test("a session whose model stops answering is stalled: interrupted, and the tas
   assert.ok(done.tasks[0]!.stages.some((s) => /loop watchdog: no progress .* \(the model stopped answering\)/.test(s.evidence ?? "")))
 })
 
+test("the stall poll watches the message bookkeeping, not the messages: a growing session is not stalled, a frozen one is", async () => {
+  // #stall is private, so this drives it through the planner turn (#ask), which is its only caller: a session whose
+  // wait() never resolves is polled until the timeout. The fingerprint is the message count and the last message's
+  // id and time, so a poll over a megabyte of history costs the same as a poll over three messages.
+  const growing = async (project: string) => {
+    const fake = fakeSession({})
+    const context = fake.api.context
+    let added = 0
+    fake.api.context = async (args) => {
+      const base = (await context(args)) as unknown[]
+      // every poll appends a message: the session is working, the history only grows
+      return [...base, { type: "assistant", id: `m${++added}`, content: [{ type: "text", text: `chunk ${added}` }] }]
+    }
+    fake.api.wait = async (args) => (args.sessionID === "ses_1" ? new Promise(() => {}) : {})
+    const { errors } = await runner(project, fake.api, { stallMs: 40, pollMs: 10, workerTimeoutMs: 300 }).plan("goal")
+    assert.match(errors?.[0] ?? "", /the planner timed out/, "a session that keeps adding messages is never stalled")
+    assert.ok(added > 1, "the session was polled more than once")
+  }
+  await growing(repo())
+
+  // and the other side: the count stays put, so the poll reports a stall (a long history, cheap to look at)
+  const frozen = fakeSession({})
+  const context = frozen.api.context
+  const history = Array.from({ length: 5_000 }, (_, i) => ({ type: "assistant", id: `m${i}`, content: [{ type: "text", text: "x".repeat(200) }] }))
+  frozen.api.context = async (args) => (args.sessionID === "ses_1" ? history : context(args))
+  frozen.api.wait = async (args) => (args.sessionID === "ses_1" ? new Promise(() => {}) : context({ sessionID: args.sessionID }))
+  const interrupted: string[] = []
+  frozen.api.interrupt = async ({ sessionID }) => { interrupted.push(sessionID); return {} }
+  const r = runner(repo(), frozen.api, { stallMs: 40, pollMs: 10, workerTimeoutMs: 10_000 })
+  const { job, errors } = await r.plan("goal")
+  assert.deepEqual(interrupted, ["ses_1"], "an unchanging session is interrupted as stalled")
+  assert.equal(errors, undefined, "and the job goes on in a fresh planner session")
+  assert.equal(frozen.created.length, 2, "the stalled planner is not resumed")
+  assert.equal(job.tasks.length, 2, summary(job))
+})
+
 // --- omo-hybrid: the rolling session job ------------------------------------------------------------------------
 
 import { addDelegated } from "../src/plan.ts"

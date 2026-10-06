@@ -4,8 +4,13 @@ import { test } from "node:test"
 import { decide, hardRule, judge, type PermissionRequest } from "../src/decide.ts"
 import { Jev, JevError, parseAnswers, redact, type Decision } from "../src/jev.ts"
 
-const req = (action: string, resources: string[], agent = "coder"): PermissionRequest =>
-  ({ sessionID: "ses_1", agent, action, resources, directory: "/p", task: "Add a --verbose flag." })
+const req = (
+  action: string,
+  resources: string[],
+  agent = "coder",
+  task = "Add a --verbose flag.",
+  directory = "/p",
+): PermissionRequest => ({ sessionID: "ses_1", agent, action, resources, directory, task })
 
 const decision = (choice: string, confidence: number, needsUser: number, risk: number): Decision => ({
   answers: {
@@ -181,4 +186,113 @@ test("a user's preset replaces Jev but never the hard rules or the deleted-path 
   const tracked = () => [{ path: "src/a.ts", exists: true, tracked: true, ignored: false }]
   assert.equal((await decide(jev, req("shell", ["rm -rf src/a.ts"]), undefined, tracked, "allow")).verdict, "user")
   assert.equal((await decide(jev, req("edit", ["src/a.ts"]), undefined, undefined, "user")).verdict, "user")
+})
+
+test("a reading program with a writing form is a write", async () => {
+  const { readsOnly } = await import("../src/decide.ts")
+  // a live run denied 67 read-only commands, sed among them: it was not a reading program at all
+  assert.equal(readsOnly(["sed -n '1,40p' src/foo.py"]), true)
+  assert.equal(readsOnly(["sed -i 's/a/b/' src/foo.py"]), false)
+  assert.equal(readsOnly(["sed --in-place s/a/b/ src/foo.py"]), false)
+  assert.equal(readsOnly(["sed -i.bak s/a/b/ src/foo.py"]), false)
+  assert.equal(readsOnly(["awk '{print $1}' src/foo.py", "jq '.a' b.json", "md5sum src/foo.py"]), true)
+  assert.equal(readsOnly(["sort -o sorted.txt a.txt"]), false)
+  assert.equal(readsOnly(["cat a.txt > out.txt"]), false, "a redirect to a file writes it")
+  assert.equal(readsOnly(["cat a.txt > /dev/null"]), true)
+})
+
+test("git is recognised behind its global flags, and a mutating subcommand still writes", async () => {
+  const { readsOnly } = await import("../src/decide.ts")
+  for (const command of [
+    "git -C /repo status --short",
+    "git --no-pager diff",
+    "git -c user.name=x log --oneline",
+    "git -C /repo -c core.pager=cat remote -v",
+    "git -C /repo branch",
+  ]) {
+    assert.equal(readsOnly([command]), true, command)
+  }
+  for (const command of [
+    "git -C /repo commit -m x",
+    "git add .",
+    "git -C /repo checkout main",
+    "git reset --soft HEAD~1",
+    "git -C /repo stash",
+    "git -C /repo fetch origin",
+    "git branch new-thing",
+    "git remote add origin url",
+    "git -C /repo update-index --refresh",
+  ]) {
+    assert.equal(readsOnly([command]), false, command)
+  }
+})
+
+test("a wrapper and a leading VAR=value do not hide what they run", async () => {
+  const { readsOnly } = await import("../src/decide.ts")
+  assert.equal(readsOnly(["timeout 120 pytest"]), false, "pytest reads nothing")
+  assert.equal(readsOnly(["timeout 120 git status"]), true)
+  assert.equal(readsOnly(["timeout -k 5 120 git status"]), true)
+  assert.equal(readsOnly(["nohup git diff"]), true)
+  assert.equal(readsOnly(["nice -n 5 ls -la"]), true)
+  assert.equal(readsOnly(["stdbuf -o0 git status"]), true)
+  assert.equal(readsOnly(["FOO=1 BAR=2 git status"]), true)
+  assert.equal(readsOnly(["env rm -rf /tmp/x"]), false)
+  assert.equal(readsOnly(["env"]), true, "a bare env prints the environment")
+  // one writing step in a chain makes the whole line a write
+  assert.equal(readsOnly(["cat a && rm b"]), false)
+  assert.equal(readsOnly(["cat a && echo b | head -5"]), true)
+  assert.equal(readsOnly(["git ls-files", "echo ---", "git -C /repo status --short", "head -5", "echo x | wc -l"]), true)
+})
+
+test("a read that stays inside the worktree needs nobody", async () => {
+  const { readsOnlyInside } = await import("../src/decide.ts")
+  assert.equal(readsOnlyInside(req("shell", ["sed -n 1,60p /p/src/foo.py"]), "/p"), true)
+  assert.equal(readsOnlyInside(req("shell", ["ls -la"]), "/p"), true, "a relative path is the worker's own")
+  assert.equal(readsOnlyInside(req("shell", ["git -C /elsewhere status"]), "/p"), false)
+  assert.equal(readsOnlyInside(req("shell", ["cat /p/../etc/passwd"]), "/p"), false, ".. cannot leave the root")
+  assert.equal(readsOnlyInside(req("shell", ["rm -f /p/src/foo.py"]), "/p"), false)
+  assert.equal(readsOnlyInside(req("read", ["cat /p/a"]), "/p"), false, "only a shell read takes the fast path")
+})
+
+test("the fast path answers a read-only command inside the root without asking Jev", async () => {
+  const jev = fakeJev(decision("deny", 0.99, 0.1, 0.1))
+  const inside = await decide(jev, req("shell", ["git -C /p status --short"]), undefined, undefined, undefined, "/p")
+  assert.deepEqual([inside.verdict, inside.reason], ["allow", "read-only command inside the job's worktree"])
+  assert.equal(jev.calls.length, 0, "Jev is not asked")
+  // the hard rules still come first, and a read that leaves the root is still Jev's call
+  const destructive = await decide(jev, req("shell", ["rm -rf /"]), undefined, undefined, undefined, "/p")
+  assert.equal(destructive.verdict, "user")
+  assert.match(destructive.reason, /always the user/)
+  const elsewhere = await decide(jev, req("shell", ["git -C /elsewhere status"]), undefined, undefined, undefined, "/p")
+  assert.equal(elsewhere.verdict, "deny", "a read outside the root is Jev's call, and Jev said no")
+  assert.equal(jev.calls.length, 1)
+  assert.equal(hardRule(req("shell", ["sed -i s/a/b/ f"])), undefined, "a write in the worktree is not a hard rule")
+})
+
+test("a task names a path for reading, not for writing", async () => {
+  const { taskNamesPath } = await import("../src/decide.ts")
+  const task = "map /home/u/Repos/oc-voice; its voice/run.ts decides the routing."
+  assert.equal(taskNamesPath(task, "/home/u/Repos/oc-voice"), true, "the exact path")
+  assert.equal(taskNamesPath(task, "/home/u/Repos/oc-voice/voice/run.ts"), true, "inside a named directory")
+  assert.equal(taskNamesPath(task, "/home/u/Repos/oc-voice-secrets"), false, "a shared name prefix is not a path")
+  assert.equal(taskNamesPath("no paths here", "/home/u/x"), false)
+  assert.equal(taskNamesPath(undefined, "/home/u/x"), false)
+})
+
+test("outside the project: the job's own area is allowed, an unvouched path is the user's", async () => {
+  const jev = fakeJev(decision("allow", 1, 0, 0))
+  const inArea = await decide(jev, req("external_directory", ["/p/.jev-micromanager/worktrees/job-a/src/x.ts"], "explorer"))
+  assert.deepEqual([inArea.verdict, inArea.reason], ["allow", "inside the job's own worktrees"])
+  const notArea = await decide(jev, req("external_directory", ["/p/.jev-micromanager/worktrees-old/src/x.ts"], "explorer"))
+  assert.equal(notArea.verdict, "user", "a sibling that shares the name is not the area")
+  const task = "summarise /data/notes/README.md"
+  assert.equal((await decide(jev, req("external_directory", ["/data/notes"], "explorer", task))).verdict, "allow")
+  assert.equal((await decide(jev, req("external_directory", ["/data/notes"], "coder", task))).verdict, "user", "a writer may not")
+  assert.equal((await decide(jev, req("external_directory", ["/data/notes"], "explorer"))).verdict, "user", "unvouched")
+  for (const path of [`${process.env.HOME ?? "/root"}/.ssh/id_rsa`, "/etc/hosts", "/usr/lib/x", "/var/lib/x", "/p/.git/refs/heads/jev/other-job"]) {
+    const forbidden = await decide(jev, req("external_directory", [path], "explorer", `read ${path}`))
+    assert.equal(forbidden.verdict, "user", path)
+    assert.match(forbidden.reason, /always the user/)
+  }
+  assert.equal(jev.calls.length, 0, "no layer outside the project asks Jev")
 })

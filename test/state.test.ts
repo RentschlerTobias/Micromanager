@@ -3,7 +3,7 @@ import { test } from "node:test"
 
 import { buildAgenda, nextProposal } from "../src/agenda.ts"
 import { applyPlan, extractJson, parsePlan, waves, type PlannedTask } from "../src/plan.ts"
-import { allDone, moveJob, moveTask, newJob, parallelSafe, promoteReady, StateError, type Task } from "../src/state.ts"
+import { allDone, canMoveTask, moveJob, moveTask, newJob, parallelSafe, promoteReady, StateError, type Task } from "../src/state.ts"
 
 const plan = (tasks: object[], acceptance: object[] = [{ id: "A1", text: "works", verify: "npm test" }]) =>
   "Here is the plan:\n```json\n" + JSON.stringify({ acceptance, tasks }) + "\n```"
@@ -32,6 +32,14 @@ test("the task FSM: blocked and cancelled from anywhere, nothing after merged", 
   moveTask(task, "passed")
   moveTask(task, "merged")
   assert.throws(() => moveTask(task, "cancelled"), StateError)
+})
+
+// The state a sweep moves a stale running task to: reachable from every live task and final, so the job can finish.
+test("a running task can be cancelled, which is where a sweep puts a worker that never handed off", () => {
+  const task = { status: "running" } as Task
+  assert.ok(canMoveTask(task.status, "cancelled"))
+  moveTask(task, "cancelled")
+  assert.throws(() => moveTask(task, "running"), StateError)
 })
 
 test("a plan is parsed from the last json fence and turned into pending tasks with waves", () => {

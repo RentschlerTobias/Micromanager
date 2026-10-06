@@ -3,9 +3,26 @@
 // directory (no external_directory ask) and git ignores it through .git/info/exclude.
 
 import { execFile } from "node:child_process"
-import { join } from "node:path"
+import { join, relative, resolve, sep } from "node:path"
 
 import { DIR } from "./store.ts"
+import type { Job, Task } from "./state.ts"
+
+// Git always materialises a worktree of the REPOSITORY ROOT, never of the directory the plugin asked from. A project
+// that is a subdirectory of the repository (a monorepo package) therefore has to carry its offset into every worktree,
+// or the worker is moved to the root, several levels above its own files, and its checks run against the wrong tree.
+// state.ts owns these interfaces; the two fields are declared here so the offset travels with the job's JSON and
+// survives a restart.
+declare module "./state.ts" {
+  interface Job {
+    integrationRel?: string // the project directory's path inside the repository root; "" when the project IS the root
+    integrationBase?: string // the commit the job's branch started from
+    integrationDirty?: string // uncommitted paths in the user's tree when the worktree was made, "" when it was clean
+  }
+  interface Task {
+    worktreeRel?: string // the same offset for the task's own worktree
+  }
+}
 
 export interface Run {
   readonly code: number
@@ -33,22 +50,65 @@ export const exec: Exec = (command, args, options) =>
 
 export interface Integration {
   readonly branch: string
-  readonly worktree: string
+  readonly worktree: string // the git worktree root: the repository root, not the project
   readonly base: string // the commit the branch started from
+  readonly rel: string // the project directory's path inside the repository root; "" when the project IS the root
+  readonly dirty: boolean // the user's working tree has changes no worker will see
+  readonly dirtySummary: string // the first few of those paths
 }
 
 export class IntegrationError extends Error {}
 
+// The project directory's path inside the repository root, as git reports it. Empty when the project is the root, which
+// is the common case and the one where a worktree and the project coincide. An offset that climbs out of the root would
+// point a worker at the user's checkout, so it is refused.
+export function projectRel(topLevel: string, project: string): string {
+  const rel = relative(resolve(topLevel), resolve(project)).split(sep).join("/")
+  if (rel === "") return ""
+  if (rel === ".." || rel.startsWith("../") || rel.includes("/../") || rel.startsWith("/")) {
+    throw new IntegrationError(`${project} is not inside the repository ${topLevel}`)
+  }
+  return rel
+}
+
+// The project's offset inside its repository, as git reports it from the project. Empty when git cannot answer, which
+// keeps the plugin behaving as before (the worktree root stands in for the project) instead of refusing to start.
+export async function repoRel(project: string, run: Exec = exec): Promise<string> {
+  const top = await run("git", ["rev-parse", "--show-toplevel"], { cwd: project })
+  return top.code === 0 && top.stdout.trim() ? projectRel(top.stdout.trim(), project) : ""
+}
+
+// Where a worker works and where its checks run: the project directory inside a worktree of the repository root. The
+// worktree argument is the git worktree root, because that is what git commands need; this is what tools and paths in a
+// task's Files and Checks lines resolve against.
+export function taskDir(worktree: string, rel: string): string {
+  if (rel === "") return resolve(worktree)
+  if (rel.startsWith("/") || rel.split("/").includes("..")) throw new IntegrationError(`a project offset may not leave the worktree: ${rel}`)
+  return resolve(worktree, ...rel.split("/").filter((p) => p && p !== "."))
+}
+
+// Uncommitted changes in the user's working tree, which no worktree carries: a task that depends on them can never
+// pass its checks, so the caller reports it rather than letting a worker discover it.
+export async function dirtyPaths(project: string, run: Exec = exec): Promise<{ dirty: boolean; summary: string }> {
+  const status = await run("git", ["status", "--porcelain"], { cwd: project })
+  const paths = status.stdout.split("\n").filter(Boolean).map((line) => line.slice(3).trim())
+  return { dirty: paths.length > 0, summary: paths.slice(0, 5).join(", ") + (paths.length > 5 ? `, +${paths.length - 5} more` : "") }
+}
+
 export async function prepareIntegration(project: string, jobId: string, run: Exec = exec): Promise<Integration> {
   const inside = await run("git", ["rev-parse", "--is-inside-work-tree"], { cwd: project })
   if (inside.code !== 0 || inside.stdout.trim() !== "true") throw new IntegrationError(`${project} is not a git repository`)
+  // The worktree is a checkout of the root, so the offset between the two decides where a worker works and checks run.
+  const rel = await repoRel(project, run)
   const head = await run("git", ["rev-parse", "HEAD"], { cwd: project })
   if (head.code !== 0) throw new IntegrationError("the repository has no commit to start from")
+  // Before the worktree exists: its own checkout must not be counted as the user's uncommitted work.
+  const { dirty, summary } = await dirtyPaths(project, run)
   const branch = `jev/${jobId}`
   const worktree = join(project, DIR, "worktrees", jobId)
   const added = await run("git", ["worktree", "add", "-q", "-b", branch, worktree, "HEAD"], { cwd: project })
   if (added.code !== 0) throw new IntegrationError(`git worktree add failed: ${added.stderr.trim()}`)
-  return { branch, worktree, base: head.stdout.trim() }
+  return { branch, worktree, base: head.stdout.trim(), rel, dirty, dirtySummary: summary }
 }
 
 // Files the worker changed in the worktree since the last commit, untracked ones included.
@@ -73,11 +133,14 @@ export interface GateResult {
   readonly output: string // the tail, enough for the worker to fix it
 }
 
-// Runs each check in the worktree at low priority; a check passes on exit code 0.
-export async function runGate(worktree: string, commands: readonly string[], run: Exec = exec, timeoutMs = 300_000): Promise<GateResult[]> {
+// Runs each check in the task's directory at low priority; a check passes on exit code 0.
+// worktree is the git worktree root; dir is where the worker's own paths resolve, which is the project directory inside
+// the worktree. Without it a check names a file of the project and the shell looks for it in the wrong tree.
+export async function runGate(worktree: string, commands: readonly string[], run: Exec = exec, timeoutMs = 300_000, dir?: string): Promise<GateResult[]> {
+  const cwd = dir ?? worktree
   const out: GateResult[] = []
   for (const command of commands) {
-    const r = await run("nice", ["-n", "15", "sh", "-c", command], { cwd: worktree, timeoutMs })
+    const r = await run("nice", ["-n", "15", "sh", "-c", command], { cwd, timeoutMs })
     const text = `${r.stdout}\n${r.stderr}`.trim()
     out.push({ command, passed: r.code === 0 && !r.timedOut, code: r.code, output: (r.timedOut ? "[timed out]\n" : "") + text.slice(-3000) })
   }
@@ -109,22 +172,30 @@ export async function revertFiles(worktree: string, files: readonly string[], ru
 
 export interface TaskWorktree {
   readonly branch: string
-  readonly worktree: string
+  readonly worktree: string // the git worktree root: what git commands need
+  readonly dir: string // where the worker works and its checks run: the project directory inside the worktree
+  readonly rel: string
+  readonly dirty: boolean
+  readonly dirtySummary: string
 }
 
 // A task of a parallel batch works in its own worktree, on a branch off the job's branch at its current commit.
 // "jev/<job>--<task>", since "jev/<job>/<task>" cannot sit next to the branch "jev/<job>" in git's refs. at: another
-// place for it (a continued worker keeps its session's directory).
-export async function prepareTaskWorktree(project: string, jobId: string, taskId: string, from: string, run: Exec = exec, at?: string): Promise<TaskWorktree> {
+// place for it (a continued worker keeps its session's directory). rel: the project's offset inside the worktree.
+export async function prepareTaskWorktree(project: string, jobId: string, taskId: string, from: string, run: Exec = exec, at?: string, rel = ""): Promise<TaskWorktree> {
   const branch = `jev/${jobId}--${taskId}`
   const worktree = at ?? join(project, DIR, "worktrees", `${jobId}--${taskId}`)
   await removeTaskWorktree(project, { branch, worktree }, run) // a leftover of an interrupted run
+  // Before the checkout exists, so the plugin never reports its own worktree as the user's uncommitted work.
+  const { dirty, summary } = await dirtyPaths(project, run)
   const added = await run("git", ["worktree", "add", "-q", "-b", branch, worktree, from], { cwd: project })
   if (added.code !== 0) throw new IntegrationError(`git worktree add failed: ${added.stderr.trim()}`)
-  return { branch, worktree }
+  return { branch, worktree, dir: taskDir(worktree, rel), rel, dirty, dirtySummary: summary }
 }
 
-export async function removeTaskWorktree(project: string, w: TaskWorktree, run: Exec = exec): Promise<void> {
+// Only the worktree root and the branch: a worktree can be removed by name alone, and callers that hold no project
+// offset (a removal after a merge) must not have to invent one.
+export async function removeTaskWorktree(project: string, w: Pick<TaskWorktree, "branch" | "worktree">, run: Exec = exec): Promise<void> {
   await run("git", ["worktree", "remove", "--force", w.worktree], { cwd: project })
   await run("git", ["branch", "-D", w.branch], { cwd: project })
 }
@@ -133,7 +204,7 @@ export type TrainStep = { readonly ok: true; readonly moved: boolean } | { reado
 
 // The first half of a merge train step: the task's branch is rebased onto the job's branch when that moved on since
 // the task started. moved tells the caller to run the task's checks again before the fast-forward.
-export async function rebaseTask(w: TaskWorktree, integrationBranch: string, run: Exec = exec): Promise<TrainStep> {
+export async function rebaseTask(w: Pick<TaskWorktree, "worktree">, integrationBranch: string, run: Exec = exec): Promise<TrainStep> {
   const base = (await run("git", ["merge-base", "HEAD", integrationBranch], { cwd: w.worktree })).stdout.trim()
   const tip = (await run("git", ["rev-parse", integrationBranch], { cwd: w.worktree })).stdout.trim()
   if (base === tip) return { ok: true, moved: false }
