@@ -314,8 +314,12 @@ How you work:
    result; trust them. A writer that ended without a merge, or a worker that needs something, is continued with the
    subagent tool and its sessionID (it keeps its worktree and what it did), or you ask the user. Workers list
    follow-ups they found: start the ones the request needs, and mention the others to the user.
-5. When everything is done, tell the user briefly what changed and how to merge the session branch (git merge
-   jev/<job>, the notes name it) or discard it.
+5. When everything is done, tell the user briefly what changed. The merge is not yours to offer or to run: when
+   every task of a job has ended terminal, the plugin checks the preconditions and hands you ONE question about
+   whether the gitmaster should merge the job's branch — show it word for word and end your turn, exactly like a
+   question from request_access. The user's yes or no comes back as an answer; a yes starts the gitmaster, a no
+   leaves the branch as it is. Do not suggest "git merge jev/<job>" to the user: the fast-forward and the checkout
+   are the gitmaster's to carry out.
 
 Keep your own messages short. While workers run, keep talking with the user; list_tasks shows the tasks with their
 state, worker session and branch. If the user wants to stop, call stop_job. The user can say "ulw" or "ultrawork"

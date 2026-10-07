@@ -126,6 +126,8 @@ interface Shared {
   vouches: Map<string, string[]> // job -> the paths the micromanager vouched for with request_access
   grants: Map<string, Grants> // job -> what the user decided about the refused paths of this job
   asked: Map<string, Asked> // job -> the question waiting for an answer, so it is never asked twice at once
+  mergeAsked: Set<string> // jobs whose one merge question went out: asked once, a no is final
+  mergeApproved: Set<string> // jobs the user opened for the gitmaster by answering yes: nothing else starts it
   native?: Native // the micromanager's workers on OpenCode's subagent tool, made by the first instance
 }
 const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicromanager ??= {
@@ -140,6 +142,8 @@ const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicr
   vouches: new Map(),
   grants: new Map(),
   asked: new Map(),
+  mergeAsked: new Set(),
+  mergeApproved: new Set(),
 })
 
 // A path outside the project that a reader may read: one its task names (live test: "map oc-voice" needs oc-voice).
@@ -409,6 +413,60 @@ export async function mergeJobInto(project: string, job: Job, ack: string, run: 
   return done(`${head}\n\nMerged ${branch} into the checkout (fast-forward), now at ${now}. The branch and its worktrees are still registered: discard_job gives them back to git.`)
 }
 
+// The one merge question (the user's decision, 2026-10-07). When a job's run leaves every task terminal, the plugin
+// checks the preconditions itself and asks the user ONE question, and that question IS the merge decision: on yes the
+// gitmaster runs, on no the branch stays and the job is never asked again. No second dialog, no confirmation echo —
+// the micromanager shows the question word for word and ends its turn, exactly as request_access does, and the user's
+// reply is matched on a whole answer (grantAnswer) rather than the meaning of a sentence.
+export function jobsTerminal(job: Job): boolean {
+  // state.ts TASK_FINAL: a task is finished when it was merged or cancelled. "passed" exists mid-train only and
+  // never in phase execute past the train's turn, so it is not terminal here.
+  return job.tasks.length > 0 && job.tasks.every((t) => t.status === "merged" || t.status === "cancelled")
+}
+
+export interface MergePlan {
+  readonly branch: string // the job's branch, jev/<job>
+  readonly into: string // the checkout branch the merge would fast-forward
+  readonly commits: readonly string[] // what would land, one line each, newest first
+  readonly whyNot?: string // what stands in the way right now; the question asks anyway and names it
+}
+
+// The preconditions, checked before the question and again by the gitmaster before it merges: a dirty checkout is
+// never merged into (mergeJobInto refuses it without writing), a branch the checkout does not sit on cannot
+// fast-forward, and nothing to land means nothing to decide. A yes with the check broken still merges nothing — the
+// gitmaster checks and reports why — which is why the question carries the reason instead of hiding it.
+export async function mergePlan(project: string, job: Job, run: Exec = exec): Promise<MergePlan> {
+  const branch = job.integrationBranch ?? `jev/${job.id}`
+  const git = (...args: string[]) => run("git", ["-C", project, ...args], { cwd: project, timeoutMs: 15_000 })
+  const into = (await git("symbolic-ref", "--short", "HEAD")).stdout.trim() || "HEAD"
+  const building = { branch, into, commits: [] as string[] }
+  const dirty = (await git("status", "--porcelain")).stdout.trim()
+  if (dirty) return { ...building, whyNot: "the working tree has uncommitted changes" }
+  const landing = (await git("log", "--oneline", `HEAD..${branch}`)).stdout.trim()
+  if (!landing) return { ...building, whyNot: `${branch} has nothing their ${into} does not have already` }
+  const commits = landing.split("\n")
+  if ((await git("merge-base", "--is-ancestor", "HEAD", branch)).code !== 0) {
+    return { ...building, commits, whyNot: `${branch} has diverged from ${into}; only a fast-forward is ever merged` }
+  }
+  return { ...building, commits }
+}
+
+// The question, self-contained: what would land (one line each), what the merge would do on a yes, and what a no
+// means. "One line each" is the user's wording: a diff dump would be a second dialog in disguise.
+export function mergeQuestion(job: Job, plan: MergePlan): string {
+  return [
+    `[job ${job.id}] Every task is done. Should the gitmaster merge ${plan.branch} into ${plan.into}?`,
+    "",
+    `That would land ${plan.commits.length} ${plan.commits.length === 1 ? "commit" : "commits"}, newest first:`,
+    ...plan.commits.map((line) => `  ${line}`),
+    ...(plan.whyNot ? ["", `One check failed before you were asked, and the merge will refuse because of it: ${plan.whyNot}. A yes then changes nothing; you would be told why, and the branch stays.`] : []),
+    "",
+    "Open the way?",
+    `"yes" runs the gitmaster: it checks once more, merges fast-forward in your checkout, and reports.`,
+    '"no" ends it here: the branch stays as it is and this job is not asked again.',
+  ].join("\n")
+}
+
 // discard_job: the cleanup a real run left undone (six stale worktrees and branches). It never touches the user's
 // checkout or a tracked file: only worktrees under the job and the branches of its tasks.
 export async function discardJob(project: string, job: Job, ack: string, run: Exec = exec): Promise<GitOutcome> {
@@ -546,6 +604,9 @@ export interface Asked {
   readonly rule: string
   readonly why: string
   readonly task?: string
+  // Set for the one merge question instead of a path open (path stays ""). The answer starts the gitmaster rather
+  // than opening a path; one question slot per job keeps "asked once" true for both kinds at once.
+  readonly merge?: { readonly jobId: string; readonly branch: string }
 }
 
 // The paths of a job the user opened, in the form decide.ts takes: a grant is an allowOutside entry and nothing else.
@@ -616,6 +677,34 @@ export function grantAnswer(text: string): boolean | undefined {
   if (["yes", "y", "yeah", "yep", "sure", "ok", "okay", "allow", "allow it", "open it", "go ahead", "do it"].includes(t)) return true
   if (["no", "n", "nope", "nah", "deny", "deny it", "refuse", "keep it closed", "no way", "not this time"].includes(t)) return false
   return undefined
+}
+
+// Whether this job is owed its one merge question right now: never already asked, nothing else waiting on the job,
+// and every task at an end. The offer then does the git work; this is the part that must never ask twice.
+export function mergeQuestionDue(job: Job): boolean {
+  return !SHARED.mergeAsked.has(job.id) && !SHARED.asked.has(job.id) && jobsTerminal(job)
+}
+
+// The question a job owes its user, so it survives until their turn answers it (SHARED.asked is keyed per job; one
+// question at a time is what keeps a second asker from overwriting the first).
+export function askJobQuestion(jobId: string, question: Asked): void {
+  SHARED.asked.set(jobId, question)
+}
+
+export function mergeApprovedFor(jobId: string): boolean {
+  return SHARED.mergeApproved.has(jobId)
+}
+
+// The answer to the one merge question, in one place: whichever way it goes, the question is gone for good. A yes is
+// the only thing that opens the job for the gitmaster (the delegation guard reads no other marker), and the note tells
+// the micromanager in one turn what to do — or to do nothing.
+export function settleMerge(jobId: string, branch: string, answer: boolean, sessionID: string | undefined, journal: (entry: Record<string, unknown>) => void = record): string {
+  SHARED.asked.delete(jobId)
+  if (answer) SHARED.mergeApproved.add(jobId)
+  journal({ kind: "merge-answer", job: jobId, branch, answer, sessionID })
+  return answer
+    ? `[job ${jobId}] The user approved the merge. Start the gitmaster now: one subagent call, agent "gitmaster", background true, a short prompt naming the branch ${branch} and that it works in your checkout. Nothing else of this job is yours to run. Its report comes back to you; tell the user what it did.`
+    : `[job ${jobId}] The user declined the merge. The job ends here; its branch ${branch} stays as it is. Say so, and do not ask again — the plugin will not re-ask either.`
 }
 
 export default {
@@ -736,6 +825,17 @@ export default {
       const guard = await checkGuards(decider, `${String(call.input.description ?? "")}. ${asked}`)
       if (guard.flagged.some((g) => g === "injection" || g === "harmful")) {
         throw new DelegationError(`The local check flagged this task (${guard.flagged.join(", ")}). Ask the user whether it should run before you start it again.`)
+      }
+      // The gitmaster is the one worker that writes in the user's checkout, so it is started on the user's yes alone:
+      // SHARED.mergeApproved is written only by the prompt hook, after a real user turn answered the plugin's merge
+      // question. No session can gain the marker by asking anywhere else — the only asker of that question is the
+      // prompt hook, so an unattended session has no way in.
+      if (routed.role === "gitmaster") {
+        const want = asked.match(/jev\/([\w-]+)/)?.[1] ?? ""
+        if (!want || !mergeApprovedFor(want)) {
+          record({ kind: "merge-refused", sessionID: call.sessionID, agent: call.agent, role: "gitmaster", job: want || undefined, reason: want ? "the user has not approved this merge" : "the prompt names no job branch" })
+          throw new DelegationError(`Not started: the gitmaster runs the merge the user approved, and there is no such approval${want ? ` for job ${want}` : ""} on record (the plugin's question asks for it). Do not retry; say in your report that the merge awaits the user's answer.`)
+        }
       }
       const d = await native.delegate(project, call.sessionID, { agent: String(call.input.agent ?? ""), description: String(call.input.description ?? ""), prompt: asked }, routed.model)
       call.input.prompt = d.prompt
@@ -1028,11 +1128,42 @@ export default {
         installedSkills: installed,
       })
     // The job queue: run_job queues, the scheduler runs in the background and the notifier reports the end.
+    // The one merge question (the user's decision, 2026-10-07): a run that left every task terminal is the moment the
+    // plugin checks the preconditions and asks whether the gitmaster should merge. Offered once per job — after a no,
+    // or after the question was answered, the ordinary end notice runs instead, and nothing re-asks. The question is
+    // shown by the micromanager word for word (the request_access pattern), ends its turn, and the user's reply is
+    // matched whole; anything else is a turn the user is free to write.
+    const offerMergeQuestion = async (job: Job, seat?: string): Promise<boolean> => {
+      if (!seat || !mergeQuestionDue(job)) return false
+      const plan = await mergePlan(project, job)
+      SHARED.mergeAsked.add(job.id)
+      askJobQuestion(job.id, { path: "", rule: plan.whyNot ?? plan.branch, why: plan.whyNot ?? "the merge of the finished job", merge: { jobId: job.id, branch: plan.branch } })
+      const text = mergeQuestion(job, plan)
+      record({
+        kind: "merge-question",
+        job: job.id,
+        branch: plan.branch,
+        into: plan.into,
+        commits: plan.commits.length,
+        ...(plan.whyNot ? { whyNot: plan.whyNot } : {}),
+      })
+      log("info", `job ${job.id}: all tasks terminal, merge question offered for ${plan.branch} -> ${plan.into}${plan.whyNot ? ` (refused now: ${plan.whyNot})` : ""}`)
+      steering.set(seat, `[job ${job.id}] Every task is terminal. Put this question to the user word for word, call no other tool, and end your turn — their reply is the answer, not a task:\n\n${text}`)
+      await notifier.flush(seat)
+      await ctx.session.synthetic({ sessionID: seat, text: `[jev-micromanager] job ${job.id}: every task is done. The merge question is in your system note — show it to the user and end your turn.`, resume: true }).catch(() => undefined)
+      return true
+    }
     const scheduler = new Scheduler({
       // Not swept on purpose: the queue is about to hand this job to the runner, which owns it from here (sweep skips a job
       // the scheduler is running anyway, so the two agree).
       run: async (id, cancel, note) => runner(loadJob(project, id)?.facilitator, id, cancel).run(id, note),
-      finished: (job, session) => void notifier.finished(session ?? job.facilitator, job.id, ending(job), summary(job)),
+      finished: async (job, session) => {
+        const seat = session ?? job.facilitator
+        // The one merge question replaces the ordinary done-report when every task came to an end: it is ack, report
+        // and offer at once, so the user is never asked twice about the merge for one run.
+        if (await offerMergeQuestion(job, seat)) return
+        void notifier.finished(seat, job.id, ending(job), summary(job))
+      },
       failed: (id, session, err) => {
         log("error", `job ${id} failed: ${String(err)}`)
         void notifier.finished(session, id, "failed", `The run broke off: ${err instanceof Error ? err.message : String(err)}. run_job resumes it.`)
@@ -1329,21 +1460,29 @@ export default {
       else if (/^\s*stop\b/i.test(text)) ultrawork.delete(sessionID)
       const job = sessionJob(sessionID)
       if (!job) return
-      // The answer to a grant question, before anything else this turn: it is a yes or a no about a path, and a turn
-      // that carried one must not be swallowed by a policy shortcut or a planning answer. This is the only way a
-      // refused path is ever opened, and it runs here — a turn the user typed in this session — never from a worker,
-      // whose turn this hook never sees.
+      // The answer to a question the plugin put to the user (a refused path, or the one merge question), before
+      // anything else this turn: a turn that carries one must not be swallowed by a policy shortcut or a planning
+      // answer. It runs here — a turn the user typed in this session — never from a worker, whose turn this hook
+      // never sees. The live defect the shape guards against: while a question was outstanding, EVERY turn was read
+      // as an answer attempt and swallowed whole, so a user writing "wait, what is going on?" got nothing but the
+      // same waiting note. Now only a turn that genuinely parses as an answer is taken; anything else runs the turn
+      // normally with the question still outstanding.
       const pending = askedFor(job)
       if (pending) {
         const answer = grantAnswer(text)
-        if (answer === undefined) {
-          steering.set(sessionID, `[job ${job.id}] Still waiting for your answer about ${pending.path}: "yes" opens it for the workers of this job, "no" leaves it closed. Answer with one word.`)
+        if (answer !== undefined && !pending.merge) {
+          const said = grant(job, pending, answer, sessionID)
+          log("info", `the user ${said.granted ? "opened" : "refused"} ${pending.path} for job ${job.id}`)
+          steering.set(sessionID, `[job ${job.id}] ${said.text} Tell the worker that in its next report.`)
           return
         }
-        const said = grant(job, pending, answer, sessionID)
-        log("info", `the user ${said.granted ? "opened" : "refused"} ${pending.path} for job ${job.id}`)
-        steering.set(sessionID, `[job ${job.id}] ${said.text} Tell the worker that in its next report.`)
-        return
+        if (answer !== undefined && pending.merge) {
+          steering.set(sessionID, settleMerge(pending.merge.jobId, pending.merge.branch, answer, sessionID))
+          log("info", `the user ${answer ? "approved" : "declined"} the merge of ${pending.merge.branch} for job ${pending.merge.jobId}`)
+          return
+        }
+        // Not an answer: the question stays outstanding and the turn goes on (the note a grant ask carried before is
+        // gone deliberately — the model now sees this turn as the question it was, not as a wall in front of it).
       }
       try {
         const pin = matchShortcut(text)

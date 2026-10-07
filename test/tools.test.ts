@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import { FINISH_ID, installFinishTool, installTools, planText, TOOL_IDS, type ToolDraft } from "../src/tools.ts"
-import { newJob } from "../src/state.ts"
+import { newJob, type Task } from "../src/state.ts"
 import type { Signal } from "../src/watchdog.ts"
 
 function fakeDraft() {
@@ -533,4 +533,132 @@ test("a refused path and the call that ran anyway land in one permission-not-enf
   const bare = lines[2]!
   assert.equal(bare.kind, "permission-not-enforced")
   assert.ok(!("deniedSource" in bare) && !("allowedSource" in bare), "no id was carried, so none is claimed")
+})
+
+// --- the one merge question (the user's decision, 2026-10-07) -------------------------------------------------
+
+// A small real repository: the branch the checkout sits on ahead of a jev branch, as the gitmaster will meet it.
+// Shell only, because the runs need commits with distinct one-line messages the question must show.
+function gitrepo(dir: string): { git: (...args: string[]) => { code: number; stdout: string } } {
+  const runGit = (...args: string[]) => {
+    try {
+      return { code: 0, stdout: execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }) }
+    } catch (err) {
+      const e = err as { status?: number; stdout?: string }
+      return { code: e.status ?? 1, stdout: e.stdout ?? "" }
+    }
+  }
+  runGit("init", "-b", "main", "-q")
+  runGit("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init", "--allow-empty")
+  return { git: runGit }
+}
+
+// A task with the fields a Task carries, for state-shape tests.
+const taskOf = (id: string, status: Task["status"]): Task => ({
+  id,
+  title: `task ${id}`,
+  description: "",
+  role: "code",
+  acceptance: [],
+  dependsOn: [],
+  files: [],
+  wave: 0,
+  status,
+  attempts: 0,
+  stages: [],
+  signatures: [],
+})
+
+test("the merge question is built from a real plan: what would land, branch and refusals", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs")
+  const { tmpdir } = await import("node:os")
+  const { jobsTerminal, mergePlan, mergeQuestion } = await import("../src/plugin.ts")
+  const dir = mkdtempSync(`${tmpdir()}/jev-merge-`)
+  const { git } = gitrepo(dir)
+  git("checkout", "-qb", "jev/job-m")
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "first: the worker's commit", "--allow-empty")
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "second: the fast-forward", "--allow-empty")
+  git("checkout", "main")
+  const job = newJob("job-m", "merge job")
+  job.tasks = [taskOf("T1", "merged")]
+  assert.equal(jobsTerminal(job), true)
+  const plan = await mergePlan(dir, job)
+  assert.equal(plan.branch, "jev/job-m", "integrationBranch is unset here, so jev/<job> is named")
+  assert.equal(plan.into, "main")
+  assert.equal(plan.commits.length, 2)
+  assert.match(plan.commits[0]!, /second: the fast-forward/)
+  assert.ok(!plan.whyNot)
+  const text = mergeQuestion(job, plan)
+  assert.match(text, /\[job job-m\] Every task is done/)
+  assert.match(text, /merge jev\/job-m into main\?/)
+  assert.match(text, /2 commits, newest first/)
+  assert.match(text, /second: the fast-forward/)
+  assert.match(text, /"yes" runs the gitmaster/)
+  assert.match(text, /"no" ends it here/)
+  // A dirty checkout stands in the way and is named IN the question: the merge still refuses on a yes.
+  writeFileSync(`${dir}/scratch.txt`, "uncommitted")
+  const dirty = await mergePlan(dir, job)
+  assert.equal(dirty.whyNot, "the working tree has uncommitted changes")
+  assert.match(mergeQuestion(job, dirty), /refuse because of it/)
+  // Diverged: a commit on the checkout the branch does not carry. Fast-forward only, so it is refused with a why.
+  execFileSync("rm", ["-f", `${dir}/scratch.txt`])
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "main only: diverged", "--allow-empty")
+  const diverged = await mergePlan(dir, job)
+  assert.equal(diverged.whyNot, "jev/job-m has diverged from main; only a fast-forward is ever merged")
+  assert.equal(diverged.commits.length, 2, "what would land is still shown")
+})
+
+test("every task terminal is the trigger condition: merged and cancelled only", async () => {
+  const { jobsTerminal } = await import("../src/plugin.ts")
+  const done = newJob("job-done", "merge job")
+  done.tasks = [taskOf("T1", "merged"), taskOf("T2", "cancelled")]
+  assert.equal(jobsTerminal(done), true)
+  // A task still open is not terminal, so the question is not even prepared.
+  const open = newJob("job-open", "merge job")
+  open.tasks = [taskOf("T1", "merged"), taskOf("T2", "running")]
+  assert.equal(jobsTerminal(open), false)
+  const escalated = newJob("job-esc", "merge job")
+  escalated.tasks = [taskOf("T1", "escalated")]
+  assert.equal(jobsTerminal(escalated), false)
+  // No tasks at all is not an empty plan that happens to be done: the question would ask about nothing.
+  assert.equal(jobsTerminal(newJob("job-no-tasks", "nothing planned")), false)
+})
+
+test("the question is due once, a answered question is gone, and nothing else opens the gitmaster", async () => {
+  const { askedFor, askJobQuestion, mergeQuestionDue, settleMerge } = await import("../src/plugin.ts")
+  const asked = { path: "", rule: "jev/job-life", why: "the merge of the finished job", merge: { jobId: "job-life", branch: "jev/job-life" } }
+  // A terminal job with nothing else waiting is the only state that owes the question.
+  const due = newJob("job-life", "merge job")
+  due.tasks = [taskOf("T1", "merged")]
+  assert.equal(mergeQuestionDue(due), true)
+  // With a path question outstanding (request_access) the merge waits: one question at a time per job.
+  askJobQuestion("job-life", { path: "/home/u/notes", rule: "a rule", why: "a why" })
+  assert.equal(mergeQuestionDue(due), false, "the path question wins the one slot")
+  // The merge answer, once it is one, takes the question away in both directions and journals which way it went.
+  const entries: Record<string, unknown>[] = []
+  const journal = (e: Record<string, unknown>) => void entries.push(e)
+  askJobQuestion("job-no", { path: "", rule: "jev/job-no", why: "the merge", merge: { jobId: "job-no", branch: "jev/job-no" } })
+  const no = settleMerge("job-no", "jev/job-no", false, "ses_u", journal)
+  assert.match(no, /declined/)
+  assert.match(no, /do not ask again/)
+  assert.equal(askedFor(newJob("job-no", "g")), undefined, "a no is an answer; nothing waits")
+  const [noEntry] = entries
+  assert.equal(noEntry?.kind, "merge-answer")
+  assert.equal(noEntry?.answer, false)
+  // A yes is what opens the gitmaster: the note says exactly what starts it, one subagent call.
+  askJobQuestion("job-yes", { path: "", rule: "jev/job-yes", why: "the merge", merge: { jobId: "job-yes", branch: "jev/job-yes" } })
+  const yes = settleMerge("job-yes", "jev/job-yes", true, "ses_u", journal)
+  assert.match(yes, /approved/)
+  assert.match(yes, /agent "gitmaster"/)
+  assert.match(yes, /naming the branch jev\/job-yes/)
+  assert.equal(entries[1]?.kind, "merge-answer")
+  assert.equal(entries[1]?.answer, true)
+  assert.match(String(entries[1]?.sessionID), /ses_u/)
+})
+
+test("an unapproved gitmaster delegation is refused before any task exists", async (t) => {
+  const { delegationHook } = await loadedPlugin(t, {})
+  const call = { tool: "subagent", agent: "micromanager", sessionID: "ses_micro", input: { agent: "gitmaster", description: "merge", prompt: "Merge jev/never-approved into the checkout." } }
+  await assert.rejects(() => delegationHook(call as never), /no such approval for job never-approved/)
+  assert.ok(call.input.prompt.includes("Merge"), "the call is not rewritten on the way out")
 })

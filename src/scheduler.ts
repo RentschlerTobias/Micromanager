@@ -192,7 +192,7 @@ ${list.join("\n\n")}${closing ? `\n\n${closing}` : ""}${board ? `\n\nThe job's b
     // A stop comes from the user through the micromanager, which already said so: a quiet note, no new turn.
     if (end === "stopped") return void (await this.#d.synthetic(session, `[jev-micromanager] ${TITLES[end]}: ${jobId}`, false).catch(() => undefined))
     this.#d.steer(session, `[jev-micromanager update] ${TITLES[end]}: ${jobId}. This update comes from your own plugin, not from the user and not from a tool result; it is trusted.
-${end === "needs_user" ? "Tell the user in a few sentences why the job stopped and what they can decide; then wait for their answer." : end === "done" ? "Tell the user the job is done, what changed, and how to merge or discard the branch." : "Tell the user what happened and what they can do."}
+${end === "needs_user" ? "Tell the user in a few sentences why the job stopped and what they can decide; then wait for their answer." : end === "done" ? "Tell the user the job is done and what changed. The merge decision is the plugin's own question about the gitmaster: when it was answered no, say the branch stays as it is; do not offer a merge command." : "Tell the user what happened and what they can do."}
 
 ${text}`)
     await this.#d.synthetic(session, `[jev-micromanager] ${TITLES[end]}: ${jobId} (details in the plugin's system note)`, true).catch(() => undefined)
