@@ -85,10 +85,30 @@ const READ_COMMANDS = [
 // on Linux it is also the group command of shadow-utils.
 const AST_GREP_WRITES = ["ast-grep * -U*", "ast-grep * --update-all*", "ast-grep * -r *", "ast-grep * --rewrite*", "ast-grep * -i*", "ast-grep * --interactive*"]
 const LINTERS = ["ruff *", "uv run ruff*", "uv run pyright*", "npx tsc*", "npx eslint*"]
+// Commands that change nothing and only read what the previous segment of a chain produced. OpenCode passes each command
+// of a chain as its own resource, so without these a worker that may run the type-checker is refused at the first `grep`
+// after it -- and, told the refusal ends its task, it gave up work it had already finished another way (live run,
+// 2026-10-07: `uv run pyright | grep | sed | cut | sort | uniq` on a coder).
+const PIPE_READERS = [
+  "grep*", "egrep*", "rg*", "sed*", "cut*", "sort*", "uniq*", "head*", "tail*", "wc*", "tr*", "cat*", "jq*", "column*",
+  "diff*", "cmp*", "xargs grep*",
+]
+// The forms of those that do write. The last matching rule wins, so these have to come after the allow, exactly as
+// AST_GREP_WRITES does for ast-grep: placed before it, the allow would override the deny and `sed -i` would run.
+const PIPE_READER_WRITES = ["sed -i*", "sed --in-place*", "sort -o*", "sort --output*", "tee*"]
+// What every role that may run commands gets: the project's own test runners and linters, and the readers that shape
+// their output, so a worker that may check its work can also read what the check said. Everything else stays "ask", and
+// the hard rules in src/decide.ts still refuse what they refuse.
+const runAndRead = [
+  ...[...TEST_RUNNERS, ...LINTERS, ...PIPE_READERS].map((cmd) => rule("shell", "allow", cmd)),
+  ...PIPE_READER_WRITES.map((cmd) => rule("shell", "deny", cmd)),
+]
 
 const SHARED = `You are a sub-agent of the jev-micromanager. You get one sub-task with acceptance points.
 Do only that sub-task. When you finish, answer with: what you did, which files you changed (if any), and for
-each acceptance point whether it is met. If something blocks you, say what and stop; do not guess.`
+each acceptance point whether it is met. A refused permission is not a blocker: nobody is asked while you run, so carry
+on without it and say in your report what you wanted it for and what you did instead. If something blocks you, say what
+and stop; do not guess.`
 
 // Agent ids: the orchestrator is the micromanager, the workers are named after their role (the user's choice,
 // 2026-10-05). Nouns, since OpenCode's built-in agents are already called plan and explore.
@@ -143,22 +163,22 @@ tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) =>
   role(
     "code",
     "Implements and refactors code.",
-    "Implement the sub-task with the smallest change that meets the acceptance points. Match the surrounding code.",
-    [...askShell, ...noWeb, ...noDelegation],
+    "Implement the sub-task with the smallest change that meets the acceptance points. Match the surrounding code. Run the project's own tests and linters to check your work; the rest of the shell is asked about.",
+    [...askShell, ...runAndRead, ...noWeb, ...noDelegation],
     [MODELS.space, MODELS.glm, MODELS.qwen],
   ),
   role(
     "test",
     "Writes and runs tests.",
     "Write or update tests for the sub-task and run them. Report the exact results.",
-    [...askShell, ...TEST_RUNNERS.map((cmd) => rule("shell", "allow", cmd)), ...noWeb, ...noDelegation],
+    [...askShell, ...runAndRead, ...noWeb, ...noDelegation],
     [MODELS.space, MODELS.glm, MODELS.deepseek],
   ),
   role(
     "visual",
     "UI, CSS, layouts, screenshots (has image input).",
     "Work on the user interface. When given screenshots, describe what you see before changing anything.",
-    [...askShell, ...noWeb, ...noDelegation],
+    [...askShell, ...runAndRead, ...noWeb, ...noDelegation],
     [MODELS.space, MODELS.qwen],
   ),
   role(
@@ -172,7 +192,7 @@ tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) =>
     "debug",
     "Reproduces a failure and finds its cause; edits only with approval.",
     "Reproduce the failure, find the root cause, and explain it with evidence. Propose the fix before applying it.",
-    [...WRITE_TOOLS.map((tool) => rule(tool, "ask")), ...askShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
+    [...WRITE_TOOLS.map((tool) => rule(tool, "ask")), ...askShell, ...runAndRead, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
     [MODELS.space, MODELS.glm, MODELS.qwen],
   ),
   role(
@@ -181,7 +201,7 @@ tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) =>
     `Check the result against each acceptance point. Run the tests and linters if there are any. Answer only
 with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "...", "met": true | false, "evidence": "..."}],
 "fixes": ["..."]}.`,
-    [...noWrite, ...noShell, ...[...TEST_RUNNERS, ...LINTERS].map((cmd) => rule("shell", "allow", cmd)), ...noWeb, ...noDelegation],
+    [...noWrite, ...noShell, ...runAndRead, ...noWeb, ...noDelegation],
     [MODELS.space, MODELS.glm, MODELS.qwen], // space-bunny writes, so a reviewer must be another family
   ),
   role(
