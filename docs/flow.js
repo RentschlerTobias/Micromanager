@@ -27,24 +27,32 @@ const NODES = {
   worker: { t: "Worker runs", s: "foreground session", x: 1300, y: 110, cat: "entry",
     e: "The sub-agent session runs on the chosen model with the role's rights and the prompt carrying a [jev-micromanager] header." },
 
-  // permission decision (src/decide.ts, src/plugin.ts)
-  ask: { t: "Permission ask", s: "effect = ask · our agents", x: 100, y: 430, cat: "entry",
+  // permission decision (src/decide.ts, src/plugin.ts) — the order is decide()'s own, top to bottom.
+  ask: { t: "Permission ask", s: "effect = ask · our agents", x: 100, y: 500, cat: "entry",
     e: "OpenCode asks before a tool call. Only the micromanager and its role agents are handled here; every other agent's ask is left to OpenCode." },
-  hard: { t: "Hard rule?", s: "git push · sudo · .env · install", x: 340, y: 430, cat: "guard",
-    e: "Rules Jev can never override: a destructive or irreversible command, installing software into the system, a .env file, or access outside the project. Always the user." },
-  deletes: { t: "Deletes files?", s: "what git says about the paths", x: 580, y: 430, cat: "check",
+  hard: { t: "Hard rule?", s: "destructive · .env · install · sensitive root", x: 340, y: 500, cat: "guard",
+    e: "Rules Jev can never override, checked first and never bypassed: a destructive or irreversible command, installing software into the system, a .env file, and — for a path outside the project — the roots that are refused at every layer (~/.ssh, ~/.aws, ~/.config, ~/.gnupg, /etc, /usr, the home directory itself, another job's worktree content). Always the user." },
+  reading: { t: "Only reads, inside the worktree?", s: "no Jev asked at all", x: 820, y: 390, cat: "check",
+    e: "A shell request whose every step only reads, with every path it names resolving inside the worker's worktree, is allowed outright — no Jev request. Reading cannot damage a throwaway checkout, and Jev's own confidence on these sits under the read floor, so asking only turned a worker's inspection into a denial (67 of 185 worker shell requests in the live run). A preset that sends this to the user still wins." },
+  outside: { t: "Outside the project?", s: "three layers", x: 820, y: 620, cat: "check",
+    e: "Layer by layer: a path inside this job's own worktrees is allowed mechanically; a read of a directory the task itself names is allowed; anything else is the user's, as it was before the layers existed." },
+  jobarea: { t: "In the job's worktrees?", s: "mechanical allow", x: 1060, y: 580, cat: "allow",
+    e: "Any path under .jev-micromanager/worktrees/ — this job's, and the integration worktree. Compared segment-wise, so a sibling directory sharing a name prefix is outside." },
+  vouched: { t: "The task names it?", s: "a read only", x: 1300, y: 620, cat: "allow",
+    e: "The task text names the path, a directory containing it, or a file in it, and the requesting agent is a reader. Vouching for a path is not vouching for a write, so a write outside the project still escalates." },
+  deletes: { t: "Deletes files?", s: "what git says about the paths", x: 1060, y: 750, cat: "check",
     e: "An rm -r/-f inside the project: the plugin asks git and the file system what the deleted paths are (exists, tracked, ignored)." },
-  tracked: { t: "Tracked or unknown?", s: "version control → user", x: 820, y: 300, cat: "check",
+  tracked: { t: "Tracked or unknown?", s: "version control → user", x: 1300, y: 750, cat: "check",
     e: "A deleted path that is under version control — or in a folder that is no git repository — is the user's call. Ignored caches stay Jev's." },
-  jev: { t: "Jev answers", s: "answer · needs_user · risk", x: 1060, y: 430, cat: "jev",
+  jev: { t: "Jev answers", s: "answer · needs_user · risk", x: 1540, y: 500, cat: "jev",
     e: "One Jev request gets the agent, its role, the action, the resources, the sub-task and (for a delete) the path facts. It returns a choice, needs_user, risk and path_relevance with probabilities." },
-  floors: { t: "Safe and sure?", s: "needs_user · risk · confidence", x: 1300, y: 430, cat: "floor",
+  floors: { t: "Safe and sure?", s: "needs_user · risk · confidence", x: 1780, y: 500, cat: "floor",
     e: "needs_user ≥ 0.5, risk ≥ 1.5, path_relevance ≥ 0.5, or a confidence below the class floor (read 0.80, write 0.85): the user decides. Otherwise Jev's choice stands." },
-  allow: { t: "Allow", s: "Jev's choice stands", x: 1540, y: 300, cat: "allow",
-    e: "Jev allowed it with enough confidence for the risk class; the permission is granted without asking the user." },
-  deny: { t: "Deny", s: "Jev's choice stands", x: 1540, y: 430, cat: "deny",
+  allow: { t: "Allow", s: "granted, or Jev's choice", x: 2020, y: 420, cat: "allow",
+    e: "Granted without asking: a read inside the worktree, a path in the job's own area, a task-vouched read, or Jev allowing it with enough confidence for the risk class." },
+  deny: { t: "Deny", s: "Jev's choice stands", x: 2020, y: 500, cat: "deny",
     e: "Jev denied it with enough confidence for the risk class; the call is blocked and the agent is told no." },
-  user: { t: "User decides", s: "question passes through", x: 1540, y: 620, cat: "user",
+  user: { t: "User decides", s: "question passes through", x: 2020, y: 660, cat: "user",
     e: "The question or permission request goes to the TUI unchanged — with Jev's suggestion and its confidence appended when there is one." },
 };
 
@@ -55,20 +63,27 @@ const EDGES = [
   ["needs", "review", "no images"], ["needs", "model", "images"], ["review", "model", "first · other"],
   ["model", "worker"],
   ["ask", "hard"],
-  ["hard", "user", "hard rule", { lane: 640 }], ["hard", "deletes", "no"],
-  ["deletes", "user", "no directory", { lane: 615 }], ["deletes", "tracked", "yes"], ["deletes", "jev", "no"],
-  ["tracked", "user", "tracked / unknown", { lane: 565 }], ["tracked", "jev", "ignored"],
-  ["jev", "user", "no key · error · unanswered", { lane: 515 }], ["jev", "floors"],
+  ["hard", "user", "hard rule", { lane: 960 }], ["hard", "deny", "a runner session\u2019s own layers"],
+  ["hard", "reading"], ["hard", "outside"], ["hard", "deletes"],
+  ["reading", "allow", "only reads · in tree"],
+  ["outside", "jobarea", "in the job area"], ["outside", "vouched", "a reader, task names it"],
+  ["outside", "user", "otherwise", { lane: 900 }],
+  ["jobarea", "allow"], ["vouched", "allow"],
+  ["deletes", "user", "no directory", { lane: 850 }], ["deletes", "tracked", "yes"], ["deletes", "jev", "no"],
+  ["tracked", "user", "tracked / unknown", { lane: 820 }], ["tracked", "jev", "ignored"],
+  ["jev", "user", "no key · error · unanswered", { lane: 780 }], ["jev", "floors"],
   ["floors", "user", "a floor"], ["floors", "allow", "allow"], ["floors", "deny", "deny"],
 ];
 // Lane headers. [text, x, y]; routing sits above the first lane, permission above the second.
 const STAGES = [
   [["INPUT", 100, -25], ["ROLE", 340, -25], ["NEEDS", 580, -25], ["REVIEW", 820, -25], ["MODEL", 1060, -25], ["RUN", 1300, -25],
-   ["ASK", 100, 378], ["GUARD", 340, 378], ["PATHS", 580, 378], ["JEV", 1060, 378], ["FLOORS", 1300, 378], ["VERDICT", 1540, 378]],
+   ["ASK", 100, 448], ["GUARD", 340, 448], ["READS", 820, 338], ["OUTSIDE", 820, 568],
+   ["PATHS", 1060, 698], ["JEV", 1540, 448], ["FLOORS", 1780, 448], ["VERDICT", 2020, 448]],
 ];
 const W = 170, H = 50;
 const CAT_VAR = { entry: "--c-entry", route: "--c-route", guard: "--c-guard", check: "--c-check",
-                  jev: "--c-jev", floor: "--c-floor", allow: "--c-allow", deny: "--c-deny", user: "--c-user" };
+                  jev: "--c-jev", floor: "--c-floor", allow: "--c-allow", deny: "--c-deny", user: "--c-user",
+                  other: "--c-other" };
 const pos = Object.fromEntries(Object.entries(NODES).map(([id, n]) => [id, { x: n.x, y: n.y }]));
 
 function el(tag, attrs = {}, parent) {
@@ -136,9 +151,16 @@ let filter = null; // {mode: "use" | "node", key, label}
 const short = (model) => String(model ?? "").split("/").pop() ?? "";
 const isDelete = (r) => /\brm\s+-[A-Za-z]*[rRf]/.test(String(r));
 
+// The chart covers two lanes: how a delegation is routed, and how a permission request is decided. The journal
+// carries more kinds than that (watchdog, checkpoint, the plugin's own startup record, …); they are kept, and they
+// list without highlighting, because an operator loading the file wants to see that the journal is alive.
+const UNCHARTED = new Set(["plugin", "watchdog", "checkpoint", "finish", "compaction", "memory", "graph",
+                          "discovered", "delegation-unrecognised", "decision", "escalation"]);
+
 function normalize(raw) {
   const kind = raw.kind ?? (raw.role && raw.model ? "routing" : "permission");
-  return { ...raw, kind, ts: raw.ts ?? raw.time };
+  const charted = kind === "routing" || kind === "permission";
+  return { ...raw, kind, charted, ts: raw.ts ?? raw.time };
 }
 const keyOf = (e) => `${e.kind}|${e.ts}|${e.agent ?? ""}|${e.action ?? e.role ?? ""}|${e.resources?.join(",") ?? e.model ?? ""}`;
 
@@ -159,19 +181,34 @@ function routingPath(e) {
   return [...p, "needs", "review", "model", "worker"];
 }
 
-// Reconstructs the walk decide() took from the recorded reason (the journal keeps verdict + reason + scores).
+// Reconstructs the walk decide() took, from the recorded reason. The journal keeps verdict + reason + scores, and
+// the reasons are the branches of decide() in order, so this mirrors src/decide.ts rather than guessing.
 function permissionPath(e) {
-  const dels = (e.resources ?? []).some(isDelete);
-  const head = dels ? ["ask", "hard", "deletes", "tracked"] : ["ask", "hard", "deletes"];
   const r = String(e.reason ?? "");
-  if (r.startsWith("always the user")) return ["ask", "hard", "user"];
-  if (/project directory is unknown/.test(r)) return ["ask", "hard", "deletes", "user"];
-  if (/^deletes /.test(r)) return [...head, "user"];
-  const p = [...head, "jev"];
-  if (/^no Jev key|^Jev failed:|^Jev unreachable:|left a question unanswered/.test(r)) return [...p, "user"];
-  p.push("floors");
-  if (/user must decide|deleted paths matter|too risky|unsure/.test(r)) return [...p, "user"];
-  return [...p, e.verdict === "deny" ? "deny" : "allow"];
+  // hardRule() is first and is never bypassed.
+  if (r.startsWith("always the user: a destructive") || r.startsWith("always the user: installs")) {
+    return ["ask", "hard", "user"];
+  }
+  // readsOnlyInside(): allowed outright, Jev never asked.
+  if (/^read-only command inside/.test(r)) return ["ask", "hard", "reading", "allow"];
+  // externalVerdict(), decide.ts's own two allow layers.
+  if (/^inside the job's own worktrees/.test(r)) return ["ask", "hard", "outside", "jobarea", "allow"];
+  if (/^a read of a directory the task names/.test(r)) return ["ask", "hard", "outside", "vouched", "allow"];
+  if (/^always the user: access outside/.test(r)) return ["ask", "hard", "outside", "user"];
+  // The plugin's own layers for a session the runner started (plugin.ts's external_directory branch), which run
+  // before decide() is consulted: the hard denials first, then a vouch from the task or from the micromanager.
+  if (/^a hard-denied path/.test(r)) return ["ask", "hard", "deny"];
+  if (/^a reader, in a directory its task/.test(r)) return ["ask", "hard", "outside", "vouched", "allow"];
+  if (/^runner session outside its directory/.test(r)) return ["ask", "hard", "deny"];
+  // Deleting inside the project: the path facts come before Jev.
+  if (/^deletes files, and the project directory is unknown/.test(r)) return ["ask", "hard", "deletes", "user"];
+  if (/^deletes /.test(r)) return ["ask", "hard", "deletes", "tracked", "user"];
+  const dels = (e.resources ?? []).some(isDelete);
+  const head = dels ? ["ask", "hard", "deletes", "tracked", "jev"] : ["ask", "hard", "deletes", "jev"];
+  if (/^no Jev key|^Jev failed:|^Jev unreachable:|left a question unanswered/.test(r)) return [...head, "user"];
+  if (/^preset by the user's policy/.test(r)) return [...head, e.verdict === "deny" ? "deny" : e.verdict === "allow" ? "allow" : "user"];
+  if (/user must decide|deleted paths matter|too risky|unsure/.test(r)) return [...head, "floors", "user"];
+  return [...head, "floors", e.verdict === "deny" ? "deny" : "allow"];
 }
 
 function pathOf(e) { return e.kind === "routing" ? routingPath(e) : permissionPath(e); }
@@ -182,20 +219,28 @@ function edgesOf(path) {
   return on;
 }
 
-// [label, category] of a decision, for the list and the detail chip.
+// [label, category] of a decision, for the list and the detail chip. The branches that decide a permission request
+// without asking Jev get their own wording, because "allow" alone does not say why it was safe.
 function label(e) {
   if (e.kind === "routing") return [`${e.role} → ${short(e.model)}`, "route"];
-  return [String(e.verdict ?? "?"), e.verdict === "allow" ? "allow" : e.verdict === "deny" ? "deny" : "user"];
+  const verdict = String(e.verdict ?? "?");
+  const noJev = NO_JEV.find(([re]) => re.test(String(e.reason ?? "")));
+  if (verdict === "allow" && noJev) return [`allow · ${noJev[1].toLowerCase()}`, "allow"];
+  return [verdict, verdict === "allow" ? "allow" : verdict === "deny" ? "deny" : "user"];
 }
 
-const said = (e) => e.kind === "routing"
-  ? `${e.requested ?? e.role}: ${(e.prompt ?? "").replace("[jev-micromanager]", "").trim()}`
-  : `${e.agent ?? "?"} · ${e.action ?? "?"}`;
+const said = (e) => {
+  if (e.kind === "routing") return `${e.requested ?? e.role}: ${(e.prompt ?? "").replace("[jev-micromanager]", "").trim()}`;
+  if (!e.charted) return `${e.kind}${e.signal ? ` · ${e.signal}` : ""}${e.reason ? ` · ${e.reason}` : ""}`;
+  return `${e.agent ?? "?"} · ${e.action ?? "?"}`;
+};
 
 // What a decision touched, for "Used" and for filtering.
 function usesOf(e) {
   if (e.kind === "routing") return [short(e.model), `role:${e.role}`];
-  return [e.agent, `action:${e.action}`, `verdict:${e.verdict}`];
+  if (!e.charted) return [e.kind];
+  const noJev = NO_JEV.find(([re]) => re.test(String(e.reason ?? "")));
+  return [e.agent, `action:${e.action}`, `verdict:${e.verdict}`, ...(noJev ? [`reason:${noJev[1]}`] : [])];
 }
 
 // --- rendering ------------------------------------------------------------------------------------------
@@ -222,13 +267,16 @@ function visible() {
 
 function renderList() {
   const items = visible();
-  $("count").textContent = `${items.length} decision${items.length === 1 ? "" : "s"}`;
+  const charted = items.filter((e) => e.charted).length;
+  $("count").textContent = charted === items.length
+    ? `${items.length} decision${items.length === 1 ? "" : "s"}`
+    : `${charted} decision${charted === 1 ? "" : "s"}, ${items.length - charted} other`;
   $("filter").hidden = !filter;
   if (filter) $("filter").textContent = `✕ ${filter.label}`;
   const box = $("entries");
   box.innerHTML = items.length ? "" : '<p class="empty" style="padding:10px">No data. Open decisions.jsonl above.</p>';
   for (const e of items) {
-    const [text, cat] = label(e);
+    const [text, cat] = e.charted ? label(e) : [e.kind, "other"];
     const div = document.createElement("div");
     div.className = `entry${keyOf(e) === selected ? " sel" : ""}`;
     div.innerHTML = `<div class="said">${esc(said(e))}</div>
@@ -241,13 +289,27 @@ function renderList() {
 
 function renderCounts() {
   const counts = {};
-  for (const e of all()) for (const id of new Set(pathOf(e))) counts[id] = (counts[id] ?? 0) + 1;
+  for (const e of all()) if (e.charted) for (const id of new Set(pathOf(e))) counts[id] = (counts[id] ?? 0) + 1;
   for (const [id, c] of Object.entries(countEls)) c.textContent = counts[id] ? `${counts[id]}×` : "";
 }
 
+// The four branches that grant a permission without asking Jev, with what each one is worth. They are the ones an
+// operator will ask about, because "allow" without a reason is the least informative verdict the plugin records.
+// Declared before the functions that read it: label(), usesOf(), renderDetail() and renderUsage() all need it.
+const NO_JEV = [
+  [/^read-only command inside/, "read only", "Only reads, inside the worktree",
+   "Every step of the command reads, and every path it names resolves inside the worker's worktree. No Jev request was made — reading cannot damage a throwaway checkout."],
+  [/^inside the job's own worktrees/, "job area", "Inside the job's own worktrees",
+   "The path is under .jev-micromanager/worktrees/: this job's, or the integration worktree. Compared segment-wise."],
+  [/^a read of a directory the task names/, "task names it", "A read the task itself names",
+   "The task text names the path (or a directory containing it) and the asking agent is a reader. A write outside the project still escalates."],
+  [/^preset by the user's policy/, "preset", "Preset by your policy",
+   "A configured decision (decisions.N13.*) answers this kind of request without asking Jev."],
+];
+
 function highlight(e) {
-  const path = e ? pathOf(e) : [];
-  const on = e ? edgesOf(path) : new Set();
+  const path = e?.charted ? pathOf(e) : [];
+  const on = path.length ? edgesOf(path) : new Set();
   for (const [id, g] of Object.entries(nodeEls)) {
     g.classList.toggle("on", path.includes(id));
     g.classList.toggle("dim", !!e && !path.includes(id));
@@ -255,7 +317,7 @@ function highlight(e) {
     subEls[id].textContent = NODES[id].s;
   }
   for (const [k, edge] of Object.entries(edgeEls)) edge.classList.toggle("on", on.has(k));
-  if (!e) return;
+  if (!e?.charted) return;
   const write = (id, text) => { if (subEls[id]) subEls[id].textContent = truncate(text, 26); };
   if (e.kind === "routing") {
     write("role", e.requested ?? e.role);
@@ -264,12 +326,17 @@ function highlight(e) {
     write("model", short(e.model));
     write("worker", short(e.model));
   } else {
+    const r = String(e.reason ?? "");
     write("ask", `${e.agent} · ${e.action}`);
-    if (/always the user/.test(String(e.reason))) write("hard", String(e.reason).replace("always the user: ", ""));
-    if (/^deletes/.test(String(e.reason))) write("tracked", String(e.reason));
-    write("jev", String(e.reason ?? "").replace(/^Jev: /, ""));
-    if (path.includes("floors")) write("floors", String(e.reason ?? "").replace(/^Jev: /, ""));
-    write(String(e.verdict), e.verdict === "user" ? "the user was asked" : "Jev's choice stands");
+    if (/^always the user: (a destructive|installs)/.test(r)) write("hard", r.replace("always the user: ", ""));
+    if (/^inside the job's own worktrees/.test(r)) write("jobarea", r);
+    if (/^a read of a directory the task names/.test(r)) write("vouched", "the task names it");
+    if (/^read-only command inside/.test(r)) write("reading", "reads only, all paths in tree");
+    if (/always the user: access outside/.test(r)) write("outside", "no layer covers it");
+    if (/^deletes/.test(r)) write("tracked", r);
+    write("jev", r.replace(/^Jev: /, ""));
+    if (path.includes("floors")) write("floors", r.replace(/^Jev: /, ""));
+    write(String(e.verdict), e.verdict === "user" ? "the user was asked" : "granted, or Jev's choice");
   }
 }
 
@@ -297,6 +364,14 @@ function renderDetail(e) {
   $("entry-title").innerHTML = `${clock(e.ts)} ${chip(text, cat, true)}`;
   let n = 0;
   const parts = [];
+  if (e.kind && !e.charted) {
+    // Not a routing or permission decision. The chart has nothing to highlight, so say what the record is instead
+    // of showing a decision that was never made.
+    parts.push(step(++n, "other", `Journal record: ${esc(e.kind)}`, `<div class="kv">${esc(e.reason ?? e.signal ?? "")}</div>
+      <div class="kv">${esc(pretty(Object.fromEntries(Object.entries(e).filter(([k]) => !["charted"].includes(k)))))}</div>`));
+    $("detail").innerHTML = `<ol class="steps">${parts.join("")}</ol>`;
+    return;
+  }
   if (e.kind === "routing") {
     parts.push(step(++n, "entry", "Delegated", `<div class="big">${esc(truncate((e.prompt ?? "").replace("[jev-micromanager]", "").trim(), 400))}</div>
       <div class="kv">${esc(e.agent ?? "micromanager")} → ${esc(e.requested ?? e.role)}</div>`));
@@ -308,19 +383,28 @@ function renderDetail(e) {
        <div class="kv">${esc((e.resources ?? []).join(" | "))}</div>
        ${e.task ? `<div class="kv">sub-task: ${esc(truncate(e.task, 300))}</div>` : ""}
        ${e.directory ? `<div class="kv">project: ${esc(e.directory)}</div>` : ""}`));
+    const r = String(e.reason ?? "");
     const guards = [];
-    if (/always the user/.test(String(e.reason))) guards.push(`hard rule — ${esc(String(e.reason).replace("always the user: ", ""))}`);
-    if (/^deletes/.test(String(e.reason))) guards.push(`git says: ${esc(String(e.reason))}`);
-    if (/no Jev key|Jev failed|Jev unreachable/.test(String(e.reason))) guards.push("Jev unavailable → the user");
+    if (/^always the user: (a destructive|installs)/.test(r)) guards.push(`hard rule — ${esc(r.replace("always the user: ", ""))}`);
+    if (/always the user: access outside/.test(r)) guards.push("outside the project, and no layer covers it");
+    if (/^deletes/.test(r)) guards.push(`git says: ${esc(r)}`);
+    if (/no Jev key|Jev failed|Jev unreachable/.test(r)) guards.push("Jev unavailable → the user");
     if (guards.length) parts.push(step(++n, "guard", "Before Jev", `<div class="kv">${guards.join("<br>")}</div>`));
-    parts.push(step(++n, "jev", "Jev's read", `<div class="big">${esc(String(e.reason ?? "").replace(/^Jev: /, ""))}</div>
-      <div class="meters">
-        ${meter("confidence", e.confidence, 1, e.confidence != null && e.confidence < 0.85)}
-        ${meter("risk", e.risk, 2, e.risk != null && e.risk >= 1.5)}
-        ${meter("needs_user", e.needsUser, 1, e.needsUser != null && e.needsUser >= 0.5)}
-        ${e.probability == null ? "" : `<div class="meter">P(${esc(String(e.verdict))}) ${f2(e.probability)}</div>`}
-        <div class="meter">Jev time ${ms(e.latencyMs)}</div>
-      </div>`));
+    // One of the branches that decide without Jev: Jev was never asked, so there are no scores to show.
+    const noJev = NO_JEV.find(([re]) => re.test(r));
+    if (noJev) {
+      parts.push(step(++n, "allow", "Decided without Jev", `<div class="big">${esc(noJev[2])}</div>
+        <div class="kv">${esc(noJev[3])}</div>`));
+    } else {
+      parts.push(step(++n, "jev", "Jev's read", `<div class="big">${esc(r.replace(/^Jev: /, ""))}</div>
+        <div class="meters">
+          ${meter("confidence", e.confidence, 1, e.confidence != null && e.confidence < 0.85)}
+          ${meter("risk", e.risk, 2, e.risk != null && e.risk >= 1.5)}
+          ${meter("needs_user", e.needsUser, 1, e.needsUser != null && e.needsUser >= 0.5)}
+          ${e.probability == null ? "" : `<div class="meter">P(${esc(String(e.verdict))}) ${f2(e.probability)}</div>`}
+          <div class="meter">Jev time ${ms(e.latencyMs)}</div>
+        </div>`));
+    }
     parts.push(step(++n, cat, "Verdict", `<div>${chip(text, cat, true)}</div>
       <div class="kv">${esc(e.reason ?? "")}</div>`));
   }
@@ -330,10 +414,12 @@ function renderDetail(e) {
 function renderUsage() {
   const groups = {
     "Permissions by verdict": { cat: "user", rows: {}, key: (name) => `verdict:${name}` },
+    "Allowed without asking Jev": { cat: "allow", rows: {}, key: (name) => `reason:${name}` },
     "Routed to": { cat: "route", rows: {}, key: (name) => name },
     "Agents": { cat: "entry", rows: {}, key: (name) => name },
   };
   for (const e of all()) {
+    if (!e.charted) continue; // the chart's two lanes; the rest is the journal, not a decision here
     if (e.kind === "routing") {
       const model = short(e.model);
       groups["Routed to"].rows[model] = (groups["Routed to"].rows[model] ?? 0) + 1;
@@ -342,8 +428,14 @@ function renderUsage() {
       groups["Permissions by verdict"].rows[verdict] = (groups["Permissions by verdict"].rows[verdict] ?? 0) + 1;
       const agent = e.agent ?? "?";
       groups["Agents"].rows[agent] = (groups["Agents"].rows[agent] ?? 0) + 1;
+      // The branches that grant without asking: the interesting split inside "allow", and the reason the counts
+      // moved when the read-only and external_directory layers landed.
+      const noJev = NO_JEV.find(([re]) => re.test(String(e.reason ?? "")));
+      if (noJev) groups["Allowed without asking Jev"].rows[noJev[1]] = (groups["Allowed without asking Jev"].rows[noJev[1]] ?? 0) + 1;
+      else if (e.verdict === "allow") groups["Allowed without asking Jev"].rows["Jev allowed it"] = (groups["Allowed without asking Jev"].rows["Jev allowed it"] ?? 0) + 1;
     }
   }
+  if (!groups["Allowed without asking Jev"].rows) delete groups["Allowed without asking Jev"];
   const max = Math.max(1, ...Object.values(groups).flatMap((g) => Object.values(g.rows)));
   let out = "";
   for (const [title, g] of Object.entries(groups)) {
@@ -367,7 +459,7 @@ function renderUsage() {
 
 function explainNode(id) {
   const n = NODES[id];
-  const count = all().filter((e) => pathOf(e).includes(id)).length;
+  const count = all().filter((e) => e.charted && pathOf(e).includes(id)).length;
   $("explain").innerHTML = `${chip(n.t, n.cat, true)} ${esc(n.e)} <span class="filter">· ${count} decision${count === 1 ? "" : "s"} — show them</span>`;
   $("explain").querySelector(".filter").onclick = () => setFilter({ mode: "node", key: id, label: n.t });
 }
@@ -418,7 +510,11 @@ function loadText(text, source) {
   renderCounts();
   renderUsage();
   renderList();
-  const first = visible()[0];
+  // ?reason=… selects the newest entry whose reason contains it. It makes a path shareable and checkable: a headless
+  // screenshot of ?reason=read-only shows the read-only branch highlighted, which is the only way to verify that a
+  // highlighted path is still the one the code takes.
+  const want = new URLSearchParams(location.search).get("reason");
+  const first = want ? visible().find((e) => String(e.reason ?? "").includes(want)) : visible()[0];
   if (first) select(keyOf(first));
   else highlight(null);
 }
@@ -460,3 +556,8 @@ document.addEventListener("drop", (e) => {
 fetch("decisions.jsonl").then((r) => r.ok ? r.text() : "").then((text) => {
   if (text.trim()) loadText(text, "decisions.jsonl");
 }).catch(() => {});
+
+// Exposed for the tests and for a headless screenshot of a specific path: there is no other way to drive the chart
+// from outside the page, and checking a highlighted path by eye is exactly the kind of thing that silently rots.
+Object.assign(window, { NODES, EDGES, pathOf, permissionPath, routingPath, label, NO_JEV, UNCHARTED,
+                        get entries() { return entries }, select, keyOf });

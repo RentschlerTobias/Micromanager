@@ -10,6 +10,8 @@
       --accent: #0d9488; --accent-soft: #ccfbf1; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
       --c-entry: #64748b; --c-route: #7c3aed; --c-guard: #dc2626; --c-check: #0891b2; --c-jev: #0d9488;
       --c-floor: #d97706; --c-allow: #16a34a; --c-deny: #dc2626; --c-user: #4f46e5;
+      /* A journal record that is neither a routing nor a permission decision: listed, never highlighted. */
+      --c-other: #a1a1aa;
     }
     @media (prefers-color-scheme: dark) {
       :root {
@@ -17,6 +19,7 @@
         --accent: #2dd4bf; --accent-soft: #134e4a; --shadow: 0 1px 2px rgba(0,0,0,.4);
         --c-entry: #94a3b8; --c-route: #a78bfa; --c-guard: #f87171; --c-check: #22d3ee; --c-jev: #2dd4bf;
         --c-floor: #fbbf24; --c-allow: #4ade80; --c-deny: #f87171; --c-user: #818cf8;
+        --c-other: #71717a;
       }
     }
     * { box-sizing: border-box; }
@@ -139,7 +142,7 @@
           <span class="hint">Click a box to see what it does; every path ends at Allow, Deny or the user.</span>
         </div>
         <div class="card-body">
-          <svg id="chart" viewBox="-40 -50 1700 740" role="img" aria-label="Decision chart"></svg>
+          <svg id="chart" viewBox="-40 -50 2200 900" role="img" aria-label="Decision chart"></svg>
           <div id="explain" class="hint"></div>
         </div>
       </section>
