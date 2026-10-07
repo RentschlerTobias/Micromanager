@@ -96,8 +96,19 @@ node ~/Fun/Projects/Repos/jev-micromanager/src/cli.ts status --watch   # redraws
 `.opencode/memory/jev-project.md` (opencode-agent-memory's format) and picks the ones that help each task's brief.
 
 Models come from a registry of the OpenCode Go models and your local ones (llama-swap, iGPU, NPU), local
-first when they can do the task (`src/registry.ts`). Permission requests go to Jev first and to you when Jev is
-not sure (`src/decide.ts`). Some phases of the design are still to come: see docs/plan.md.
+first when they can do the task (`src/registry.ts`).
+
+**Model choice.** `opencode-go/space-bunny` leads every role's chain (your choice, 2026-10-07: strong on code and
+free), and the three paid cloud models sit behind it as the fallbacks — `glm-5.3-flash`, `qwen3.8-flash`,
+`deepseek-v4.1-flash`. Two paths pick the model and they do not read the same thing: the native path
+(`chooseModel` in `src/routing.ts`) takes the first entry of the role's chain, and the runner's router
+(`route` in `src/registry.ts`) picks from the registry by tier, where the order of `DEFAULT_REGISTRY` decides.
+A review is the exception both paths honour: a reviewer never checks the work of its own model family, so a review
+of space-bunny's work goes to `glm-5.3-flash`. Set a chain yourself with `decisions.N5.model`, or one model per role
+in the config's `registry`; see the settings below.
+
+Permission requests go to Jev first and to you when Jev is not sure (`src/decide.ts`). Some phases of the design
+are still to come: see docs/plan.md.
 
 Optional settings in `~/.config/opencode/jev-micromanager.jsonc`:
 

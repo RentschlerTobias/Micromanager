@@ -34,7 +34,12 @@ export interface Role {
 }
 
 // The only models routed to for now (user, 2026-10-01): coding, tool use + images, fast + cheap.
+//
+// space-bunny leads every chain since 2026-10-07 (the user's choice): strong on code and free, so it is the first
+// model every role gets and the others are its fallback. The three cloud models stay registered because they are
+// what the fallbacks use, and because `review` needs a second family — see there.
 export const MODELS = {
+  space: "opencode-go/space-bunny",
   glm: "opencode-go/glm-5.3-flash",
   qwen: "opencode-go/qwen3.8-flash",
   deepseek: "opencode-go/deepseek-v4.1-flash",
@@ -119,56 +124,56 @@ what you saw beats reading every file.
 The shell runs only these, one command per call, in your current directory (no cd, no && chains, no pipes into other
 tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) => all.indexOf(c) === i).join(", ")}. Use glob and grep for the rest.`,
     [...noWrite, ...noShell, ...READ_COMMANDS.map((cmd) => rule("shell", "allow", cmd)), ...AST_GREP_WRITES.map((cmd) => rule("shell", "deny", cmd)), ...noWeb, ...noDelegation],
-    [MODELS.deepseek, MODELS.qwen],
+    [MODELS.space, MODELS.deepseek, MODELS.qwen],
   ),
   role(
     "research",
     "Read-only with web access: docs, APIs, other repositories, current information.",
     "Look up documentation and sources on the web. Cite the URLs you used. Change nothing in the project.",
     [...noWrite, ...noShell, ...noDelegation],
-    [MODELS.deepseek, MODELS.qwen],
+    [MODELS.space, MODELS.deepseek, MODELS.qwen],
   ),
   role(
     "plan",
     "Read-only: split a problem into steps with acceptance points; no code.",
     "Produce a short plan: steps, acceptance points per step, risks. Write no code.",
     [...noWrite, ...noShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
-    [MODELS.qwen, MODELS.glm],
+    [MODELS.space, MODELS.qwen, MODELS.glm],
   ),
   role(
     "code",
     "Implements and refactors code.",
     "Implement the sub-task with the smallest change that meets the acceptance points. Match the surrounding code.",
     [...askShell, ...noWeb, ...noDelegation],
-    [MODELS.glm, MODELS.qwen],
+    [MODELS.space, MODELS.glm, MODELS.qwen],
   ),
   role(
     "test",
     "Writes and runs tests.",
     "Write or update tests for the sub-task and run them. Report the exact results.",
     [...askShell, ...TEST_RUNNERS.map((cmd) => rule("shell", "allow", cmd)), ...noWeb, ...noDelegation],
-    [MODELS.glm, MODELS.deepseek],
+    [MODELS.space, MODELS.glm, MODELS.deepseek],
   ),
   role(
     "visual",
     "UI, CSS, layouts, screenshots (has image input).",
     "Work on the user interface. When given screenshots, describe what you see before changing anything.",
     [...askShell, ...noWeb, ...noDelegation],
-    [MODELS.qwen],
+    [MODELS.space, MODELS.qwen],
   ),
   role(
     "write",
     "Docs, README, comments, commit and PR texts.",
     "Write clear, short English prose. Change only documentation files unless told otherwise.",
     [...noShell, ...noWeb, ...noDelegation],
-    [MODELS.deepseek, MODELS.qwen],
+    [MODELS.space, MODELS.deepseek, MODELS.qwen],
   ),
   role(
     "debug",
     "Reproduces a failure and finds its cause; edits only with approval.",
     "Reproduce the failure, find the root cause, and explain it with evidence. Propose the fix before applying it.",
     [...WRITE_TOOLS.map((tool) => rule(tool, "ask")), ...askShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
-    [MODELS.glm, MODELS.qwen],
+    [MODELS.space, MODELS.glm, MODELS.qwen],
   ),
   role(
     "review",
@@ -177,14 +182,14 @@ tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) =>
 with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "...", "met": true | false, "evidence": "..."}],
 "fixes": ["..."]}.`,
     [...noWrite, ...noShell, ...[...TEST_RUNNERS, ...LINTERS].map((cmd) => rule("shell", "allow", cmd)), ...noWeb, ...noDelegation],
-    [MODELS.qwen, MODELS.glm], // the router picks the one of another family than the worker
+    [MODELS.space, MODELS.glm, MODELS.qwen], // space-bunny writes, so a reviewer must be another family
   ),
   role(
     "oracle",
     "Read-only: hard decisions, architecture, trade-offs.",
     "Weigh the options for the question with evidence from the code. Give one recommendation and why.",
     [...noWrite, ...noShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
-    [MODELS.qwen, MODELS.glm],
+    [MODELS.space, MODELS.qwen, MODELS.glm],
   ),
 ]
 

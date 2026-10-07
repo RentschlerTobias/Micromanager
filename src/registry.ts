@@ -28,6 +28,7 @@ const TIER_RANK: Record<Tier, number> = { quick: 0, agent: 1, deep: 2 }
 // Cloud models (OpenCode Go) and the local fleet of ~/Models/bench/ROSTER.md (2026-10-04). Local models run with
 // a 16k context. The NPU is reserved for Whisper plus one small quick model (Phase A).
 export const DEFAULT_REGISTRY: readonly ModelEntry[] = [
+  { id: MODELS.space, location: "cloud", device: "cloud", censored: true, family: "space", tier: "agent", vision: true, ctx: 200000, note: "free and strong on code; leads every role's chain since 2026-10-07" },
   { id: MODELS.glm, location: "cloud", device: "cloud", censored: true, family: "glm", tier: "agent", vision: false, ctx: 128000 },
   { id: MODELS.qwen, location: "cloud", device: "cloud", censored: true, family: "qwen", tier: "agent", vision: true, ctx: 128000 },
   { id: MODELS.deepseek, location: "cloud", device: "cloud", censored: true, family: "deepseek", tier: "agent", vision: false, ctx: 128000 },

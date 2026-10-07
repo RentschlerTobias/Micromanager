@@ -3,17 +3,40 @@ import { test } from "node:test"
 
 import { parseRouting, stripComments } from "../src/config.ts"
 import { backstop, DELEGATION_TOOLS, delegationRole, HEADER, notRouted, routeDelegation, routeSubagentCall, unownedDelegation, type ChildSession } from "../src/hooks.ts"
-import { MODELS, roleById } from "../src/roles.ts"
+import { family, MODELS, ROLES, roleById } from "../src/roles.ts"
 import { DEFAULT_ROUTING, chooseModel, guessNeeds } from "../src/routing.ts"
+
+// The three paid cloud models: everything a role keeps behind space-bunny.
+const PAID = new Set<string>([MODELS.glm, MODELS.qwen, MODELS.deepseek])
 
 test("a role's first model, images to the vision model, a review in another family", () => {
   const code = roleById("code")!
-  assert.equal(chooseModel(code, { vision: false }).model, MODELS.glm)
+  assert.equal(chooseModel(code, { vision: false }).model, MODELS.space, "space-bunny leads every chain")
   assert.equal(chooseModel(code, guessNeeds("fix the layout shown in the screenshot")).model, MODELS.qwen)
   const review = roleById("review")!
-  assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.qwen).model, MODELS.glm)
-  assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.glm).model, MODELS.qwen)
-  assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.deepseek).model, MODELS.qwen)
+  // The rule is "not the worker's own family", not "not space-bunny": reviewing qwen or glm work with space-bunny
+  // is a different family and free, so it is allowed. Only a review OF space-bunny has to leave the family.
+  assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.qwen).model, MODELS.space)
+  assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.glm).model, MODELS.space)
+  assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.deepseek).model, MODELS.space)
+  // space-bunny writes almost everything, so a review of its work has to be another family: the rule finds the
+  // first entry in the chain whose family differs, which is what keeps a reviewer from checking its own output.
+  assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.space).model, MODELS.glm)
+  assert.equal(chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.space).reason,
+    "another family than the worker (space)", "and it says which family it avoided")
+  assert.notEqual(family(MODELS.space), family(MODELS.glm))
+  assert.notEqual(family(MODELS.space), family(MODELS.qwen))
+  assert.notEqual(family(MODELS.space), family(MODELS.deepseek))
+})
+
+test("every role leads with space-bunny and keeps a fallback behind it", () => {
+  for (const role of ROLES) {
+    assert.equal(role.models[0], MODELS.space, `${role.id} leads with space-bunny`)
+    assert.ok(role.models.length > 1, `${role.id} keeps a fallback`)
+    assert.equal(new Set(role.models).size, role.models.length, `${role.id}: no model twice in its chain`)
+    // The fallbacks are the three paid cloud models, which is what a review of space-bunny's work falls back to.
+    for (const m of role.models.slice(1)) assert.ok(PAID.has(m), `${role.id}: ${m}`)
+  }
 })
 
 test("the micromanager's subagent call gets the routed model, runs in the background, carries a header", () => {
@@ -23,10 +46,10 @@ test("the micromanager's subagent call gets the routed model, runs in the backgr
     input: { agent: "coder", model: "opencode-go/kimi-k3", prompt: "Add a --verbose flag.", background: false },
   }
   const routed = routeSubagentCall(call, DEFAULT_ROUTING)
-  assert.deepEqual(routed, { role: "code", model: MODELS.glm, reason: "first model for code" })
-  assert.equal(call.input.model, MODELS.glm) // the model the micromanager asked for is overridden
+  assert.deepEqual(routed, { role: "code", model: MODELS.space, reason: "first model for code" })
+  assert.equal(call.input.model, MODELS.space) // the model the micromanager asked for is overridden
   assert.equal(call.input.background, true)
-  assert.ok(String(call.input.prompt).startsWith(`${HEADER} role: code · model: ${MODELS.glm}\n\nAdd a --verbose flag.`))
+  assert.ok(String(call.input.prompt).startsWith(`${HEADER} role: code · model: ${MODELS.space}\n\nAdd a --verbose flag.`))
   routeSubagentCall(call, DEFAULT_ROUTING)
   assert.equal(String(call.input.prompt).split(HEADER).length, 2) // the header only once
 })
@@ -70,8 +93,8 @@ test("a delegation from another agent produces the same task and worktree as the
   // Both route to the same role and the same model, and both rewrite the call the same way — so one delegation still
   // makes one task and one worktree, whichever agent made it.
   assert.deepEqual(routeDelegation(direct, DEFAULT_ROUTING), routeDelegation(alternate, DEFAULT_ROUTING))
-  assert.equal(direct.input.model, MODELS.glm)
-  assert.equal(alternate.input.model, MODELS.glm)
+  assert.equal(direct.input.model, MODELS.space)
+  assert.equal(alternate.input.model, MODELS.space)
   assert.equal(direct.input.background, true)
   assert.equal(alternate.input.background, true)
   assert.equal(String(alternate.input.prompt), String(direct.input.prompt))

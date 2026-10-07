@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { DEFAULT_REGISTRY, mergeRegistry, probe, route, tierFor } from "../src/registry.ts"
+import { family, MODELS } from "../src/roles.ts"
 
 const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } })
 
@@ -86,8 +87,12 @@ test("tiers and registry overrides", () => {
 test("cloud roles follow the role matrix when the router has nothing else to choose by", () => {
   const cloud = DEFAULT_REGISTRY.filter((m) => m.location === "cloud")
   const pick = (role: string, avoidFamilies?: string[]) => route(cloud, { role, difficulty: 0.5, avoidFamilies }).model
-  assert.equal(pick("code"), "opencode-go/glm-5.3-flash")
-  assert.equal(pick("plan"), "opencode-go/qwen3.8-flash")
-  assert.equal(pick("explore"), "opencode-go/deepseek-v4.1-flash")
-  assert.equal(pick("code", ["glm"]), "opencode-go/qwen3.8-flash", "rung 2 takes the role's fallback")
+  // The runner's router picks from the registry by tier, not from the role's chain (that is the native path's
+  // chooseModel), so the order of DEFAULT_REGISTRY is what decides here — and space-bunny leads it.
+  assert.equal(pick("code"), MODELS.space)
+  assert.equal(pick("plan"), MODELS.space)
+  assert.equal(pick("explore"), MODELS.space)
+  assert.equal(pick("code", ["space"]), MODELS.glm, "avoiding a family takes the next one")
+  assert.equal(pick("review", ["space"]), MODELS.glm, "a review of space-bunny's work leaves the family")
+  assert.notEqual(family(MODELS.space), family(MODELS.glm))
 })

@@ -1107,7 +1107,9 @@ test("cloud only: guards ask cloud Jev, no local model is routed, and a local-on
   assert.equal(parseCloudOnly('{"cloudOnly": false}'), false)
   const reg = cloudRegistry(DEFAULT_REGISTRY)
   assert.ok(reg.filter((m) => m.location === "local").every((m) => m.disabled))
-  assert.equal(route(reg, { role: "plan", difficulty: 0.7 }).model, "opencode-go/qwen3.8-flash")
+  // Cloud only leaves the three paid models plus space-bunny; every local one is disabled. The router picks from the
+  // registry by tier, so the leading cloud entry is what a plan gets.
+  assert.equal(route(reg, { role: "plan", difficulty: 0.7 }).model, MODELS.space)
   assert.doesNotMatch(gateQuestion({ flagged: ["sensitive"], scores: { sensitive: 0.8 }, checked: true }, true), /always local/)
 
   const project = repo()
@@ -1183,6 +1185,7 @@ test("rolling: an answer can replace a task's wrong checks", () => {
 // --- project memory: Jev keeps what workers learned and recalls it per task ---------------------------------------
 
 import { readMemory, writeMemory } from "../src/memory.ts"
+import { MODELS } from "../src/roles.ts"
 
 test("memory: a lasting, new LEARNED line is kept; a known or one-off one is not; the next task's brief recalls it", async () => {
   const project = repo()
