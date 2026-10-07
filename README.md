@@ -33,25 +33,57 @@ Jev and the plugin securing every task:
 2. **Each writer works in its own git worktree** under `.jev-micromanager/worktrees/`, branched off the session's
    branch `jev/<job>`: OpenCode starts the child in your checkout, and the plugin moves it into the worktree before
    its first step. Your checkout is never touched. Readers work on the session branch and change nothing.
-3. **Jev and the plugin secure each task:**
+
+   Git always materialises a worktree of the **repository root**, so if your project is a subdirectory of a larger
+   repository the worker keeps its offset: the plugin records it as `rel` and runs the worker *and its checks* in
+   `<worktree>/<rel>`, where its files are. A check naming one of your files resolves there, not at the root. The
+   job also records whether your working tree has uncommitted changes, because no worker can see them — a task that
+   needs them cannot pass, and you are told so rather than finding out from a confused worker.
+3. **Isolation fails loud.** A session that is a child of a micromanager session but is not a claimed worker has its
+   write tools denied, with a journal record naming the job, session, directory and reason. Reads stay allowed so the
+   situation stays diagnosable. A role agent you pick by hand in your own checkout is not a child and is untouched.
+4. **Jev and the plugin secure each task:**
    - **Guards.** A check looks at each delegation, at web content and at workers' permission requests. Keys and
      tokens are masked.
    - **Model and skills.** The plugin routes each role to its model and names the skills in the worker's brief.
    - **Permissions (N13).** Workers' permission requests go to Jev; what Jev is not sure about is denied with a
-     note to report it, since nobody sits at a background worker.
+     note to report it, since nobody sits at a background worker. `external_directory` is layered: a path inside the
+     job's own worktrees is allowed, a path the task itself names is allowed, and anything else goes to you.
+     `~/.ssh`, `~/.config`, `/etc`, your home directory and another job's worktree are never allowed at any layer.
+   - **Checks are gated too.** A check is a string a model wrote, and the plugin runs it in a shell, so every check
+     goes through the same hard rules as a permission request: pushes, `sudo`, system installs and destructive
+     deletions are refused before the task or its worktree exists. A writer with no checks at all is refused as well.
    - **Checks and merge.** A writer ends by calling `finish_task`: the plugin runs the checks in the worktree; on
      a failure the worker gets the output and fixes it, on a pass the plugin commits and a merge train brings the
      commit onto `jev/<job>` (rebased and checked again when another task got there first).
-   - **Limits.** The watchdog stops loops and stalled workers; every 60 steps Jev reviews a worker's progress.
-4. **Reports come back.** The plugin's note "T… merged into …" lands in the micromanager's session, then OpenCode
+   - **A task that changed nothing does not merge.** A gate that passes over an empty diff verified nothing, so it is
+     reported as unverified instead. Failing checks come back at most twice; then the worker stops and says the
+     check is the likely problem, because an unsatisfiable one otherwise burns the whole session.
+   - **Limits.** The watchdog stops loops and stalled workers; every 60 steps Jev reviews a worker's progress. A
+     command that ran and did not fail is progress, so a worker verifying its work is not mistaken for a stuck one.
+5. **Reports come back.** The plugin's note "T… merged into …" lands in the micromanager's session, then OpenCode
    adds the worker's report and wakes the micromanager. It decides what comes next, continues a worker by its
-   session when something is left (it keeps its worktree), asks you what only you can decide and, at the end, tells
-   you how to merge or discard the branch. Say "ulw" or "ultrawork" and it goes on until every todo is done.
-   `list_tasks` shows the tasks with their worker sessions, and `stop_job` stops the workers.
-5. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
+   session when something is left (it keeps its worktree), asks you what only you can decide and, at the end, merges
+   or discards the branch itself. Say "ulw" or "ultrawork" and it goes on until every todo is done.
+
+   The controls, all for the micromanager:
+
+   | tool | what it does |
+   |---|---|
+   | `list_tasks` | the tasks with their worker sessions, branches and stages |
+   | `steer_task` | a note to a worker that is still running, without interrupting it |
+   | `stop_task` | stop one task and leave the rest of the job running; the worktree is kept |
+   | `merge_job` | fast-forward the job branch into your checkout — the one write it may make there. Shows what would land, refuses on a dirty checkout or unfinished tasks |
+   | `discard_job` | give the branch and worktrees back to git; lists what it removes first |
+   | `request_access` | vouch that a worker needs a path outside the project, for the permission path to see |
+   | `stop_job` | stop the whole job; `run_job` resumes it |
+
+6. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
    after a planning session with you. You approve it, and `run_job` runs it.
 
-Jobs and task notes live in `.jev-micromanager/`, kept out of git through `.git/info/exclude`.
+Jobs and task notes live in `.jev-micromanager/`, kept out of git through the repository's `.git/info/exclude` — found
+with `git rev-parse --git-common-dir`, so it works when the project is a subdirectory of a larger repository and when
+it is itself a worktree.
 
 **Overview.** `job_status` shows an ASCII board of the job: each task with its state, role, model and what it does
 or waits for, plus tokens, requests and cost. In a terminal, in the project:
@@ -100,8 +132,27 @@ measures them; the journal
 (role → needs → model) and the permission lane (hard rules → deleted paths → Jev → the floors → allow / deny /
 user). Open it in a browser and load `~/.local/state/jev-micromanager/decisions.jsonl` with the button or by dropping
 it on the page; over http a `decisions.jsonl` next to the page is picked up automatically. Each decision is
-listed, and selecting one highlights the exact path it took through the chart. The journal holds `permission`
-entries (from `src/decide.ts`) and `routing` entries (from the subagent hook in `src/plugin.ts`).
+listed, and selecting one highlights the exact path it took through the chart.
+
+## Observability
+
+`ctx.app` has no `log` method on this host, so `ctx.app?.log?.()` is undefined and nothing the plugin logs reaches
+`opencode.log`. **The journal is the channel that persists**, and it is worth knowing what to look for:
+
+```bash
+J=~/.local/state/jev-micromanager/decisions.jsonl
+grep '"kind":"plugin"' $J | tail -1 | jq     # one per server start
+```
+
+That record is written before anything can fail and carries the version, the project directory, the repository root,
+the `rel` offset, and the tool names and agents the delegation hook recognises. A healthy first minute is one such
+line, then silence until you delegate. After the first delegation you should see a `routing` entry whose `agent` is
+whoever made the call and whose `prompt` starts `[jev-micromanager] task T1 · job …`, plus a task with a `worktree`
+in the job file. `delegation-unrecognised` means a delegation the hook will not route; `isolation-denied` means the
+backstop caught a worker that was not placed in a worktree.
+
+The journal also holds `permission` entries (from `src/decide.ts`), `routing` (delegations), `finish`, `watchdog`,
+`checkpoint` and `graph`.
 
 ## Develop
 
@@ -110,3 +161,9 @@ npm install       # typescript + @types/node, for the type check only
 npm test          # node's test runner, TypeScript runs as is
 npm run typecheck
 ```
+
+Two things to know when changing the delegation path. A delegation is recognised by its **target** — a `subagent`
+call aimed at one of this plugin's role agents — not by which agent made it, because the agent is a property of the
+session and switching it silently skipped every later delegation (live test, 2026-10-06: ten workers wrote into the
+user's checkout with no task, no worktree and no error). And plugins load when the OpenCode server starts, so a change
+to `src/plugin.ts` needs a restart before anything observes it.

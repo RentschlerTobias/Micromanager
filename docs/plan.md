@@ -719,6 +719,36 @@ Jev), the plugin's fix rounds and model-family fallback, the review stage, the r
 `cloudOnly` is on). The micromanager covers some of it (a reviewer worker, continuing a worker),
 the rest needs its own decision.
 
+### A live run against a real project (2026-10-06), and what it changed (2026-10-07)
+A full session on a Quarto deck project inside a monorepo, with the micromanager orchestrating ~21 tasks. The work
+itself largely succeeded — ten reader tasks reported, five writers merged clean commits, the merge train behaved. The
+*plumbing* did not, and the defects were all of one kind: **a layer that silently did not engage.**
+
+| defect | how it showed | fix |
+|---|---|---|
+| worktree isolation skipped for every delegation | ten workers wrote into the user's checkout; no task, no worktree, no checks, no error; the job file held no writer task at all | recognition by delegation **target** instead of calling agent, plus a `parentID` backstop that denies writes to an unclaimed child of a micromanager session |
+| checks ran in the wrong directory | two correct tasks failed their gates nine times because a relative path in `Checks:` resolved at the monorepo root | `rel` computed and persisted; worker and gate cwd resolve through it (§11 of design.md) |
+| read-only shell misclassified as a write | 67 of 185 worker shell requests escalated to the user — `sed`, `git -C`, one non-read command poisoning a whole batch | classifier extended per segment; a read inside a worktree is allowed outright |
+| `external_directory` was always the user | a worker blocked on its very first `ls -l` of the directory it was sent to read | layered policy (§12 of design.md) |
+| `.git/info/exclude` never written | the user saw `?? .jev-micromanager/` | resolved via `git rev-parse --git-common-dir` |
+| watchdog counted working commands as no progress | a writer stopped after eight calls of reading one source file, before writing anything | a command that ran and did not fail is progress; only a *failing* one counts (§10.1) |
+| the gate ran model-written strings unvalidated | `curl … \| sh` was a valid acceptance point | every check goes through the hard rules before the task exists (§9) |
+| a task with no checks, or an empty diff, merged | a worker that changed nothing reported success | at least one check; a passing gate over an empty diff is unverified, not merged |
+| native gate had no retry cap | a structurally unsatisfiable check burned a whole session | `FIX_ROUNDS` on both paths |
+| `stop_job` could not interrupt a check | all checks of a job ran regardless | `runGate` takes the cancel signal |
+| stale task state | five tasks showed `running` forever; `attempts`, `workersUsed` and every counter stayed 0 | `reconcileJob` on load, without clobbering a live runner |
+
+Two lessons worth keeping, both of them about **failing visibly**. A guard that returns early on an unexpected input
+is indistinguishable from a guard that passed; every one of the rows above was silent. And a rule that cannot be
+evaluated truthfully — "a check must be able to fail", asked of the check text — is worse than no rule, because it
+forces a guess: it was written, rejected by the tests (`npm test` is a read), and removed with the reason recorded in
+`src/plan.ts`. Ask the question where the answer is true instead, which here meant the real diff.
+
+The one remaining from that list, since the run made it concrete: **native workers have no per-task profile** (N5), so
+a writer's rights are the role's defaults rather than what the decision model would narrow them to. The permission
+path compensates for most of it — the hard rules and the classifier now run for native workers too — but the
+`skillsFor` and role-change parts of N5 are still only on the runner's path.
+
 **Live** (private `opencode serve`, cloud only, glm-5.3-flash as micromanager, a small Node project; slugify and
 readingTime with tests):
 - The worker was moved into its worktree before its first step, wrote its files, called `finish_task` through

