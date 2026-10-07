@@ -104,8 +104,18 @@ free), and the three paid cloud models sit behind it as the fallbacks — `glm-5
 (`chooseModel` in `src/routing.ts`) takes the first entry of the role's chain, and the runner's router
 (`route` in `src/registry.ts`) picks from the registry by tier, where the order of `DEFAULT_REGISTRY` decides.
 A review is the exception both paths honour: a reviewer never checks the work of its own model family, so a review
-of space-bunny's work goes to `glm-5.3-flash`. Set a chain yourself with `decisions.N5.model`, or one model per role
-in the config's `registry`; see the settings below.
+of space-bunny's work goes to `glm-5.3-flash` — unless nothing else in the chain is available, in which case the
+rule is relaxed rather than handed a model that cannot run, and the reason says so.
+
+**When space-bunny stops being free.** It will very likely not be called that any more, and a renamed or withdrawn
+model must not break every role at once. So the chain is walked, not read at its first entry: before a delegation the
+plugin asks the host's catalog (`ctx.catalog`) whether the model exists, and takes the first entry of the chain that
+does. A skip is journalled as a `routing` record whose reason names what was unavailable, so the change is visible
+rather than silent. If *nothing* in the chain is available the first entry is used anyway — a call against a missing
+model fails loudly, which beats quietly substituting something the role never asked for.
+
+Set a chain yourself with `decisions.N5.model`, or one model per role in the config's `registry`; see the settings
+below.
 
 Permission requests go to Jev first and to you when Jev is not sure (`src/decide.ts`). Some phases of the design
 are still to come: see docs/plan.md.

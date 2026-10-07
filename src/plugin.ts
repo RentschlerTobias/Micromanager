@@ -16,6 +16,7 @@ import { record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe } from "./registry.ts"
+import { unknown as allAvailable, type Available } from "./routing.ts"
 import { MICROMANAGER, ROLES, roleByAgent, type Rule } from "./roles.ts"
 import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
@@ -75,6 +76,8 @@ interface Context {
     get(args: { sessionID: string }): Promise<unknown>
   }
   permission: { hook(name: string, callback: (evaluation: Evaluation) => Promise<void> | void): Promise<unknown> }
+  // The host model catalog: the only authority on which models exist (see modelAvailability).
+  catalog?: ModelCatalog
   location?: { directory?: string }
   app?: { log?(entry: { level: string; message: string }): unknown }
 }
@@ -134,6 +137,34 @@ const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicr
 // two copies of a path rule drift apart, and only one of them would be fixed next time.
 export function namedInTask(task: string | undefined, resources: readonly string[]): boolean {
   return resources.length > 0 && resources.every((path) => taskNamesPath(task, path.replace(/\/\*+$/, "")))
+}
+
+// The bit of ctx.catalog this plugin uses, named so the routing code can be tested without a host.
+export interface ModelCatalog {
+  transform: (fn: (draft: { model: { get: (provider: string, model: string) => unknown } }) => void) => unknown
+}
+
+// Whether the host can run a model, from `ctx.catalog`. The host is the only authority here: the plugin's own registry
+// says what it hopes exists, and nothing else finds out about a lost account, an unauthenticated provider, or a
+// renamed id. It is what keeps a free model that stops being free from breaking every role at once.
+//
+// A failed read is "everything is available". An unreadable catalog is not evidence that a model is missing, and
+// treating it as one would quietly move every role off its chain for a reason that has nothing to do with the model.
+export function modelAvailability(catalog?: ModelCatalog): Available {
+  if (!catalog) return allAvailable
+  return async (model: string): Promise<boolean> => {
+    const [provider = "", id = ""] = model.split("/")
+    if (!provider || !id) return true
+    try {
+      let present: unknown
+      await catalog.transform((draft) => {
+        present = draft.model.get(provider, id)
+      })
+      return present !== undefined
+    } catch {
+      return true
+    }
+  }
 }
 
 // The plugin's log line. Where it goes on this host is worth writing down, because a security layer that cannot be
@@ -410,7 +441,24 @@ export default {
       if (!delegationRole(call) || !call.sessionID) return
       const asked = String(call.input.prompt ?? "")
       const resumed = String(call.input.sessionID ?? "")
-      const routed = routeDelegation(call, routing)
+      // The host is the only authority on which models exist: an account can lose one, a provider can lose its
+      // auth, an id can be renamed. ctx.catalog.model.get() answers it, so the role's chain is walked rather than
+      // taken at its first entry — otherwise a renamed free model breaks every role at once (the user's question,
+      // 2026-10-07).
+      const routed = await routeDelegation(call, routing, undefined, modelAvailability(ctx.catalog))
+      if (routed?.skipped?.length) {
+        record({
+          kind: "routing",
+          sessionID: call.sessionID,
+          agent: call.agent,
+          role: routed.role,
+          requested: String(call.input.agent ?? ""),
+          model: routed.model,
+          reason: `${routed.reason}; not available here: ${routed.skipped.join(", ")}`,
+          prompt: String(call.input.prompt ?? "").slice(0, 300),
+        })
+        log("warn", `${routed.model} instead of ${routed.skipped.join(", ")}: those are not available here`)
+      }
       if (resumed) {
         // A worker continued by its session: it stays in its worktree (spike), a merged writer gets a new task.
         const task = await native.resume(resumed)

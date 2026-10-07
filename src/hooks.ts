@@ -1,7 +1,7 @@
 // Before the micromanager's subagent call runs: the routed model goes into the call, and the call runs in the
 // background (OpenCode notifies the micromanager when the worker ends; src/native.ts keeps writers in worktrees).
 
-import { chooseModel, guessNeeds, type Routing } from "./routing.ts"
+import { chooseModel, guessNeeds, type Available, type Routing } from "./routing.ts"
 import { MICROMANAGER, ROLES, roleByAgent, type Role } from "./roles.ts"
 
 export interface ToolCall {
@@ -35,6 +35,8 @@ export interface Routed {
   readonly role: string
   readonly model: string
   readonly reason: string
+  // The chain entries the host cannot run. Absent unless the catalog said so, so an ordinary delegation is unchanged.
+  readonly skipped?: readonly string[]
 }
 
 export const HEADER = "[jev-micromanager]"
@@ -65,29 +67,30 @@ export function unownedDelegation(call: ToolCall): boolean {
 }
 
 // Rewrites `call.input` in place; returns what was decided, or undefined when the call is not the micromanager's.
-export function routeSubagentCall(call: ToolCall, routing: Routing, workerModel?: string): Routed | undefined {
+export async function routeSubagentCall(call: ToolCall, routing: Routing, workerModel?: string, available?: Available): Promise<Routed | undefined> {
   if (call.tool !== DELEGATION_TOOL || call.agent !== MICROMANAGER.agent) return undefined
-  return route(call, routing, workerModel)
+  return await route(call, routing, workerModel, available)
 }
 
 // The same routing for a delegation that the micromanager agent did not make. Narrower than the caller alone would
 // suggest and never wider: it returns nothing at all for a tool that is not the delegation tool.
-export function routeDelegation(call: ToolCall, routing: Routing, workerModel?: string): Routed | undefined {
+export async function routeDelegation(call: ToolCall, routing: Routing, workerModel?: string, available?: Available): Promise<Routed | undefined> {
   if (call.tool !== DELEGATION_TOOL) return undefined
-  return route(call, routing, workerModel)
+  return await route(call, routing, workerModel, available)
 }
 
-function route(call: ToolCall, routing: Routing, workerModel?: string): Routed | undefined {
+async function route(call: ToolCall, routing: Routing, workerModel?: string, available?: Available): Promise<Routed | undefined> {
   const role = roleByAgent(String(call.input.agent ?? ""))
   if (!role) return undefined // a built-in agent: left as the caller asked
   const prompt = String(call.input.prompt ?? "")
-  const choice = chooseModel(role, guessNeeds(prompt), routing, workerModel)
+  const choice = await chooseModel(role, guessNeeds(prompt), routing, workerModel, available)
   call.input.model = choice.model
   call.input.background = true
   if (!prompt.startsWith(HEADER)) {
     call.input.prompt = `${HEADER} role: ${role.id} · model: ${choice.model}\n\n${prompt}`
   }
-  return { role: role.id, model: choice.model, reason: choice.reason }
+  // skipped travels with the decision so the plugin can journal why this model and not the first of the chain.
+  return { role: role.id, model: choice.model, reason: choice.reason, ...(choice.skipped ? { skipped: choice.skipped } : {}) }
 }
 
 // --- the backstop: a child of a micromanager session that no worktree ever got must not be able to write ---
