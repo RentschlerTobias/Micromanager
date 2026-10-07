@@ -170,6 +170,28 @@ test("a conflict on the merge train goes back to the worker, its change kept", a
   assert.equal(readFileSync(join(a.job.integrationWorktree!, "README.md"), "utf8"), "from a\nfrom b\n")
 })
 
+test("a gitmaster works in the checkout: no worktree, no branch, and the brief says so", async () => {
+  const project = repo()
+  const native = new Native()
+  const d = await native.delegate(project, "ses_mm", { agent: "gitmaster", description: "merge job-1", prompt: "Merge jev/job-1 into the checkout. It is behind, so expect a conflict." }, MODEL)
+  // The one role with no worktree of its own: it works where the user's commits are, which is what a merge needs.
+  assert.equal(d.task.worktree, undefined)
+  assert.equal(d.task.branch, undefined)
+  assert.equal(d.task.files.length, 0, "no Files line: it does not declare a write scope, it merges a branch")
+  const claimed = native.claim("ses_g", child(d.prompt))!
+  assert.equal(claimed.dir, project, "the project root, not a worktree below it")
+  assert.ok(!existsSync(join(project, ".jev-micromanager", "worktrees", `${d.job.id}--T1`)), "no worktree was created for it")
+  assert.equal(git(project, "branch", "--list", `jev/${d.job.id}--T1`), "", "and no task branch")
+  assert.notEqual(git(project, "branch", "--show-current"), `jev/${d.job.id}`, "the checkout stayed on its own branch")
+  assert.match(d.prompt, /You work in the user's own checkout/)
+  assert.doesNotMatch(d.prompt, /a git worktree of its own/)
+  assert.doesNotMatch(d.prompt, /finish_task/, "the plugin neither checks nor commits what it did")
+  // It ends like a reader: the plugin records that the worker ran, and the merge itself is the user's own history.
+  assert.match((await native.finish("ses_g", "")).text, /^You only read/)
+  assert.deepEqual(await native.ended("ses_g"), { note: undefined, parent: "ses_mm" })
+  assert.equal(loadJob(project, d.job.id)!.tasks[0]!.status, "passed")
+})
+
 test("a reader works on the session branch and ends with its findings", async () => {
   const project = repo()
   const native = new Native({ graphs: { get: async () => undefined } })
@@ -225,6 +247,8 @@ test("what is not a valid delegation is refused with a reason", async () => {
   assert.match(await refused("general", "do it"), /use one of the role agents/)
   assert.match(await refused("coder", "Change it.\nChecks: npm test"), /a coder changes files; end the prompt with a line "Files:/)
   assert.match(await refused("explorer", "Look.\nFiles: a.js"), /explorer only reads/)
+  // A gitmaster may resolve a conflict, so it is not told it only reads; it is told it chooses no files.
+  assert.match(await refused("gitmaster", "Merge it.\nFiles: src/a.ts"), /gitmaster merges one branch into the checkout/)
   // The check's own reason now carries the message; the wrapper sentence around it was dropped so it reads directly.
   assert.match(await refused("coder", "Change it.\nFiles: a.js\nChecks: Run the tests and make sure they pass."), /reads like a sentence/)
   assert.match(await refused("coder", "Change it.\nFiles: /etc/passwd\nChecks: true"), /inside the project/)

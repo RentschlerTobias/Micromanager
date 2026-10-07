@@ -16,6 +16,9 @@ export interface CatalogSkill extends Skill {
   readonly asked: boolean // offered to the decision model; otherwise only added by rule
 }
 
+// The gitmaster is deliberately not in this list and so gets no skill: a merge is not work with a process to follow, and
+// the one skill that would apply (verification-before-completion) tells it to run the checks, which its shell rules refuse
+// on purpose — the plugin already ran them on the branch before the merge.
 const WRITER_ROLES = ["code", "test", "visual", "write", "debug"]
 
 export const SKILLS: readonly CatalogSkill[] = [

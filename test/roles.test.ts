@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { MICROMANAGER, MODELS, ROLES, micromanagerSystem, family, roleByAgent } from "../src/roles.ts"
+import { MICROMANAGER, MODELS, ROLES, micromanagerSystem, family, roleByAgent, roleById } from "../src/roles.ts"
 
 const ALLOWED = new Set<string>(Object.values(MODELS))
 const effect = (rules: readonly { action: string; resource: string; effect: string }[], action: string, resource = "*") =>
@@ -162,4 +162,84 @@ test("no agent may read or change the plugin's state directory", () => {
 
 test("the micromanager never reads outside the project (live test: it searched the plugin's source for a way past the gate)", () => {
   assert.ok(MICROMANAGER.rules.some((r) => r.action === "external_directory" && r.effect === "deny" && r.resource === "*"))
+})
+
+test("the gitmaster is a role like any other, and it works in the user's checkout", () => {
+  const role = roleByAgent("gitmaster")!
+  assert.equal(role.id, "gitmaster")
+  assert.equal(roleById("gitmaster"), role)
+  assert.match(role.description, /merges? one named job branch into/i)
+  assert.equal(role.models[0], MODELS.space, "space-bunny first, a paid model behind it")
+  assert.ok(role.models.length > 1)
+  // Its own words, because the difference from every other role is exactly this: the checkout, never a worktree, and
+  // a stop instead of a fix when the merge is not clean.
+  for (const phrase of [/user's own checkout/i, /never push/i, /never reset/i, /rebase/i, /dirty/i, /report what you found and stop/i]) {
+    assert.match(role.system, phrase, String(phrase))
+  }
+  assert.ok(micromanagerSystem().includes("gitmaster"), "the micromanager can pick it")
+})
+
+test("the gitmaster may read the repository and merge one branch, and nothing else", () => {
+  const rules = roleById("gitmaster")!.rules
+  for (const cmd of ["git status*", "git log*", "git show*", "git diff*", "git branch*", "git ls-files*", "git rev-parse*", "git merge*", "git add *", "git commit*", "git worktree list", "git stash list"]) {
+    assert.equal(effect(rules, "shell", cmd), "allow", cmd)
+  }
+  for (const cmd of ["git status --porcelain", "git log --oneline", "git diff HEAD~1", "git merge jev/job-1", "git add src/a.ts", "git commit -m merge", "git worktree list", "git stash list"]) {
+    assert.equal(effectFor(rules, cmd), "allow", cmd)
+  }
+  // The commands it may not run: the destructive and the irreversible ones, which are the only way a merge could lose
+  // the user's commits or move the checkout somewhere nobody asked for.
+  for (const cmd of ["git push", "git push origin main", "git reset --hard HEAD~1", "git checkout other", "git switch -c x", "git rebase main", "git clean -fd", "git cherry-pick abc", "git revert abc", "git remote add x y", "git reflog expire --all", "git gc --prune=now", "git filter-branch --all"]) {
+    assert.equal(effectFor(rules, cmd), "deny", cmd)
+  }
+  // A chain is checked segment by segment, so a merge followed by a push is refused on the push.
+  assert.deepEqual(everySegment(rules, "git fetch origin && git merge jev/job-1"), ["git fetch origin -> ask", "git merge jev/job-1 -> allow"])
+  assert.deepEqual(everySegment(rules, "git merge jev/job-1 && git push"), ["git merge jev/job-1 -> allow", "git push -> deny"])
+  // Not a test runner and not a linter: the plugin already ran the checks on the branch before the merge.
+  for (const cmd of ["npm test", "uv run pyright .", "npx tsc", "grep -rn foo src", "sed -i s/a/b/ f.ts"]) {
+    assert.notEqual(effectFor(rules, cmd), "allow", cmd)
+  }
+})
+
+test("the gitmaster's denies come after the allows, or a later edit would let them run", () => {
+  // The whole mechanism, asserted the way the sed -i test asserts it: last matching rule wins, so a deny placed before
+  // the allow it overlaps is overridden by it. `git merge*` does not overlap a deny, so the ordering is checked on the
+  // role's own shell lists: every deny must sit after every allow, and the ask that opens them.
+  const rules = roleById("gitmaster")!.rules
+  const shell = rules.map((r, i) => ({ ...r, i })).filter((r) => r.action === "shell")
+  const lastAllow = Math.max(...shell.filter((r) => r.effect === "allow").map((r) => r.i))
+  const firstDeny = Math.min(...shell.filter((r) => r.effect === "deny").map((r) => r.i))
+  assert.ok(firstDeny > lastAllow, `the first deny (${firstDeny}) comes after the last allow (${lastAllow})`)
+  assert.ok(shell.some((r) => r.effect === "ask" && r.resource === "*"), "everything else still asks")
+  // And the effect of a command is what the last matching rule says, not what the first one says.
+  for (const cmd of ["git push*", "git reset*", "git checkout*", "git rebase*", "git clean*", "git remote*"]) {
+    assert.equal(effect(rules, "shell", cmd), "deny", cmd)
+  }
+})
+
+test("the gitmaster edits a file only where a conflict asks it to, and has no web and no sub-agents", () => {
+  const rules = roleById("gitmaster")!.rules
+  // ask, not deny (a conflict cannot be resolved without an edit) and not allow (it would rewrite anything it likes).
+  for (const tool of ["edit", "write", "patch"]) assert.equal(effect(rules, tool), "ask", tool)
+  for (const tool of ["webfetch", "websearch"]) assert.equal(effect(rules, tool), "deny", tool)
+  assert.equal(effect(rules, "subagent"), "deny")
+  // It works in the checkout and nowhere else.
+  assert.ok(rules.some((r) => r.action === "external_directory" && r.effect === "deny" && r.resource === "*"))
+  assert.ok(!rules.some((r) => r.action === "external_directory" && r.effect === "allow"))
+})
+
+test("the gitmaster is the only change to the matrix: eleven roles, and the other ten kept their rights", () => {
+  assert.equal(ROLES.length, 11)
+  assert.deepEqual(ROLES.map((r) => r.id), ["explore", "research", "plan", "code", "test", "visual", "write", "debug", "review", "oracle", "gitmaster"])
+  // How many rules each role has, its own plus the shared tail it always got (21 state paths + 4 memory tools). A role
+  // that gained or lost one for this task would move a number here.
+  const counts: Record<string, number> = { explore: 51, research: 30, plan: 32, code: 66, test: 66, visual: 66, write: 29, debug: 69, review: 69, oracle: 32, gitmaster: 57 }
+  for (const [id, n] of Object.entries(counts)) assert.equal(roleById(id)!.rules.length, n, id)
+  // No other role was given a merge command: the ten kept the shell rights the tests above pin, and this is the check
+  // that none of them silently gained a way into the checkout.
+  for (const role of ROLES.filter((r) => r.id !== "gitmaster")) {
+    const own = role.rules.filter((r) => r.action === "shell" && /^(git merge|git push|git add|git commit|git stash|git worktree)/.test(r.resource))
+    assert.deepEqual(own, [], role.id)
+    assert.ok(!role.rules.some((r) => r.action === "external_directory" && r.effect === "allow"), `${role.id}: no path outside the project`)
+  }
 })

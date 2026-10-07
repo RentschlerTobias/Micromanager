@@ -23,6 +23,7 @@ export type RoleId =
   | "debug"
   | "review"
   | "oracle"
+  | "gitmaster"
 
 export interface Role {
   readonly id: RoleId
@@ -96,6 +97,21 @@ const PIPE_READERS = [
 // The forms of those that do write. The last matching rule wins, so these have to come after the allow, exactly as
 // AST_GREP_WRITES does for ast-grep: placed before it, the allow would override the deny and `sed -i` would run.
 const PIPE_READER_WRITES = ["sed -i*", "sed --in-place*", "sort -o*", "sort --output*", "tee*"]
+// The gitmaster (user's decision, 2026-10-07): the only worker that works in the user's checkout, and only to merge one
+// named job branch into it. Everything it may run reads the repository or moves one branch into another.
+const MERGE_READ_COMMANDS = [
+  "git status*", "git log*", "git show*", "git diff*", "git branch*", "git ls-files*", "git rev-parse*", "git merge*",
+  // A conflicted merge is finished with add of the resolved paths and a commit; `git commit*` records it.
+  "git add *", "git commit*", "git worktree list", "git stash list",
+]
+// The irreversible and the outward-going: none of these is ever needed to merge one branch, and every one of them can
+// lose the user's commits or move the checkout somewhere they did not ask for. The last matching rule wins, so these
+// have to come after the allow above, exactly as PIPE_READER_WRITES does for the readers and AST_GREP_WRITES for
+// ast-grep: placed before it, the allow would override the deny.
+const MERGE_DENIED_COMMANDS = [
+  "git push*", "git reset*", "git checkout*", "git switch*", "git rebase*", "git clean*", "git cherry-pick*", "git revert*",
+  "git remote*", "git reflog*", "git gc*", "git filter-branch*",
+]
 // What every role that may run commands gets: the project's own test runners and linters, and the readers that shape
 // their output, so a worker that may check its work can also read what the check said. Everything else stays "ask", and
 // the hard rules in src/decide.ts still refuse what they refuse.
@@ -123,6 +139,7 @@ const AGENT_NAMES: Record<RoleId, string> = {
   debug: "debugger",
   review: "reviewer",
   oracle: "oracle",
+  gitmaster: "gitmaster",
 }
 
 const role = (
@@ -211,6 +228,34 @@ with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "...", "met": true 
     [...noWrite, ...noShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
     [MODELS.space, MODELS.qwen, MODELS.glm],
   ),
+  role(
+    "gitmaster",
+    "Works in the user's checkout and does one thing: merges one named job branch into it, resolving conflicts if there are any.",
+    // "ask", not deny and not allow: this is the one role that edits a project file on purpose, and the file it edits
+    // is exactly one git says is conflicted. Deny would make resolving a conflict impossible, which is the case the
+    // role exists for; allow would let it rewrite anything to "improve" it. ask routes every edit through decide.ts,
+    // where the task text says which paths are conflicted, so a rewrite of anything else is refused there.
+    `You work in the user's own checkout, not in a worktree of your own. Merge exactly the job branch you were given
+into it and do nothing else.
+
+If the working tree is dirty (uncommitted changes that are not yours), or the merge is not a clean fast-forward:
+report what you found and stop. Do not stash, do not reset, do not rebase, do not force anything. A conflict you can
+resolve is yours to resolve, keeping both sides' changes; anything else is the user's call.
+
+Never push, never reset or rebase anything, never discard or rewrite the user's commits. Never touch a file you are not
+resolving a conflict in, and never run the project's tests or builds to "check" the merge: the plugin already ran the
+checks on the branch before you were started.`,
+    [
+      ...WRITE_TOOLS.map((tool) => rule(tool, "ask")),
+      ...askShell,
+      ...MERGE_READ_COMMANDS.map((cmd) => rule("shell", "allow", cmd)),
+      ...MERGE_DENIED_COMMANDS.map((cmd) => rule("shell", "deny", cmd)),
+      ...noWeb,
+      ...noDelegation,
+      rule("external_directory", "deny"),
+    ],
+    [MODELS.space, MODELS.glm, MODELS.qwen],
+  ),
 ]
 
 export function roleByAgent(agent: string): Role | undefined {
@@ -238,7 +283,9 @@ export function micromanagerSystem(roles: readonly Role[] = ROLES): string {
   const lines = roles.map((r) => `- ${r.agent}: ${r.description}`)
   return `You are the micromanager, an orchestrator. You never do the work yourself: you do not edit files or run
 commands, and you read only enough to orient yourself (the README, the file list, a file or two). Workers do the
-rest, in the background, on the session's own git branch; the user's checkout is never touched.
+rest, in the background, on the session's own git branch; the user's checkout is never touched by a task's work. The one
+exception is the gitmaster, which merges the finished job's branch into the checkout and is started only after the user
+says yes.
 
 How you work:
 1. Understand the request. If something only the user can decide is unclear (behaviour, scope, interfaces), ask
@@ -250,7 +297,9 @@ How you work:
    files ends its prompt with two lines the plugin reads:
      Files: the project paths it may change, comma separated
      Checks: a shell command that exits 0 when the task is done (usually the project's test command)
-   A worker that only reads (explore, research, plan, review, oracle) has neither line; its report is the result.
+   A worker that only reads (explore, research, plan, review, oracle, gitmaster) has neither line; its report is the
+   result. The gitmaster is the one worker that works in the user's checkout instead of a worktree: it merges one named
+   job branch into it and does nothing else.
    To get to know a whole repository, start several explorers at once, each on one part (e.g. one per top-level
    package, one for tests and CI), each asked for a short overview; never ask one worker to read everything. A
    question about particular code (who calls X, what breaks if Y changes) goes to one explorer: it has a code graph

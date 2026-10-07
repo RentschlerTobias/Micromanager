@@ -32,6 +32,12 @@ export const CHILD_PREFIX = "You are a subagent spawned by another session."
 
 export class DelegationError extends Error {}
 
+// The roles that work in the user's checkout instead of a worktree of their own (src/roles.ts). The gitmaster merges a
+// finished job's branch into the checkout, which is the one thing a worktree cannot do: the checkout is where the
+// user's own commits and uncommitted work are, and a merge has to land there. Every other role, writer or reader,
+// works in the job's own worktrees.
+const IN_CHECKOUT: ReadonlySet<string> = new Set(["gitmaster"])
+
 export interface Delegation {
   readonly body: string // the prompt without the Files and Checks lines
   readonly files: string // as written, parsed by parseFiles
@@ -142,7 +148,11 @@ export class Native {
     if (parsed.problem) throw new DelegationError(`Not started: ${parsed.problem}`)
     const writer = WRITERS.has(role.id)
     if (writer && !parsed.files.length) throw new DelegationError(`Not started: a ${role.agent} changes files; end the prompt with a line "Files: <the project paths it may change>" and a line "Checks: <shell command>".`)
-    if (!writer && parsed.files.length) throw new DelegationError(`Not started: ${role.agent} only reads; leave out the Files line, or pick a role that writes.`)
+    // The gitmaster gets its own wording: it does edit a project file when git says one is conflicted, so "only reads"
+    // would be a lie it acts on. What it must not do is declare a write scope, because it does not choose its files.
+    if (!writer && parsed.files.length) throw new DelegationError(IN_CHECKOUT.has(role.id)
+      ? `Not started: a ${role.agent} merges one branch into the checkout and changes only what the merge changes; leave out the Files line.`
+      : `Not started: ${role.agent} only reads; leave out the Files line, or pick a role that writes.`)
     // Every check that will reach runGate is validated here, before the task or its worktree exist: a command that is
     // not one, one that is destructive, and a writer whose set cannot fail at all. A refused delegation must leave
     // nothing behind, and this runs before addDelegated and prepareTaskWorktree, so it does.
@@ -172,7 +182,11 @@ export class Native {
     task.model = model
     for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
     stage(task, "delegate", "pass", `${role.agent} on ${model}`)
-    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: taskDir(job.integrationWorktree!, rel), worktree: job.integrationWorktree!, rel, checks: d.checks }
+    // A role that works in the checkout gets no worktree and no branch: its directory is the project itself, so it sees
+    // the user's own commits and uncommitted work, which is what a merge has to be judged against. `writer` stays false,
+    // so the plugin neither runs checks on it nor commits for it: what it does to the checkout is not a task change.
+    const inCheckout = IN_CHECKOUT.has(role.id)
+    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: inCheckout ? project : taskDir(job.integrationWorktree!, rel), worktree: inCheckout ? project : job.integrationWorktree!, rel: inCheckout ? "" : rel, checks: d.checks }
     if (writer) {
       const w = await prepareTaskWorktree(project, job.id, task.id, job.integrationBranch!, this.#exec, undefined, rel)
       entry.dir = w.dir
@@ -458,6 +472,9 @@ export class Native {
   #brief(job: Job, task: Task, role: Role, model: string, d: Delegation, entry: Entry, graph?: Graph): string {
     const skills = [...(entry.writer ? ["verification-before-completion"] : []), ...(role.id === "research" ? ["research"] : [])].filter((s) => this.#skills.has(s))
     const others = job.tasks.filter((t) => t.id !== task.id && ["running", "gating", "fixing"].includes(t.status))
+    // The one role that is given no worktree of its own works in the checkout, so it is told so plainly: that is what
+    // separates it from every other worker, and a brief that said "your worktree" here would be a lie it acts on.
+    const checkout = IN_CHECKOUT.has(role.id)
     return [
       `${HEADER} task ${task.id} · job ${job.id} · role ${role.id} · model ${model}`,
       "",
@@ -465,11 +482,13 @@ export class Native {
       "",
       graph ? graphBrief(graph) : "",
       "",
-      entry.writer ? `Files you may change: ${task.files.join(", ")}. Work only in your current directory, a git worktree of its own.` : "Change no files.",
+      checkout
+        ? `You work in the user's own checkout ${entry.dir}. There is no worktree of yours and no Files line: you merge one branch into this checkout and change nothing that the merge does not change.`
+        : entry.writer ? `Files you may change: ${task.files.join(", ")}. Work only in your current directory, a git worktree of its own.` : "Change no files.",
       // A worktree is a checkout of the repository root, so a project that is a subdirectory sits below it. Saying so
       // keeps a worker from concluding its premise is false when a path of its own does not resolve at the top.
       entry.rel ? `Your directory ${entry.dir} is the project directory inside the worktree ${entry.worktree}; the worktree holds the whole repository (${entry.rel} below its root). Every path you read or write is relative to your own directory, never to the worktree root.` : "",
-      dirtyNote(job, entry.writer),
+      checkout ? checkoutDirtyNote(job) : dirtyNote(job, entry.writer),
       entry.writer
         ? entry.checks.length
           ? `Checks the plugin runs when you finish: ${entry.checks.join("; ")}`
@@ -481,13 +500,23 @@ export class Native {
       "",
       entry.writer
         ? "When your change is done, call finish_task with a two-line summary. The plugin then runs the checks, commits and merges; if it answers with failures, fix them and call finish_task again. Once it says merged, end with a short report: what you changed, what the checks showed, anything left open, and work you noticed outside your task (follow-ups)."
-        : "End with your findings: they are your result. Add work you noticed that the request needs (follow-ups).",
+        : checkout
+          ? "End with what you merged and the commit it is now at, or with what you found and why you stopped. The plugin checks and commits nothing you did here, and the merge is the user's own history, so no tool is called at the end."
+          : "End with your findings: they are your result. Add work you noticed that the request needs (follow-ups).",
     ].filter((line, i, all) => line !== "" || all[i - 1] !== "").join("\n").trim()
   }
 }
 
 function key(project: string, job: string): string {
   return `${project}\0${job}`
+}
+
+// The checkout already holds the uncommitted work, so the worktree note would be the opposite of the truth here. A
+// dirty checkout is the case the gitmaster is told to stop in (src/roles.ts): a merge on top of someone else's
+// uncommitted work is not a clean fast-forward, and the decision on what to do with that work is the user's.
+function checkoutDirtyNote(job: Job): string {
+  if (!job.integrationDirty) return ""
+  return `The checkout has uncommitted changes that are not yours (${job.integrationDirty}), so a merge on top of them is not a clean fast-forward. Report them and stop; do not stash or discard them.`
 }
 
 // A worktree starts from the last commit, so the user's uncommitted work is not in it. A worker told this fails far more

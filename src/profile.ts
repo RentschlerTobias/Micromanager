@@ -23,7 +23,9 @@ export const TOOL_GROUPS: Record<ToolGroup, readonly string[]> = {
 // What a role is for: these groups are never narrowed away from it.
 const ROLE_NEEDS: Partial<Record<string, readonly ToolGroup[]>> = { test: ["shell"], review: ["shell"], research: ["web"] }
 
-// Roles that change files; a task with declared files needs one of them, a task without files must not get one.
+// Roles that change files; a task with declared files needs one of them, a task without files must not get one. The
+// gitmaster is deliberately not one: it edits no declared file, works in the checkout, and is never picked by the
+// classifier (see classifyQuestions) — the plugin names it when a job is finished.
 export const WRITERS = new Set(["code", "test", "visual", "write", "debug"])
 
 export interface Skill {
@@ -57,7 +59,10 @@ export interface Profile {
 
 // The questions for one task: the fixed set, the role choice, and one noul per skill the planner's role may load.
 export function classifyQuestions(task: Task, skills: readonly Skill[], memory: readonly string[] = []): Record<string, Question> {
-  const roles = Object.fromEntries(ROLES.map((r) => [r.id, r.description]))
+  // The gitmaster is not offered: it is not a role a task can be classified into. The plugin names it when a job is
+  // finished and the user agreed to the merge, and it works in the checkout, so a classifier that picked it for an
+  // ordinary task would put that task in the user's checkout.
+  const roles = Object.fromEntries(ROLES.filter((r) => r.id !== "gitmaster").map((r) => [r.id, r.description]))
   const allowed = skills.filter((s) => s.roles.includes(task.role))
   return {
     role: roleChoice(roles),
