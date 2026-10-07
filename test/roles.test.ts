@@ -71,8 +71,23 @@ test("a coder may run the project's own tests and linters (live test: it could r
   }
 })
 
-test("a coder may run the readers after a pipe: OpenCode asks about each segment on its own", () => {
-  // The live command that lost a task, with the pipe inside the sed expression left out so each segment is a command:
+test("a reviewer may read the history it judges: a pure-git review task no longer dies on the first command", async () => {
+  // The live report, 2026-10-07: the reviewer's rule set gave noShell plus the test/lint runners, its task was pure
+  // git, and not one git command it needed was on any list — every one was an ask, and an ask in a worker is a
+  // refusal. The explorer's git reads are the reviewer's now.
+  const role = ROLES.find((r) => r.id === "review")!
+  for (const cmd of ["git log --oneline -1", "git show HEAD", "git status --short", "git diff HEAD~1", "git branch --list x", "git ls-files", "ast-grep run 'fn x' src/", "ls -la", "tree .", "wc -l src/a.ts"]) {
+    assert.equal(effectFor(role.rules, cmd), "allow", cmd)
+  }
+  assert.equal(effectFor(role.rules, "git log -C /repo"), "allow", "an argument after the subcommand does not change the reading")
+  assert.equal(effectFor(role.rules, "git -C . show HEAD"), "deny", "a global flag before the subcommand is not on any list: the wildcard deny holds")
+  assert.equal(effectFor(role.rules, "git commit -m x"), "deny", "a commit is no reviewer's")
+  assert.equal(effectFor(role.rules, "git merge jev/x"), "deny", "the merge belongs to the gitmaster")
+  assert.equal(effectFor(role.rules, "git push origin main"), "deny", "nothing outward is on a list")
+  assert.equal(effect(role.rules, "shell"), "deny", "anything not on a list stays denied by the wildcard")
+})
+
+test("a coder may run the readers after a pipe: OpenCode asks about each segment on its own", () => {  // The live command that lost a task, with the pipe inside the sed expression left out so each segment is a command:
   // every segment after `uv run pyright` was on no allow list.
   const live = "uv run pyright 2>&1 | grep -E '^  /' | sed -E 's#.*--T1/##' | cut -d: -f1 | sort | uniq -c | sort -rn"
   for (const rules of [ROLES.find((r) => r.id === "code")!.rules, ROLES.find((r) => r.id === "test")!.rules]) {
@@ -233,7 +248,7 @@ test("the gitmaster is the only change to the matrix: eleven roles, and the othe
   assert.deepEqual(ROLES.map((r) => r.id), ["explore", "research", "plan", "code", "test", "visual", "write", "debug", "review", "oracle", "gitmaster"])
   // How many rules each role has, its own plus the shared tail it always got (21 state paths + 4 memory tools). A role
   // that gained or lost one for this task would move a number here.
-  const counts: Record<string, number> = { explore: 51, research: 30, plan: 32, code: 66, test: 66, visual: 66, write: 29, debug: 69, review: 69, oracle: 32, gitmaster: 57 }
+  const counts: Record<string, number> = { explore: 51, research: 30, plan: 32, code: 66, test: 66, visual: 66, write: 29, debug: 69, review: 88, oracle: 32, gitmaster: 57 }
   for (const [id, n] of Object.entries(counts)) assert.equal(roleById(id)!.rules.length, n, id)
   // No other role was given a merge command: the ten kept the shell rights the tests above pin, and this is the check
   // that none of them silently gained a way into the checkout.

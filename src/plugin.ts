@@ -685,6 +685,25 @@ export function mergeQuestionDue(job: Job): boolean {
   return !SHARED.mergeAsked.has(job.id) && !SHARED.asked.has(job.id) && jobsTerminal(job)
 }
 
+const withinArea = (path: string, base: string): boolean => path === base || path.startsWith(`${base}/`)
+
+// Whether a read reaches the plugin's own state area (.jev-micromanager of the project) from outside the session's
+// own directory. The role rules deny the area too, but on relative patterns, and opencode asserts read paths the
+// way FileAccess names them (absolute or ~-collapsed) — a live run of 2026-10-07 read worktrees under the state
+// area with the denies never matching anything. This is the same hold, tied to what the evaluate hook actually
+// sees: the area is refused unless it lies inside the session's own worktree, which is where every legitimate read
+// of a worker sits. Returns false for anything relative (a worker's own tree) and for paths outside the area.
+export function stateAreaRead(mine: string | undefined, resources: readonly string[], project: string): boolean {
+  const area = normalizeOutside(join(project, ".jev-micromanager"))
+  if (!area.startsWith("/")) return false
+  const own = mine ? normalizeOutside(mine) : undefined
+  return resources.some((path) => {
+    const where = normalizeOutside(path)
+    if (!where.startsWith("/") || !withinArea(where, area)) return false
+    return !own || !withinArea(where, own)
+  })
+}
+
 // The question a job owes its user, so it survives until their turn answers it (SHARED.asked is keyed per job; one
 // question at a time is what keeps a second asker from overwriting the first).
 export function askJobQuestion(jobId: string, question: Asked): void {
@@ -938,6 +957,16 @@ export default {
           record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: `micromanager read cap (${MICROMANAGER_READ_CAP})`, source: evaluation.source })
           return
         }
+      }
+      // The state area, airtight at the plugin's own layer: the role rules deny relative patterns only, and the
+      // runner session that read the job's worktrees through the plugin's own state in the live run (2026-10-07, the
+      // local planner or a worker climbing up) never had them match. A read of the area from outside the session's
+      // own directory is refused here, whatever effect opencode computed.
+      if (READS.has(evaluation.action) && runnerSessions.has(evaluation.sessionID) && project && stateAreaRead(workerDirs.get(evaluation.sessionID), evaluation.resources, project)) {
+        evaluation.effect = "deny"
+        evaluation.message = "This is the plugin's own state (the job board and notes) and not part of your task; read only your own worktree. If you need what a report said, ask in your report; it reaches whoever can decide."
+        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "the plugin's state area, from outside the session's own directory", source: evaluation.source })
+        return
       }
       if (evaluation.effect !== "ask" || !ours.has(evaluation.agent)) return
       if (runnerSessions.has(evaluation.sessionID) && evaluation.action === "external_directory") {

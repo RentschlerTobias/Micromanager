@@ -662,3 +662,28 @@ test("an unapproved gitmaster delegation is refused before any task exists", asy
   await assert.rejects(() => delegationHook(call as never), /no such approval for job never-approved/)
   assert.ok(call.input.prompt.includes("Merge"), "the call is not rewritten on the way out")
 })
+
+// The state-area hold (leftover 2): opcode asserts read paths absolutely or ~-collapsed, and the role rules deny
+// relative patterns, so the deny never matched in the live run — a worker read worktrees under .jev-micromanager
+// with no refusal anywhere. The plugin's own layer carries the hold now, tied to what the evaluate hook sees.
+test("the plugin's state area is refused from outside a worker's own directory, and its own tree is not", async () => {
+  const { stateAreaRead } = await import("../src/plugin.ts")
+  const project = "/repo"
+  const area = `${project}/.jev-micromanager`
+  // Outside the area entirely: ordinary project work, never refused by this.
+  assert.equal(stateAreaRead(`${area}/worktrees/job-1/T1`, ["src/a.ts", "/repo/src/a.ts", "~"], project), false)
+  assert.equal(stateAreaRead(undefined, ["x"], project), false)
+  // Its own worktree inside the area: a worker reads its own files.
+  const own = `${area}/worktrees/job-1/T1`
+  assert.equal(stateAreaRead(own, [`${own}/src/a.ts`, `${area}/worktrees/job-1/T1`], project), false, "its own tree stays open")
+  // The job board, the notes, and another job's worktree: all the area, none of it its own.
+  const outside = [`${area}/jobs/job-1.json`, `${area}/notes/job-1/T1.md`, `${area}/worktrees/job-2/base/src/x.py`, `${area}/worktrees/job-1`]
+  for (const path of outside) {
+    assert.equal(stateAreaRead(own, [path], project), true, path)
+    assert.equal(stateAreaRead(undefined, [path], project), true, "no known directory: the area is refused whole")
+  }
+  // Relative paths resolve in the session's own directory: the worktree-relative read is the worker's own.
+  assert.equal(stateAreaRead(own, ["src/a.ts", "."], project), false)
+  // The area itself as a base is what is compared, so a sibling that shares the name is just a project directory.
+  assert.equal(stateAreaRead(own, ["/repo/.jev-micromanager-old/notes/a.md"], project), false)
+})

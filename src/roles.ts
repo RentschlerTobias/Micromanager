@@ -214,11 +214,18 @@ tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) =>
   ),
   role(
     "review",
-    "Read-only: checks a worker's result against its acceptance points; may run tests and linters.",
-    `Check the result against each acceptance point. Run the tests and linters if there are any. Answer only
+    "Read-only: checks a worker's result against its acceptance points; may run tests, linters and git reads.",
+    `Check the result against each acceptance point. Run the tests and linters if there are any. The shell runs only
+git reads (git log, git show, git diff, git status, git branch, git ls-files, git grep) and the readers after a pipe,
+one command per call, in your current directory, without global git flags (no -C, no -c, no --no-pager): judge a
+branch's work with git log <branch> and git show <branch>:<file>, from where you sit. Answer only
 with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "...", "met": true | false, "evidence": "..."}],
 "fixes": ["..."]}.`,
-    [...noWrite, ...noShell, ...runAndRead, ...noWeb, ...noDelegation],
+    // Live task, 2026-10-07: a review task was pure git, and the shell was test/lint readers only — no git read was
+    // ever allowed, so every git command was refused and the review had nothing to read. The explorer's git reads are
+    // the reviewer's now: the same permission list, the same one-command-per-call shape, no global flags (they are
+    // not in the patterns, in the explorer as much as in the reviewer — the flagless forms judge a branch fine).
+    [...noWrite, ...noShell, ...READ_COMMANDS.map((cmd) => rule("shell", "allow", cmd)), ...runAndRead, ...AST_GREP_WRITES.map((cmd) => rule("shell", "deny", cmd)), ...noWeb, ...noDelegation],
     [MODELS.space, MODELS.glm, MODELS.qwen], // space-bunny writes, so a reviewer must be another family
   ),
   role(
