@@ -128,7 +128,7 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
   draft.add({
     id: "request_access",
     name: "request_access",
-    description: "Vouch that a worker of this job legitimately needs a path outside the project: path with its full path, why in one sentence for the user. From then on a worker that only reads may read it without asking again; writing there still goes to the user. It cannot open the user's keys, credentials, config or home directory, the system directories or another job's worktrees, whatever the reason: for those, ask the user.",
+    description: "Vouch that a worker of this job legitimately needs a path outside the project: path with its full path, why in one sentence for the user. From then on a worker that only reads may read it without asking again; writing there still goes to the user. A path the plugin refuses by default — the user's keys, credentials, home and the system directories — is not a refusal but a question: calling this with one returns the question to put to the user word for word, and their answer on the next turn opens it for this job or leaves it closed. End your turn after showing it.",
     input: input("path", "why"),
     execute: guarded(([path, why], ctx) => handlers.access(path!, why!, ctx), "path", "why"),
   })
