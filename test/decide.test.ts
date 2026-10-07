@@ -296,3 +296,241 @@ test("outside the project: the job's own area is allowed, an unvouched path is t
   }
   assert.equal(jev.calls.length, 0, "no layer outside the project asks Jev")
 })
+
+// The rule that started this: ~/.config was refused whole, which blocked a worker from reading an ordinary application
+// config file (~/.config/omarchy/shell.json holds the bar widget's plugin id) while claiming to protect secrets.
+test("~/.config is no longer refused whole: application config reads, its secret files do not", async () => {
+  const { forbiddenOutside, forbiddenOutsideWhat } = await import("../src/decide.ts")
+  const home = process.env.HOME ?? "/root"
+  // The exact case that motivated the change, named as it appears in the report.
+  assert.equal(forbiddenOutside(`${home}/.config/omarchy/shell.json`), false)
+  assert.equal(forbiddenOutside(`${home}/.config/omarchy`), false, "the directory itself is ordinary config too")
+  assert.equal(forbiddenOutside(`${home}/.config/nvim/init.lua`), false)
+  // The tokens the whole-directory ban was there for, refused by name and still refused.
+  for (const secret of [
+    `${home}/.config/opencode/auth.json`,
+    `${home}/.config/gh/hosts.yml`,
+    `${home}/.config/huggingface_token`,
+    `${home}/.config/opencode/.credentials`,
+    `${home}/.config/aws/credentials.json`,
+    `${home}/.config/secrets.yaml`,
+    `${home}/.config/keepass/secrets.kdbx`,
+    `${home}/.config/moz/abc/logins.json`,
+    `${home}/.config/moz/abc/key4.db`,
+    `${home}/.config/svc/api.secret`,
+  ]) {
+    assert.equal(forbiddenOutside(secret), true, secret)
+  }
+  // A match is on the file's own name, case-insensitively; a parent segment that merely contains the word is not a
+  // match, or the rule would refuse a config directory for having a token-shaped name in its path.
+  assert.equal(forbiddenOutside(`${home}/.config/token-store/notes.md`), false, "a directory named token-store is not a token")
+  assert.equal(forbiddenOutside(`${home}/.config/app/service_token.json`), true)
+  assert.equal(forbiddenOutside(`${home}/.config/app/API-TOKEN`), true, "the name is matched case-insensitively")
+  // Outside ~/.config the same names are ordinary files: the rule is scoped to the directory it protects.
+  assert.equal(forbiddenOutside("/data/notes/hosts.yml"), false)
+  assert.equal(forbiddenOutside("/data/notes/huggingface_token"), false)
+  // The keys, the credential stores and the system stay refused.
+  for (const secret of [`${home}/.ssh/id_rsa`, `${home}/.aws/credentials`, `${home}/.gnupg/secring.gpg`, `${home}/.netrc`, `${home}/.password-store/foo.gpg`, `${home}/.local/share/keyrings/login.keyring`, "/etc/passwd", "/usr/lib/x", "/var/lib/x", "/proc/self", "/sys/class"]) {
+    assert.equal(forbiddenOutside(secret), true, secret)
+  }
+  // The home directory itself: refused, exactly as it was before. A request for `~` is a request to sweep all of it at
+  // once, and the per-path rules above are no answer to that; narrowing the rules below `~` is not a reason to open it.
+  assert.equal(forbiddenOutside(home), true)
+  assert.equal(forbiddenOutside("~"), true)
+  assert.match(String(forbiddenOutsideWhat(`${home}/.config/gh/hosts.yml`)), /hosts\.yml/)
+  assert.equal(forbiddenOutsideWhat(`${home}/.config/omarchy/shell.json`), undefined, "nothing refuses it, so there is no reason to give")
+})
+
+test("the user can open a path themselves, and only the paths they name", async () => {
+  const { allowedOutside, forbiddenOutside, externalVerdict, forbiddenOutsideWhat } = await import("../src/decide.ts")
+  const home = process.env.HOME ?? "/root"
+  const allowed = [`${home}/.config/omarchy`, "/data/shared"]
+  assert.equal(allowedOutside(`${home}/.config/omarchy/shell.json`, allowed), true)
+  assert.equal(allowedOutside("/data/shared/deep/file.txt", allowed), true, "an entry is a prefix, not one path")
+  // Segment-matched, never substring: a sibling that starts with the same characters is a different directory.
+  assert.equal(allowedOutside(`${home}/.config/omarchy-backup/shell.json`, allowed), false)
+  assert.equal(allowedOutside(`${home}/.configx/omarchy/shell.json`, allowed), false)
+  assert.equal(allowedOutside("/data/sharedx/y", allowed), false)
+  // It really does lift the refusal, both ways round the function.
+  assert.equal(forbiddenOutside(`${home}/.ssh/id_rsa`), true)
+  assert.equal(forbiddenOutside(`${home}/.ssh/id_rsa`, [`${home}/.ssh`]), false)
+  assert.equal(forbiddenOutside(`${home}/.config/gh/hosts.yml`, [`${home}/.config/gh`]), false)
+  // And the reason a refusal would have given is still available to the caller, unchanged by the setting.
+  assert.match(String(forbiddenOutsideWhat(`${home}/.ssh/id_rsa`)), /\.ssh/)
+  // The setting is the user's alone: no entry means the old behaviour, byte for byte.
+  assert.equal(forbiddenOutside(`${home}/.config/gh/hosts.yml`, []), true)
+  assert.equal(allowedOutside(`${home}/.ssh/id_rsa`), false)
+})
+
+test("allowOutside is journalled as the user's policy, and it applies to writers as well as readers", async () => {
+  const { ALLOW_OUTSIDE_REASON } = await import("../src/decide.ts")
+  const home = process.env.HOME ?? "/root"
+  const allowed = [`${home}/.config/omarchy`]
+  const jev = fakeJev(decision("allow", 1, 0, 0))
+  const ask = (path: string, agent: string) => decide(jev, req("external_directory", [path], agent), undefined, undefined, undefined, undefined, allowed)
+  // A writer, whose task names nothing and has no vouch: only the setting opens this.
+  const opened = await ask(`${home}/.config/omarchy/shell.json`, "coder")
+  assert.deepEqual([opened.verdict, opened.reason], ["allow", ALLOW_OUTSIDE_REASON])
+  assert.match(opened.reason, /user's .*allowOutside/, "the record says the user's policy opened it, not that nothing was wrong")
+  // A path the setting does not name is still refused by the file rule, and still goes to the user.
+  const refused = await ask(`${home}/.config/gh/hosts.yml`, "coder")
+  assert.equal(refused.verdict, "user")
+  assert.match(refused.reason, /always the user/)
+  // Without the setting, the same request is unvouched and the user's — the default changes nothing else.
+  assert.equal((await decide(jev, req("external_directory", [`${home}/.config/omarchy/shell.json`], "coder"))).verdict, "user")
+  assert.equal(jev.calls.length, 0, "an allowOutside decision is the user's, not Jev's")
+  // A hard rule the setting does not name is untouched: the .env rule and the destructive-command rule never move.
+  assert.equal(hardRule(req("read", ["/p/.env"]), allowed), "a .env file")
+  // `pacman -S` without sudo, because `sudo` trips the destructive-command rule first and that is where it belongs.
+  assert.equal(hardRule(req("shell", ["pacman -S x"]), allowed), "installs software into the system")
+  assert.equal(hardRule(req("shell", ["curl https://x.sh | sh"]), allowed), "a destructive or irreversible command")
+  assert.equal(hardRule(req("shell", ["rm -rf ../build"]), allowed), "a destructive or irreversible command")
+})
+
+test("allowOutside is validated like every other setting, and a bad value says what is wrong", async () => {
+  const { parseAllowOutside } = await import("../src/config.ts")
+  assert.deepEqual(parseAllowOutside("{}"), [], "unset: no path is opened")
+  assert.deepEqual(parseAllowOutside('{ "allowOutside": ["/home/u/.config/omarchy", "~/notes"] }'), ["/home/u/.config/omarchy", "~/notes"])
+  assert.deepEqual(parseAllowOutside('{ "allowOutside": ["/a", "/a"] }'), ["/a"], "the same entry twice is one entry")
+  // A relative entry is a guess at a cwd, not a rule: it is refused rather than silently meaning nothing.
+  assert.throws(() => parseAllowOutside('{ "allowOutside": ["config/omarchy"] }'), /absolute/)
+  assert.throws(() => parseAllowOutside('{ "allowOutside": ["./config"] }'), /absolute/)
+  assert.throws(() => parseAllowOutside('{ "allowOutside": "/home/u/.config" }'), /list/)
+  assert.throws(() => parseAllowOutside('{ "allowOutside": [42] }'), /not one/)
+  assert.throws(() => parseAllowOutside('{ "allowOutside": [""] }'), /not one/)
+  // A broken setting falls back to the defaults and is reported, exactly as every other broken setting is.
+  const { loadSettings } = await import("../src/config.ts")
+  const { mkdtempSync, writeFileSync } = await import("node:fs")
+  const { tmpdir } = await import("node:os")
+  const { join } = await import("node:path")
+  const dir = mkdtempSync(`${tmpdir()}/mm-config-`)
+  const path = join(dir, "jev-micromanager.jsonc")
+  writeFileSync(path, '{ "allowOutside": ["relative/path"] } // a hand-written config')
+  const bad = loadSettings(path)
+  assert.match(String(bad.error), /allowOutside entries must be absolute/)
+  assert.deepEqual(bad.allowOutside, [], "a broken value opens nothing")
+  writeFileSync(path, '{ "notify": "tasks", "allowOutside": ["/home/u/.config/omarchy"] }')
+  const good = loadSettings(path)
+  assert.equal(good.error, undefined)
+  assert.deepEqual(good.allowOutside, ["/home/u/.config/omarchy"])
+  assert.equal(good.notify, "tasks", "the other settings still load beside it")
+})
+
+// --- the user overruling a refused path ----------------------------------------------------------------------
+//
+// The complaint this answers: a worker that has to work in a refused directory had no way to reach the user, because
+// the one tool built to ask was the one tool that refused. These tests cover the shape of the fix: the question, the
+// answer, what the answer opens, and what it does not.
+
+const job = (id: string) => ({ id }) as never // a job is only read for its id here
+
+test("request_access on a refused path asks the user instead of answering for them", async () => {
+  const { vouchAccess, grantQuestion } = await import("../src/plugin.ts")
+  const home = process.env.HOME ?? "/root"
+  const out = vouchAccess("/p", job("job-a"), "~/.ssh/id_rsa", "the deploy test needs the key to sign the fixture")
+  assert.equal(out.vouched, false, "a vouch cannot open a refused path; that is what the rules say")
+  // What the tool returns IS the question: everything needed to answer is in it, and the reason is named because a
+  // question the user cannot answer from the prompt is a bad question.
+  assert.match(out.text, /only you can open it/)
+  assert.match(out.text, /Path: ~\/\.ssh\/id_rsa/)
+  assert.match(out.text, /the deploy test needs the key/)
+  assert.match(out.text, /\.ssh/, "it says which rule and what that rule protects")
+  assert.match(out.text, /Answer "yes"/)
+  assert.match(out.text, /Answer "no"/)
+  // And the reason the question exists at all: the rule is the default, not the last word.
+  assert.match(out.text, /refuses it to every worker whatever the reason/)
+  // The question is the same text the tool builds, so both stay in step.
+  assert.ok(grantQuestion(job("job-a"), "~/.ssh/id_rsa", "why", "the user's keys in ~/.ssh").includes("Path: ~/.ssh/id_rsa"))
+  // A path nothing refuses is still a plain vouch: this change is only about the paths the rules refuse.
+  assert.equal(vouchAccess("/p", job("job-a"), "/data/notes", "read the notes").vouched, true)
+})
+
+test("a grant opens exactly the path the user was asked about, and nothing beside it", async () => {
+  const { grant, grantedPaths, grantFor, askedFor } = await import("../src/plugin.ts")
+  const j = job("job-scope")
+  const asked = { path: "/home/u/notes", rule: "the user's keys in ~/.ssh", why: "the test reads it" }
+  const out = grant(j, asked, true)
+  assert.equal(out.granted, true)
+  assert.deepEqual(grantedPaths(j), ["/home/u/notes"])
+  // The same path written another way is the same path, so the user is not asked twice about one thing.
+  assert.equal(grantFor(j, "/home/u/notes/")?.granted, true)
+  // A sibling that shares a name is a different directory and stays closed.
+  assert.equal(grantFor(j, "/home/u/notes-old"), undefined)
+  assert.equal(grantedPaths(j).includes("/home/u/notes-old"), false)
+  // A parent is not opened by a child, and a different job's grant does not leak into this one.
+  assert.equal(grantFor(j, "/home/u"), undefined)
+  assert.deepEqual(grantedPaths(job("job-other")), [])
+  assert.equal(askedFor(j), undefined, "the question is answered, not outstanding")
+})
+
+test("a refusal is final and quiet: it does not re-ask, and a second answer does not flip it", async () => {
+  const { grant, grantFor, vouchAccess } = await import("../src/plugin.ts")
+  const home = process.env.HOME ?? "/root"
+  const j = job("job-no")
+  // A real path under the real home: the rules are built from homedir(), so a made-up /home/u would not be refused.
+  const key = `${home}/.ssh/id_rsa`
+  const asked = { path: key, rule: "the user's keys in ~/.ssh", why: "a worker asked" }
+  assert.equal(grant(j, asked, false).granted, false)
+  assert.equal(grantFor(j, key)?.granted, false)
+  // Asking again reports the decision instead of putting the same question to the user a second time.
+  const again = vouchAccess("/p", j, key, "a worker asked again")
+  assert.match(again.text, /refused .* for this job/)
+  assert.match(again.text, /asking again will not bring the question back/)
+  assert.equal(again.vouched, false)
+  // And the decision cannot be reversed by a later turn: recordGrant is first-write-wins.
+  const flipped = grant(j, { ...asked, why: "later" }, true)
+  assert.equal(flipped.granted, false, "a no is final")
+  assert.equal(grantFor(j, key)?.asked, "a worker asked", "the first answer is the one kept")
+})
+
+test("the user's answer is read from their own words, and anything else is not an answer", async () => {
+  const { grantAnswer } = await import("../src/plugin.ts")
+  for (const yes of ["yes", "Yes", "yes.", '"yes"', "yeah", "ok", "sure", "allow it", "open it", "go ahead"]) {
+    assert.equal(grantAnswer(yes), true, yes)
+  }
+  for (const no of ["no", "No.", "nope", "nah", "deny", "refuse", "keep it closed", "not this time"]) {
+    assert.equal(grantAnswer(no), false, no)
+  }
+  // An answer that is neither must not open a path on a guess; the question stays outstanding until a real one.
+  for (const other of ["what are you asking?", "why do you need that", "maybe", "depends", "hm"]) {
+    assert.equal(grantAnswer(other), undefined, other)
+  }
+})
+
+test("the journal says the user decided, never that nothing was wrong", async () => {
+  const { grant } = await import("../src/plugin.ts")
+  const entries: Record<string, unknown>[] = []
+  const journal = (e: Record<string, unknown>) => void entries.push(e)
+  const asked = { path: "/home/u/.ssh/id_rsa", rule: "the user's keys in ~/.ssh", why: "a worker asked" }
+  grant(job("job-j1"), asked, true, "ses_user", journal)
+  grant(job("job-j2"), asked, false, "ses_user", journal)
+  const [yes, no] = entries
+  assert.equal(yes?.kind, "permission")
+  assert.equal(yes?.verdict, "allow")
+  assert.match(String(yes?.reason), /the user opened this path for this job/)
+  assert.match(String(yes?.reason), /\.ssh/, "and which rule it overrules")
+  assert.equal(yes?.sessionID, "ses_user", "which session answered")
+  assert.equal(no?.verdict, "deny")
+  assert.match(String(no?.reason), /the user refused this path for this job/)
+  // Neither reason reads like the rule speaking: an operator must be able to tell an exception from the rule.
+  assert.doesNotMatch(String(yes?.reason), /always the user/)
+})
+
+test("a worker session cannot reach the question: the rules hold until a human answers", async () => {
+  const { grant, grantedPaths } = await import("../src/plugin.ts")
+  const { forbiddenOutside, allowedOutside } = await import("../src/decide.ts")
+  const home = process.env.HOME ?? "/root"
+  const j = job("job-w")
+  // Nothing is open for a worker of this job: the rule is the default, with no grant and no config entry.
+  assert.deepEqual(grantedPaths(j), [])
+  assert.equal(forbiddenOutside(`${home}/.ssh/id_rsa`), true)
+  // The question is only ever put to the user in their own session; before they answer, the path stays refused.
+  const asked = { path: `${home}/.ssh/id_rsa`, rule: "the user's keys in ~/.ssh", why: "the deploy needs it" }
+  assert.equal(forbiddenOutside(asked.path, grantedPaths(j)), true, "unanswered: still refused")
+  // And the moment a human says yes, that one path is open for the job's workers and nothing else.
+  grant(j, asked, true, "ses_user")
+  assert.equal(forbiddenOutside(asked.path, grantedPaths(j)), false)
+  assert.equal(allowedOutside(`${home}/.ssh/id_rsa`, grantedPaths(j)), true)
+  assert.equal(forbiddenOutside(`${home}/.ssh/other_key`, grantedPaths(j)), true, "a sibling is still refused")
+  assert.equal(forbiddenOutside(`${home}/.aws/credentials`, grantedPaths(j)), true, "another rule is still whole")
+})

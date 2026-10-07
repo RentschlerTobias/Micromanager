@@ -324,16 +324,21 @@ test("a job load sweeps a stale task to a terminal state and reports the leftove
   assert.deepEqual(reconcileJob(next, { aliveSessions: live }).result.changes, [])
 })
 
-test("request_access refuses a hard-denied path whatever the reason, and vouches for an ordinary one", async () => {
+test("request_access asks the user about a refused path rather than answering for them, and vouches for an ordinary one", async () => {
   const { vouchAccess, vouchText } = await import("../src/plugin.ts")
   const j = job()
   const PROJECT = "/home/t1dde/Fun/Projects/Repos/jev-micromanager"
   // ~/.ssh is layer 1 of decide.ts: no layer may pass it, and a vouch from the orchestrator is not a layer above that.
+  // What changed is not the rule but who answers it: the tool used to refuse, which meant the one place built to ask
+  // the user was the one place that never did. It now puts the question to them, with the path and the reason.
   const denied = vouchAccess(PROJECT, j, "~/.ssh/id_rsa", "the deploy needs the key to run the tests")
-  assert.equal(denied.vouched, false)
-  assert.match(denied.text, /^Not vouched: ~\/\.ssh\/id_rsa/)
-  assert.match(denied.text, /only the user can open it|let them decide/)
-  assert.equal(vouchText(j), undefined, "nothing was recorded")
+  assert.equal(denied.vouched, false, "a vouch still cannot open a refused path")
+  assert.match(denied.text, /only you can open it/)
+  assert.match(denied.text, /Path: ~\/\.ssh\/id_rsa/)
+  assert.match(denied.text, /the deploy needs the key to run the tests/, "the reason the worker gave travels with it")
+  assert.match(denied.text, /the user's keys in ~\/\.ssh/, "and what the rule protects, so the user can answer")
+  assert.match(denied.text, /Answer "yes".*Answer "no"/s)
+  assert.equal(vouchText(j), undefined, "nothing was recorded: the user has not answered yet")
   assert.equal(vouchAccess(PROJECT, j, "~/.aws/credentials", "read the credentials").vouched, false)
   assert.equal(vouchAccess(PROJECT, j, "/etc/hosts", "check the hosts file").vouched, false)
   assert.equal(vouchAccess(PROJECT, j, "~", "the whole home directory").vouched, false)

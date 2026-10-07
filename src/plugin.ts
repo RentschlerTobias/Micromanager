@@ -7,8 +7,8 @@
 import { execFile } from "node:child_process"
 
 import { installAgents, type AgentDraft } from "./agents.ts"
-import { cloudRegistry, loadSettings } from "./config.ts"
-import { decide, forbiddenOutside, inJobArea, taskNamesPath, type PermissionRequest } from "./decide.ts"
+import { cloudRegistry, configPath, loadSettings } from "./config.ts"
+import { allowedOutside, decide, forbiddenOutside, forbiddenOutsideWhat, inJobArea, normalizeOutside, taskNamesPath, ALLOW_OUTSIDE_REASON, GRANT_OUTSIDE_REASON, REFUSED_OUTSIDE_REASON, type PermissionRequest } from "./decide.ts"
 import { injected, injectionScore } from "./gate.ts"
 import { backstop, DELEGATION_TOOLS, delegationRole, notRouted, resultText, rewriteResult, routeDelegation, unownedDelegation, type ChildSession, type ToolCall } from "./hooks.ts"
 import { Jev, apiKey, redact } from "./jev.ts"
@@ -118,6 +118,8 @@ interface Shared {
   stops: Map<string, Signal> // why the watchdog stopped a session
   ended: Set<string> // worker sessions known to be over: reconcileJob must not call these alive
   vouches: Map<string, string[]> // job -> the paths the micromanager vouched for with request_access
+  grants: Map<string, Grants> // job -> what the user decided about the refused paths of this job
+  asked: Map<string, Asked> // job -> the question waiting for an answer, so it is never asked twice at once
   native?: Native // the micromanager's workers on OpenCode's subagent tool, made by the first instance
 }
 const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicromanager ??= {
@@ -130,6 +132,8 @@ const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicr
   stops: new Map(),
   ended: new Set(),
   vouches: new Map(),
+  grants: new Map(),
+  asked: new Map(),
 })
 
 // A path outside the project that a reader may read: one its task names (live test: "map oc-voice" needs oc-voice).
@@ -344,14 +348,31 @@ export async function discardJob(project: string, job: Job, ack: string, run: Ex
 }
 
 // request_access: the micromanager vouches that a worker of the job legitimately needs a path outside the project.
-// It is layer 2 of src/decide.ts made explicit. The hard denials there are absolute and stay so: keys, credentials,
-// the system directories and another job's worktrees are refused whatever the reason, and only the user opens them.
-export function vouchAccess(project: string, job: Job | undefined, path: string, why: string): { vouched: boolean; text: string } {
+// It is layer 2 of src/decide.ts made explicit.
+//
+// A path nothing refuses is a vouch, as before. A path the hard rules refuse is neither vouched nor refused here: it
+// is a question for the user, because they are present in this session and the rules are the default rather than the
+// last word. The question is put to them (grantQuestion) and only their answer decides anything; see grant() below.
+export function vouchAccess(
+  project: string,
+  job: Job | undefined,
+  path: string,
+  why: string,
+  allowOutside: readonly string[] = [],
+  task?: string,
+): { vouched: boolean; text: string } {
   const want = path.trim()
   if (!want) return { vouched: false, text: "request_access needs path: the directory the worker needs, with its full path." }
   if (!why.trim()) return { vouched: false, text: `request_access needs why: what the worker has to read or write in ${want}, in one sentence for the user.` }
-  if (forbiddenOutside(want)) {
-    return { vouched: false, text: `Not vouched: ${want} is one of the paths no worker may have, whatever the reason (the user's keys, credentials, config and home directory, the system directories, another job's git data). Tell the user what the worker needs and let them decide; this plugin will not open it.` }
+  if (allowedOutside(want, allowOutside)) {
+    return { vouched: false, text: `${want} is in the user's allowOutside setting: every worker may reach it already, there is nothing to vouch for.` }
+  }
+  if (forbiddenOutside(want, allowOutside)) {
+    // Already answered, either way: say what the user decided rather than asking again. A "no" that brought the
+    // question back on the next call would be a question the user cannot escape, which is the opposite of a decision.
+    const said = grantFor(job, want)
+    if (said) return { vouched: false, text: refusalText(want, said) }
+    return { vouched: false, text: grantQuestion(job, want, why.trim(), forbiddenOutsideWhat(want) ?? "a path no worker may have", task) }
   }
   if (want === project || want.startsWith(`${project}/`)) return { vouched: false, text: `${want} is inside the project: a worker may use it without a vouch.` }
   if (inJobArea(project, want)) return { vouched: false, text: `${want} is one of this job's own worktrees: already allowed for every worker of the job, nothing to vouch.` }
@@ -363,6 +384,32 @@ export function vouchAccess(project: string, job: Job | undefined, path: string,
   return { vouched: true, text: `Vouched for ${want} in job ${job.id}: a worker of this job that only reads may read it without asking again (${why.trim()}). Writing to it still goes to the user; so does anything the hard rules refuse. Tell the user what you vouched for and why.` }
 }
 
+// What the user already decided about a refused path, said back to the micromanager. A "yes" reports the grant and
+// what it does not cover; a "no" is final and says so once, without asking again.
+function refusalText(want: string, said: Grant): string {
+  return said.granted
+    ? `The user opened ${want} for this job: a worker of this job may read and write there for as long as this server runs. They were asked because it is ${said.rule}. Nothing else opened with it: another path needs its own question.`
+    : `The user refused ${want} for this job. It stays closed, and asking again will not bring the question back: the answer is final. Tell the worker to report STATUS: NEEDS_CONTEXT.`
+}
+
+// request_access on a path the rules refuse: the user is asked, and their answer opens or closes it. Separate from
+// vouchAccess because this one changes state — it records a decision and journals it — and because it must be callable
+// from the user's turn, where the answer arrives.
+//
+// asked is what stops a question being asked twice over: while one is outstanding the second call says so instead of
+// putting the same question to the user again, so an agent that loops on the tool cannot spam them.
+export function grant(
+  job: Job | undefined,
+  question: Asked,
+  answer: boolean,
+  sessionID?: string,
+  journal: (entry: Record<string, unknown>) => void = record,
+): { text: string; granted: boolean } {
+  if (!job) return { text: "There is no job of this session to open a path for. plan_job or delegate a worker first.", granted: false }
+  const recorded = recordGrant(job, { path: question.path, granted: answer, rule: question.rule, asked: question.why, task: question.task, sessionID }, journal)
+  return { text: refusalText(question.path, recorded), granted: recorded.granted }
+}
+
 // The vouch a job carries, as a task the decision path reads: decide.ts layer 3 allows a read of a path the task names,
 // so a vouch is exactly that, made by the orchestrator instead of written into the task text.
 export function vouchText(job: Job | undefined): string | undefined {
@@ -370,12 +417,121 @@ export function vouchText(job: Job | undefined): string | undefined {
   return lines?.length ? `the micromanager vouched for these paths of job ${job!.id}: ${lines.join("; ")}` : undefined
 }
 
+// --- the user overruling a refused path -----------------------------------------------------------------------
+//
+// The rule in src/decide.ts is the default, not the last word: the one place the user is never consulted is the one
+// place built to consult them, and a worker that genuinely has to work in a refused directory had no way to say so.
+// So request_access on a refused path asks the user instead of answering for them.
+//
+// What makes that safe is structural, not clever. The rule stands, so the default is still no. What opens a path is a
+// human reading the path and the reason in the question, in a foreground session where somebody is watching. A worker
+// cannot reach that session (it has no request_access, and the permission hook still refuses the path until an answer
+// exists), so the worst an injected instruction can achieve is a question the user reads and declines. A decline is
+// final and quiet: it is remembered, the second request does not re-ask, and nothing opened.
+//
+// Grants are per job and per path, exactly as asked: a grant for /home/u/notes opens that path and nothing beside it,
+// because a grant for one thing must not quietly become a grant for a sibling the user never saw. They live in memory
+// on SHARED like the vouches, so they last this server run and are gone on the next start. A standing, deliberate
+// decision is what allowOutside in the config is for; this is the one-off.
+
+// What the user decided about one path of one job, and why they were asked.
+export interface Grant {
+  readonly path: string // normalised, so the same path written two ways is one path
+  readonly granted: boolean
+  readonly rule: string // what the rule protects: "the user's keys in ~/.ssh"
+  readonly asked: string // the micromanager's own reason, in the user's words where possible
+  readonly task?: string
+  readonly sessionID?: string // the user's session that answered, for the journal
+}
+
+// The grants of one job, by normalised path.
+export type Grants = Map<string, Grant>
+
+// A question put to the user and not yet answered: what was asked, and why it was refused. Held so the answer can be
+// journalled with the reason the user actually saw, and so the same question is never put twice at once.
+export interface Asked {
+  readonly path: string
+  readonly rule: string
+  readonly why: string
+  readonly task?: string
+}
+
+// The paths of a job the user opened, in the form decide.ts takes: a grant is an allowOutside entry and nothing else.
+export function grantedPaths(job: Job | undefined): readonly string[] {
+  const grants = job ? SHARED.grants.get(job.id) : undefined
+  return grants ? [...grants.values()].filter((g) => g.granted).map((g) => g.path) : []
+}
+
+// The user's decision about a path of a job, or undefined when they have not answered about it yet.
+export function grantFor(job: Job | undefined, path: string): Grant | undefined {
+  const grants = job ? SHARED.grants.get(job.id) : undefined
+  return grants?.get(normalizeOutside(path))
+}
+
+// The question waiting for an answer, if any.
+export function askedFor(job: Job | undefined): Asked | undefined {
+  return job ? SHARED.asked.get(job.id) : undefined
+}
+
+// Records the user's answer, once. A second answer to the same path is ignored rather than applied: the question is
+// asked once, and a later turn of the conversation must not quietly reverse a decision the user already made.
+export function recordGrant(job: Job, decided: Grant, journal: (entry: Record<string, unknown>) => void = record): Grant {
+  const grants = SHARED.grants.get(job.id) ?? new Map<string, Grant>()
+  const existing = grants.get(decided.path)
+  if (existing) return existing
+  grants.set(decided.path, decided)
+  SHARED.grants.set(job.id, grants)
+  SHARED.asked.delete(job.id)
+  journal({
+    kind: "permission",
+    job: job.id,
+    sessionID: decided.sessionID,
+    action: "external_directory",
+    resources: [decided.path],
+    verdict: decided.granted ? "allow" : "deny",
+    // Both reasons name the user, because both are exceptions to a standing rule rather than the rule speaking again.
+    reason: decided.granted ? `${GRANT_OUTSIDE_REASON} (${decided.rule})` : `${REFUSED_OUTSIDE_REASON} (${decided.rule})`,
+    rule: decided.rule,
+    why: decided.asked,
+    task: decided.task?.slice(0, 300),
+  })
+  return decided
+}
+
+// The question the user is asked about one refused path. Everything needed to answer is in it: the path, what the
+// worker says it needs, what the task is, and what the rule protects. A question the user cannot answer from the prompt
+// is a bad question, and "should I trust this agent with your SSH key?" without the reason is exactly that.
+export function grantQuestion(job: Job | undefined, path: string, why: string, rule: string, task?: string): string {
+  const lines = [
+    `[${job ? `job ${job.id}` : "this session"}] A worker needs a path this plugin refuses by default, so only you can open it.`,
+    "",
+    `Path: ${path}`,
+    `What the worker says it needs there: ${why}`,
+    task ? `The task: ${task}` : "",
+    `Why it is refused: ${rule}. This plugin refuses it to every worker whatever the reason, and no task or vouch opens it.`,
+    "",
+    "Open this path for this job?",
+    'Answer "yes" and the workers of this job may read and write there for as long as this server runs.',
+    'Answer "no" and it stays closed for this job; asking again will not bring the question back.',
+  ].filter(Boolean)
+  return lines.join("\n")
+}
+
+// The user's answer to a grant question: yes or no, in the words people actually use. Matched before anything else, and
+// an answer that is neither is not an answer — the path stays closed rather than opening on a guess.
+export function grantAnswer(text: string): boolean | undefined {
+  const t = text.trim().toLowerCase().replace(/[.!?"']+$/g, "").replace(/^["']/, "")
+  if (["yes", "y", "yeah", "yep", "sure", "ok", "okay", "allow", "allow it", "open it", "go ahead", "do it"].includes(t)) return true
+  if (["no", "n", "nope", "nah", "deny", "deny it", "refuse", "keep it closed", "no way", "not this time"].includes(t)) return false
+  return undefined
+}
+
 export default {
   id: "jev-micromanager",
   setup: async (ctx: Context): Promise<void> => {
     const log = logger(ctx)
     const settings = loadSettings()
-    const { cloudOnly, parallel, perModel, budget, notify, routing, floors, decisions, error } = settings
+    const { cloudOnly, parallel, perModel, budget, notify, routing, floors, decisions, allowOutside, error } = settings
     const registry = cloudOnly ? cloudRegistry(settings.registry) : settings.registry
     if (error) log("warn", `config ignored, defaults used: ${error}`)
 
@@ -589,17 +745,36 @@ export default {
       }
       if (evaluation.effect !== "ask" || !ours.has(evaluation.agent)) return
       if (runnerSessions.has(evaluation.sessionID) && evaluation.action === "external_directory") {
-        // A reader may read a directory its task names, or one the micromanager vouched for with request_access
-        // (which arrives here as a line of the task, so decide.ts layer 3 decides it); nothing else outside, and
-        // writers never. The hard denials are absolute and come first: no task and no vouch opens the user's keys.
-        if (evaluation.resources.some(forbiddenOutside)) {
+        // A reader may read a directory its task names, one the micromanager vouched for with request_access (which
+        // arrives here as a line of the task, so decide.ts layer 3 decides it), one the user put in allowOutside, or one
+        // the user opened for this job after being asked; nothing else outside. Writers never, unless the user named the
+        // path for them.
+        //
+        // The hard denials come first and name what is refused: a task, a vouch and a prompt injection cannot open the
+        // user's keys. A path the user themselves opened is checked below, against the job it was granted for.
+        const here = jobOfSession(evaluation.sessionID)
+        const opened = [...allowOutside, ...grantedPaths(here)]
+        const refused = evaluation.resources.filter((path) => forbiddenOutside(path, opened))
+        if (refused.length > 0) {
+          // The reason names what is refused, and for a refused file the file itself: a worker told only "~/.config is
+          // out" cannot act on the answer, one told "hosts.yml is a credential file" can. Nothing refuses a path the
+          // user has already opened, so at least one reason is always here.
+          const what = refused.map(forbiddenOutsideWhat).filter(Boolean).join("; ")
+          const turnedDown = refused.filter((path) => grantFor(here, path)?.granted === false).length > 0
           evaluation.effect = "deny"
-          evaluation.message = "This path is one no worker ever reads: the user's keys, credentials, config and home directory, the system directories, another job's git data. Tell the micromanager; only the user can open it."
-          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "a hard-denied path" })
+          evaluation.message = turnedDown
+            ? "The user was asked about this path for this job and said no. It stays closed; do not try another way, report STATUS: NEEDS_CONTEXT."
+            : `This path is one no worker may reach: ${what}. Tell the micromanager; only the user can open it, by saying so when it asks them (request_access) or by putting the path in allowOutside in ${configPath()}.`
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: turnedDown ? `${REFUSED_OUTSIDE_REASON} (${what})` : `a hard-denied path (${what})` })
+          return
+        }
+        if (evaluation.resources.every((path) => allowedOutside(path, opened))) {
+          evaluation.effect = "allow"
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: ALLOW_OUTSIDE_REASON })
           return
         }
         const reader = !WRITERS.has(roleByAgent(evaluation.agent)?.id ?? "code")
-        const task = [workerTasks.get(evaluation.sessionID), vouchText(jobOfSession(evaluation.sessionID))].filter(Boolean).join("\n")
+        const task = [workerTasks.get(evaluation.sessionID), vouchText(here)].filter(Boolean).join("\n")
         if (reader && namedInTask(task, evaluation.resources)) {
           evaluation.effect = "allow"
           record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: "a reader, in a directory its task or the micromanager names" })
@@ -638,7 +813,7 @@ export default {
       // A worker session reads inside its own worktree (its directory), so the read-only-inside fast path applies to a
       // worker's inspection instead of asking Jev, whose confidence on those sits below the read floor.
       const root = runnerSessions.has(evaluation.sessionID) ? workerDirs.get(evaluation.sessionID) ?? ctx.location?.directory : undefined
-      const outcome = await decide(jev, request, floors, undefined, preset, root)
+      const outcome = await decide(jev, request, floors, undefined, preset, root, [...allowOutside, ...grantedPaths(job)])
       if (outcome.verdict !== "user") evaluation.effect = outcome.verdict
       else if (runnerSessions.has(evaluation.sessionID)) {
         evaluation.effect = "deny"
@@ -846,7 +1021,7 @@ export default {
               // lists only stop_job and plan_job, and a control it does not know about is one it will not reach for.
               `One task at a time: steer_task ${job.tasks[0]?.id ?? "<id>"} "<note>" for a running worker (no interrupt), stop_task <id> to stop one worker and keep the rest going.`,
               `The job branch: merge_job brings it into the user's checkout (fast-forward only; refuses a dirty checkout and unfinished work unless you pass the user's own words as ack), discard_job gives the branch and its worktrees back to git.`,
-              `A worker needs a path outside the project: request_access "<path>" "<why>" vouches for it, so a reader of this job may read it without asking again. The user's keys, credentials, config, home and the system directories stay refused either way.`,
+              `A worker needs a path outside the project: request_access "<path>" "<why>" vouches for it, so a reader of this job may read it without asking again. Most paths outside are open to nobody without the user. The user's keys, their home directory, the system directories and the credential files under ~/.config are refused by default, and request_access on one of those puts the question to the user instead of answering it: show that question word for word, call no tool, end your turn, and the user decides. A "yes" opens that one path for this job; a "no" is final.`,
             ].join("\n")
           },
           plan: async (goal, tctx) => {
@@ -973,10 +1148,27 @@ export default {
             // The job the vouch belongs to: the orchestrator's own job, so every worker of it inherits the vouch.
             const jobs = listSwept()
             const job = tctx.sessionID ? jobs.find((j) => j.facilitator === tctx.sessionID && j.rolling) ?? sessionJob(tctx.sessionID) : jobs[0]
-            const out = vouchAccess(project, job, path, why)
+            const out = vouchAccess(project, job, path, why, allowOutside, workerTasks.get(tctx.sessionID ?? ""))
             if (out.vouched && job) {
               record({ kind: "access", sessionID: tctx.sessionID, job: job.id, path: path.trim(), why: why.slice(0, 300) })
               log("info", `vouched for ${path.trim()} in job ${job.id}: ${why.slice(0, 120)}`)
+              return out.text
+            }
+            // A refused path is not a refusal: it is a question, and only the user can answer it. The question is
+            // marked outstanding for the job so a second call says so rather than asking the same thing twice, and the
+            // user's next turn in this session (the prompt hook above) settles it. Nothing opens until they say yes.
+            if (job && forbiddenOutside(path.trim(), allowOutside) && !out.vouched) {
+              const rule = forbiddenOutsideWhat(path.trim()) ?? "a path no worker may have"
+              const question: Asked = { path: normalizeOutside(path), rule, why: why.trim(), task: workerTasks.get(tctx.sessionID ?? "") }
+              const waiting = askedFor(job)
+              // One question at a time per job: a second request while the first is unanswered repeats the question to
+              // the user rather than to the agent, so the loop cannot become a way of pestering them.
+              if (waiting && waiting.path !== question.path) {
+                return `There is already a question waiting for the user about ${waiting.path}. Their answer comes first; ask again about ${path.trim()} afterwards. Do not ask a second question now.`
+              }
+              SHARED.asked.set(job.id, question)
+              record({ kind: "access", sessionID: tctx.sessionID, job: job.id, path: question.path, why: question.why, rule, asked: "the user has not answered yet" })
+              return `${grantQuestion(job, path.trim(), question.why, rule, question.task)}\n\nAsk the user this now: show it as it is, call no tool, and end your turn. Their reply reaches the plugin by itself.`
             }
             return out.text
           },
@@ -1030,6 +1222,22 @@ export default {
       else if (/^\s*stop\b/i.test(text)) ultrawork.delete(sessionID)
       const job = sessionJob(sessionID)
       if (!job) return
+      // The answer to a grant question, before anything else this turn: it is a yes or a no about a path, and a turn
+      // that carried one must not be swallowed by a policy shortcut or a planning answer. This is the only way a
+      // refused path is ever opened, and it runs here — a turn the user typed in this session — never from a worker,
+      // whose turn this hook never sees.
+      const pending = askedFor(job)
+      if (pending) {
+        const answer = grantAnswer(text)
+        if (answer === undefined) {
+          steering.set(sessionID, `[job ${job.id}] Still waiting for your answer about ${pending.path}: "yes" opens it for the workers of this job, "no" leaves it closed. Answer with one word.`)
+          return
+        }
+        const said = grant(job, pending, answer, sessionID)
+        log("info", `the user ${said.granted ? "opened" : "refused"} ${pending.path} for job ${job.id}`)
+        steering.set(sessionID, `[job ${job.id}] ${said.text} Tell the worker that in its next report.`)
+        return
+      }
       try {
         const pin = matchShortcut(text)
         if (pin) {

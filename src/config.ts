@@ -137,6 +137,31 @@ export function parseCloudOnly(text: string): boolean {
   return raw
 }
 
+// "allowOutside": absolute paths (or path prefixes) a worker may reach even where src/decide.ts refuses, e.g.
+// ["/home/u/.config/omarchy"]. Empty by default: the user's list is the only thing that lifts those rules, and it lifts
+// nothing until they write it. A wrong entry here is a widened rule, so the value is checked, not cast: a list of
+// non-empty strings, each of which resolves to an absolute path. `~` is left to src/decide.ts to expand, so what the
+// user wrote is what they can see in the journal.
+export function parseAllowOutside(text: string): readonly string[] {
+  const raw = (JSON.parse(stripComments(text)) as { allowOutside?: unknown }).allowOutside ?? []
+  if (!Array.isArray(raw)) throw new Error('allowOutside must be a list of absolute paths, e.g. ["/home/u/.config/omarchy"]')
+  const out: string[] = []
+  for (const entry of raw) {
+    if (typeof entry !== "string" || entry.trim() === "") {
+      throw new Error(`allowOutside must be a list of absolute paths; ${JSON.stringify(entry)} is not one`)
+    }
+    const path = entry.trim()
+    // A relative entry is a silent no-op or, worse, a guess at the cwd of whatever asked; say so instead.
+    if (!path.startsWith("/") && path !== "~" && !path.startsWith("~/")) {
+      throw new Error(`allowOutside entries must be absolute paths (or start with ~), got ${JSON.stringify(entry)}`)
+    }
+    // The entry is kept as written (src/decide.ts normalises it when it matches), so the journal shows the user their
+    // own words. A repeated entry is dropped: a list that lists the same path twice says nothing a list says once.
+    if (!out.includes(path)) out.push(path)
+  }
+  return out
+}
+
 // With cloudOnly, local models stay in the registry (they show up in the journal's ranking) but are never routed to.
 export function cloudRegistry(registry: readonly ModelEntry[]): ModelEntry[] {
   return registry.map((m) => (m.location === "local" ? { ...m, disabled: true } : m))
@@ -152,6 +177,21 @@ export interface Settings {
   readonly floors: Floors
   readonly decisions: PolicySet
   readonly registry: readonly ModelEntry[]
+  readonly allowOutside: readonly string[]
+}
+
+// The settings a config file that is missing or broken falls back to. One place, so the two returns below cannot drift
+// apart and a setting added here is never left out of the error path.
+const DEFAULTS: Omit<Settings, "registry"> = {
+  cloudOnly: true,
+  parallel: 3,
+  perModel: 2,
+  budget: DEFAULT_BUDGET,
+  notify: "jobs",
+  routing: DEFAULT_ROUTING,
+  floors: DEFAULT_FLOORS,
+  decisions: {},
+  allowOutside: [],
 }
 
 export function loadSettings(path = configPath()): Settings & { error?: string } {
@@ -159,11 +199,11 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { cloudOnly: true, parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY } // no file: the defaults
+    return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { cloudOnly: parseCloudOnly(text), ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text) }
   } catch (err) {
-    return { cloudOnly: true, parallel: 3, perModel: 2, budget: DEFAULT_BUDGET, notify: "jobs", routing: DEFAULT_ROUTING, floors: DEFAULT_FLOORS, decisions: {}, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
+    return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }
 }

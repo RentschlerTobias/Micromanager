@@ -9,8 +9,9 @@
 // floor (0.80), so asking only turned inspection into denials.
 //
 // external_directory is layered, not a blanket "never":
-//   1. a hard rule that no layer can pass: the user's keys and credentials, their home itself, the system
-//      directories, another job's branch in the repository's own git data;
+//   1. a hard rule no layer can pass: the user's keys and credential stores, their home itself, the system
+//      directories, the secret files inside ~/.config, another job's branch in the repository's own git data. The
+//      user's `allowOutside` setting is the one thing that lifts it, and only for the paths it names (below);
 //   2. the job's own area: any worktree under <project>/.jev-micromanager/worktrees/, this job's integration
 //      worktree included. Path-based, never a substring: `worktrees-old` is not `worktrees`;
 //   3. task-vouched: a path the task text names with its full path, for a read only (a named path is a vouch for
@@ -20,7 +21,7 @@
 import { execFileSync } from "node:child_process"
 import { existsSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, isAbsolute, join, normalize } from "node:path"
+import { basename, dirname, isAbsolute, join, normalize } from "node:path"
 
 import type { Decision, Jev, Question } from "./jev.ts"
 import { WRITERS } from "./profile.ts"
@@ -60,9 +61,13 @@ export const DEFAULT_FLOORS: Floors = { read: 0.8, write: 0.85, needsUser: 0.5, 
 
 const READ_ACTIONS = new Set(["read", "glob", "grep", "list", "webfetch", "websearch", "lsp", "skill", "question"])
 
-// Never decided by Jev, whatever it says.
-const ALWAYS_USER: readonly { readonly test: (r: PermissionRequest) => boolean; readonly why: string }[] = [
-  { test: (r) => r.action === "external_directory" && r.resources.some(forbiddenOutside), why: "a path no layer may allow" },
+// Never decided by Jev, whatever it says. The user's allowOutside is passed to every test, so a path the user named
+// falls through to the layers below instead of stopping here.
+const ALWAYS_USER: readonly { readonly test: (r: PermissionRequest, allowed: readonly string[]) => boolean; readonly why: string }[] = [
+  {
+    test: (r, allowed) => r.action === "external_directory" && r.resources.some((p) => forbiddenOutside(p, allowed)),
+    why: "a path no layer may allow",
+  },
   { test: (r) => r.action === "read" && r.resources.some((p) => /(^|\/)\.env(\.|$)/.test(p) && !p.endsWith(".example")), why: "a .env file" },
   {
     test: (r) =>
@@ -139,18 +144,82 @@ function relevanceFacts(facts: readonly PathFacts[]): string {
 }
 
 const HOME = homedir()
-// Paths outside the project that no layer may allow: the user's keys, credentials and config, and the system.
-const FORBIDDEN_OUTSIDE: readonly string[] = [
-  join(HOME, ".ssh"), join(HOME, ".aws"), join(HOME, ".gnupg"), join(HOME, ".config"),
-  join(HOME, ".local", "share", "keyrings"), join(HOME, ".netrc"),
-  "/etc", "/usr", "/boot", "/var", "/proc", "/sys",
+// Directories outside the project that no layer may allow, each named with what it holds. These are refused whole
+// because nearly everything inside them is a secret, so a per-file rule would be theatre: .ssh, .aws and .gnupg are
+// private keys, .netrc and the keyring are logins, .password-store is a password database.
+//
+// ~/.config is deliberately NOT on this list. It holds application configuration as much as tokens — 61 application
+// directories on the user's own machine and not one file matching the names the old whole-directory ban claimed to
+// protect — and refusing it whole made a real task impossible (2026-10-07: a worker could not read
+// ~/.config/omarchy/shell.json for the plugin id that decides whether a system service restarts in a loop). What is
+// refused there is the secret files themselves, below, at the granularity that actually protects them.
+const FORBIDDEN_OUTSIDE: readonly { readonly dir: string; readonly what: string }[] = [
+  { dir: join(HOME, ".ssh"), what: "the user's keys in ~/.ssh" },
+  { dir: join(HOME, ".aws"), what: "the user's AWS credentials in ~/.aws" },
+  { dir: join(HOME, ".gnupg"), what: "the user's GPG keys in ~/.gnupg" },
+  { dir: join(HOME, ".password-store"), what: "the user's password store in ~/.password-store" },
+  { dir: join(HOME, ".local", "share", "keyrings"), what: "the user's keyring in ~/.local/share/keyrings" },
+  { dir: join(HOME, ".netrc"), what: "the user's login credentials in ~/.netrc" },
+  // The system itself. /var and /sys stay whole on purpose: they are read-mostly, so refusing them costs a worker
+  // little (nothing a task needs lives only there, and a reading tool asks about a file it names), while narrowing
+  // them to a file list would mean guessing at every package's and the kernel's own state files.
+  { dir: "/etc", what: "the system directory /etc" },
+  { dir: "/usr", what: "the system directory /usr" },
+  { dir: "/boot", what: "the system directory /boot" },
+  { dir: "/var", what: "the system directory /var" },
+  { dir: "/proc", what: "the system directory /proc" },
+  { dir: "/sys", what: "the system directory /sys" },
 ]
+
+// The secret files inside ~/.config, matched case-insensitively against the LAST path segment only. The segment is the
+// point: `*token*` is a rule about a file's own name (huggingface_token, .netrc_token, a service-token.json), not about
+// a directory that happens to contain the word somewhere in its parents — a directory called token-store is a config
+// directory, and refusing it would reproduce the bug this list replaces.
+const SECRET_IN_CONFIG: readonly RegExp[] = [
+  /^auth\.json$/, // opencode's own stored credentials
+  /^credentials(\..*)?$/, // ~/.aws/credentials' shape, and the git-credential-store default
+  /^\.credentials$/, // python keyring's file of the same name
+  /^hosts\.yml$/, // the GitHub CLI's token store
+  /^logins\.json$/, // a Firefox profile's saved logins
+  /^key[34]\.db$/, // Firefox's own key databases
+  /\.kdbx$/, // keepass databases
+  /token/, // huggingface_token, *-token.json, .token
+  /_token$/, // the explicit spelling of the same, kept so the rule reads as one rule per convention
+  /\.secret$/, // *.secret, and npm's own .npmrc-adjacent secrets
+  /^secrets\./, // secrets.json, secrets.yaml, secrets.toml
+]
+
 // Another job's worktree metadata and branches live under .git/; a worker never reaches them, whatever its task says.
 const GIT_DATA = /(^|\/)\.git\/(worktrees|refs)\//
 
+// What the journal and the refusal messages call the user's own setting, so every layer words it the same way.
+export const ALLOW_OUTSIDE_REASON = "the user's allowOutside setting"
+
+// What the journal says when the user opened one refused path for one job, and when they turned it down. Both name the
+// user on purpose: a record that only said "allowed" or "denied" would read as though nothing had ever been wrong,
+// and an operator reading the journal after the fact could not tell a rule from an exception to it.
+export const GRANT_OUTSIDE_REASON = "the user opened this path for this job"
+export const REFUSED_OUTSIDE_REASON = "the user refused this path for this job"
+
+// The user's own `allowOutside` setting: absolute paths or path prefixes the user has decided a worker may reach, even
+// where the rules above refuse. Matching is on whole segments like every other path rule here, so an entry never opens
+// a sibling that merely shares its name (/home/u/.config-x is not /home/u/.config), and the entries are compared
+// through the same normalisation, so `~`, a trailing slash and `..` cannot smuggle a path past a rule.
+export function allowedOutside(resource: string, allowed: readonly string[] = []): boolean {
+  const path = normalizeOutside(resource)
+  if (path.length === 0 || path === ".") return false
+  return allowed.some((entry) => {
+    const base = normalizeOutside(entry)
+    return base.length > 0 && under(path, base)
+  })
+}
+
 // `~` expanded, a trailing `/*` or `/` dropped, `..` resolved lexically. No filesystem access: a path that does not
 // exist yet has to be classified the same way as one that does.
-function normalizeOutside(path: string): string {
+//
+// Exported because a grant the user gave is remembered as a path, and the only thing that may decide whether a later
+// request is "the same path" is the same normalisation the rules use. A second copy here would drift from it.
+export function normalizeOutside(path: string): string {
   const trimmed = path.trim()
   const bare = trimmed.replace(/\/+$/, "").replace(/(?<=[^/])\/\*+$/, "")
   const expanded = bare === "~" ? HOME : bare.startsWith("~/") ? join(HOME, bare.slice(2)) : bare
@@ -162,15 +231,43 @@ function under(path: string, base: string): boolean {
   return path === base || path.startsWith(`${base}/`)
 }
 
-export function forbiddenOutside(resource: string): boolean {
+// The user's own `allowOutside`, checked first: it is the one thing that lifts the rules below, and it is only ever the
+// user's own list, never a task's or a vouch's. A refusal that survives it survives everything.
+export function forbiddenOutside(resource: string, allowed: readonly string[] = []): boolean {
+  if (allowedOutside(resource, allowed)) return false
   const path = normalizeOutside(resource)
   if (path === "/") return true // the whole file system
   if (path.length === 0 || path === ".") return false
-  return path === HOME || FORBIDDEN_OUTSIDE.some((f) => under(path, f)) || GIT_DATA.test(path)
+  // The home directory itself stays refused whatever the per-path rules above say: a request for `~` is a request to
+  // sweep everything in it at once, and the rules for its subdirectories are no answer to that. Naming `~` in
+  // allowOutside is the one way past it, and only because the user wrote it down.
+  if (path === HOME) return true
+  if (FORBIDDEN_OUTSIDE.some((f) => under(path, f.dir))) return true
+  // ~/.config is not refused whole; its secret files are, by name, last segment only.
+  if (under(path, join(HOME, ".config")) && SECRET_IN_CONFIG.some((pattern) => pattern.test(basename(path).toLowerCase()))) return true
+  return GIT_DATA.test(path)
 }
 
-export function hardRule(request: PermissionRequest): string | undefined {
-  return ALWAYS_USER.find((rule) => rule.test(request))?.why
+// Why a refusal is written down with, or undefined when nothing refuses the path: what the rule protects, and for a
+// secret file the file's own name, so a worker is told which file was the problem rather than being told about a whole
+// directory. undefined rather than a wrong sentence, so a caller cannot put a reason on a path no rule refused.
+export function forbiddenOutsideWhat(resource: string): string | undefined {
+  const path = normalizeOutside(resource)
+  if (path === "/") return "the whole file system"
+  if (path === HOME) return "the home directory itself"
+  const dir = FORBIDDEN_OUTSIDE.find((f) => under(path, f.dir))
+  if (dir) return dir.what
+  const config = join(HOME, ".config")
+  if (under(path, config)) {
+    const name = basename(path).toLowerCase()
+    if (SECRET_IN_CONFIG.some((pattern) => pattern.test(name))) return `${name}, a credential file in ~/.config`
+  }
+  if (GIT_DATA.test(path)) return "another job's branches and worktree metadata in the repository's own git data"
+  return undefined
+}
+
+export function hardRule(request: PermissionRequest, allowed: readonly string[] = []): string | undefined {
+  return ALWAYS_USER.find((rule) => rule.test(request, allowed))?.why
 }
 
 const READ_PROGRAMS = new Set([
@@ -340,12 +437,19 @@ function readsOutside(request: PermissionRequest): boolean {
   return !WRITERS.has(roleByAgent(request.agent)?.id ?? "code")
 }
 
-// Layer 2 and 3 of the external_directory policy: the job's own area is mechanical, everything else is the user
-// unless the task names the path and nothing is written to it. Vouching for a path is not vouching for a write.
-export function externalVerdict(request: PermissionRequest): Outcome | undefined {
+// Layer 2 and 3 of the external_directory policy: the job's own area is mechanical, the user's own allowOutside is
+// their standing decision, everything else is the user unless the task names the path and nothing is written to it.
+// Vouching for a path is not vouching for a write.
+//
+// The allowOutside reason names the setting on purpose. A record that said only "allowed" would leave an operator
+// asking whether anything was wrong with the request; this one says the user's own policy opened it.
+export function externalVerdict(request: PermissionRequest, allowed: readonly string[] = []): Outcome | undefined {
   if (request.action !== "external_directory" || request.resources.length === 0) return undefined
   if (request.resources.every((path) => inJobArea(request.directory, path))) {
     return { verdict: "allow", reason: "inside the job's own worktrees" }
+  }
+  if (request.resources.every((path) => allowedOutside(path, allowed))) {
+    return { verdict: "allow", reason: ALLOW_OUTSIDE_REASON }
   }
   if (readsOutside(request) && request.resources.every((path) => taskNamesPath(request.task, path))) {
     return { verdict: "allow", reason: "a read of a directory the task names" }
@@ -429,6 +533,11 @@ export function judge(decision: Decision, request: PermissionRequest, floors: Fl
 //
 // root: the job's worktree (or the project root), where a read needs nobody. It defaults to the request's own
 // directory so a caller that knows nothing more still gets the fast path.
+//
+// allowed: the user's own `allowOutside` setting, the paths they decided a worker may reach. It is threaded into the
+// hard rules (forbiddenOutside) and into the external_directory layers, never asked about: it is a decision the user
+// already made in the config, not one for Jev to re-litigate per request. Default empty: with no setting, a caller's
+// behaviour is exactly what it was before the setting existed.
 export async function decide(
   jev: Jev | undefined,
   request: PermissionRequest,
@@ -436,8 +545,9 @@ export async function decide(
   inspect: Inspect = inspectPaths,
   preset?: "allow" | "deny" | "user",
   root: string | undefined = request.directory,
+  allowed: readonly string[] = [],
 ): Promise<Outcome> {
-  const rule = hardRule(request)
+  const rule = hardRule(request, allowed)
   if (rule) return { verdict: "user", reason: `always the user: ${rule}` }
   // A read-only command inside the job's own worktree: it changes nothing and names no path outside, and Jev's own
   // confidence on these sits under the read floor, so asking it only turned a worker's inspection into a denial.
@@ -446,10 +556,12 @@ export async function decide(
   if (!presetRules && request.action !== "external_directory" && root !== undefined && readsOnlyInside(request, root)) {
     return { verdict: "allow", reason: "read-only command inside the job's worktree" }
   }
-  const outside = presetRules ? undefined : externalVerdict(request)
+  const outside = presetRules ? undefined : externalVerdict(request, allowed)
   if (outside) return outside
   // Layer 3: anything else outside the project is the user's, as it was before the layers existed (a preset never
   // reached this far either: an ask outside the project was never the policy's to answer).
+  // A preset still wins over allowOutside, as it does over the job area and the task's own paths: the user wrote both,
+  // and a per-request policy is the narrower word.
   if (request.action === "external_directory") {
     return { verdict: "user", reason: "always the user: access outside the project" }
   }
