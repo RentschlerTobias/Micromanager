@@ -6,8 +6,8 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import {
-  dirtyPaths, IntegrationError, prepareIntegration, prepareTaskWorktree, projectRel, runGate, taskDir,
-  type Exec, type Run,
+  changedFiles, dirtyPaths, hashFiles, IntegrationError, prepareIntegration, prepareTaskWorktree, projectRel,
+  revertFiles, runGate, taskDir, type Exec, type Run,
 } from "../src/integration.ts"
 import { DIR } from "../src/store.ts"
 
@@ -138,4 +138,47 @@ test("an uncommitted working tree is reported, and a clean one is not", async ()
 
   const many = Array.from({ length: 8 }, (_, n) => `?? a/b/c/f${n}.txt`).join("\n")
   assert.match((await dirtyPaths(PROJECT, fakeGit(answers(TOP, many), PROJECT).run)).summary, /\+3 more/, "a short summary, not the whole tree")
+})
+
+test("changed files are project-relative, the basis task.files is on", async () => {
+  // git reports from the repository root; task.files and a Checks line are project-relative. Without the offset
+  // resolved away, every change in a subdirectory project looks like it happened outside its declared files.
+  const status = " M a/b/c/references.bib\n?? a/b/c/notes.md\n M a/b/c/deep/dir/fig.png\n M other/x.txt\n"
+  // changedFiles asks for `git status --porcelain --untracked-files=all`; answers() keys on the short form, so build it.
+  const porcelain = (lines: string): Record<string, string> => ({
+    ...answers(TOP, ""),
+    "git status --porcelain --untracked-files=all": lines,
+  })
+
+  const plain = await changedFiles("/wt", fakeGit(porcelain(status), "/wt").run, "")
+  assert.deepEqual(plain, ["a/b/c/references.bib", "a/b/c/notes.md", "a/b/c/deep/dir/fig.png", "other/x.txt"])
+
+  const offset = await changedFiles("/wt", fakeGit(porcelain(status), "/wt").run, "a/b/c")
+  assert.deepEqual(
+    offset.slice(0, 3),
+    ["references.bib", "notes.md", "deep/dir/fig.png"],
+    "inside the project: relative to the project, so a declared file matches",
+  )
+  assert.equal(offset.at(-1), "../../../other/x.txt", "outside the project: an escape that climbs to the root, so it cannot match a declared file")
+  assert.ok(offset.at(-1)!.startsWith(".."), "an outside change is never reported as an inside one")
+})
+
+test("revertFiles and hashFiles act in the directory the paths are relative to", async () => {
+  // Both are fed changedFiles output. A same-named file at the worktree root must not be the one that gets touched.
+  const seen: Call[] = []
+  const record: Exec = async (command, args, options) => {
+    seen.push({ command, args: [...args], cwd: options.cwd })
+    return { code: 0, stdout: "deadbeef\n", stderr: "" }
+  }
+
+  await hashFiles("/wt", ["references.bib"], record, "/wt/a/b/c")
+  assert.deepEqual(seen.at(-1), { command: "git", args: ["hash-object", "--", "references.bib"], cwd: "/wt/a/b/c" })
+
+  await revertFiles("/wt", ["references.bib"], record, "/wt/a/b/c")
+  const restore = seen.find((c) => c.args.includes("checkout"))!
+  assert.equal(restore.cwd, "/wt/a/b/c", "git resolves a pathspec against its own directory: the wrong one touches a different file")
+  assert.deepEqual(restore.args, ["checkout", "-q", "HEAD", "--", "references.bib"])
+
+  const fallback = await hashFiles("/wt", ["references.bib"], record)
+  assert.equal(seen.at(-1)!.cwd, "/wt", "without a directory it keeps the worktree root, as before")
 })

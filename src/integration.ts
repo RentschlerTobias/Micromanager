@@ -112,9 +112,18 @@ export async function prepareIntegration(project: string, jobId: string, run: Ex
 }
 
 // Files the worker changed in the worktree since the last commit, untracked ones included.
-export async function changedFiles(worktree: string, run: Exec = exec): Promise<string[]> {
+// The paths come back relative to the project directory inside the worktree, the basis every caller compares them on:
+// task.files and a task's Checks line are project-relative. git always reports from the repository root, so with a
+// non-empty rel the offset is resolved away; a change outside the project comes back as a "../" path, which cannot
+// match a declared file (which is what it is: outside).
+export async function changedFiles(worktree: string, run: Exec = exec, rel = ""): Promise<string[]> {
   const status = await run("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: worktree })
-  return status.stdout.split("\n").filter(Boolean).map((line) => line.slice(3).trim())
+  const project = taskDir(worktree, rel)
+  return status.stdout
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.slice(3).trim())
+    .map((path) => relative(project, resolve(worktree, path)).split(sep).join("/"))
 }
 
 // Commits a passed task on the job's branch. Returns the commit, or undefined when nothing changed.
@@ -154,17 +163,20 @@ export async function workingDiff(worktree: string, run: Exec = exec): Promise<s
 }
 
 // Content hashes of files, to see whether frozen tests were changed; a missing file hashes to "".
-export async function hashFiles(worktree: string, files: readonly string[], run: Exec = exec): Promise<Map<string, string>> {
+// dir: the project directory inside the worktree, because the paths are project-relative (changedFiles).
+export async function hashFiles(worktree: string, files: readonly string[], run: Exec = exec, dir = worktree): Promise<Map<string, string>> {
   const out = new Map<string, string>()
-  for (const f of files) out.set(f, (await run("git", ["hash-object", "--", f], { cwd: worktree })).stdout.trim())
+  for (const f of files) out.set(f, (await run("git", ["hash-object", "--", f], { cwd: dir })).stdout.trim())
   return out
 }
 
 // Undoes a worker's changes to the given files: tracked ones back to the last commit, new ones removed.
-export async function revertFiles(worktree: string, files: readonly string[], run: Exec = exec): Promise<void> {
+// dir: the project directory inside the worktree, because the paths are project-relative (changedFiles). git resolves a
+// pathspec against the directory it runs in, so resolving the wrong one would silently touch a file of the same name.
+export async function revertFiles(worktree: string, files: readonly string[], run: Exec = exec, dir = worktree): Promise<void> {
   for (const f of files) {
-    const restored = await run("git", ["checkout", "-q", "HEAD", "--", f], { cwd: worktree })
-    if (restored.code !== 0) await run("git", ["clean", "-q", "-f", "--", f], { cwd: worktree })
+    const restored = await run("git", ["checkout", "-q", "HEAD", "--", f], { cwd: dir })
+    if (restored.code !== 0) await run("git", ["clean", "-q", "-f", "--", f], { cwd: dir })
   }
 }
 
