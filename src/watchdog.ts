@@ -24,7 +24,7 @@ export interface Limits {
   readonly window: number // ... within this many calls
   readonly readRepeat: number // the same path read this often ...
   readonly readWindow: number // ... within this many calls, and with no write in between
-  readonly noNewFiles: number // this many calls in a row without a new path or a search
+  readonly noNewFiles: number // this many calls in a row without progress; 0 disables the check (see below)
   readonly restartLength: number // the opening calls repeated in this length
   readonly monologue: number // assistant turns in a row without a tool call
 }
@@ -40,15 +40,20 @@ export interface Limits {
 //   work*. Before the window, reading a config file three times anywhere in a 200-call session was a hard stop, and
 //   normal work looked like the planner's loop. 16 calls is more than a read-explore-read cycle takes and less than
 //   a session's worth, so a real loop cannot hide outside it.
-// - noNewFiles 8: calls in a row that neither open a path nor search. Searches count as progress (a worker doing
-//   nine greps is exploring, not stuck); anything else counts towards the run, so a session that only runs commands
-//   still gets caught.
+// - noNewFiles 16: calls in a row that make no progress. Three things count as progress: a new path, a search, and
+//   a command that actually did something. A command that runs is progress -- a worker verifying with `npm test` or
+//   `git status` ten times over is working, not stuck -- and the signature that actually catches a stuck command is
+//   sameCall, which compares the command itself rather than counting calls (live test, 2026-10-07: a worker was
+//   stopped after "8 calls in a row without a new file or a search" while it was eight calls into reading a source
+//   file it had already opened, before it had written anything). Only a command that keeps FAILING now counts
+//   towards the run, because that is the case sameCall cannot see. Readers, whose whole job is reading and who never
+//   write, are the extreme case: they would trip a low bar on ordinary work.
 // - restartLength 4: the opening calls repeated verbatim at the tail of the *whole* session. That comparison is
 //   deliberately not windowed: starting over is by definition where the session began. Four is enough of an opening
 //   to be a shape rather than a coincidence (one read can repeat by chance, four calls rarely do).
 // - monologue 3: a worker writing a long report in several messages was interrupted mid-report, so it only nudges.
 // - maxSteps: the last safety net for a session that never ends (the user, 2026-10-05: a cut session wastes work).
-export const DEFAULT_LIMITS: Limits = { maxSteps: 60, sameCall: 3, window: 10, readRepeat: 3, readWindow: 16, noNewFiles: 8, restartLength: 4, monologue: 3 }
+export const DEFAULT_LIMITS: Limits = { maxSteps: 60, sameCall: 3, window: 10, readRepeat: 3, readWindow: 16, noNewFiles: 16, restartLength: 4, monologue: 3 }
 
 // The budget tier the decision model picks (design.md §8.1) maps to step limits; code keeps the ceiling.
 export const TIER_STEPS = { S: 30, M: 60, L: 120 } as const
@@ -77,8 +82,16 @@ export const TIER_TOKENS = { S: 250_000, M: 600_000, L: 1_500_000 } as const
 const READS = new Set(["read", "list"])
 const WRITES = new Set(["edit", "write", "patch", "multiedit", "apply_patch"])
 // Searching is work: a worker that greps and globs nine times in a row is exploring a repository, not going in
-// circles, and none of those calls opens a path the noNewFiles counter could see.
-const SEARCHES = new Set(["grep", "glob", "ast-grep", "astgrep", "websearch", "webfetch", "search", "code_search"])
+// circles, and none of those calls opens a path the noNewFiles counter could see. code_graph is in here because it
+// is a search over the syntax tree that opens no path at all (added 2026-10-06, missed by this list until then).
+const SEARCHES = new Set([
+  "grep", "glob", "ast-grep", "astgrep", "websearch", "webfetch", "search", "code_search", "code_graph",
+])
+// Tools that act: they run something whose outcome is not a file this watchdog can see. A successful one is progress,
+// whatever it touched. A failing one is not counted here -- it falls through and counts towards the run, which is
+// what a worker repeatedly failing the same way looks like, and the one case sameCall cannot catch because the
+// command text differs each time.
+const ACTS = new Set(["shell", "bash", "execute", "task"])
 
 interface State {
   limits: Limits
@@ -163,13 +176,18 @@ export class Watchdog {
       const n = s.readWindow.filter((p) => p === part).length
       if (n >= s.limits.readRepeat) return { kind: "read_loop", severity: "nudge", detail: `read ${path}${i?.offset !== undefined ? ` from line ${String(i.offset)}` : ""} ${n}x in a row with no write in between` }
     }
-    // Progress, not only new files: a search is progress, and so is anything that is not a plain re-read.
+    // Progress, not only new files. A search counts, and so does a command that ran and did not fail -- including
+    // the `execute` tool, which is how a worker acts in code mode and which opens no path for the check below to
+    // see. Only a command that keeps failing counts towards the run (see ACTS above).
     if (wrote || SEARCHES.has(tool)) s.quiet = 0
+    else if (ACTS.has(tool) && !failed) s.quiet = 0
     else if (path && READS.has(tool) && !s.readPaths.has(path)) {
       s.readPaths.add(path)
       s.quiet = 0
     } else s.quiet++
-    if (s.quiet >= s.limits.noNewFiles) return { kind: "no_new_files", severity: "stop", detail: `${s.quiet} calls in a row without a new file or a search` }
+    if (s.limits.noNewFiles > 0 && s.quiet >= s.limits.noNewFiles) {
+      return { kind: "no_new_files", severity: "stop", detail: `${s.quiet} calls in a row without progress: no new file, no search, no command that worked` }
+    }
     const k = s.limits.restartLength
     if (s.calls.length >= 2 * k && s.calls.slice(-k).join("\n") === s.calls.slice(0, k).join("\n")) {
       return { kind: "restart", detail: `the first ${k} calls came again: the session started over` }

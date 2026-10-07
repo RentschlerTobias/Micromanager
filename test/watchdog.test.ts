@@ -106,10 +106,65 @@ test("any progress clears the read count, a `git commit` through the shell inclu
   assert.equal(added.onTool("s", "read", { path: "b.ts" }), undefined)
 })
 
-test("searching is progress: nine greps in a row are no stall, eight plain reads are", () => {
+test("a command that works is progress: verifying repeatedly is not a stall", () => {
+  // Live test, 2026-10-07: a worker was stopped after "8 calls in a row without a new file or a search" while it
+  // was eight calls into reading a source file, before it had written anything. SameCall is the signature that
+  // catches a stuck *command*; counting calls as well stopped workers that were simply verifying their work.
+  const w = new Watchdog()
+  w.watch("s")
+  for (let n = 0; n < 40; n++) {
+    assert.equal(w.onTool("s", "shell", { command: `npm test -- --run ${n}` }), undefined, `call ${n + 1}`)
+  }
+  // The same command over and over is still caught, by the signature meant for it.
+  const loop = new Watchdog()
+  loop.watch("l")
+  assert.equal(loop.onTool("l", "shell", { command: "npm test" }), undefined)
+  assert.equal(loop.onTool("l", "shell", { command: "npm test" }), undefined)
+  assert.equal(loop.onTool("l", "shell", { command: "npm test" })?.kind, "same_call")
+
+  // A command that keeps failing is the case sameCall cannot see: the text differs, nothing works.
+  const failing = new Watchdog()
+  failing.watch("f", { noNewFiles: 6 })
+  for (let n = 0; n < 5; n++) assert.equal(failing.onTool("f", "shell", { command: `step-${n}` }, true), undefined)
+  assert.equal(failing.onTool("f", "shell", { command: "step-5" }, true)?.kind, "no_new_files")
+
+  // execute is how a worker acts in code mode: it opens no path, so it must count as progress.
+  const code = new Watchdog()
+  code.watch("c")
+  for (let n = 0; n < 30; n++) assert.equal(code.onTool("c", "execute", { code: `step ${n}` }), undefined)
+
+  // code_graph is a search over the syntax tree; it opens no path either.
+  const graph = new Watchdog()
+  graph.watch("g")
+  for (let n = 0; n < 30; n++) assert.equal(graph.onTool("g", "code_graph", { symbol: `sym${n}` }), undefined)
+})
+
+test("re-reading one file to work through it is a reader doing its job", () => {
+  // An explorer never writes and often re-opens what it read; a low bar on "new file" stops it on ordinary work.
+  const w = new Watchdog()
+  w.watch("s")
+  for (let n = 0; n < 12; n++) {
+    assert.equal(w.onTool("s", "read", { path: "/repo/src/deep/file.ts", offset: n * 100 }), undefined, `part ${n + 1}`)
+  }
+  // A genuinely quiet session -- re-reading and nothing else -- is still caught, at the higher bar. It takes 16
+  // calls: the first opened a new path, so the run starts after it.
+  const quiet = new Watchdog()
+  quiet.watch("q")
+  // The first call opened a new path, so the run starts after it: 16 further re-reads reach the bar.
+  for (let n = 0; n < 16; n++) assert.equal(quiet.onTool("q", "read", { path: "/repo/src/deep/file.ts", offset: n * 100 }), undefined, `part ${n}`)
+  assert.equal(quiet.onTool("q", "read", { path: "/repo/src/deep/file.ts", offset: 1600 })?.kind, "no_new_files")
+
+  // A reader may opt out entirely: the check is about writing progress, which a reader never does.
+  const off = new Watchdog()
+  off.watch("o", { noNewFiles: 0 })
+  for (let n = 0; n < 100; n++) assert.equal(off.onTool("o", "read", { path: "/repo/src/deep/file.ts", offset: n }), undefined)
+})
+
+test("searching is progress: a run of greps is no stall, a run of the same re-read is", () => {
   const searching = w({ sameCall: 99 })
-  for (let i = 0; i < 9; i++) assert.equal(searching.onTool("s", "grep", { pattern: `p${i}` }), undefined, `grep ${i}`)
-  const d = w({ sameCall: 99, readRepeat: 99, restartLength: 99 }) // restartLength: eight identical calls are a start-over, not a stall run
+  for (let i = 0; i < 30; i++) assert.equal(searching.onTool("s", "grep", { pattern: `p${i}` }), undefined, `grep ${i}`)
+  // restartLength: a long run of identical calls is caught as a start-over instead, which is a better description.
+  const d = w({ sameCall: 99, readRepeat: 99, restartLength: 99, noNewFiles: 8 })
   d.onTool("s", "read", { path: "a.ts" })
   for (let i = 0; i < 7; i++) assert.equal(d.onTool("s", "read", { path: "a.ts" }), undefined, `read ${i}`)
   assert.equal(d.onTool("s", "read", { path: "a.ts" })?.kind, "no_new_files")
@@ -128,9 +183,11 @@ test("a read loop and a monologue nudge; the tight loops still stop; untouched k
   same.onTool("s", "shell", { command: "npm test" })
   same.onTool("s", "shell", { command: "npm test" })
   assert.equal(same.onTool("s", "shell", { command: "npm test" })?.severity, "stop")
+  // Re-reading one path and nothing else is the quiet run this signature is for. The bar is noNewFiles (16 by
+  // default), and it counts calls rather than the eight the old threshold used.
   const files = w({ sameCall: 99, readRepeat: 99, restartLength: 99 })
   files.onTool("s", "read", { path: "a.ts" })
-  for (let i = 0; i < 8; i++) files.onTool("s", "read", { path: "a.ts" })
+  for (let i = 0; i < 15; i++) files.onTool("s", "read", { path: "a.ts" })
   assert.equal(files.onTool("s", "read", { path: "a.ts" })?.severity, "stop")
   // a kind this change did not touch keeps the old shape: no severity field at all, so every caller behaves as before
   const steps = w({ maxSteps: 0 })
