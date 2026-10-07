@@ -145,10 +145,21 @@ export interface GateResult {
 // Runs each check in the task's directory at low priority; a check passes on exit code 0.
 // worktree is the git worktree root; dir is where the worker's own paths resolve, which is the project directory inside
 // the worktree. Without it a check names a file of the project and the shell looks for it in the wrong tree.
-export async function runGate(worktree: string, commands: readonly string[], run: Exec = exec, timeoutMs = 300_000, dir?: string): Promise<GateResult[]> {
+export interface Cancelled {
+  readonly cancelled?: () => boolean
+}
+
+// cancel: checked between checks, not inside one. A single check is bounded by its own timeout (300s by default),
+// because there is nothing to interrupt a shell with once it started; but without this a job with five checks could
+// not be stopped until all five ran, and stop_job looked broken for as long as the first one took.
+export async function runGate(worktree: string, commands: readonly string[], run: Exec = exec, timeoutMs = 300_000, dir?: string, cancel: Cancelled = {}): Promise<GateResult[]> {
   const cwd = dir ?? worktree
   const out: GateResult[] = []
   for (const command of commands) {
+    if (cancel.cancelled?.()) {
+      out.push({ command, passed: false, code: -1, output: "not run: the job was stopped" })
+      continue
+    }
     const r = await run("nice", ["-n", "15", "sh", "-c", command], { cwd, timeoutMs })
     const text = `${r.stdout}\n${r.stderr}`.trim()
     out.push({ command, passed: r.code === 0 && !r.timedOut, code: r.code, output: (r.timedOut ? "[timed out]\n" : "") + text.slice(-3000) })

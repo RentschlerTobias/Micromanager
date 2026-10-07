@@ -16,11 +16,12 @@
 import { Graphs, graphBrief, queryGraph, type Graph } from "./graph.ts"
 import { HEADER } from "./hooks.ts"
 import {
-  commitTask, exec as defaultExec, fastForward, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, repoRel, runGate, taskDir,
+  changedFiles, commitTask, exec as defaultExec, fastForward, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, repoRel, runGate, taskDir,
   type Exec, type GateResult,
 } from "./integration.ts"
-import { addDelegated, checkProblem, parseFiles } from "./plan.ts"
+import { addDelegated, checkSetProblems, parseFiles } from "./plan.ts"
 import { WRITERS } from "./profile.ts"
+import { FIX_ROUNDS } from "./watchdog.ts"
 import { ROLES, roleByAgent, type Role } from "./roles.ts"
 import { moveTask, newJob, moveJob, stage, type Job, type Task } from "./state.ts"
 import { excludeFromGit, jobId, listJobs, saveJob } from "./store.ts"
@@ -142,8 +143,11 @@ export class Native {
     const writer = WRITERS.has(role.id)
     if (writer && !parsed.files.length) throw new DelegationError(`Not started: a ${role.agent} changes files; end the prompt with a line "Files: <the project paths it may change>" and a line "Checks: <shell command>".`)
     if (!writer && parsed.files.length) throw new DelegationError(`Not started: ${role.agent} only reads; leave out the Files line, or pick a role that writes.`)
-    const bad = d.checks.map(checkProblem).filter(Boolean)
-    if (bad.length) throw new DelegationError(`Not started: checks must be shell commands that exit 0 when the task is done. ${bad.join("; ")}`)
+    // Every check that will reach runGate is validated here, before the task or its worktree exist: a command that is
+    // not one, one that is destructive, and a writer whose set cannot fail at all. A refused delegation must leave
+    // nothing behind, and this runs before addDelegated and prepareTaskWorktree, so it does.
+    const checks = checkSetProblems(d.checks, writer)
+    if (checks) throw new DelegationError(`Not started: ${checks}`)
     if (!d.body) throw new DelegationError("Not started: the prompt has no task.")
 
     const job = this.job(project, parent)
@@ -303,11 +307,43 @@ export class Native {
     // that far down, and a check naming one of its files finds nothing above it.
     const failed = (await runGate(entry.worktree, entry.checks, this.#exec, undefined, entry.dir)).filter((r) => !r.passed)
     if (failed.length) {
+      // The same cap the runner applies to its fix rounds (runner.ts: #work, `fixRounds ?? 2`). Without it a check that
+      // cannot be satisfied in this environment -- a path that does not exist, a command the gate refuses -- was handed
+      // back to the model until the watchdog's step limit stopped it, burning a session for nothing (live test,
+      // 2026-10-06: four identical gate failures, then the worker gave up). The last failure goes back with the
+      // reason, because at the cap the useful message is that the CHECK is the problem, not the work.
+      task.attempts++
+      if (task.attempts > FIX_ROUNDS) {
+        stage(task, "gate", "fail", failed.map((f) => f.command).join(", "))
+        moveTask(task, "blocked")
+        task.summary = `its checks still fail after ${FIX_ROUNDS} fix round(s): ${failed.map((f) => f.command).join(", ")}`
+        const note = `[jev-micromanager] ${task.id} ${task.title}: its worker hit the limit of ${FIX_ROUNDS} fix rounds with the checks still failing (${failed.map((f) => f.command).join(", ")}). If the check is what is wrong -- a path that does not exist in the worktree, a command the gate refuses -- correct the task with steer_task and its sessionID ${session} rather than starting a new worker.`
+        saveJob(entry.project, job)
+        return {
+          text: `Your checks still fail after ${FIX_ROUNDS} rounds, so I am stopping here rather than spending the rest of your budget on them:\n\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}\n\nIf the work is done and the CHECK is what cannot be satisfied here, say so plainly in your report. If the work is not done, name what is missing.`,
+          note,
+          parent: entry.parent,
+        }
+      }
       moveTask(task, "fixing")
       moveTask(task, "running")
       stage(task, "gate", "fail", failed.map((f) => f.command).join(", "))
       saveJob(entry.project, job)
-      return { text: failText("The checks fail in your directory", failed, entry.dir) }
+      return { text: failText(`The checks fail in your directory (fix round ${task.attempts} of ${FIX_ROUNDS})`, failed, entry.dir) }
+    }
+    // A passing gate over an untouched tree proves nothing: read-only checks exit 0 on a worktree nobody wrote to, and
+    // a worker whose session died mid-task never gets this far but a silent no-op worker does.
+    const touched = await changedFiles(entry.worktree, this.#exec, task.worktreeRel ?? job.integrationRel ?? "")
+    if (!touched.length) {
+      stage(task, "gate", "fail", "the checks passed but no file was changed")
+      moveTask(task, "blocked")
+      task.summary = "its checks passed but it changed no file, so nothing was verified."
+      saveJob(entry.project, job)
+      return {
+        text: `Your checks pass, but you changed no file, so there is nothing to commit and nothing was verified. If the task was already done by someone else, say so in your report. Otherwise make the change the task asked for and call finish_task again.`,
+        note: `[jev-micromanager] ${task.id} ${task.title}: its checks passed but it changed no file, so nothing was committed. Continue it with the subagent tool and sessionID ${session}, or tell the user.`,
+        parent: entry.parent,
+      }
     }
     stage(task, "gate", "pass", entry.checks.length ? entry.checks.join(", ") : "no checks given")
     const commit = await commitTask(entry.worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${task.model ?? "?"} (${task.role}), session ${session}${task.summary ? `\n\n${task.summary}` : ""}`, this.#exec)

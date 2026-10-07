@@ -43,7 +43,7 @@ import {
 import { discoveredCap, isDone, parallelSafe, moveJob, moveTask, newJob, promoteReady, stage, type FollowUp, type Job, type JobPhase, type Later, type Task } from "./state.ts"
 import { skillsFor, type Stage } from "./skills.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
-import { handoffNote, MAX_STEPS, TIER_STEPS, type Signal } from "./watchdog.ts"
+import { FIX_ROUNDS, handoffNote, MAX_STEPS, TIER_STEPS, type Signal } from "./watchdog.ts"
 
 // The part of ctx.session the runner needs (argument shapes as seen in Phase A).
 export interface SessionApi {
@@ -1076,13 +1076,25 @@ export class Runner {
         return undefined
       }
       moveTask(task, "gating")
-      const results = [...(await runGate(worktree, checks, this.#exec, undefined, dir)), ...(await frozenCheck(worktree, frozen, this.#exec))]
+      const results = [...(await runGate(worktree, checks, this.#exec, undefined, dir, { cancelled: () => Boolean(this.#d.cancelled?.()) })), ...(await frozenCheck(worktree, frozen, this.#exec))]
       const failed = results.filter((r) => !r.passed)
-      const changed = await changedFiles(worktree, this.#exec)
+      const changed = await changedFiles(worktree, this.#exec, task.worktreeRel ?? job.integrationRel ?? "")
       const outside = task.files.length ? changed.filter((f) => !task.files.includes(f) && !frozen.has(f)) : changed
       stage(task, "gate", failed.length ? "fail" : "pass", results.length ? results.map((r) => `${r.command}: exit ${r.code}`).join("; ") : "no checks defined")
       saveNote(this.#d.project, job.id, task.id, noteText(task, report.text, results, outside))
-      if (failed.length === 0) return work
+      if (failed.length === 0) {
+        // A gate that only reads exits 0 on an untouched tree, so passing it proves nothing: a worker that wrote
+        // nothing, or died before writing, would otherwise merge as a success (live test, 2026-10-06). Reported apart
+        // from a failing check, because the fix is different -- a passing check set and no diff means the task was
+        // never done, not that it is broken.
+        if (!changed.length) {
+          moveTask(task, "blocked")
+          task.summary = "its checks passed but it changed no file, so nothing was verified. Ask the worker what it did, or give the task checks that can fail on an unchanged tree."
+          this.#stop(job, `${task.id} finished without changing anything: ${task.summary}`, task)
+          return undefined
+        }
+        return work
+      }
       // N8: the same diff as the last round (the worker changed nothing) is a loop; the same failure is one when the
       // decision model says so, or without one. A loop skips the remaining fix rounds.
       const diff = createHash("sha1").update(await workingDiff(worktree, this.#exec)).digest("hex").slice(0, 12)
@@ -1093,7 +1105,7 @@ export class Runner {
       task.signatures.push(`diff:${diff}`)
       ;[lastDiff, lastFailure] = [diff, failure]
       task.attempts++
-      if (loop || task.attempts > (this.#d.fixRounds ?? 2)) {
+      if (loop || task.attempts > (this.#d.fixRounds ?? FIX_ROUNDS)) {
         const why = loop ? `it kept failing the same way: ${failed.map((f) => f.command).join(", ")}` : `checks still fail after ${task.attempts - 1} fix round(s): ${failed.map((f) => f.command).join(", ")}`
         const next = await this.#nextRung(job, task, work, frozen, why, failure)
         if (!next) return undefined

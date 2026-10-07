@@ -56,8 +56,12 @@ function fakeSession(behaviour: { plan?: string[]; worker?: (dir: string, prompt
   return { api, created, sessions, setPlan: (p: string[]) => { planAnswers = p } }
 }
 
+// A discovered or follow-up task writes add.js again on top of what the first task already committed, so it has to
+// write something different: a gate that passes while the diff is empty is refused (runner.ts, #work), and this fake
+// would otherwise pass that check without doing the work it claims.
 const writeFiles = (dir: string, prompt: string) => {
-  if (prompt.includes("task T1")) writeFileSync(join(dir, "add.js"), "export const add = (a, b) => a + b\n")
+  if (prompt.includes("export add as default")) writeFileSync(join(dir, "add.js"), "export const add = (a, b) => a + b\nexport default add\n")
+  else if (prompt.includes("task T1")) writeFileSync(join(dir, "add.js"), "export const add = (a, b) => a + b\n")
   if (prompt.includes("task T2")) writeFileSync(join(dir, "notes.md"), "ok\n")
   return "Done.\nSTATUS: DONE\nFILES: add.js\nEVIDENCE: wrote it\nOPEN: nothing"
 }
@@ -587,6 +591,12 @@ test("the decision model's N7 answers set the priority, and the user's call goes
   const project = repo()
   const fake = fakeSession({
     worker: (dir, prompt) => {
+      // The follow-up writes index.js, not add.js, so writeFiles' add.js branch would write outside the task's files and
+      // the discovered task would never be dispatched (it does not exist yet).
+      if (prompt.includes("export add from index")) {
+        writeFileSync(join(dir, "index.js"), "export { add } from './add.js'\n")
+        return "Done.\nSTATUS: DONE\nFILES: index.js\nEVIDENCE: wrote it\nOPEN: nothing"
+      }
       const out = writeFiles(dir, prompt)
       return prompt.includes("task T1 ") ? `${out}\nFOLLOWUP: export add from index | callers | index.js\nFOLLOWUP: rename the package | clearer | package.json` : out
     },

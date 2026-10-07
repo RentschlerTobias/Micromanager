@@ -53,6 +53,12 @@ export interface Limits {
 //   to be a shape rather than a coincidence (one read can repeat by chance, four calls rarely do).
 // - monologue 3: a worker writing a long report in several messages was interrupted mid-report, so it only nudges.
 // - maxSteps: the last safety net for a session that never ends (the user, 2026-10-05: a cut session wastes work).
+// How many times a worker's failing checks are handed back for another try, on both gate paths (the runner's fix
+// rounds and the native finish_task loop). The runner's own cap is configurable through RunnerDeps.fixRounds; this is
+// the default both use. A check that cannot be satisfied in the environment -- a path that does not exist there, a
+// command the gate refuses -- is the case this exists for: handed back forever, it burned a whole session.
+export const FIX_ROUNDS = 2
+
 export const DEFAULT_LIMITS: Limits = { maxSteps: 60, sameCall: 3, window: 10, readRepeat: 3, readWindow: 16, noNewFiles: 16, restartLength: 4, monologue: 3 }
 
 // The budget tier the decision model picks (design.md §8.1) maps to step limits; code keeps the ceiling.

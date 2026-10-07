@@ -140,6 +140,31 @@ test("an uncommitted working tree is reported, and a clean one is not", async ()
   assert.match((await dirtyPaths(PROJECT, fakeGit(answers(TOP, many), PROJECT).run)).summary, /\+3 more/, "a short summary, not the whole tree")
 })
 
+test("a stopped job does not start the next check", async () => {
+  // runGate bounded a single check by its own timeout but never looked at the cancel signal between checks, so a job
+  // with five checks kept running all of them and stop_job looked broken for as long as the first one took.
+  const seen: Call[] = []
+  let stop = false
+  const record: Exec = async (command, args, options) => {
+    seen.push({ command, args: [...args], cwd: options.cwd })
+    stop = true // the user stops the job while the first check runs
+    return { code: 0, stdout: "", stderr: "" }
+  }
+  const [first, second] = await runGate("/wt", ["npm test", "npm run build"], record, undefined, "/wt", {
+    cancelled: () => stop,
+  })
+  assert.equal(first!.passed, true)
+  assert.equal(second!.passed, false, "the gate reports the check as failed, so the caller cannot read it as a pass")
+  assert.equal(second!.output, "not run: the job was stopped")
+  assert.equal(second!.code, -1)
+  assert.deepEqual(seen.map((c) => c.cwd), ["/wt"], "the second check never started")
+
+  // Not cancelled: a failing check is a real exit code, not the not-run marker.
+  const failing: Exec = async (_c, a) => (a.join(" ").includes("build") ? { code: 2, stdout: "", stderr: "boom" } : { code: 0, stdout: "", stderr: "" })
+  const all = await runGate("/wt", ["npm test", "npm run build"], failing, undefined, "/wt", { cancelled: () => false })
+  assert.deepEqual(all.map((r) => [r.passed, r.code]), [[true, 0], [false, 2]])
+})
+
 test("changed files are project-relative, the basis task.files is on", async () => {
   // git reports from the repository root; task.files and a Checks line are project-relative. Without the offset
   // resolved away, every change in a subdirectory project looks like it happened outside its declared files.
