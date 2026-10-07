@@ -46,6 +46,10 @@ export interface Outcome {
   readonly risk?: number
   readonly needsUser?: number
   readonly latencyMs?: number
+  // The parser's own class of the request ("read"/"write"), set where the class selects the floor. Journalled with
+  // the permission record, so a later run can be checked against the floor this says applied — whatever the
+  // permission record's reason named, the class here is the one the decision actually used.
+  readonly riskClass?: "read" | "write"
 }
 
 export interface Floors {
@@ -465,6 +469,9 @@ function describe(request: PermissionRequest): string {
   const role = roleByAgent(request.agent)
   const lines = [
     `A coding agent in OpenCode (agent "${request.agent}") ${what}.`,
+    // The parser's own classification, so the model sees it and the journal keeps it: a refusal can later be checked
+    // against the floor this says applied, instead of re-deriving the class from a live run's evidence.
+    `The plugin's own parser classes this request as ${riskClass(request)}.`,
     role ? `Its role is "${role.id}": ${role.description}` : "",
     request.agent === MICROMANAGER.agent ? `It is the orchestrator: ${MICROMANAGER.description}` : "",
     request.directory ? `Project directory: ${request.directory}` : "",
@@ -520,12 +527,17 @@ export function judge(decision: Decision, request: PermissionRequest, floors: Fl
     return { ...base, verdict: "user", reason: `Jev: the deleted paths matter (${relevance.score.toFixed(2)})` }
   }
   if (risk.score >= floors.risk) return { ...base, verdict: "user", reason: "Jev: too risky to decide alone" }
-  const cls = riskClass(request) === "read" && risk.score < 0.5 ? "read" : "write"
+  // The class that picks the floor is the plugin's own parse of the command (riskClass), never the model's
+  // self-assessment: Jev answers "how risky is this action?" from the bare command and the task text, and a task
+  // about a merge made it score a plain `git log` at 1.03 — the old condition let that self-score flip a provable
+  // read to the write floor and refuse it as a write. The score keeps the one job the floors leave it: the risk
+  // ceiling at the line above, which stays first.
+  const cls = riskClass(request)
   const floor = cls === "read" ? floors.read : floors.write
   if (answer.confidence < floor) {
-    return { ...base, verdict: "user", reason: `Jev unsure (${answer.confidence.toFixed(2)} < ${floor} for ${cls})` }
+    return { ...base, verdict: "user", reason: `Jev unsure (${answer.confidence.toFixed(2)} < ${floor} for ${cls})`, riskClass: cls }
   }
-  return { ...base, verdict: answer.choice === "allow" ? "allow" : "deny", reason: `Jev: ${answer.choice} (${cls})` }
+  return { ...base, verdict: answer.choice === "allow" ? "allow" : "deny", reason: `Jev: ${answer.choice} (${cls})`, riskClass: cls }
 }
 
 // preset: the user's policy for this kind of request ("N13.shell": "fixed:allow", design.md §22). It applies after

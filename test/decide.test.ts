@@ -122,6 +122,36 @@ test("the role and its job are in Jev's context; floors can be set in the config
   assert.throws(() => parseFloors('{"floors": {"wrte": 0.9}}'), /unknown floor/)
 })
 
+// The live defect (2026-10-07): on a merge task, Jev rated a plain `git log` at risk 1.03 and at 0.80 confidence,
+// and the old condition (cls read only when risk < 0.5) used its self-score to pick the write floor — so a command
+// the parser knew was a read was refused "for write" while a `git merge` at 0.96 sailed through. The class that
+// picks the floor is the parser's own; Jev's risk keeps only the ceiling (>= 1.5 to the user), the line above.
+test("the parser's class selects the floor, not Jev's own risk rating", () => {
+  const log = judge(decision("allow", 0.85, 0.1, 1.03), req("shell", ["git -C /repo log --oneline -1"]))
+  assert.deepEqual([log.verdict, log.riskClass], ["allow", "read"], "risk 1.03 (observed) no longer flips the class")
+  assert.match(log.reason, /\(read\)/, "and the reason names the class that produced it")
+  assert.equal(judge(decision("allow", 0.8, 0.1, 1.03), req("shell", ["git -C /repo log --oneline -1"])).verdict, "allow", "the observed git log at 0.80 now passes the read floor")
+  // Jev's uncertainty is refused against the read floor, naming the confidence and the class it used
+  const unsure = judge(decision("allow", 0.72, 0.1, 1.03), req("shell", ["git -C /repo log --oneline -1"]))
+  assert.equal(unsure.verdict, "user")
+  assert.match(unsure.reason, /0\.72 < 0\.8 for read/)
+  // a genuine write keeps the write floor, and Jev's risk still rides the ceiling first
+  const merge = judge(decision("allow", 0.86, 0.1, 1.03), req("shell", ["git -C /repo merge --no-edit jev/job-1"]))
+  assert.equal(merge.riskClass, "write")
+  assert.equal(merge.verdict, "allow")
+  assert.match(judge(decision("allow", 1, 0.1, 1.5), req("shell", ["git -C /repo log --oneline -1"])).reason, /too risky/)
+})
+
+// Jev's context now carries the parser's own classification, and the journal keeps it with each decision, so a
+// future run can be diagnosed against the floor that applied instead of re-derived from its evidence.
+test("Jev's context states the parser's classification of the request", async () => {
+  const jev = fakeJev(decision("allow", 0.9, 0.1, 0.6))
+  await decide(jev, req("shell", ["git -C /repo log --oneline -1"]))
+  assert.match(jev.calls[0] ?? "", /parser classes this request as read/)
+  await decide(jev, req("shell", ["git -C /repo merge --no-edit jev/job-1"]))
+  assert.match(jev.calls[1] ?? "", /parser classes this request as write/)
+})
+
 test("before an rm inside the project: tracked files go to the user, ignored caches are Jev's call", async () => {
   const facts = (tracked: boolean | undefined, ignored: boolean) => (_dir: string, paths: readonly string[]) =>
     paths.map((path) => ({ path, exists: true, tracked, ignored }))

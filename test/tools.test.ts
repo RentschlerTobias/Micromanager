@@ -404,7 +404,7 @@ async function loadedPlugin(t: { after(fn: () => void): void }, sessions: Record
     await evaluate(e as never)
     return e
   }
-  return { journal, run, delegationHook: take("execute.before")! }
+  return { journal, run, evaluate, delegationHook: take("execute.before")! }
 }
 
 test("the plugin says it is loaded, and what it thinks it is doing", async (t) => {
@@ -466,4 +466,71 @@ test("a delegation the hook cannot route is written down, and one that merely sa
   await delegationHook(mentions as never)
   assert.equal(mentions.input.command, "grep -rn subagent src/")
   assert.equal(journal().filter((e) => e.kind === "delegation-unrecognised").length, 1)
+})
+
+// The live defect the pairing exists for (2026-10-07): a `shell` record read "allowed" at 10:30:42 and the
+// external_directory records over the same path read "denied" at 10:30:44 and 10:30:51 — one command, three lines,
+// and no field to say they belonged together. opencode's evaluate payload carries the call under `source`
+// ({type:"tool", messageID, id}, read in the bundled server), so the record keeps it.
+test("a permission record names the tool call it belongs to", async (t) => {
+  // The user's preset answers the ask before any model: this test is about pairing, and no Jev key is wanted here.
+  const { mkdtempSync, writeFileSync, mkdirSync } = await import("node:fs")
+  const { tmpdir } = await import("node:os")
+  const config = mkdtempSync(`${tmpdir()}/jev-config-`)
+  mkdirSync(`${config}/opencode`, { recursive: true })
+  writeFileSync(`${config}/opencode/jev-micromanager.jsonc`, JSON.stringify({ decisions: { "N13.shell": "fixed:allow" } }))
+  const before = process.env.XDG_CONFIG_HOME
+  process.env.XDG_CONFIG_HOME = config
+  t.after(() => { if (before === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = before })
+  const { journal, evaluate } = await loadedPlugin(t, {})
+  const asked = { sessionID: "ses_mm", agent: "micromanager", action: "shell", resources: ["git -C . log --oneline"], effect: "ask", message: undefined as string | undefined, source: { type: "tool", messageID: "msg_01", id: "call_01" } }
+  await evaluate(asked as never)
+  assert.equal(asked.effect, "allow", "the preset answered it")
+  const entry = journal().find((e) => e.kind === "permission" && e.sessionID === "ses_mm")!
+  assert.equal(entry.verdict, "allow")
+  const source = entry.source as { type: string; messageID?: string; id?: string }
+  assert.equal(source.id, "call_01", "the call id the two legs share")
+  assert.equal(source.messageID, "msg_01")
+  // An ask without a call context records nothing it never had: the field is dropped rather than invented.
+  const bare = { sessionID: "ses_mm2", agent: "micromanager", action: "shell", resources: ["ls"], effect: "ask", message: undefined as string | undefined }
+  await evaluate(bare as never)
+  const bareEntry = journal().find((e) => e.kind === "permission" && e.sessionID === "ses_mm2")!
+  assert.ok(bareEntry.source === undefined, "no call id, no invented one")
+})
+
+// Both orders the live run showed are paired: the command that ran first, and the refusal that came first. Each
+// path rings once per session — the alarm that repeats every tool call is the one nobody reads.
+test("a refused path and the call that ran anyway land in one permission-not-enforced record", async () => {
+  const { legPairs } = await import("../src/plugin.ts")
+  const lines: Record<string, unknown>[] = []
+  const loud: unknown[] = []
+  const legs = legPairs((e) => lines.push(e), (_level, message) => { loud.push(message) })
+  // The command ran, the refusal came after: the pairing says what ran and under which call it was asked.
+  legs.allowed("ses_w", "shell", ["git -C /home/u/.config/omarchy status --short"], 1000, { type: "tool", messageID: "msg_a", id: "call_a" })
+  legs.refused("ses_w", ["/home/u/.config/*"], "a hard-denied path (~/.config/opencode/auth.json)", { type: "tool", messageID: "msg_b", id: "call_b" })
+  const ranFirst = lines[0]!
+  assert.equal(ranFirst.kind, "permission-not-enforced")
+  assert.equal(ranFirst.sessionID, "ses_w")
+  assert.equal(ranFirst.action, "shell")
+  assert.match(String(ranFirst.refusal), /hard-denied/)
+  const allowedSource = ranFirst.allowedSource as { messageID?: string; id?: string }
+  const deniedSource = ranFirst.deniedSource as { messageID?: string; id?: string }
+  assert.equal(allowedSource.messageID, "msg_a", "both legs' ids, whatever itself was denied")
+  assert.equal(deniedSource.messageID, "msg_b")
+  assert.match(String(loud[0]), /permission not enforced/, "fail loud, like the isolation backstop")
+  // The refusal came first, the command ran after: the same record, the other way round.
+  legs.refused("ses_v", ["/etc/*"], "always the user: /etc", { type: "tool", messageID: "msg_c", id: "call_c" })
+  legs.allowed("ses_v", "shell", ["cat /etc/hosts"], 2000, { type: "tool", messageID: "msg_d", id: "call_d" })
+  const refusedFirst = lines[1]!
+  assert.match(String(refusedFirst.command), /cat \/etc\/hosts/)
+  // A path that has already rung once stays silent the second time it is hit in the same session.
+  legs.allowed("ses_v", "shell", ["cat /etc/hosts"], 3000, undefined)
+  legs.refused("ses_v", ["/etc/*"], "always the user: /etc", undefined)
+  assert.equal(lines.length, 2, "one alarm per path and session")
+  // An ask without ids is still paired, on the path in the command text, and records no invented ids.
+  legs.refused("ses_n", ["/etc/*"], "always the user: /etc", undefined)
+  legs.allowed("ses_n", "shell", ["ls /etc/hosts"], 4000, undefined)
+  const bare = lines[2]!
+  assert.equal(bare.kind, "permission-not-enforced")
+  assert.ok(!("deniedSource" in bare) && !("allowedSource" in bare), "no id was carried, so none is claimed")
 })

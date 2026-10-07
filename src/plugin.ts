@@ -36,6 +36,10 @@ import { CHILD_PREFIX, DelegationError, Native } from "./native.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
 // What the permission hook "evaluate" gets (opencode 2.0.18): the planned effect can be changed in place.
+// `source` names the tool call that made the ask — read in the bundled server: every built-in tool assert passes
+// its call context as `source: {type:"tool", messageID, id}`, external_directory included, so the id there is the
+// one id two legs of the same call share. It is absent for asks that come from something else; there is no call id
+// anywhere else on this payload.
 interface Evaluation {
   sessionID: string
   agent: string
@@ -43,6 +47,8 @@ interface Evaluation {
   resources: string[]
   effect: "allow" | "ask" | "deny"
   message?: string
+  metadata?: Record<string, unknown>
+  source?: { type: string; messageID?: string; id?: string; [key: string]: unknown }
 }
 
 // The micromanager reads only to orient itself (README, file list); past this many reads per session it is refused
@@ -214,6 +220,92 @@ export function applySignal(sessionID: string, signal: Signal, deps: SignalDeps)
   deps.record({ kind: "watchdog", sessionID, signal: signal.kind, detail: signal.detail })
   deps.interrupt(sessionID)
   return "stopped"
+}
+
+// The two legs of one tool call are decided apart: opencode asserts the action itself (a `shell` merge), and from
+// inside the same call asserts external_directory over the paths outside the project. A live run let the legs drift:
+// the shell record read "allowed" at one second, the external_directory record "denied" at another, the commit
+// landed under a guard that had just refused its path — and no line of the journal could say the two belonged to
+// one call. Whether an accompanying denial stops the call is opencode's to enforce, not this plugin's (that stays
+// open, described in the T8 note); what the plugin owes here is honest bookkeeping. When a refused path and a call
+// that ran anyway meet, this registry journals ONE `permission-not-enforced` record naming both legs' ids — fail
+// loud like the isolation backstop, once per path and session, because an alarm that repeats every tool call is
+// one nobody reads.
+//
+// The legs' ids live on `evaluation.source` ({type:"tool", messageID, id}; see Evaluation above). A leg without an
+// id — some asks carry none — is still paired, by the refused path appearing in the command's text; the record
+// then simply carries the legs it got, so a future opencode that grants ids does not silently lose the pairing.
+export interface LegId {
+  readonly type?: string
+  readonly messageID?: string
+  readonly id?: string
+}
+
+export function legPairs(journal: (entry: Record<string, unknown>) => void, loud?: (level: "info" | "warn" | "error", message: string) => void) {
+  // Per session: the outside paths refused and not yet paired, and the calls that ran (bounded — a long worker run
+  // must not grow the registry without limit).
+  const denied = new Map<string, Map<string, { reason: string; at: number; source?: LegId }>>()
+  const ran = new Map<string, { action: string; text: string; at: number; source?: LegId }[]>()
+  const told = new Set<string>()
+  const tell = (
+    sessionID: string,
+    path: string,
+    denial: { reason: string; at: number; source?: LegId },
+    ranLeg?: { action: string; text: string; at: number; source?: LegId },
+  ): void => {
+    const key = `${sessionID}\n${path}`
+    if (told.has(key)) return
+    told.add(key)
+    const entry: Record<string, unknown> = {
+      kind: "permission-not-enforced",
+      sessionID,
+      action: ranLeg?.action ?? "external_directory",
+      path,
+      refusal: denial.reason,
+    }
+    if (denial.source) entry.deniedSource = denial.source
+    if (ranLeg) {
+      entry.command = ranLeg.text
+      if (ranLeg.source) entry.allowedSource = ranLeg.source
+    }
+    journal(entry)
+    loud?.("error", `permission not enforced: ${sessionID} ran ${ranLeg?.action ?? "a call"} over the path denied moments earlier (${denial.reason}); opencode stopped no tool call over it`)
+  }
+  return {
+    // A refusal: record the path for the command that is to come, and check whether a call already ran over it.
+    refused(sessionID: string, paths: readonly string[], reason: string, source: LegId | undefined): void {
+      for (const path of paths) {
+        const where = normalizeOutside(path)
+        if (!where) continue
+        const denial = { reason, at: Date.now(), source }
+        const past = (ran.get(sessionID) ?? []).find((leg) => leg.text.includes(where))
+        if (past) {
+          tell(sessionID, where, denial, past)
+          continue
+        }
+        const known = denied.get(sessionID) ?? new Map()
+        known.set(where, denial)
+        denied.set(sessionID, known)
+      }
+    },
+    // A call that ran: pair it against what is refused, and keep it for what gets refused next. One alarm per
+    // path, so a worker that trips it repeatedly still produces a readable journal.
+    allowed(sessionID: string, action: string, resources: readonly string[], at: number, source: LegId | undefined): void {
+      const text = resources.join(" ")
+      const known = denied.get(sessionID)
+      if (known) {
+        for (const [path, denial] of known) {
+          if (text.includes(path)) {
+            tell(sessionID, path, denial, { action, text, at, source })
+            known.delete(path)
+          }
+        }
+      }
+      const list = ran.get(sessionID) ?? []
+      list.push({ action, text, at, source })
+      ran.set(sessionID, list.slice(-20))
+    },
+  }
 }
 
 // --- the micromanager's own tools, as plain functions (so they can be read and tested apart from the server) ------
@@ -530,6 +622,9 @@ export default {
   id: "jev-micromanager",
   setup: async (ctx: Context): Promise<void> => {
     const log = logger(ctx)
+    // Refused paths paired with the calls that ran anyway (legPairs above): the alarm lands in the journal and on
+    // stderr, the way the isolation backstop fails loud.
+    const legs = legPairs(record, log)
     const settings = loadSettings()
     const { cloudOnly, parallel, perModel, budget, notify, routing, floors, decisions, allowOutside, error } = settings
     const registry = cloudOnly ? cloudRegistry(settings.registry) : settings.registry
@@ -731,7 +826,7 @@ export default {
       if (narrowed && evaluation.effect !== "deny") {
         evaluation.effect = "deny"
         evaluation.message = `This task's profile does not include ${evaluation.action}. If the task really needs it, say so in your report (STATUS: NEEDS_CONTEXT).`
-        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "task profile" })
+        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "task profile", source: evaluation.source })
         return
       }
       if (evaluation.agent === MICROMANAGER.agent && READS.has(evaluation.action) && evaluation.effect !== "deny") {
@@ -740,7 +835,7 @@ export default {
         if (reads > MICROMANAGER_READ_CAP) {
           evaluation.effect = "deny"
           evaluation.message = "The micromanager only orients itself; let the agents explore (plan_job starts a planner that reads the project)."
-          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: `micromanager read cap (${MICROMANAGER_READ_CAP})` })
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: `micromanager read cap (${MICROMANAGER_READ_CAP})`, source: evaluation.source })
           return
         }
       }
@@ -766,24 +861,29 @@ export default {
           evaluation.message = turnedDown
             ? "The user was asked about this path for this job and said no. It stays closed; do not try another way, report STATUS: NEEDS_CONTEXT."
             : `This path is one no worker may reach: ${what}. Tell the micromanager; only the user can open it, by saying so when it asks them (request_access) or by putting the path in allowOutside in ${configPath()}.`
-          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: turnedDown ? `${REFUSED_OUTSIDE_REASON} (${what})` : `a hard-denied path (${what})` })
+          const deniedReason = turnedDown ? `${REFUSED_OUTSIDE_REASON} (${what})` : `a hard-denied path (${what})`
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: deniedReason, source: evaluation.source })
+          // Paired with the call that made the ask: if a command over this path runs anyway (its own leg was once
+          // allowed), legPairs writes the permission-not-enforced record naming both legs.
+          legs.refused(evaluation.sessionID, refused, deniedReason, evaluation.source)
           return
         }
         if (evaluation.resources.every((path) => allowedOutside(path, opened))) {
           evaluation.effect = "allow"
-          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: ALLOW_OUTSIDE_REASON })
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: ALLOW_OUTSIDE_REASON, source: evaluation.source })
           return
         }
         const reader = !WRITERS.has(roleByAgent(evaluation.agent)?.id ?? "code")
         const task = [workerTasks.get(evaluation.sessionID), vouchText(here)].filter(Boolean).join("\n")
         if (reader && namedInTask(task, evaluation.resources)) {
           evaluation.effect = "allow"
-          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: "a reader, in a directory its task or the micromanager names" })
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: "a reader, in a directory its task or the micromanager names", source: evaluation.source })
           return
         }
         evaluation.effect = "deny"
         evaluation.message = "Stay inside your working directory; the job's state and the user's checkout are not part of your task. If you need something from outside, say so in your report (STATUS: NEEDS_CONTEXT)."
-        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "runner session outside its directory" })
+        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "runner session outside its directory", source: evaluation.source })
+        legs.refused(evaluation.sessionID, evaluation.resources, "runner session outside its directory", evaluation.source)
         return
       }
       // A worker's request is text a model wrote, possibly steered by what it read: the local injection guard looks
@@ -793,7 +893,7 @@ export default {
         if (injected(score)) {
           evaluation.effect = "deny"
           evaluation.message = "This request looks like an attempt to get around the task's rules. Do not try another way; if the task needs it, report STATUS: NEEDS_CONTEXT."
-          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: `injection guard (${score!.toFixed(2)})` })
+          record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: `injection guard (${score!.toFixed(2)})`, source: evaluation.source })
           return
         }
       }
@@ -820,7 +920,13 @@ export default {
         evaluation.effect = "deny"
         evaluation.message = `This is refused, not queued: nobody is asked while you run (${outcome.reason}), and asking again would not bring the question back. It does not stop your task: carry on without it, and say in your report what you wanted it for and what you did instead. Report STATUS: NEEDS_CONTEXT only if you genuinely cannot proceed without it. Still, do not reach the same result by a route around this permission.`
       }
-      record({ kind: "permission", ...request, task: request.task?.slice(0, 500), ...outcome })
+      record({ kind: "permission", ...request, task: request.task?.slice(0, 500), ...outcome, source: evaluation.source })
+      // The running leg of the pair (legPairs): a worker call that was allowed, fed against the other leg in case a
+      // refused path sits in the command. Only worker sessions — the refusal side is asked for in the guard above,
+      // and the micromanager's own calls have no paired legs to name.
+      if (outcome.verdict === "allow" && runnerSessions.has(evaluation.sessionID) && evaluation.action !== "external_directory") {
+        legs.allowed(evaluation.sessionID, evaluation.action, evaluation.resources, Date.now(), evaluation.source)
+      }
       log("info", `${evaluation.action} ${evaluation.resources.join(" | ").slice(0, 120)}: ${outcome.verdict} (${outcome.reason})`)
     })
 
