@@ -5,7 +5,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 
+import { segments } from "../src/decide.ts"
 import { CHILD_PREFIX, DelegationError, Native, parseDelegation } from "../src/native.ts"
+import { roleByAgent } from "../src/roles.ts"
 import { loadJob } from "../src/store.ts"
 import { FIX_ROUNDS } from "../src/watchdog.ts"
 
@@ -33,6 +35,10 @@ function subRepo(): { root: string; project: string } {
 
 const git = (dir: string, ...args: string[]) => execFileSync("git", ["-C", dir, ...args]).toString().trim()
 const MODEL = "opencode-go/glm-5.3-flash"
+
+// A shell resource as a role's rule matches it: "*" is any run of characters, as in OpenCode's permission patterns.
+const matches = (pattern: string, command: string) =>
+  new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`).test(command)
 
 // What OpenCode's subagent tool sends as the child's first prompt.
 const child = (brief: string) => `${CHILD_PREFIX}\n${brief}`
@@ -243,6 +249,29 @@ test("what is not a valid delegation is refused with a reason", async () => {
   await allowed("coder", "Change it.\nFiles: a.js\nChecks: test -f a.js")
   await allowed("coder", "Change it.\nFiles: a.js\nChecks: grep -q foo a.js && npm test")
   await allowed("explorer", "Look at it.\nFiles: none")
+})
+
+test("a coder may be given a Checks line that is a pipeline, and every segment of it is its own right", async () => {
+  // The live command a coder ran to get the file list, refused twice on the segments after the first: OpenCode passes
+  // each command of a chain as its own resource, so a role needs an allow for the readers as well as the runner.
+  const pipeline = "uv run pyright 2>&1 | grep -E '^  /' | sed -E 's#.*--T1/##' | cut -d: -f1 | sort | uniq -c | sort -rn"
+  const project = repo()
+  const native = new Native()
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "count errors per file", prompt: `Write it down.\nFiles: notes.md\nChecks: ${pipeline}` }, MODEL)
+  assert.ok(d.prompt.includes(`Checks the plugin runs when you finish: ${pipeline}`), d.prompt)
+
+  // The chain as the permission hook sees it: one resource per segment, each matched against the role's rules.
+  const effectOn = (agent: string, segment: string) => {
+    const rules = roleByAgent(agent)!.rules
+    return [...rules].reverse().find((r) => r.action === "shell" && matches(r.resource, segment))?.effect
+  }
+  assert.deepEqual(segments(pipeline).map((s) => effectOn("coder", s)), Array(7).fill("allow"))
+  // A writer in the chain is not allowed by the readers, which is why the deny sits after the allow it overrides.
+  const writing = segments("npm test | tail -20 | sed -i s/1/2/ notes.md")
+  assert.deepEqual(writing.map((s) => effectOn("coder", s)), ["allow", "allow", "deny"])
+  // An explorer gained none of it: its deny on * is what every segment of the chain still meets.
+  assert.ok(!roleByAgent("explorer")!.rules.some((r) => r.action === "shell" && r.effect === "allow" && /^(grep|sed|cut|sort|uniq)/.test(r.resource)))
+  assert.deepEqual(segments(pipeline).map((s) => effectOn("explorer", s)), Array(7).fill("deny"))
 })
 
 test("a call that failed before its worker started drops the task and its worktree", async () => {

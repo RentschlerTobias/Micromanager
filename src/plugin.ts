@@ -555,8 +555,9 @@ export default {
     // what still comes through, e.g. a tool reached from the code-mode execute tool.
     const workerRules = SHARED.workerRules
     // Sessions the runner started (planner, workers, reviewers, readers). Nobody sits at them: a question there would
-    // wait until the worker times out (live tests, headless and with --auto). So they never ask the user directly;
-    // they stop and report, and the job asks the user in the micromanager's session.
+    // wait until the worker times out (live tests, headless and with --auto). So they never ask the user directly; a
+    // question comes back to them as a refusal, and what they cannot do they say in their report, which the job asks the
+    // user about in the micromanager's session. A refusal is rarely the end of the task, so it says so.
     const runnerSessions = SHARED.runnerSessions
 
     // The micromanager's workers run on OpenCode's subagent tool, in the background; writers in worktrees of their own.
@@ -817,7 +818,7 @@ export default {
       if (outcome.verdict !== "user") evaluation.effect = outcome.verdict
       else if (runnerSessions.has(evaluation.sessionID)) {
         evaluation.effect = "deny"
-        evaluation.message = `This needs the user's decision (${outcome.reason}). Do not try another way: stop and report STATUS: NEEDS_CONTEXT with what you wanted to do and why.`
+        evaluation.message = `This is refused, not queued: nobody is asked while you run (${outcome.reason}), and asking again would not bring the question back. It does not stop your task: carry on without it, and say in your report what you wanted it for and what you did instead. Report STATUS: NEEDS_CONTEXT only if you genuinely cannot proceed without it. Still, do not reach the same result by a route around this permission.`
       }
       record({ kind: "permission", ...request, task: request.task?.slice(0, 500), ...outcome })
       log("info", `${evaluation.action} ${evaluation.resources.join(" | ").slice(0, 120)}: ${outcome.verdict} (${outcome.reason})`)
