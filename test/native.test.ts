@@ -67,6 +67,8 @@ test("the same work is not delegated twice: a live writer is steered, an unfinis
   const native = new Native()
   const pill = (title: string, extra = "") => ({ agent: "coder", description: title, prompt: `Delete the dashed pill between lane 1 and lane 2.${extra}\nFiles: add.js\nChecks: test -f add.js` })
   const first = await native.delegate(project, "ses_mm", pill("Remove dashed pill on lanes slide"), MODEL)
+  // two equal calls in one message: the second comes before the first worker exists
+  await assert.rejects(native.delegate(project, "ses_mm", pill("Remove dashed pill on lanes slide"), MODEL), /T1 .* is doing this already .*its worker is starting/s)
   native.claim("ses_w1", child(first.prompt))
   // running: a second delegation of the same work is refused and names the running task
   await assert.rejects(native.delegate(project, "ses_mm", pill("Delete dashed pill on lanes slide"), MODEL), (err: Error) => {

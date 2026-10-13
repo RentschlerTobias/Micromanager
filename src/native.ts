@@ -256,10 +256,13 @@ export class Native {
     for (const task of job.tasks) {
       if (replaced.includes(task.id)) continue
       const entry = this.#entries.get(`${job.id}/${task.id}`)
-      if (!entry?.session || entry.writer !== writer) continue
+      // A task whose worker has not started yet counts as running: two equal calls in one message come one after the
+      // other, before either child exists.
+      if (!entry || entry.writer !== writer) continue
+      const session = entry.session ? `session ${entry.session}` : "its worker is starting"
       if (!writer) {
         if (LIVE.has(task.status) && !entry.ended && task.role === role.id && similarity(body, task.description) >= SAME_QUESTION) {
-          return `Not started: ${task.id} "${task.title}" asks this already (session ${entry.session}); its report comes to you when it ends.`
+          return `Not started: ${task.id} "${task.title}" asks this already (${session}); its report comes to you when it ends.`
         }
         continue
       }
@@ -267,9 +270,9 @@ export class Native {
       if (!shared.length) continue
       if (similarity(title, task.title) < SAME_WORK && similarity(body, task.description) < SAME_WORK) continue
       if (LIVE.has(task.status) && !entry.ended) {
-        return `Not started: ${task.id} "${task.title}" is doing this already (it changes ${shared.join(", ")}; session ${entry.session}). Send it a note with steer_task, or wait for its report. To replace it, stop it with stop_task, then delegate again with a line "Replaces: ${task.id}".`
+        return `Not started: ${task.id} "${task.title}" is doing this already (it changes ${shared.join(", ")}; ${session}). Send it a note with steer_task, or wait for its report. To replace it, stop it with stop_task, then delegate again with a line "Replaces: ${task.id}".`
       }
-      if ((UNFINISHED.has(task.status) || (LIVE.has(task.status) && entry.ended)) && !entry.removed) {
+      if ((UNFINISHED.has(task.status) || (LIVE.has(task.status) && entry.ended)) && !entry.removed && entry.session) {
         const last = task.stages[task.stages.length - 1]
         return `Not started: ${task.id} "${task.title}" did this work and stopped before its merge${last ? ` (${last.stage}: ${last.evidence ?? last.result})` : ""}; its change is still in its worktree. Continue it with the subagent tool and sessionID ${entry.session}, saying what is left, so the change is kept. To start over instead, add a line "Replaces: ${task.id}": its worktree is discarded.`
       }
