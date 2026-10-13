@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import { segments } from "../src/decide.ts"
-import { CHILD_PREFIX, DelegationError, Native, parseDelegation } from "../src/native.ts"
+import { CHILD_PREFIX, DelegationError, Native, parseDelegation, similarity } from "../src/native.ts"
 import { roleByAgent } from "../src/roles.ts"
 import { loadJob } from "../src/store.ts"
 import { FIX_ROUNDS } from "../src/watchdog.ts"
@@ -49,7 +49,56 @@ test("the Files and Checks lines are read off the prompt", () => {
   assert.equal(d.files, "cli.js, test/cli.test.js")
   assert.deepEqual(d.checks, ["npm test", "node --test test/cli.test.js"])
   assert.deepEqual(parseDelegation("Checks: test -f a.js\nFiles: a.js").checks, ["test -f a.js"])
-  assert.deepEqual(parseDelegation("Where is the router?"), { body: "Where is the router?", files: "", checks: [] })
+  assert.deepEqual(parseDelegation("Where is the router?"), { body: "Where is the router?", files: "", checks: [], replaces: [] })
+  const again = parseDelegation("Start over on the pill.\nReplaces: t5, T9\nFiles: slides.qmd\nChecks: true")
+  assert.deepEqual(again.replaces, ["T5", "T9"])
+  assert.equal(again.body, "Start over on the pill.")
+})
+
+test("two task texts about the same work are told apart from different work", () => {
+  assert.ok(similarity("Remove dashed pill on lanes slide", "Delete dashed pill on lanes slide") >= 0.5)
+  assert.ok(similarity("Fix cross-attention wording", "Cross-attention conditioning wording") >= 0.5)
+  assert.ok(similarity("Trim Edge Network box labels", "Fix FiLM caption on Model slide") < 0.5)
+  assert.equal(similarity("", "x y z"), 0)
+})
+
+test("the same work is not delegated twice: a live writer is steered, an unfinished one continued, or replaced on purpose", async () => {
+  const project = repo()
+  const native = new Native()
+  const pill = (title: string, extra = "") => ({ agent: "coder", description: title, prompt: `Delete the dashed pill between lane 1 and lane 2.${extra}\nFiles: add.js\nChecks: test -f add.js` })
+  const first = await native.delegate(project, "ses_mm", pill("Remove dashed pill on lanes slide"), MODEL)
+  native.claim("ses_w1", child(first.prompt))
+  // running: a second delegation of the same work is refused and names the running task
+  await assert.rejects(native.delegate(project, "ses_mm", pill("Delete dashed pill on lanes slide"), MODEL), (err: Error) => {
+    assert.ok(err instanceof DelegationError)
+    assert.match(err.message, /T1 "Remove dashed pill on lanes slide" is doing this already .*session ses_w1.*steer_task.*Replaces: T1/s)
+    return true
+  })
+  // other work on the same file is not refused: writers on one file run in parallel and the merge train rebases
+  const other = await native.delegate(project, "ses_mm", { agent: "coder", description: "Rename the add export", prompt: "Rename the add export to sum.\nFiles: add.js\nChecks: test -f add.js" }, MODEL)
+  assert.equal(other.task.id, "T2")
+  // T1 stops before its merge: its change waits in its worktree, so the next try is told to continue it
+  await native.ended("ses_w1", "stopped by the watchdog")
+  await assert.rejects(native.delegate(project, "ses_mm", pill("Delete dashed pill on lanes slide"), MODEL), /T1 .* stopped before its merge .*sessionID ses_w1/s)
+  // a running T1 cannot be replaced, a stopped one can: it is cancelled and its worktree goes
+  await assert.rejects(native.delegate(project, "ses_mm", pill("Delete dashed pill on lanes slide", "\nReplaces: T2"), MODEL), /T2 still runs; stop it with stop_task first/)
+  const worktree = first.task.worktree!
+  const redo = await native.delegate(project, "ses_mm", pill("Delete dashed pill on lanes slide", "\nReplaces: T1"), MODEL)
+  assert.equal(redo.task.id, "T3")
+  const job = loadJob(project, redo.job.id)!
+  assert.equal(job.tasks.find((t) => t.id === "T1")!.status, "cancelled")
+  assert.ok(!existsSync(worktree), "the replaced task's worktree is gone")
+  await assert.rejects(native.delegate(project, "ses_mm", pill("x", "\nReplaces: T9"), MODEL), /there is no task T9 to replace/)
+})
+
+test("a reader asking what a running reader asks already is refused; a different question is not", async () => {
+  const project = repo()
+  const native = new Native({ graphs: { get: async () => undefined } })
+  const ask = (prompt: string) => native.delegate(project, "ses_mm", { agent: "explorer", description: "status", prompt }, MODEL)
+  const first = await ask("Report the status of the embed fix job and its queue.")
+  native.claim("ses_r1", child(first.prompt))
+  await assert.rejects(ask("Report the status of the embed fix job and its queue"), /T1 "status" asks this already \(session ses_r1\)/)
+  assert.equal((await ask("Where is the router defined?")).task.id, "T2")
 })
 
 test("a writer works in its own worktree; failing checks go back to it, passing ones merge", async () => {

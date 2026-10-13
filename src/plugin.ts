@@ -764,6 +764,25 @@ export default {
       return true
     }
     const claimedRequests = new Set<string>()
+    // A worker's own work ends with it, as a task's owned work does in Pi Durable: its helpers that still run are
+    // interrupted, and the paused requests of the worker and its helpers are dropped, with a note to the micromanager so
+    // it stops asking the user about them. Without this a stopped worker's request woke the micromanager ten minutes
+    // later about a session that no longer existed.
+    const release = async (session: string, why: string): Promise<void> => {
+      const helpers = [...SHARED.helperOf].filter(([, writer]) => writer === session).map(([helper]) => helper)
+      for (const helper of helpers) {
+        if (ended.has(helper)) continue
+        ended.add(helper)
+        await ctx.session.interrupt({ sessionID: helper }).catch(() => undefined)
+        record({ kind: "helper", event: "interrupted", helper, sessionID: session, why })
+      }
+      const dropped = await SHARED.asks.drop([session, ...helpers], why)
+      const byParent = new Map<string, string[]>()
+      for (const ask of dropped) byParent.set(ask.parent, [...(byParent.get(ask.parent) ?? []), ask.id])
+      for (const [parent, ids] of byParent) {
+        await ctx.session.synthetic({ sessionID: parent, text: `[jev-micromanager] ${ids.join(", ")} ${ids.length > 1 ? "are" : "is"} void: ${why}. If you put ${ids.length > 1 ? "them" : "it"} to the user, tell them no answer is needed.`, resume: false }).catch(() => undefined)
+      }
+    }
 
     // Every question of the micromanager and its sub-agents goes to Jev first: it answers itself when sure enough,
     // else the user is asked as usual.
@@ -964,6 +983,7 @@ export default {
       ended: (helper) => {
         ended.add(helper)
         watchdog.unwatch(helper)
+        void release(helper, "the helper that asked it has ended")
       },
       journal: record,
     })
@@ -1205,6 +1225,7 @@ export default {
             if (session) {
               ended.add(session)
               await ctx.session.interrupt({ sessionID: session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
+              await release(session, `${task.id} was stopped`)
             }
             // Terminal but not final-destructive: the task stops and its worktree stays, so run_job or the user decides
             // what happens to the work.
@@ -1406,6 +1427,7 @@ export default {
           native.watchEnd(worker, () => ctx.session.wait({ sessionID: worker }), () => stops.get(worker)?.detail, (note, parent) => {
             // Its end is the one thing reconcileJob needs to stop calling this worker alive (src/state.ts).
             ended.add(worker)
+            void release(worker, "the worker that asked it has ended")
             if (note) void ctx.session.synthetic({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
             // Ultrawork: when the last worker of the session ended, the micromanager goes on with its todos.
             const wakes = ultrawork.get(parent)

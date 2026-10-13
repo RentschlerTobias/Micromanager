@@ -95,3 +95,22 @@ test("the note says what is asked, why, who decides and what happens without an 
   assert.match(hard, /only the user can allow it/)
   assert.doesNotMatch(hard, /call answer_permission with id/)
 })
+
+test("the requests of a worker that ended are dropped, and only those", async () => {
+  const journal: Record<string, unknown>[] = []
+  const asks = new Asks((e) => journal.push(e))
+  const worker = replies()
+  const helper = replies()
+  const other = replies()
+  asks.open(REQ, worker.reply)
+  asks.open({ ...REQ, sessionID: "ses_helper" }, helper.reply)
+  const kept = asks.open({ ...REQ, sessionID: "ses_other" }, other.reply)
+  const dropped = await asks.drop(["ses_w", "ses_helper"], "the worker that asked it has ended")
+  assert.deepEqual(dropped.map((a) => a.id), ["A1", "A2"])
+  assert.deepEqual(worker.got, ["reject: This request is void: the worker that asked it has ended."])
+  assert.equal(helper.got.length, 1)
+  assert.deepEqual(other.got, [], "another worker's request still waits")
+  assert.equal(asks.oldest("ses_mm")?.id, kept.id)
+  assert.equal(asks.standing("ses_mm", REQ.action, REQ.resources), undefined, "a dropped request is nobody's decision")
+  assert.deepEqual(journal.filter((e) => e.event === "dropped").map((e) => e.id), ["A1", "A2"])
+})

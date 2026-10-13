@@ -126,6 +126,22 @@ export class Asks {
     return { text: `${id} ${verdict} (${who}); the worker ${decision === "refuse" ? "gets the refusal with the reason" : "goes on"}.`, ask }
   }
 
+  // The paused requests of sessions that ended or were stopped: nobody needs their answer any more, so they are failed
+  // quietly and leave the list, and the caller tells the micromanager they are void (src/plugin.ts release).
+  async drop(sessionIDs: readonly string[], why: string): Promise<PendingAsk[]> {
+    const dropped: PendingAsk[] = []
+    for (const [id, ask] of this.#pending) {
+      if (!sessionIDs.includes(ask.sessionID)) continue
+      this.#pending.delete(id)
+      clearTimeout(ask.timer)
+      await ask.reply("reject", `This request is void: ${why}.`).catch(() => undefined)
+      this.#journal({ kind: "ask", event: "dropped", id, sessionID: ask.sessionID, parent: ask.parent, why, waitedMs: Date.now() - ask.at })
+      const { reply: _reply, timer: _timer, ...shown } = ask
+      dropped.push(shown)
+    }
+    return dropped
+  }
+
   #set(map: Map<string, Set<string>>, parent: string, key: string): void {
     const set = map.get(parent) ?? new Set<string>()
     set.add(key)

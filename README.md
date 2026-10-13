@@ -89,6 +89,15 @@ Jev and the plugin securing every task:
    session when something is left (it keeps its worktree), asks you what only you can decide and, at the end, merges
    or discards the branch itself. Say "ulw" or "ultrawork" and it goes on until every todo is done.
 
+   **The same work is not delegated twice.** A writer on files another writer of the job is changing, whose title
+   or brief is about the same thing, is refused: a running one is to be steered (`steer_task`), and one that stopped
+   before its merge is to be continued by its session, so its change is kept (live run, 2026-10-07: three workers in
+   turn removed the same element from the same slide, each one starting over). A line `Replaces: T5` in the prompt
+   starts over on purpose: T5 is cancelled and its worktree goes. A reader whose brief is nearly that of one still
+   running is refused the same way. **A worker's own work ends with it:** when it ends or is stopped, its running
+   helpers are interrupted and its paused permission requests are dropped, and the micromanager is told they need no
+   answer any more.
+
    The controls, all for the micromanager:
 
    | tool | what it does |

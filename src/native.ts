@@ -33,9 +33,10 @@ export const CHILD_PREFIX = "You are a subagent spawned by another session."
 export class DelegationError extends Error {}
 
 export interface Delegation {
-  readonly body: string // the prompt without the Files and Checks lines
+  readonly body: string // the prompt without the Files, Checks and Replaces lines
   readonly files: string // as written, parsed by parseFiles
   readonly checks: string[]
+  readonly replaces: string[] // tasks this one deliberately starts over ("Replaces: T5")
 }
 
 // The "Files:" and "Checks:" lines of a delegation, wherever they stand; the checks go on over the following lines
@@ -43,12 +44,17 @@ export interface Delegation {
 export function parseDelegation(prompt: string): Delegation {
   const body: string[] = []
   const checks: string[] = []
+  const replaces: string[] = []
   let files = ""
   let inChecks = false
   for (const line of prompt.split("\n")) {
     const f = line.match(/^\s*files:\s*(.*)$/i)
     const c = line.match(/^\s*checks:\s*(.*)$/i)
-    if (f) {
+    const r = line.match(/^\s*replaces:\s*(.*)$/i)
+    if (r) {
+      replaces.push(...r[1]!.split(/[\s,]+/).map((id) => id.trim().toUpperCase()).filter(Boolean))
+      inChecks = false
+    } else if (f) {
       files = f[1]!.trim()
       inChecks = false
     } else if (c) {
@@ -60,8 +66,28 @@ export function parseDelegation(prompt: string): Delegation {
       body.push(line)
     }
   }
-  return { body: body.join("\n").trim(), files, checks }
+  return { body: body.join("\n").trim(), files, checks, replaces }
 }
+
+// How much two task texts are about the same thing: the share of their words they have in common (Jaccard over the
+// words of three letters or more, without the filler). "Remove dashed pill on lanes slide" and "Delete dashed pill on
+// lanes slide" share four of six: the same work, delegated twice in a live run (2026-10-07).
+const FILLER = new Set(["the", "and", "for", "with", "from", "into", "that", "this", "its", "are", "was", "not", "but", "you", "your"])
+function words(text: string): Set<string> {
+  return new Set(text.toLowerCase().split(/[^a-z0-9äöüß]+/).filter((w) => w.length > 2 && !FILLER.has(w)))
+}
+export function similarity(a: string, b: string): number {
+  const x = words(a)
+  const y = words(b)
+  if (x.size === 0 || y.size === 0) return 0
+  let shared = 0
+  for (const w of x) if (y.has(w)) shared++
+  return shared / (x.size + y.size - shared)
+}
+const SAME_WORK = 0.5 // a writer on the same files with a title or brief this close is the same work
+const SAME_QUESTION = 0.8 // a reader with a brief this close asks the same question
+const LIVE = new Set(["running", "gating", "fixing"])
+const UNFINISHED = new Set(["blocked", "escalated", "cancelled"])
 
 interface Entry {
   readonly project: string
@@ -77,6 +103,7 @@ interface Entry {
   session?: string // the child session, once claimed
   checks: string[]
   graph?: boolean // an explorer with a code graph of its directory (the code_graph tool)
+  ended?: boolean // its session ended; a writer that did not merge stays "running" until it is continued or swept
 }
 
 export interface NativeDeps {
@@ -151,6 +178,9 @@ export class Native {
     if (!d.body) throw new DelegationError("Not started: the prompt has no task.")
 
     const job = this.job(project, parent)
+    await this.#replace(project, job, d.replaces)
+    const duplicate = this.#duplicate(job, role, input.description.trim(), d.body, parsed.files, d.replaces)
+    if (duplicate) throw new DelegationError(duplicate)
     if (!job.integrationWorktree) {
       excludeFromGit(project)
       const integration = await prepareIntegration(project, job.id, this.#exec)
@@ -195,6 +225,58 @@ export class Native {
     return { task, job, prompt: this.#brief(job, task, role, model, d, entry, graph), notes }
   }
 
+  // "Replaces: T5": the micromanager starts T5's work over on purpose. T5 is cancelled and its worktree, with whatever
+  // change it held, goes; a task that still runs has to be stopped first, and a merged one has nothing to replace.
+  async #replace(project: string, job: Job, ids: readonly string[]): Promise<void> {
+    for (const id of ids) {
+      const task = job.tasks.find((t) => t.id === id)
+      if (!task) throw new DelegationError(`Not started: there is no task ${id} to replace.`)
+      const live = LIVE.has(task.status) && !this.#entries.get(`${job.id}/${id}`)?.ended
+      if (live) throw new DelegationError(`Not started: ${id} still runs; stop it with stop_task first, then delegate again with "Replaces: ${id}".`)
+      if (task.status === "merged") throw new DelegationError(`Not started: ${id} is merged, so there is nothing to replace; leave out "Replaces: ${id}" and say in the brief what to change on top of it.`)
+      const k = `${job.id}/${id}`
+      const entry = this.#entries.get(k)
+      if (task.status !== "cancelled") moveTask(task, "cancelled")
+      stage(task, "replace", "pass", "started over by a new task")
+      if (entry) {
+        await this.#dropWorktree(entry, task)
+        this.#entries.delete(k)
+      }
+      saveJob(project, job)
+    }
+  }
+
+  // The same work delegated a second time (live run, 2026-10-07: three tasks each removed the same pill from the same
+  // slide, because the first two stopped before their merge and the micromanager started over instead of continuing).
+  // A writer on files another writer of this job is changing, or left unfinished with its change still in its worktree,
+  // and whose title or brief is about the same thing, is refused with what to do instead; a reader is refused when one
+  // with nearly the same brief still runs. Returns the refusal, or undefined.
+  #duplicate(job: Job, role: Role, title: string, body: string, files: readonly string[], replaced: readonly string[]): string | undefined {
+    const writer = WRITERS.has(role.id)
+    for (const task of job.tasks) {
+      if (replaced.includes(task.id)) continue
+      const entry = this.#entries.get(`${job.id}/${task.id}`)
+      if (!entry?.session || entry.writer !== writer) continue
+      if (!writer) {
+        if (LIVE.has(task.status) && !entry.ended && task.role === role.id && similarity(body, task.description) >= SAME_QUESTION) {
+          return `Not started: ${task.id} "${task.title}" asks this already (session ${entry.session}); its report comes to you when it ends.`
+        }
+        continue
+      }
+      const shared = files.filter((f) => task.files.includes(f))
+      if (!shared.length) continue
+      if (similarity(title, task.title) < SAME_WORK && similarity(body, task.description) < SAME_WORK) continue
+      if (LIVE.has(task.status) && !entry.ended) {
+        return `Not started: ${task.id} "${task.title}" is doing this already (it changes ${shared.join(", ")}; session ${entry.session}). Send it a note with steer_task, or wait for its report. To replace it, stop it with stop_task, then delegate again with a line "Replaces: ${task.id}".`
+      }
+      if ((UNFINISHED.has(task.status) || (LIVE.has(task.status) && entry.ended)) && !entry.removed) {
+        const last = task.stages[task.stages.length - 1]
+        return `Not started: ${task.id} "${task.title}" did this work and stopped before its merge${last ? ` (${last.stage}: ${last.evidence ?? last.result})` : ""}; its change is still in its worktree. Continue it with the subagent tool and sessionID ${entry.session}, saying what is left, so the change is kept. To start over instead, add a line "Replaces: ${task.id}": its worktree is discarded.`
+      }
+    }
+    return undefined
+  }
+
   // The subagent call failed before its child took the task (refused, an unknown agent): the task is dropped.
   async abandon(prompt: string): Promise<void> {
     const k = tokenOf(prompt)
@@ -236,6 +318,7 @@ export class Native {
     const job = entry && this.#job(entry)
     let task = job?.tasks.find((t) => t.id === entry!.taskId)
     if (!entry || !job || !task) return undefined
+    entry.ended = false
     if (entry.writer && (task.status === "merged" || task.status === "cancelled")) {
       const added = addDelegated(job, { title: `${task.title} (continued)`, prompt: task.description, files: task.files, dependsOn: [], checks: entry.checks })
       if (!added.task) return undefined
@@ -427,6 +510,7 @@ export class Native {
     const job = entry && this.#job(entry)
     const task = job?.tasks.find((t) => t.id === entry!.taskId)
     if (!entry || !job || !task) return undefined
+    entry.ended = true
     let note: string | undefined
     if (!entry.writer) {
       if (task.status === "running") {
