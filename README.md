@@ -50,6 +50,16 @@ Jev and the plugin securing every task:
      note to report it, since nobody sits at a background worker. `external_directory` is layered: a path inside the
      job's own worktrees is allowed, a path the task itself names is allowed, and anything else goes to you.
      `~/.ssh`, `~/.config`, `/etc`, your home directory and another job's worktree are never allowed at any layer.
+   - **A writer's worktree is its sandbox.** A shell command a writer runs in its own task worktree is allowed without
+     Jev when it stays there: no path outside the worktree or `/tmp`, no home directory, no program that reaches past
+     the tree (`kill`, `systemctl`, `curl`, `ssh`, publishing, …) and no git command that moves shared refs (`commit`,
+     `checkout`, `stash`, `reset`, …). The hard rules still come first. Asking Jev there turned a worker's own
+     verification — tests, a render, a screenshot — into refusals; replayed against the journal, 85% of the refusals
+     in task worktrees no longer happen.
+   - **Readers read.** Explorer, researcher, planner, reviewer and oracle run `git log`/`diff`/`show`, `ls` and the
+     like without asking, and any chain or pipe of reading programs passes the read-only check; a command that writes
+     is refused with the reason, not a bare "Permission denied". No worker may put up a question: nobody answers one
+     in a background session.
    - **Checks are gated too.** A check is a string a model wrote, and the plugin runs it in a shell, so every check
      goes through the same hard rules as a permission request: pushes, `sudo`, system installs and destructive
      deletions are refused before the task or its worktree exists. A writer with no checks at all is refused as well.

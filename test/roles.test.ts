@@ -26,20 +26,26 @@ test("every role routes only to the three allowed models", () => {
   }
 })
 
-test("read-only roles can neither write nor run commands, and no sub-agent delegates further", () => {
+test("read-only roles cannot write, their other shell commands are asked, and no sub-agent delegates further", () => {
   for (const id of ["explore", "research", "plan", "review", "oracle"]) {
     const role = ROLES.find((r) => r.id === id)!
     for (const tool of ["edit", "write", "patch"]) assert.equal(effect(role.rules, tool), "deny", `${id} ${tool}`)
-    assert.equal(effect(role.rules, "shell"), "deny", `${id} shell`)
+    // asked, so the permission hook allows what only reads and refuses the rest with a reason (src/decide.ts)
+    assert.equal(effect(role.rules, "shell"), "ask", `${id} shell`)
+    for (const cmd of ["git log*", "git diff*", "ls *"]) assert.equal(effect(role.rules, "shell", cmd), "allow", `${id} ${cmd}`)
   }
   for (const role of ROLES) assert.equal(effect(role.rules, "subagent"), "deny", role.id)
 })
 
-test("an explorer may read git history and the file tree, nothing else on the shell", () => {
+test("no worker may put up a question: nobody sits at a background session to answer it", () => {
+  for (const role of ROLES) assert.equal(effect(role.rules, "question"), "deny", role.id)
+})
+
+test("an explorer runs git history and the file tree without asking; the rest of its shell is asked", () => {
   const explore = ROLES.find((r) => r.id === "explore")!
   for (const cmd of ["git log*", "git show*", "ls *", "tree *"]) assert.equal(effect(explore.rules, "shell", cmd), "allow", cmd)
-  assert.equal(effect(explore.rules, "shell"), "deny")
-  assert.equal(effect(explore.rules, "shell", "git commit*"), undefined, "no rule for it: the deny on * applies")
+  assert.equal(effect(explore.rules, "shell"), "ask")
+  assert.equal(effect(explore.rules, "shell", "git commit*"), undefined, "no rule for it: the ask on * applies")
   assert.equal(effect(explore.rules, "shell", "ast-grep run *"), "allow")
   assert.equal(effect(explore.rules, "shell", "graphify update *"), undefined, "the graph is the plugin's: explorers ask it through code_graph")
   const last = (cmd: string) => explore.rules.findLastIndex((r) => r.action === "shell" && r.resource === cmd)
@@ -112,18 +118,18 @@ test("the readers that write are denied, and only because the deny comes after t
   }
 })
 
-test("a read-only role gained nothing from the pipe readers", () => {
+test("a read-only role gained no allow rule from the pipe readers or the runners", () => {
   for (const id of ["explore", "research", "plan", "oracle"]) {
     const rules = ROLES.find((r) => r.id === id)!.rules
-    assert.equal(effect(rules, "shell"), "deny", `${id} shell`)
-    // No allow for a runner or a reader, so the deny on * is what every command still meets.
+    assert.equal(effect(rules, "shell"), "ask", `${id} shell`)
+    // No allow for a runner or a reader: the hook decides them, by whether they only read.
     for (const cmd of ["npm test*", "uv run pyright*", "grep*", "sed*"]) assert.equal(effect(rules, "shell", cmd), undefined, `${id} ${cmd}`)
     for (const cmd of ["npm test", "uv run pyright .", "grep -rn foo src", "sed -n 1,20p a.ts"]) {
       assert.notEqual(effectFor(rules, cmd), "allow", `${id}: ${cmd}`)
     }
   }
   const explore = ROLES.find((r) => r.id === "explore")!
-  assert.equal(effectFor(explore.rules, "npm test"), "deny")
+  assert.equal(effectFor(explore.rules, "npm test"), "ask")
   assert.equal(effectFor(explore.rules, "git log --oneline"), "allow", "what it had before")
 })
 

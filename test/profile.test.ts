@@ -58,8 +58,9 @@ test("a task that needs shell never stays with a role that has none (live test: 
   assert.equal(modelled.role, "review")
   assert.match(modelled.roleReason, /oracle has no shell/)
   assert.ok(modelled.confidence < 1, "the contradiction lowers the confidence")
+  // A writer has a shell of its own now (its worktree is its sandbox), so it keeps its role.
   const writer = combine(task({ role: "write", files: ["README.md"] }), acc, asked({ "tool.shell": noul(0.9) }), {})
-  assert.equal(writer.role, "code")
+  assert.equal(writer.role, "write")
 })
 
 test("user presets beat the model", () => {

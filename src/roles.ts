@@ -68,7 +68,7 @@ const noDelegation = [rule("subagent", "deny")]
 const STATE_PATHS = [".jev-micromanager*", "*/.jev-micromanager/jobs*", "*/.jev-micromanager/notes*"]
 const noStateDir = ["read", "glob", "grep", "list", "edit", "write", "patch"].flatMap((tool) => STATE_PATHS.map((path) => rule(tool, "deny", path)))
 
-const TEST_RUNNERS = [
+export const TEST_RUNNERS = [
   "pytest*", "python -m pytest*", "python3 -m pytest*", "uv run pytest*", "uv run python -m pytest*",
   "npm test*", "npx vitest*", "node --test*", "cargo test*", "go test*",
 ]
@@ -103,6 +103,24 @@ const runAndRead = [
   ...[...TEST_RUNNERS, ...LINTERS, ...PIPE_READERS].map((cmd) => rule("shell", "allow", cmd)),
   ...PIPE_READER_WRITES.map((cmd) => rule("shell", "deny", cmd)),
 ]
+// What every role that only reads gets on the shell. The listed commands run without asking; everything else is asked,
+// so it reaches the permission hook, where a command that only reads (src/decide.ts readsOnly, which knows a writing
+// redirect and `sed -i` from a read) is allowed and anything else is refused with a reason. A flat deny on "*" did
+// neither: live runs refused 97 reading chains (`ls -la && echo --- && find src`) with a bare "Permission denied", and a
+// reviewer could not run `git diff` on the change it was asked to review.
+const readShell = [
+  ...askShell,
+  ...READ_COMMANDS.map((cmd) => rule("shell", "allow", cmd)),
+  ...AST_GREP_WRITES.map((cmd) => rule("shell", "deny", cmd)),
+]
+// Nobody sits at a background worker, so a question it puts up is never answered and the worker hangs on it (live runs:
+// coders called it four times). What a worker cannot decide goes into its report.
+const noQuestion = [rule("question", "deny")]
+
+// What a reader is told about its shell, so it knows what runs instead of finding out from refusals.
+const READER_SHELL = `The shell runs commands that only read: ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) => all.indexOf(c) === i).join(", ")}, and
+also chains and pipes of reading programs (cat, head, grep, find, sed -n, echo, jq, …). A command that writes a file, a
+redirect into a file included, is refused: you only read.`
 
 const SHARED = `You are a sub-agent of the jev-micromanager. You get one sub-task with acceptance points.
 Do only that sub-task. When you finish, answer with: what you did, which files you changed (if any), and for
@@ -131,7 +149,7 @@ const role = (
   system: string,
   rules: readonly Rule[],
   models: readonly string[],
-): Role => ({ id, agent: AGENT_NAMES[id], description, system: `${SHARED}\n\n${system}`, rules: [...rules, ...noStateDir, ...noMemory], models })
+): Role => ({ id, agent: AGENT_NAMES[id], description, system: `${SHARED}\n\n${system}`, rules: [...rules, ...noStateDir, ...noMemory, ...noQuestion], models })
 
 export const ROLES: readonly Role[] = [
   role(
@@ -141,23 +159,22 @@ export const ROLES: readonly Role[] = [
 Be quick: when you have the code_graph tool, ask it who calls or uses what before you grep; read many files at once
 (several read, glob and grep calls in one step), prefer grep and the file tree to reading whole files, use git log and git show for history, and stop as soon as the question is answered; a summary of
 what you saw beats reading every file.
-The shell runs only these, one command per call, in your current directory (no cd, no && chains, no pipes into other
-tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) => all.indexOf(c) === i).join(", ")}. Use glob and grep for the rest.`,
-    [...noWrite, ...noShell, ...READ_COMMANDS.map((cmd) => rule("shell", "allow", cmd)), ...AST_GREP_WRITES.map((cmd) => rule("shell", "deny", cmd)), ...noWeb, ...noDelegation],
+${READER_SHELL}`,
+    [...noWrite, ...readShell, ...noWeb, ...noDelegation],
     [MODELS.space, MODELS.deepseek, MODELS.qwen],
   ),
   role(
     "research",
     "Read-only with web access: docs, APIs, other repositories, current information.",
-    "Look up documentation and sources on the web. Cite the URLs you used. Change nothing in the project.",
-    [...noWrite, ...noShell, ...noDelegation],
+    `Look up documentation and sources on the web. Cite the URLs you used. Change nothing in the project.\n${READER_SHELL}`,
+    [...noWrite, ...readShell, ...noDelegation],
     [MODELS.space, MODELS.deepseek, MODELS.qwen],
   ),
   role(
     "plan",
     "Read-only: split a problem into steps with acceptance points; no code.",
-    "Produce a short plan: steps, acceptance points per step, risks. Write no code.",
-    [...noWrite, ...noShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
+    `Produce a short plan: steps, acceptance points per step, risks. Write no code.\n${READER_SHELL}`,
+    [...noWrite, ...readShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
     [MODELS.space, MODELS.qwen, MODELS.glm],
   ),
   role(
@@ -185,7 +202,7 @@ tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) =>
     "write",
     "Docs, README, comments, commit and PR texts.",
     "Write clear, short English prose. Change only documentation files unless told otherwise.",
-    [...noShell, ...noWeb, ...noDelegation],
+    [...askShell, ...runAndRead, ...noWeb, ...noDelegation],
     [MODELS.space, MODELS.deepseek, MODELS.qwen],
   ),
   role(
@@ -201,14 +218,14 @@ tools): ${READ_COMMANDS.map((c) => c.replace(/ ?\*$/, "")).filter((c, i, all) =>
     `Check the result against each acceptance point. Run the tests and linters if there are any. Answer only
 with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "...", "met": true | false, "evidence": "..."}],
 "fixes": ["..."]}.`,
-    [...noWrite, ...noShell, ...runAndRead, ...noWeb, ...noDelegation],
+    [...noWrite, ...readShell, ...runAndRead, ...noWeb, ...noDelegation],
     [MODELS.space, MODELS.glm, MODELS.qwen], // space-bunny writes, so a reviewer must be another family
   ),
   role(
     "oracle",
     "Read-only: hard decisions, architecture, trade-offs.",
-    "Weigh the options for the question with evidence from the code. Give one recommendation and why.",
-    [...noWrite, ...noShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
+    `Weigh the options for the question with evidence from the code. Give one recommendation and why.\n${READER_SHELL}`,
+    [...noWrite, ...readShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
     [MODELS.space, MODELS.qwen, MODELS.glm],
   ),
 ]

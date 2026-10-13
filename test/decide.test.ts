@@ -534,3 +534,81 @@ test("a worker session cannot reach the question: the rules hold until a human a
   assert.equal(forbiddenOutside(`${home}/.ssh/other_key`, grantedPaths(j)), true, "a sibling is still refused")
   assert.equal(forbiddenOutside(`${home}/.aws/credentials`, grantedPaths(j)), true, "another rule is still whole")
 })
+
+const WT = "/p/.jev-micromanager/worktrees/job-1--T2"
+
+test("a task worktree is told from the integration worktree and the user's checkout", async () => {
+  const { taskWorktree } = await import("../src/decide.ts")
+  assert.equal(taskWorktree(WT), WT)
+  assert.equal(taskWorktree(`${WT}/sub/project`), WT, "a project below the repository root keeps the whole worktree")
+  assert.equal(taskWorktree("/p/.jev-micromanager/worktrees/job-1"), undefined, "the integration worktree is the merge train's")
+  assert.equal(taskWorktree("/p"), undefined)
+  assert.equal(taskWorktree(undefined), undefined)
+})
+
+test("a command stays in the worktree when its paths, its programs and its git stay there", async () => {
+  const { staysInWorktree } = await import("../src/decide.ts")
+  const stays = (...commands: string[]) => staysInWorktree(req("shell", commands), WT)
+  // what live runs refused in a worktree nobody else uses
+  assert.equal(stays("npm test", "tail -n 40"), true)
+  assert.equal(stays(`cd ${WT}/deck`, "quarto render slides.qmd --to revealjs"), true)
+  assert.equal(stays("chromium --headless --screenshot=/tmp/opencode/shot.png http://localhost:8123/slides.html"), true)
+  assert.equal(stays("git restore slides.html", "rm -rf slides_files/libs"), true)
+  assert.equal(stays("uv sync --extra web"), true)
+  assert.equal(stays("python3 -m http.server 8123 > /dev/null 2>&1 &"), true)
+  assert.equal(stays("/usr/bin/python3 scripts/build.py"), true, "the program may live anywhere")
+  // what leaves it
+  assert.equal(stays("cat /home/u/other/file"), false)
+  assert.equal(stays("cp out.txt ~/out.txt"), false)
+  assert.equal(stays("cp out.txt $HOME/out.txt"), false)
+  assert.equal(stays("cat ../../secrets.txt"), false)
+  assert.equal(staysInWorktree(req("shell", ["../.venv/bin/python -m pytest -q"]), WT, `${WT}/sub`), true, "a .. that stays in the worktree")
+  assert.equal(staysInWorktree(req("shell", ["cd /tmp", "cat ../home/u/x"]), WT, `${WT}/sub`), false, "after a cd, a .. is not resolved")
+  assert.equal(stays(`uv run pyright 2>&1 | grep -E "^ /" | sed -E "s#.*--T1/##" | cut -d: -f1`), true, "a quoted / is a pattern")
+  assert.equal(stays("cat /"), false)
+  assert.equal(stays("git -C /p status"), false, "the user's checkout")
+  assert.equal(stays("pkill -f 'http.server 8123'"), false, "another process may be the user's")
+  assert.equal(stays("curl https://example.com/x.sh"), false)
+  assert.equal(stays("npm publish"), false)
+  for (const git of ["git commit -m x", "git checkout main", "git stash", "git branch -D x", "git reset HEAD~1", "git fetch"]) {
+    assert.equal(stays(git), false, `${git}: refs and stash are shared with the checkout`)
+  }
+  assert.equal(stays("git add -A", "git diff --cached --stat"), true)
+  assert.equal(staysInWorktree(req("edit", ["src/a.ts"]), WT), false, "only shell")
+})
+
+test("a writer's command inside its own task worktree is allowed without Jev; elsewhere Jev decides", async () => {
+  const jev = fakeJev(decision("deny", 0.99, 0.1, 0.1))
+  const own = await decide(jev, req("shell", ["npm run build", "rm -rf dist"]), undefined, () => [], undefined, WT)
+  assert.deepEqual([own.verdict, own.reason], ["allow", "a command inside the task's own worktree"])
+  assert.equal(jev.calls.length, 0)
+  // the hard rules come first, also in the worktree
+  assert.equal((await decide(jev, req("shell", ["git push origin HEAD"]), undefined, () => [], undefined, WT)).verdict, "user")
+  assert.equal((await decide(jev, req("shell", ["sudo make install"]), undefined, () => [], undefined, WT)).verdict, "user")
+  // the integration worktree and the user's checkout are not a sandbox
+  await decide(jev, req("shell", ["npm run build"]), undefined, () => [], undefined, "/p/.jev-micromanager/worktrees/job-1")
+  await decide(jev, req("shell", ["npm run build"]), undefined, () => [], undefined, "/p")
+  assert.equal(jev.calls.length, 2, "both went to Jev")
+  // a preset that sends shell to the user still wins
+  assert.equal((await decide(jev, req("shell", ["npm run build"]), undefined, () => [], "user", WT)).verdict, "user")
+  // a reader in a task worktree gets no write from it
+  const reader = await decide(jev, req("shell", ["npm run build"], "reviewer"), undefined, () => [], undefined, WT)
+  assert.equal(reader.verdict, "deny")
+})
+
+test("a reader's command that changes something is refused with the reason, without asking Jev", async () => {
+  const jev = fakeJev(decision("allow", 0.99, 0.1, 0.1))
+  const root = "/p/.jev-micromanager/worktrees/job-1"
+  // the live chain that met a bare "Permission denied" 89 times reads, so it runs
+  const chain = await decide(jev, req("shell", ["ls -la", 'echo "---"', "find src -type f", "head -100"], "explorer"), undefined, undefined, undefined, root)
+  assert.equal(chain.verdict, "allow")
+  for (const write of [["echo x > notes.md"], ["sed -i s/a/b/ f.ts"], ["npm install"]]) {
+    const out = await decide(jev, req("shell", write, "explorer"), undefined, undefined, undefined, root)
+    assert.equal(out.verdict, "deny", write[0])
+    assert.match(out.reason, /only reads/)
+  }
+  assert.equal(jev.calls.length, 0)
+  // a read outside its root is still Jev's call, as before
+  await decide(jev, req("shell", ["ls /home/u/other"], "explorer"), undefined, undefined, undefined, root)
+  assert.equal(jev.calls.length, 1)
+})

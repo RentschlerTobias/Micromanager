@@ -7,7 +7,7 @@ import { CHOICE_FLOOR, CLASSIFY, NOUL_FLOOR, roleChoice, RISKS, skillQuestion, t
 import type { Question } from "./jev.ts"
 import { recallQuestions, recalled } from "./memory.ts"
 import { resolvePolicy, type Policies } from "./policy.ts"
-import { ROLES, roleById, type Role, type Rule } from "./roles.ts"
+import { ROLES, TEST_RUNNERS, roleById, type Role, type Rule } from "./roles.ts"
 import type { Acceptance, Task } from "./state.ts"
 
 export type PermProfile = "strict" | "normal" | "trusted"
@@ -77,11 +77,16 @@ export function classifyState(_goal: string, task: Task, acceptance: readonly Ac
   }
 }
 
-// A role can use an action unless it denies it outright with no exception (review denies shell but allows test
-// runners and linters, so it can run the tests).
-const canUse = (role: Role, action: string) =>
-  !role.rules.some((r) => r.action === action && r.resource === "*" && r.effect === "deny") ||
-  role.rules.some((r) => r.action === action && r.resource !== "*" && r.effect !== "deny")
+// A role can use an action unless it denies it outright with no exception. For the shell of a role that only reads,
+// what counts is whether it may run the tests: every reader may run reading commands (git log, ls, grep), and a task
+// that needs the shell needs it to run something (review allows the test runners, oracle does not).
+const canUse = (role: Role, action: string) => {
+  if (action === "shell" && !WRITERS.has(role.id)) return TEST_RUNNERS.some((cmd) => role.rules.some((r) => r.action === "shell" && r.resource === cmd && r.effect === "allow"))
+  return (
+    !role.rules.some((r) => r.action === action && r.resource === "*" && r.effect === "deny") ||
+    role.rules.some((r) => r.action === action && r.resource !== "*" && r.effect !== "deny")
+  )
+}
 
 // The first role in the same write class that may use the group, for a task whose role cannot do what it needs.
 function roleThatCan(group: ToolGroup, writer: boolean): Role | undefined {

@@ -6,7 +6,8 @@
 //
 // A shell request that only reads inside the job's own worktree skips Jev entirely (readsOnlyInside): a worker
 // cannot change anything with it, and its own confidence on `git status --porcelain` (0.75) sits below the read
-// floor (0.80), so asking only turned inspection into denials.
+// floor (0.80), so asking only turned inspection into denials. A writer's command that stays in its own task worktree
+// skips Jev too (staysInWorktree), and a reader's command that does not only read is refused without asking.
 //
 // external_directory is layered, not a blanket "never":
 //   1. a hard rule no layer can pass: the user's keys and credential stores, their home itself, the system
@@ -401,6 +402,76 @@ export function readsOnlyInside(request: PermissionRequest, root: string): boole
   )
 }
 
+// The task worktree a directory lies in (<project>/.jev-micromanager/worktrees/<job>--T<id>), or undefined. Only a task's
+// own worktree, never the job's integration worktree: that one is the merge train's target and the readers' tree, so
+// nothing may change it outside a merge. A project inside a larger repository works in <worktree>/<rel>; the area is
+// the whole worktree either way.
+const TASK_WORKTREE = /^(.*\/\.jev-micromanager\/worktrees\/[^/]+--T[\w.]+)(?:\/|$)/
+
+export function taskWorktree(directory: string | undefined): string | undefined {
+  return directory ? normalizeOutside(directory).match(TASK_WORKTREE)?.[1] : undefined
+}
+
+// Programs whose effect reaches past the worktree whatever their arguments say: other processes, services, the
+// network, the desktop, the user's accounts.
+const BEYOND_WORKTREE = new Set([
+  "kill", "pkill", "killall", "systemctl", "journalctl", "loginctl", "crontab", "at", "docker", "podman", "ssh", "scp",
+  "sftp", "rsync", "curl", "wget", "nc", "ncat", "socat", "shutdown", "reboot", "poweroff", "mount", "umount", "chown",
+  "su", "doas", "xdg-open", "open", "notify-send", "hyprctl", "gh", "flatpak", "snap",
+])
+// git inside a worktree: reading, and changing the working tree and the index. The refs, the stash and the config are
+// shared with the user's checkout and every other worktree, so commit, checkout, branch, reset, stash, fetch, … stay Jev's.
+// `branch` and `remote` are left to gitReads, which tells `git branch` from `git branch -D x` by the arguments.
+const GIT_IN_WORKTREE = new Set([...[...GIT_READS].filter((sub) => sub !== "branch" && sub !== "remote"), "add", "restore", "rm", "mv", "apply", "grep", "check-ignore", "ls-tree", "cat-file"])
+const PUBLISH = /\b(npm|pnpm|yarn|cargo|twine|gem|poetry|uv)\s+(publish|upload|login|adduser)\b/
+// Paths outside the worktree that a command may still name: scratch space and the standard streams.
+const SCRATCH = ["/tmp", "/dev/null", "/dev/stdout", "/dev/stderr"]
+
+// A command a writer runs in its own task worktree that stays there: every path it names is inside the worktree or
+// scratch space, it names no home directory, and no step is a program that acts beyond the tree (processes, services,
+// network, publishing) or a git command that moves shared refs. What it does is the worker's business: the worktree is a
+// throwaway checkout, and only the task's checks and the merge train bring its content anywhere. This judges the command
+// line, not what a program does once it runs, exactly as the test-runner allow rules do: running the project's own code
+// is what a writer is for.
+//
+// cwd is the directory the worker runs in, which for a project below the repository root is <worktree>/<rel>: a `..`
+// there can stay in the worktree (`../.venv/bin/python`), so a relative path is resolved against it. A `cd` anywhere in
+// the request makes that guess unsafe, and then any `..` leaves the fast path.
+export function staysInWorktree(request: PermissionRequest, worktree: string, cwd: string = worktree): boolean {
+  if (request.action !== "shell" || request.resources.length === 0) return false
+  const area = normalizeOutside(worktree)
+  if (area.length === 0) return false
+  const allowed = (path: string) => under(path, area) || SCRATCH.some((dir) => path === dir || under(path, dir))
+  const moves = request.resources.some((command) => segments(command).some((segment) => /^cd(\s|$)/.test(segment)))
+  // One argument as a path, or undefined when it is none. A quoted lone "/" is a pattern (`grep -E "^ /"`), not the root.
+  const pathOf = (token: string): string | undefined => {
+    const value = token.startsWith("-") && token.includes("=") ? token.slice(token.indexOf("=") + 1) : token
+    const bare = value.replace(/^['"(]+|['",;)]+$/g, "")
+    if (bare === "/" && bare !== value) return undefined
+    if (isAbsolute(bare)) return normalizeOutside(bare)
+    if (/(^|\/)\.\.(\/|$)/.test(bare)) return moves ? "/" : normalize(join(cwd, bare))
+    return undefined
+  }
+  return request.resources.every((command) => {
+    if (PUBLISH.test(command)) return false
+    if (/(^|[\s"'=:])(~|\$\{?HOME\b)/.test(command)) return false
+    return segments(command).every((segment) => {
+      const tokens = unwrap(segment.split(/\s+/).filter(Boolean))
+      const program = (tokens[0] ?? "").replace(/^.*\//, "")
+      if (BEYOND_WORKTREE.has(program) || program.startsWith("omarchy")) return false
+      if (program === "git") {
+        const at = gitSubcommand(tokens)
+        if (!GIT_IN_WORKTREE.has(tokens[at] ?? "") && !gitReads(tokens, at)) return false
+      }
+      // The program itself may live anywhere (/usr/bin/python3); its arguments may not.
+      return tokens.slice(1).every((token) => {
+        const path = pathOf(token)
+        return path === undefined || allowed(path)
+      })
+    })
+  })
+}
+
 export function riskClass(request: PermissionRequest): "read" | "write" {
   if (READ_ACTIONS.has(request.action)) return "read"
   return request.action === "shell" && readsOnly(request.resources) ? "read" : "write"
@@ -555,6 +626,23 @@ export async function decide(
   const presetRules = preset === "user" || preset === "deny"
   if (!presetRules && request.action !== "external_directory" && root !== undefined && readsOnlyInside(request, root)) {
     return { verdict: "allow", reason: "read-only command inside the job's worktree" }
+  }
+  // A writer's own task worktree is its sandbox. Asking Jev there turned a worker's verification into denials (live
+  // runs: 478 "Jev unsure" refusals on writes, among them `npm test`, a render, a screenshot and `git restore` in a
+  // worktree nobody else uses), and a worker that cannot check its work cannot finish it. Deleting a tracked file there
+  // is allowed too: git has it, and the task's diff shows it before anything merges.
+  const role = roleByAgent(request.agent)?.id
+  if (!presetRules && request.action === "shell" && role !== undefined) {
+    const worktree = WRITERS.has(role) ? taskWorktree(root) : undefined
+    if (worktree && staysInWorktree(request, worktree, root)) {
+      return { verdict: "allow", reason: "a command inside the task's own worktree" }
+    }
+    // A reader's shell asks about every command its rules do not list, so that a chain of reading programs reaches the
+    // read-only check above instead of a flat deny. What does not read is refused here, with the reason, and Jev is
+    // not asked to decide whether a role that only reads may write.
+    if (!WRITERS.has(role) && !readsOnly(request.resources)) {
+      return { verdict: "deny", reason: `a ${request.agent} only reads, and this command changes something; run read-only commands only (no writing redirects, no sed -i), or report what you needed it for` }
+    }
   }
   const outside = presetRules ? undefined : externalVerdict(request, allowed)
   if (outside) return outside

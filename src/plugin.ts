@@ -815,8 +815,11 @@ export default {
       // worker's inspection instead of asking Jev, whose confidence on those sits below the read floor.
       const root = runnerSessions.has(evaluation.sessionID) ? workerDirs.get(evaluation.sessionID) ?? ctx.location?.directory : undefined
       const outcome = await decide(jev, request, floors, undefined, preset, root, [...allowOutside, ...grantedPaths(job)])
-      if (outcome.verdict !== "user") evaluation.effect = outcome.verdict
-      else if (runnerSessions.has(evaluation.sessionID)) {
+      if (outcome.verdict !== "user") {
+        evaluation.effect = outcome.verdict
+        // A refusal says why, so the worker can choose another way instead of guessing from a bare "denied".
+        if (outcome.verdict === "deny") evaluation.message = `Refused: ${outcome.reason}.`
+      } else if (runnerSessions.has(evaluation.sessionID)) {
         evaluation.effect = "deny"
         evaluation.message = `This is refused, not queued: nobody is asked while you run (${outcome.reason}), and asking again would not bring the question back. It does not stop your task: carry on without it, and say in your report what you wanted it for and what you did instead. Report STATUS: NEEDS_CONTEXT only if you genuinely cannot proceed without it. Still, do not reach the same result by a route around this permission.`
       }

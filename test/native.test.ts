@@ -269,9 +269,10 @@ test("a coder may be given a Checks line that is a pipeline, and every segment o
   // A writer in the chain is not allowed by the readers, which is why the deny sits after the allow it overrides.
   const writing = segments("npm test | tail -20 | sed -i s/1/2/ notes.md")
   assert.deepEqual(writing.map((s) => effectOn("coder", s)), ["allow", "allow", "deny"])
-  // An explorer gained none of it: its deny on * is what every segment of the chain still meets.
+  // An explorer has no allow for the runner or the readers: each segment is asked, and the permission hook allows a
+  // chain only when every segment reads (src/decide.ts), which `uv run pyright` does not.
   assert.ok(!roleByAgent("explorer")!.rules.some((r) => r.action === "shell" && r.effect === "allow" && /^(grep|sed|cut|sort|uniq)/.test(r.resource)))
-  assert.deepEqual(segments(pipeline).map((s) => effectOn("explorer", s)), Array(7).fill("deny"))
+  assert.deepEqual(segments(pipeline).map((s) => effectOn("explorer", s)), Array(7).fill("ask"))
 })
 
 test("a call that failed before its worker started drops the task and its worktree", async () => {
