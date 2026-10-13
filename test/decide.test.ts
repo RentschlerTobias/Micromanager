@@ -565,7 +565,8 @@ test("a command stays in the worktree when its paths, its programs and its git s
   assert.equal(staysInWorktree(req("shell", ["../.venv/bin/python -m pytest -q"]), WT, `${WT}/sub`), true, "a .. that stays in the worktree")
   assert.equal(staysInWorktree(req("shell", ["cd /tmp", "cat ../home/u/x"]), WT, `${WT}/sub`), false, "after a cd, a .. is not resolved")
   assert.equal(stays(`uv run pyright 2>&1 | grep -E "^ /" | sed -E "s#.*--T1/##" | cut -d: -f1`), true, "a quoted / is a pattern")
-  assert.equal(stays("cat /"), false)
+  // the live inline script that went to Jev: its division sign is no path
+  assert.equal(stays("node -e '\nconst x = v * f\nconst out = (half ? r : r - 1) / f // per cent\nconsole.log(out)'"), true)
   assert.equal(stays("git -C /p status"), false, "the user's checkout")
   assert.equal(stays("pkill -f 'http.server 8123'"), false, "another process may be the user's")
   assert.equal(stays("curl https://example.com/x.sh"), false)

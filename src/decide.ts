@@ -443,11 +443,12 @@ export function staysInWorktree(request: PermissionRequest, worktree: string, cw
   if (area.length === 0) return false
   const allowed = (path: string) => under(path, area) || SCRATCH.some((dir) => path === dir || under(path, dir))
   const moves = request.resources.some((command) => segments(command).some((segment) => /^cd(\s|$)/.test(segment)))
-  // One argument as a path, or undefined when it is none. A quoted lone "/" is a pattern (`grep -E "^ /"`), not the root.
+  // One argument as a path, or undefined when it is none. A lone "/" or "//" is a division or a comment in inline code
+  // (`node -e '… r) / f'`, live run 2026-10-13) or a pattern (`grep -E "^ /"`), never a path a command works in.
   const pathOf = (token: string): string | undefined => {
     const value = token.startsWith("-") && token.includes("=") ? token.slice(token.indexOf("=") + 1) : token
     const bare = value.replace(/^['"(]+|['",;)]+$/g, "")
-    if (bare === "/" && bare !== value) return undefined
+    if (/^\/+$/.test(bare)) return undefined
     if (isAbsolute(bare)) return normalizeOutside(bare)
     if (/(^|\/)\.\.(\/|$)/.test(bare)) return moves ? "/" : normalize(join(cwd, bare))
     return undefined
