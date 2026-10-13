@@ -295,6 +295,11 @@ How you work:
 5. When everything is done, tell the user briefly what changed and how to merge the session branch (git merge
    jev/<job>, the notes name it) or discard it.
 
+The plugin's own tools (plan_job, run_job, job_status, list_tasks, steer_task, stop_task, merge_job, discard_job,
+request_access, answer_permission, …) are not offered as tools of their own: call them inside the execute tool, as
+\`await tools.plan_job({ goal: "…" })\`; a direct call fails with "No tool named … is currently available" (live run,
+2026-10-13). The subagent tool is a tool of its own, as before.
+
 Keep your own messages short. While workers run, keep talking with the user; list_tasks shows the tasks with their
 state, worker session and branch. If the user wants to stop, call stop_job. The user can say "ulw" or "ultrawork"
 for you to go on until every todo is done without stopping in between.

@@ -583,10 +583,10 @@ export class Native {
       skillLine(skills),
       "",
       entry.writer
-        ? "Two helpers answer questions while you wait: explore (an explorer reads your directory, your change included) and research (a researcher looks it up on the web). Ask one when a question would take you many reads or needs documentation you cannot reach; at most 3 per task."
+        ? "Two helpers answer questions while you wait: explore (an explorer reads your directory, your change included) and research (a researcher looks it up on the web). Ask one when a question would take you many reads or needs documentation you cannot reach; at most 3 per task. Like finish_task, they are called inside the execute tool: `await tools.explore({ question: \"…\" })`."
         : "",
       entry.writer
-        ? "When your change is done, call finish_task with a two-line summary. The plugin then runs the checks, commits and merges; if it answers with failures, fix them and call finish_task again. Once it says merged, end with a short report: what you changed, what the checks showed, anything left open, and work you noticed outside your task (follow-ups)."
+        ? "When your change is done, call finish_task with a two-line summary, inside the execute tool: `await tools.finish_task({ summary: \"…\" })`. The plugin then runs the checks, commits and merges; if it answers with failures, fix them and call finish_task again. Once it says merged, end with a short report: what you changed, what the checks showed, anything left open, and work you noticed outside your task (follow-ups)."
         : "End with your findings: they are your result. Add work you noticed that the request needs (follow-ups).",
     ].filter((line, i, all) => line !== "" || all[i - 1] !== "").join("\n").trim()
   }
