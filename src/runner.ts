@@ -82,6 +82,7 @@ export interface RunnerDeps {
   readonly parallel?: number // tasks of a job at the same time (Phase F); 1 runs them one after another in the job's worktree
   readonly perModel?: number // sessions of one cloud model at the same time; a local model serves one at a time
   readonly taskEnded?: (job: Job, task: Task) => void // a task of a rolling job merged, escalated or waits for the user
+  readonly waiting?: (sessionID: string) => boolean // a permission request of the session is paused for an answer (src/ask.ts)
 }
 
 // Thrown out of a session turn when the user stopped the job; run() pauses the job, and the next run resumes it.
@@ -219,7 +220,8 @@ export class Runner {
       // A context call that fails counts as no change, as before: an unreadable session is not a moving one.
       const seen = await this.#d.session.context({ sessionID }).catch(() => undefined)
       const now = seen === undefined ? last : fingerprint(seen)
-      if (now !== last) [last, since] = [now, Date.now()]
+      // A session paused on a permission request waits for an answer, not for a stuck model: it is no stall.
+      if (now !== last || this.#d.waiting?.(sessionID)) [last, since] = [now, Date.now()]
       else if (Date.now() - since >= stallMs) {
         await this.#d.session.interrupt({ sessionID }).catch(() => undefined)
         return { kind: "stalled", detail: `no progress for ${Math.round(stallMs / 1000)} s (the model stopped answering)` }

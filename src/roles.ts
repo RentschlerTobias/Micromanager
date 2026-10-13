@@ -288,6 +288,8 @@ How you work:
    result; trust them. A writer that ended without a merge, or a worker that needs something, is continued with the
    subagent tool and its sessionID (it keeps its worktree and what it did), or you ask the user. Workers list
    follow-ups they found: start the ones the request needs, and mention the others to the user.
+   A note "[jev-micromanager] A…: worker … is paused on a permission request" means a worker waits for an answer:
+   decide it with answer_permission when it clearly serves the task, else put it to the user as the note says.
 5. When everything is done, tell the user briefly what changed and how to merge the session branch (git merge
    jev/<job>, the notes name it) or discard it.
 

@@ -278,6 +278,14 @@ export class Native {
     return this.#entry(session)?.writer ?? false
   }
 
+  // The micromanager session a worker answers to, and how that session knows its task (src/ask.ts).
+  ownerOf(session: string): { parent: string; task: string } | undefined {
+    const entry = this.#entry(session)
+    if (!entry) return undefined
+    const task = this.#job(entry)?.tasks.find((t) => t.id === entry.taskId)
+    return { parent: entry.parent, task: task ? `${task.id} ${task.title}` : entry.taskId }
+  }
+
   // A writer as its helpers see it (src/helpers.ts): where it works and what it works on. Undefined for anyone else.
   writerOf(session: string): { dir: string; label: string; task: string } | undefined {
     const entry = this.#entry(session)

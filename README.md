@@ -46,9 +46,16 @@ Jev and the plugin securing every task:
    - **Guards.** A check looks at each delegation, at web content and at workers' permission requests. Keys and
      tokens are masked.
    - **Model and skills.** The plugin routes each role to its model and names the skills in the worker's brief.
-   - **Permissions (N13).** Workers' permission requests go to Jev; what Jev is not sure about is denied with a
-     note to report it, since nobody sits at a background worker. `external_directory` is layered: a path inside the
-     job's own worktrees is allowed, a path the task itself names is allowed, and anything else goes to you.
+   - **Permissions (N13).** Workers' permission requests go to Jev. What Jev is not sure about, what it says only
+     you can decide, and what a hard rule sends to you is **paused, not refused**: the worker waits, and the
+     micromanager is woken with the request (`A1`, `A2`, …), what it is for and why it was not decided. It answers a
+     request that clearly serves the task itself with `answer_permission` (`once`, `job` for the same request for the
+     rest of the job, or `refuse`), and puts anything else to you. You answer in your own words — "yes", "yes always",
+     "no" (also "ja", "ja immer", "nein") — and the plugin reads that from your turn, so a hard rule only ever opens
+     on your word, never on the micromanager's. Nobody answering within 10 minutes refuses it, and the worker carries
+     on without it as before; a desktop notification says a worker waits. `external_directory` is layered: a path
+     inside the job's own worktrees is allowed, a path the task itself names is allowed, and anything else is
+     paused for you the same way.
      `~/.ssh`, `~/.config`, `/etc`, your home directory and another job's worktree are never allowed at any layer.
    - **A writer's worktree is its sandbox.** A shell command a writer runs in its own task worktree is allowed without
      Jev when it stays there: no path outside the worktree or `/tmp`, no home directory, no program that reaches past

@@ -5,7 +5,7 @@
   "type": "module",
   "description": "An OpenCode v2 plugin that orchestrates sub-agents, with TypeSafe Jev making the decisions",
   "scripts": {
-    "test": "node --test 'test/**/*.test.ts'",
+    "test": "XDG_STATE_HOME=$(mktemp -d) node --test 'test/**/*.test.ts'",
     "typecheck": "tsc -p tsconfig.json",
     "eval": "node src/cli.ts eval",
     "export-dataset": "node src/cli.ts export-dataset",

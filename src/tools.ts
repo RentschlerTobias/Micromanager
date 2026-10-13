@@ -13,6 +13,8 @@ export const TOOL_IDS = [
   "list_tasks", "plan_job", "plan_questions", "run_job", "job_status", "stop_job",
   // The controls a run showed were missing: one task at a time, the job branch, the worktrees behind it, and a vouch.
   "steer_task", "stop_task", "merge_job", "discard_job", "request_access",
+  // A worker's paused permission request, answered (src/ask.ts).
+  "answer_permission",
 ] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
@@ -38,6 +40,7 @@ export interface Handlers {
   merge(job: string, ack: string, ctx: ToolContext): Promise<string>
   discard(job: string, ack: string, ctx: ToolContext): Promise<string>
   access(path: string, why: string, ctx: ToolContext): Promise<string>
+  permission(id: string, decision: string, note: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -131,6 +134,13 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     description: "Vouch that a worker of this job legitimately needs a path outside the project: path with its full path, why in one sentence for the user. From then on a worker that only reads may read it without asking again; writing there still goes to the user. A path the plugin refuses by default — the user's keys, credentials, home and the system directories — is not a refusal but a question: calling this with one returns the question to put to the user word for word, and their answer on the next turn opens it for this job or leaves it closed. End your turn after showing it.",
     input: input("path", "why"),
     execute: guarded(([path, why], ctx) => handlers.access(path!, why!, ctx), "path", "why"),
+  })
+  draft.add({
+    id: "answer_permission",
+    name: "answer_permission",
+    description: "Answer a worker's paused permission request (a note \"[jev-micromanager] A…: worker … is paused\" names it). id: the A-number. decision: once (let this call run), job (also this exact request for the rest of the job) or refuse. note: for a refusal, why, in one sentence for the worker. Allow only what clearly serves the worker's task and reaches nothing outside the project; anything else is the user's to decide, and a hard rule always is.",
+    input: input("id", "decision", "note"),
+    execute: guarded(([id, decision, note], ctx) => handlers.permission(id!, decision!, note!, ctx), "id", "decision", "note"),
   })
   return [...TOOL_IDS]
 }

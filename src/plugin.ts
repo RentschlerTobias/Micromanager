@@ -33,6 +33,7 @@ import { readFileSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { FINISH_ID, GRAPH_ID, HELPER_IDS, installFinishTool, installGraphTool, installHelperTools, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 import { HELPER_STEPS, Helpers } from "./helpers.ts"
+import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
 import { CHILD_PREFIX, DelegationError, Native } from "./native.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
@@ -76,7 +77,12 @@ interface Context {
     // context's session domain is the client session API with get/switchAgent/switchModel/prompt on it.
     get(args: { sessionID: string }): Promise<unknown>
   }
-  permission: { hook(name: string, callback: (evaluation: Evaluation) => Promise<void> | void): Promise<unknown> }
+  permission: {
+    hook(name: string, callback: (evaluation: Evaluation) => Promise<void> | void): Promise<unknown>
+    // A session's paused requests, and the reply that lets one go or fails it (opencode 2.0.18, src/ask.ts).
+    list(args: { sessionID: string }): Promise<{ id: string; action: string; resources: readonly string[] }[]>
+    reply(args: { sessionID: string; requestID: string; decision: "once" | "always" | "reject"; message?: string }): Promise<unknown>
+  }
   // The host model catalog: the only authority on which models exist (see modelAvailability).
   catalog?: ModelCatalog
   location?: { directory?: string }
@@ -122,6 +128,8 @@ interface Shared {
   grants: Map<string, Grants> // job -> what the user decided about the refused paths of this job
   asked: Map<string, Asked> // job -> the question waiting for an answer, so it is never asked twice at once
   native?: Native // the micromanager's workers on OpenCode's subagent tool, made by the first instance
+  asks: Asks // workers' paused permission requests, answered by the micromanager or the user (src/ask.ts)
+  helperOf: Map<string, string> // helper session -> the writer it answers (src/helpers.ts)
 }
 const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicromanager ??= {
   workerTasks: new Map(),
@@ -129,6 +137,8 @@ const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicr
   runnerSessions: new Set(),
   workerJobs: new Map(),
   workerDirs: new Map(),
+  asks: new Asks(record),
+  helperOf: new Map(),
   watchdog: new Watchdog(),
   stops: new Map(),
   ended: new Set(),
@@ -692,6 +702,65 @@ export default {
     // that repeats itself every tool call is one nobody reads.
     const deniedSessions = new Set<string>()
 
+    // The micromanager session a worker answers to: a native worker's parent, a helper's writer's, or a planned job's
+    // facilitator. Undefined for a session nobody answers for, whose requests are refused as before.
+    const ownerOf = (sessionID: string): { parent: string; task: string } | undefined => {
+      const native_ = native.ownerOf(sessionID)
+      if (native_) return native_
+      const writer = SHARED.helperOf.get(sessionID)
+      const viaWriter = writer ? native.ownerOf(writer) : undefined
+      if (viaWriter) return { parent: viaWriter.parent, task: `the helper of ${viaWriter.task}` }
+      const job = workerJobs.get(sessionID)
+      const facilitator = job && ctx.location?.directory ? loadJob(ctx.location.directory, job)?.facilitator : undefined
+      return facilitator ? { parent: facilitator, task: (workerTasks.get(sessionID) ?? sessionID).slice(0, 120) } : undefined
+    }
+    // A worker's request nobody could decide is paused and put to its micromanager instead of being refused
+    // (src/ask.ts). The effect stays "ask", so OpenCode parks the call; the request is found in the session's pending
+    // list once the hook has returned, and the micromanager is woken with it. Returns false when there is nobody to
+    // ask, and the caller refuses as before.
+    const pause = (evaluation: Evaluation, reason: string, hard: boolean): boolean => {
+      const owner = ownerOf(evaluation.sessionID)
+      if (!owner) return false
+      const standing = SHARED.asks.standing(owner.parent, evaluation.action, evaluation.resources)
+      if (standing === "allow") {
+        evaluation.effect = "allow"
+        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: "allowed for this job when it was asked before" })
+        return true
+      }
+      if (standing === "deny") {
+        evaluation.effect = "deny"
+        evaluation.message = "This exact request was refused earlier in this job. Do not try it another way; carry on without it, and say in your report what you wanted it for."
+        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "refused for this job when it was asked before" })
+        return true
+      }
+      evaluation.effect = "ask"
+      const { sessionID, action, agent } = evaluation
+      const resources = [...evaluation.resources]
+      void (async () => {
+        // The request enters the pending list right after this hook returns; a short poll finds it.
+        let requestID: string | undefined
+        for (let i = 0; i < 50 && !requestID; i++) {
+          await new Promise((r) => setTimeout(r, 200))
+          const pending = await ctx.permission.list({ sessionID }).catch(() => [])
+          requestID = pending.find((p) => p.action === action && p.resources.join("\0") === resources.join("\0") && !claimedRequests.has(p.id))?.id
+        }
+        if (!requestID) {
+          log("error", `paused ${action} of ${sessionID} but found no pending request to answer; it waits until the session ends`)
+          record({ kind: "ask", event: "lost", sessionID, action, resources })
+          return
+        }
+        claimedRequests.add(requestID)
+        const id = requestID
+        const ask = SHARED.asks.open({ sessionID, parent: owner.parent, task: owner.task, agent, action, resources, reason, hard }, async (decision, message) => {
+          await ctx.permission.reply({ sessionID, requestID: id, decision, message })
+        })
+        await ctx.session.synthetic({ sessionID: owner.parent, text: askNote(ask), resume: true }).catch((err: unknown) => log("warn", `ask note failed: ${String(err)}`))
+        if (notify !== "off") execFile("notify-send", ["-a", "jev-micromanager", `${ask.id}: a worker waits for you`, `${action}: ${resources.join(" ").slice(0, 160)}`], () => {})
+      })()
+      return true
+    }
+    const claimedRequests = new Set<string>()
+
     // Every question of the micromanager and its sub-agents goes to Jev first: it answers itself when sure enough,
     // else the user is asked as usual.
     const micromanagerReads = new Map<string, number>()
@@ -782,6 +851,7 @@ export default {
           record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: "a reader, in a directory its task or the micromanager names" })
           return
         }
+        if (pause(evaluation, "a path outside the worker's directory that its task does not name", false)) return
         evaluation.effect = "deny"
         evaluation.message = "Stay inside your working directory; the job's state and the user's checkout are not part of your task. If you need something from outside, say so in your report (STATUS: NEEDS_CONTEXT)."
         record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "runner session outside its directory" })
@@ -820,6 +890,8 @@ export default {
         evaluation.effect = outcome.verdict
         // A refusal says why, so the worker can choose another way instead of guessing from a bare "denied".
         if (outcome.verdict === "deny") evaluation.message = `Refused: ${outcome.reason}.`
+      } else if (runnerSessions.has(evaluation.sessionID) && pause(evaluation, outcome.reason, outcome.reason.startsWith("always the user"))) {
+        // paused: the micromanager or the user answers it (src/ask.ts)
       } else if (runnerSessions.has(evaluation.sessionID)) {
         evaluation.effect = "deny"
         evaluation.message = `This is refused, not queued: nobody is asked while you run (${outcome.reason}), and asking again would not bring the question back. It does not stop your task: carry on without it, and say in your report what you wanted it for and what you did instead. Report STATUS: NEEDS_CONTEXT only if you genuinely cannot proceed without it. Still, do not reach the same result by a route around this permission.`
@@ -877,6 +949,7 @@ export default {
       caller: (sessionID) => native.writerOf(sessionID),
       model: async (role) => (await chooseModel(role, { vision: false }, routing, undefined, modelAvailability(ctx.catalog))).model,
       started: (helper, caller, dir, brief) => {
+        SHARED.helperOf.set(helper, caller)
         runnerSessions.add(helper)
         workerDirs.set(helper, dir)
         workerTasks.set(helper, brief)
@@ -944,6 +1017,7 @@ export default {
         stopped: (sessionID) => stops.get(sessionID),
         skills: SKILLS.filter((s) => s.asked && installed.has(s.name)),
         installedSkills: installed,
+        waiting: (sessionID) => SHARED.asks.waiting(sessionID),
       })
     // The job queue: run_job queues, the scheduler runs in the background and the notifier reports the end.
     const scheduler = new Scheduler({
@@ -1169,6 +1243,13 @@ export default {
             record({ kind: "discard", sessionID: tctx.sessionID, job: found.id, deleted: out.wrote, text: out.text.slice(-500) })
             return out.text
           },
+          permission: async (id, decision, note, tctx) => {
+            const ask = SHARED.asks.get(id.trim())
+            if (!ask || ask.parent !== tctx.sessionID) return `There is no request ${id.trim()} waiting for you: it was answered already, timed out, or belongs to another session.`
+            const d = decision.trim().toLowerCase()
+            if (d !== "once" && d !== "job" && d !== "refuse") return 'decision must be "once", "job" or "refuse".'
+            return (await SHARED.asks.answer(ask.id, d as AskDecision, "micromanager", note.trim())).text
+          },
           access: async (path, why, tctx) => {
             // The job the vouch belongs to: the orchestrator's own job, so every worker of it inherits the vouch.
             const jobs = listSwept()
@@ -1250,6 +1331,18 @@ export default {
       if (!runnerSessions.has(sessionID)) steering.delete(sessionID)
       if (/\b(ulw|ultrawork)\b/i.test(text)) ultrawork.set(sessionID, 0)
       else if (/^\s*stop\b/i.test(text)) ultrawork.delete(sessionID)
+      // The user's answer to a worker's paused request (src/ask.ts): read from their own turn, never from the
+      // micromanager's word, so it is the one way a hard rule opens. It answers the oldest request still waiting.
+      const waiting = runnerSessions.has(sessionID) ? undefined : SHARED.asks.oldest(sessionID)
+      if (waiting) {
+        const said = askAnswer(text)
+        if (said) {
+          const r = await SHARED.asks.answer(waiting.id, said, "user")
+          const next = SHARED.asks.oldest(sessionID)
+          steering.set(sessionID, `[jev-micromanager] The user answered ${waiting.id}: ${r.text} Confirm it in one sentence${next ? `, then put ${next.id} to them the same way` : " and go on"}.`)
+          return
+        }
+      }
       const job = sessionJob(sessionID)
       if (!job) return
       // The answer to a grant question, before anything else this turn: it is a yes or a no about a path, and a turn
