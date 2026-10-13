@@ -59,8 +59,9 @@ Jev and the plugin securing every task:
    - **Writers can ask.** A writer has two tools of its own: `explore` starts an explorer that reads the writer's
      directory, its uncommitted change included, and `research` starts a researcher with the web. The writer waits for
      the answer, which comes back as the tool's result. A helper is no task of the job: no worktree, no merge, no place
-     on the micromanager's list, no helper of its own, at most three per task. Its session is a child of the writer's,
-     and the permission hook, the guards, the watchdog and the journal (`"kind":"helper"`) treat it like any worker.
+     on the micromanager's list, no helper of its own, at most three per task. The permission hook, the guards, the
+     watchdog and the journal (`"kind":"helper"`) treat it like any worker. Its session is a top-level one whose title
+     starts with the writer's task: OpenCode 2.0.18's plugin API drops `parentID`, so it cannot be nested.
    - **Readers read.** Explorer, researcher, planner, reviewer and oracle run `git log`/`diff`/`show`, `ls` and the
      like without asking, and any chain or pipe of reading programs passes the read-only check; a command that writes
      is refused with the reason, not a bare "Permission denied". No worker may put up a question: nobody answers one

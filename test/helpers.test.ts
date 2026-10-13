@@ -43,7 +43,7 @@ test("a writer's question runs an explorer in the writer's directory and comes b
   assert.equal(await h.ask("ses_writer", "explore", "Who parses the flags?"), "src/cli.ts:12 parses the flags")
   const [args] = host.created
   assert.equal(args!.agent, "explorer")
-  assert.equal(args!.parentID, "ses_writer", "OpenCode shows it under the writer")
+  assert.deepEqual(args!.metadata, { jevMicromanager: { helperOf: "ses_writer", task: "T3 of job-1" } }, "the writer is named: the host drops parentID")
   assert.deepEqual(args!.location, { directory: CALLER.dir }, "it reads the writer's change, uncommitted edits included")
   assert.match(String(args!.title), /^T3 of job-1 · explorer · Who parses/)
   assert.deepEqual(started, [`ses_h1<-ses_writer@${CALLER.dir}`], "registered before its first turn")

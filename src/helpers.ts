@@ -6,8 +6,9 @@
 // the subagent tool to workers would make every such call a new task of the job, with a worktree, a merge and a place
 // on the micromanager's list. A helper is none of that: it reads in the asking writer's own directory (so it sees the
 // writer's uncommitted change), it runs while the writer waits, it cannot ask a helper of its own, and a writer gets a
-// few per task. Its session is a child of the writer's, so OpenCode shows it under the writer, and the plugin treats it
-// like any other worker: the permission hook, the guards on web content, the watchdog and the journal.
+// few per task. The plugin treats it like any other worker: the permission hook, the guards on web content, the watchdog
+// and the journal. It is not shown under the writer: the plugin's session.create drops parentID (opencode 2.0.18 passes
+// only id, title, agent, model, metadata, permissions and location on), so the title and the metadata name the writer.
 
 import { lastAssistantText } from "./brief.ts"
 import { redact } from "./jev.ts"
@@ -74,11 +75,11 @@ export class Helpers {
     const model = await this.#d.model(r)
     const brief = helperBrief(role, caller, question.trim())
     const s = await this.#d.session.create({
-      parentID: callerSession,
       title: `${caller.label} · ${r.agent} · ${question.trim().slice(0, 60)}`,
       agent: r.agent,
       model: toModel(model),
       location: { directory: caller.dir },
+      metadata: { jevMicromanager: { helperOf: callerSession, task: caller.label } },
     })
     this.#d.started(s.id, callerSession, caller.dir, brief)
     const start = Date.now()
