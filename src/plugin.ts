@@ -16,7 +16,7 @@ import { record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe } from "./registry.ts"
-import { unknown as allAvailable, type Available } from "./routing.ts"
+import { chooseModel, unknown as allAvailable, type Available } from "./routing.ts"
 import { MICROMANAGER, ROLES, roleByAgent, type Rule } from "./roles.ts"
 import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
@@ -31,7 +31,8 @@ import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "
 import { exec, repoRel, type Exec } from "./integration.ts"
 import { readFileSync } from "node:fs"
 import { join, resolve } from "node:path"
-import { FINISH_ID, GRAPH_ID, installFinishTool, installGraphTool, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
+import { FINISH_ID, GRAPH_ID, HELPER_IDS, installFinishTool, installGraphTool, installHelperTools, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
+import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { CHILD_PREFIX, DelegationError, Native } from "./native.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
@@ -868,6 +869,26 @@ export default {
       // A nudge leaves the session watched and running; a stop ends it, so nothing may call it alive after this.
       if (what === "stopped") ended.add(sessionID)
     }
+    // A writer's helpers (explore, research): sessions of the writer's own, registered like every other worker so the
+    // permission hook decides their requests in the writer's directory, the guards see what they fetch and the
+    // watchdog stops a loop.
+    const helpers = new Helpers({
+      session: ctx.session as unknown as SessionApi,
+      caller: (sessionID) => native.writerOf(sessionID),
+      model: async (role) => (await chooseModel(role, { vision: false }, routing, undefined, modelAvailability(ctx.catalog))).model,
+      started: (helper, caller, dir, brief) => {
+        runnerSessions.add(helper)
+        workerDirs.set(helper, dir)
+        workerTasks.set(helper, brief)
+        watchdog.watch(helper, { maxSteps: HELPER_STEPS })
+        log("info", `helper ${helper} for ${caller} in ${dir}`)
+      },
+      ended: (helper) => {
+        ended.add(helper)
+        watchdog.unwatch(helper)
+      },
+      journal: record,
+    })
     // Skills are read once per start, like the agents: install.sh --skills and a restart make new ones known.
     const installed = installedSkills()
     log("info", `skills for workers: ${[...installed].join(", ") || "none (./install.sh --skills)"}`)
@@ -1192,6 +1213,11 @@ export default {
         log("error", `finish_task not installed: ${String(err)}`)
       }
       try {
+        installHelperTools(draft, (role, question, tctx) => helpers.ask(tctx.sessionID!, role, question), (sessionID) => native.isWriter(sessionID))
+      } catch (err) {
+        log("error", `explore and research not installed: ${String(err)}`)
+      }
+      try {
         installGraphTool(draft, async (a, tctx) => {
           const text = await native.askGraph(tctx.sessionID!, a.action, a.symbol, a.to)
           record({ kind: "graph", sessionID: tctx.sessionID, action: a.action, symbol: a.symbol.slice(0, 100), chars: text.length })
@@ -1275,6 +1301,7 @@ export default {
         if (input.tools) for (const id of TOOL_IDS) delete input.tools[id]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[FINISH_ID]
         if (input.tools && !(input.sessionID && native.hasGraph(input.sessionID))) delete input.tools[GRAPH_ID]
+        if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
         // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
         if (input.sessionID && native.isWorker(input.sessionID)) {
           const worker = input.sessionID
@@ -1308,6 +1335,7 @@ export default {
       if (input.tools) {
         delete input.tools[FINISH_ID]
         delete input.tools[GRAPH_ID]
+        for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
       }
       if (input.sessionID) {
         const c = await compactor.apply(input.sessionID, input.messages).catch((err: unknown) => {

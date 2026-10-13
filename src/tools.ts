@@ -183,6 +183,37 @@ export function installGraphTool(draft: ToolDraft, ask: (args: { action: string;
   })
 }
 
+// A writer's helpers (src/helpers.ts): an explorer or a researcher answers one question while the writer waits. Only the
+// writers the micromanager started may use them; the context hook hides them from every other session, the helpers
+// themselves included, so a helper never asks a helper.
+export const HELPER_IDS = { explore: "explore", research: "research" } as const
+
+export function installHelperTools(draft: ToolDraft, ask: (role: "explore" | "research", question: string, ctx: ToolContext) => Promise<string>, allowed: (sessionID: string) => boolean): void {
+  const read = draft.get("read")
+  const str = read?.input?.fields?.path
+  if (!read?.input?.mapFields || !str) throw new Error("the built-in read tool has no input schema to build from")
+  const descriptions = {
+    explore: "Ask an explorer one question about the code and wait for its answer: who calls or uses something, where a thing is defined, how a part works, what the history says. It reads your directory as it is now, your uncommitted change included. Use it for a question that would take you many reads; for one file, read it yourself. question: one question in a sentence. At most 3 helpers per task.",
+    research: "Ask a researcher one question that needs the web and wait for its answer: an API's documentation, a library's behaviour, an error message, a current version. It cites its sources. question: one question in a sentence. At most 3 helpers per task.",
+  }
+  for (const role of ["explore", "research"] as const) {
+    draft.add({
+      id: HELPER_IDS[role],
+      name: HELPER_IDS[role],
+      description: descriptions[role],
+      input: read.input.mapFields(() => ({ question: str })),
+      execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+        if (!ctx?.sessionID || !allowed(ctx.sessionID)) return { content: "Only a worker that changes files for the micromanager may ask a helper." }
+        try {
+          return { content: await ask(role, String(args?.question ?? ""), ctx) }
+        } catch (err) {
+          return { content: `failed: ${err instanceof Error ? err.message : String(err)}` }
+        }
+      },
+    })
+  }
+}
+
 // The plan as the micromanager shows it to the user.
 export function planText(job: Job): string {
   const acceptance = job.acceptance.map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (check: ${a.verify})` : ""}`)

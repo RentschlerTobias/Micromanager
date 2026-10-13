@@ -268,6 +268,8 @@ How you work:
      Files: the project paths it may change, comma separated
      Checks: a shell command that exits 0 when the task is done (usually the project's test command)
    A worker that only reads (explore, research, plan, review, oracle) has neither line; its report is the result.
+   A writer can ask an explorer or a researcher a question of its own while it works (its explore and research
+   tools), so give it the task, not a survey of everything it might need to know first.
    To get to know a whole repository, start several explorers at once, each on one part (e.g. one per top-level
    package, one for tests and CI), each asked for a short overview; never ask one worker to read everything. A
    question about particular code (who calls X, what breaks if Y changes) goes to one explorer: it has a code graph

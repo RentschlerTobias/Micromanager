@@ -278,6 +278,14 @@ export class Native {
     return this.#entry(session)?.writer ?? false
   }
 
+  // A writer as its helpers see it (src/helpers.ts): where it works and what it works on. Undefined for anyone else.
+  writerOf(session: string): { dir: string; label: string; task: string } | undefined {
+    const entry = this.#entry(session)
+    if (!entry?.writer) return undefined
+    const task = this.#job(entry)?.tasks.find((t) => t.id === entry.taskId)
+    return { dir: entry.dir, label: `${entry.taskId} of ${entry.jobId}`, task: task ? `${task.title}: ${task.description}`.slice(0, 1500) : entry.taskId }
+  }
+
   hasGraph(session: string): boolean {
     return this.#entry(session)?.graph ?? false
   }
@@ -479,6 +487,9 @@ export class Native {
       "Keys and tokens show as <secret> in what you read; never write <secret> into a file, leave such lines as they are.",
       skillLine(skills),
       "",
+      entry.writer
+        ? "Two helpers answer questions while you wait: explore (an explorer reads your directory, your change included) and research (a researcher looks it up on the web). Ask one when a question would take you many reads or needs documentation you cannot reach; at most 3 per task."
+        : "",
       entry.writer
         ? "When your change is done, call finish_task with a two-line summary. The plugin then runs the checks, commits and merges; if it answers with failures, fix them and call finish_task again. Once it says merged, end with a short report: what you changed, what the checks showed, anything left open, and work you noticed outside your task (follow-ups)."
         : "End with your findings: they are your result. Add work you noticed that the request needs (follow-ups).",

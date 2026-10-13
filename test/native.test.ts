@@ -72,6 +72,11 @@ test("a writer works in its own worktree; failing checks go back to it, passing 
   assert.equal(git(claimed.dir, "branch", "--show-current"), `jev/${d.job.id}--T1`)
   assert.equal(native.claim("ses_w2", child(d.prompt)), undefined, "a task is claimed once")
   assert.ok(native.isWriter("ses_w1"))
+  // what its helpers see of it (src/helpers.ts): its own directory and its task
+  const writer = native.writerOf("ses_w1")!
+  assert.equal(writer.dir, claimed.dir)
+  assert.match(writer.label, /^T1 of job-/)
+  assert.match(d.prompt, /explore \(an explorer reads your directory/, "the brief names the helpers")
 
   // An unterminated object literal: node cannot parse it, so requiring the module exits non-zero.
   writeFileSync(join(claimed.dir, "add.js"), "const add = {\n")
@@ -179,6 +184,8 @@ test("a reader works on the session branch and ends with its findings", async ()
   const claimed = native.claim("ses_r", child(d.prompt))!
   assert.equal(claimed.dir, d.job.integrationWorktree)
   assert.ok(native.isWorker("ses_r") && !native.isWriter("ses_r"))
+  assert.equal(native.writerOf("ses_r"), undefined, "a reader gets no helpers")
+  assert.doesNotMatch(d.prompt, /explore \(an explorer/)
   assert.match((await native.finish("ses_r", "")).text, /^You only read/)
   assert.deepEqual(await native.ended("ses_r"), { note: undefined, parent: "ses_mm" })
   assert.equal(loadJob(project, d.job.id)!.tasks[0]!.status, "passed")

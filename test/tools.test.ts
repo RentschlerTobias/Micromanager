@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 
-import { FINISH_ID, installFinishTool, installTools, planText, TOOL_IDS, type ToolDraft } from "../src/tools.ts"
+import { FINISH_ID, HELPER_IDS, installFinishTool, installHelperTools, installTools, planText, TOOL_IDS, type ToolDraft } from "../src/tools.ts"
 import { newJob } from "../src/state.ts"
 import type { Signal } from "../src/watchdog.ts"
 
@@ -93,6 +93,20 @@ test("finish_task is for the micromanager's writers only", async () => {
   assert.deepEqual(await run({ summary: "added x" }, { agent: "micromanager", sessionID: "ses_user" }), { content: "Only a worker that changes files for the micromanager may use this tool." })
   assert.deepEqual(summaries, ["ses_writer:added x"])
   assert.ok(!(TOOL_IDS as readonly string[]).includes(FINISH_ID), "the micromanager's tool list does not carry it")
+})
+
+test("explore and research are for the micromanager's writers only", async () => {
+  const { draft, added, str } = fakeDraft()
+  const asked: string[] = []
+  installHelperTools(draft, async (role, question, ctx) => { asked.push(`${ctx.sessionID}:${role}:${question}`); return "answer" }, (id) => id === "ses_writer")
+  for (const id of Object.values(HELPER_IDS)) {
+    assert.deepEqual(byId(added, id).input, { mapped: { question: str } })
+    assert.ok(!(TOOL_IDS as readonly string[]).includes(id), "the micromanager's tool list does not carry it")
+  }
+  assert.deepEqual(await byId(added, "explore").run({ question: "who calls x?" }, { agent: "coder", sessionID: "ses_writer" }), { content: "answer" })
+  assert.deepEqual(await byId(added, "research").run({ question: "zod v4 api?" }, { agent: "coder", sessionID: "ses_writer" }), { content: "answer" })
+  assert.match((await byId(added, "explore").run({ question: "q" }, { agent: "explorer", sessionID: "ses_helper" })).content, /^Only a worker that changes files/)
+  assert.deepEqual(asked, ["ses_writer:explore:who calls x?", "ses_writer:research:zod v4 api?"])
 })
 
 test("a session the runner started is refused even as the micromanager agent", async () => {
