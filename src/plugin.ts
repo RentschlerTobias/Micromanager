@@ -753,6 +753,10 @@ export default {
         const id = requestID
         const ask = SHARED.asks.open({ sessionID, parent: owner.parent, task: owner.task, agent, action, resources, reason, hard }, async (decision, message) => {
           await ctx.permission.reply({ sessionID, requestID: id, decision, message })
+          // OpenCode's shell tool reports any failure as "Unable to execute command: …" and drops the refusal's
+          // message, so the worker never learnt it was refused and tried variants of the same request (live run,
+          // 2026-10-13). The message also goes in as a note at the worker's next turn.
+          if (decision === "reject" && message) steering.set(sessionID, `[jev-micromanager] Your ${action} request (${resources.join(" | ").slice(0, 160)}) was not run: ${message}`)
         })
         await ctx.session.synthetic({ sessionID: owner.parent, text: askNote(ask), resume: true }).catch((err: unknown) => log("warn", `ask note failed: ${String(err)}`))
         if (notify !== "off") execFile("notify-send", ["-a", "jev-micromanager", `${ask.id}: a worker waits for you`, `${action}: ${resources.join(" ").slice(0, 160)}`], () => {})
@@ -851,7 +855,8 @@ export default {
           record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "allow", reason: "a reader, in a directory its task or the micromanager names" })
           return
         }
-        if (pause(evaluation, "a path outside the worker's directory that its task does not name", false)) return
+        const named = namedInTask(task, evaluation.resources)
+        if (pause(evaluation, named ? "a writer outside its directory: the task names the path, but a named path opens it for readers only" : "a path outside the worker's directory that its task does not name", false)) return
         evaluation.effect = "deny"
         evaluation.message = "Stay inside your working directory; the job's state and the user's checkout are not part of your task. If you need something from outside, say so in your report (STATUS: NEEDS_CONTEXT)."
         record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "runner session outside its directory" })
