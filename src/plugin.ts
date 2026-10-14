@@ -98,6 +98,15 @@ interface SessionRecord {
   location?: { directory?: string }
 }
 
+// The commit of the plugin's own repository, and whether its tree has uncommitted changes, read once per server start.
+async function pluginCode(): Promise<{ commit: string; dirty: boolean | "unknown" }> {
+  const dir = new URL("..", import.meta.url).pathname
+  const head = await exec("git", ["-C", dir, "rev-parse", "--short", "HEAD"], { cwd: dir, timeoutMs: 5_000 }).catch(() => undefined)
+  if (!head || head.code !== 0) return { commit: "unknown", dirty: "unknown" }
+  const status = await exec("git", ["-C", dir, "status", "--porcelain"], { cwd: dir, timeoutMs: 5_000 }).catch(() => undefined)
+  return { commit: head.stdout.trim(), dirty: status && status.code === 0 ? status.stdout.trim() !== "" : "unknown" }
+}
+
 // The plugin's own version, read from its package.json so the journal can never claim a version the manifest does not
 // carry. "unknown" rather than a throw: a version this install cannot read must not stop the plugin from loading, and
 // the setup record exists precisely so an operator can see when it looks wrong.
@@ -128,6 +137,7 @@ interface Shared {
   grants: Map<string, Grants> // job -> what the user decided about the refused paths of this job
   asked: Map<string, Asked> // job -> the question waiting for an answer, so it is never asked twice at once
   native?: Native // the micromanager's workers on OpenCode's subagent tool, made by the first instance
+  code?: { commit: string; dirty: boolean | "unknown" } // the plugin code this server loaded
   asks: Asks // workers' paused permission requests, answered by the micromanager or the user (src/ask.ts)
   helperOf: Map<string, string> // helper session -> the writer it answers (src/helpers.ts)
 }
@@ -932,9 +942,15 @@ export default {
     // of the journal alone — before a job, a delegation or a denial is involved.
     {
       const rel = project ? await repoRel(project, exec).catch(() => "") : ""
+      const code = await pluginCode()
+      SHARED.code ??= code
       record({
         kind: "plugin",
         version: version(),
+        // Which code this server runs: the plugin loads once per server, so after an update a server that was not
+        // restarted runs the old one (2026-10-13: the user's hub ran the morning's code all day).
+        commit: code.commit,
+        dirty: code.dirty,
         directory: project,
         // The repository the project sits in and the offset inside it: together they say which worktree a worker's
         // directory is, which is the question the isolation-denied records below cannot answer on their own.
@@ -948,6 +964,13 @@ export default {
     if (!project) {
       log("warn", "no project directory: the micromanager tools are not installed")
       return
+    }
+    // The workers of the project's open jobs, known again after a restart (src/native.ts adopt).
+    try {
+      const adopted = native.adopt(project)
+      if (adopted.length) record({ kind: "adopt", directory: project, tasks: adopted })
+    } catch (err) {
+      record({ kind: "adopt", directory: project, error: String(err) })
     }
     const backends = { ...DEFAULT_BACKENDS, cloudOnly }
     const decider = new Decider(backends, makeAskers(backends, key))
@@ -1189,7 +1212,7 @@ export default {
             const q = scheduler.snapshot()
             const queue = `queue: ${q.running ? `running ${q.running}` : "nothing running"}${q.queued.length ? `; waiting: ${q.queued.join(", ")}` : ""}`
             // The board first: what runs, waits and is done, at a glance (show it to the user as it is).
-            return job ? `${queue}\n\n${board(job)}\n\n${job.rolling ? "" : planText(job)}`.trim() : `${queue}\nno job yet`
+            return job ? `${queue}\n\n${board(job, 110, Date.now(), SHARED.code ? `${SHARED.code.commit}${SHARED.code.dirty === true ? "+dirty" : ""}` : undefined)}\n\n${job.rolling ? "" : planText(job)}`.trim() : `${queue}\nno job yet`
           },
           stop: async (id, tctx) => {
             const r = scheduler.stop(id.trim() || undefined)

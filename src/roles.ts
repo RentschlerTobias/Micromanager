@@ -230,6 +230,8 @@ with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "...", "met": true 
   ),
 ]
 
+const ROLE_AGENTS = Object.values(AGENT_NAMES)
+
 export function roleByAgent(agent: string): Role | undefined {
   return ROLES.find((r) => r.agent === agent)
 }
@@ -238,14 +240,17 @@ export function roleById(id: string): Role | undefined {
   return ROLES.find((r) => r.id === id)
 }
 
-// The micromanager itself: plans and delegates, never edits or runs commands. Every delegation is a question
-// ("ask"), which goes to Jev first and to the user only when Jev is not sure enough (src/decide.ts).
+// The micromanager itself: plans and delegates, never edits or runs commands. A delegation to one of the role agents
+// is allowed: the plugin's guard checks its text before it starts (checkGuards in the subagent hook) and every action of
+// the worker is gated on its own (worktree, permission hook, hard rules). Asking Jev whether a worker may start at all
+// sent 18 of 101 delegations to the user (Jev unsure at a median confidence of 0.94), and without a TUI they were
+// refused outright. Any other agent is still a question.
 export const MICROMANAGER = {
   agent: "micromanager",
   description: "Orchestrator: splits a job into sub-tasks and delegates each to a role sub-agent.",
   // No reads outside the project: in a live test the micromanager went into the plugin's own source to find a way past
   // the local check, instead of asking the user.
-  rules: [...noWrite, ...noShell, ...noWeb, rule("subagent", "ask"), rule("external_directory", "deny"), ...noStateDir] as readonly Rule[],
+  rules: [...noWrite, ...noShell, ...noWeb, rule("subagent", "ask"), ...ROLE_AGENTS.map((agent) => rule("subagent", "allow", agent)), rule("external_directory", "deny"), ...noStateDir] as readonly Rule[],
 } as const
 
 // omo-hybrid: the micromanager drives the flow like oh-my-openagent's Sisyphus (split, todos, parallel background

@@ -152,6 +152,48 @@ export class Native {
     return job
   }
 
+  // After a restart: the workers of the project's open jobs, rebuilt from the job files. Everything the plugin knew of
+  // them lived in memory, so a worker continued after a restart (reboot, 2026-10-14) answered finish_task with "no
+  // task", and the duplicate check could not see the change it had left in its worktree. Every session found here is
+  // over, since the restart ended it; resume() makes it live again when the micromanager continues it. Returns the
+  // adopted "<job>/<task>" keys.
+  adopt(project: string): string[] {
+    const adopted: string[] = []
+    for (const job of listJobs(project)) {
+      if (!job.rolling || !job.facilitator || ["done", "stopped", "failed"].includes(job.phase)) continue
+      const known = this.#jobs.get(key(project, job.id))
+      if (known) continue
+      this.#jobs.set(key(project, job.id), job)
+      for (const task of job.tasks) {
+        const k = `${job.id}/${task.id}`
+        if (!task.session || this.#entries.has(k)) continue
+        const writer = WRITERS.has(task.role)
+        const worktree = writer ? task.worktree : job.integrationWorktree
+        const rel = (writer ? task.worktreeRel : job.integrationRel) ?? job.integrationRel ?? ""
+        const verify = job.acceptance.filter((a) => task.acceptance.includes(a.id)).map((a) => a.verify).filter((v): v is string => Boolean(v))
+        const entry: Entry = {
+          project,
+          jobId: job.id,
+          taskId: task.id,
+          parent: job.facilitator,
+          writer,
+          dir: worktree ? taskDir(worktree, rel) : project,
+          worktree: worktree ?? job.integrationWorktree ?? project,
+          rel,
+          branch: writer ? task.branch : undefined,
+          removed: writer && !task.worktree,
+          session: task.session,
+          checks: verify.flatMap((v) => v.split(" && ")).map((c) => c.trim()).filter(Boolean),
+          ended: true,
+        }
+        this.#entries.set(k, entry)
+        for (const s of new Set([task.session, ...(task.sessions ?? [])])) this.#bySession.set(s, k)
+        adopted.push(k)
+      }
+    }
+    return adopted
+  }
+
   // A new subagent call of the micromanager: the task, its worktree and the worker's brief. Throws a
   // DelegationError the micromanager can act on when the call is not a valid delegation. Calls of one message come
   // at the same time; they go one after another (live test: two made the session branch at once, and one failed).

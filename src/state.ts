@@ -144,6 +144,7 @@ export interface Task {
   conflicts?: number // merge train conflicts so far
   learned?: string[] // the worker's LEARNED lines, for the project memory
   sessions?: string[] // every session that worked on it (worker, reviewers, fresh tries), to look into them
+  undone?: string // the checkpoint rewind_job went back to, which left this task's merged change out of the branch
 }
 
 export interface Job {
@@ -176,6 +177,7 @@ export interface Job {
   lessons: string[]
   later?: Later[] // follow-ups that did not become tasks
   rolling?: boolean // a micromanager session's job: the orchestrator delegates tasks into it while it runs (omo-hybrid)
+  merges?: { from: string; to: string; at: string }[] // what merge_job did to the user's checkout, for undo_merge
   created: string
   updated: string
 }

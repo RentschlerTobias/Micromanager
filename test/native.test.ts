@@ -421,3 +421,25 @@ test("a reader in a worktree is moved to the project directory too, and uncommit
   assert.equal(claimed.dir, join(d.job.integrationWorktree!, "DFG_SPP2335/2026/H"))
   assert.ok(!existsSync(join(claimed.dir, "uncommitted.md")), "the worktree is a checkout of the last commit")
 })
+
+test("after a restart the workers of open jobs are known again: continued, they merge; started over, they are refused", async () => {
+  const project = repo()
+  const before = new Native()
+  const pill = { agent: "coder", description: "Remove dashed pill on lanes slide", prompt: `Delete the dashed pill.\nFiles: add.js\nChecks: node -e "require('./add.js')"` }
+  const d = await before.delegate(project, "ses_mm", pill, MODEL)
+  const claimed = before.claim("ses_w1", child(d.prompt))!
+  writeFileSync(join(claimed.dir, "add.js"), "module.exports = {}\n")
+  // the server restarts: a new process knows nothing until it adopts the job files
+  const after = new Native()
+  assert.equal(after.isWriter("ses_w1"), false)
+  assert.deepEqual(after.adopt(project), [`${d.job.id}/T1`])
+  assert.ok(after.isWriter("ses_w1"))
+  assert.deepEqual(after.adopt(project), [], "adopting twice adds nothing")
+  // the micromanager tries to start over: refused, with the session to continue
+  await assert.rejects(after.delegate(project, "ses_mm", { ...pill, description: "Delete dashed pill on lanes slide" }, MODEL), /T1 .* stopped before its merge .*sessionID ses_w1/s)
+  // it continues the worker instead: the change in its worktree merges with the checks from the job file
+  await after.resume("ses_w1")
+  const r = await after.finish("ses_w1", "deleted the pill")
+  assert.match(r.text, /^Merged into jev\/.*checks passed: node -e "require\('\.\/add\.js'\)"/s)
+  assert.equal(loadJob(project, d.job.id)!.tasks[0]!.status, "merged")
+})

@@ -140,9 +140,11 @@ test("a worker is told a refused permission does not end its task", () => {
   }
 })
 
-test("the micromanager never edits or runs commands, and every delegation asks the user", () => {
+test("the micromanager never edits or runs commands; it delegates to its roles freely, to anything else only on a question", () => {
   for (const tool of ["edit", "write", "patch", "shell"]) assert.equal(effect(MICROMANAGER.rules, tool), "deny", tool)
   assert.equal(effect(MICROMANAGER.rules, "subagent"), "ask")
+  for (const role of ROLES) assert.equal(effect(MICROMANAGER.rules, "subagent", role.agent), "allow", role.agent)
+  assert.equal(effect(MICROMANAGER.rules, "subagent", "general"), undefined, "a built-in agent meets the ask on *")
   const system = micromanagerSystem()
   for (const role of ROLES) assert.ok(system.includes(role.agent), role.agent)
 })

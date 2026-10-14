@@ -32,6 +32,7 @@ function since(iso?: string, now = Date.now()): string {
 // What a task does right now, or why it stopped.
 function detail(task: Task, now: number): string {
   const last = task.stages.at(-1)
+  if (task.undone) return `undone (rewind to ${task.undone})`
   if (task.status === "blocked") return `waits: ${task.summary ?? ""}`
   if (task.status === "escalated") return `given up: ${task.escalation?.detail ?? ""}`
   if (["running", "gating", "reviewing", "fixing"].includes(task.status)) {
@@ -42,11 +43,11 @@ function detail(task: Task, now: number): string {
   return ""
 }
 
-export function board(job: Job, width = 110, now = Date.now()): string {
-  const done = job.tasks.filter((t) => t.status === "merged" || t.status === "passed").length
+export function board(job: Job, width = 110, now = Date.now(), plugin?: string): string {
+  const done = job.tasks.filter((t) => (t.status === "merged" || t.status === "passed") && !t.undone).length
   const head = [
     `┌─ jev-micromanager · ${job.id} · ${job.rolling ? "session tasks" : "planned job"} · ${job.phase}${job.resumePhase ? ` (from ${job.resumePhase})` : ""}`,
-    `│  branch ${job.integrationBranch ?? "-"} · ${done}/${job.tasks.length} done · tokens ${k(job.counters.tokens)} · requests ${job.counters.requests ?? 0}${job.counters.cost ? ` · $${job.counters.cost.toFixed(2)}` : ""}`,
+    `│  branch ${job.integrationBranch ?? "-"}${plugin ? ` · plugin ${plugin}` : ""} · ${done}/${job.tasks.length} done · tokens ${k(job.counters.tokens)} · requests ${job.counters.requests ?? 0}${job.counters.cost ? ` · $${job.counters.cost.toFixed(2)}` : ""}`,
     `├${"─".repeat(Math.min(width, 100))}`,
   ]
   const rows = job.tasks.map((t) => {
