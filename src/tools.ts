@@ -15,6 +15,8 @@ export const TOOL_IDS = [
   "steer_task", "stop_task", "merge_job", "discard_job", "request_access",
   // A worker's paused permission request, answered (src/ask.ts).
   "answer_permission",
+  // Checkpoints: the job branch back to an earlier state, and the last merge_job taken back.
+  "rewind_job", "undo_merge",
 ] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
@@ -41,6 +43,8 @@ export interface Handlers {
   discard(job: string, ack: string, ctx: ToolContext): Promise<string>
   access(path: string, why: string, ctx: ToolContext): Promise<string>
   permission(id: string, decision: string, note: string, ctx: ToolContext): Promise<string>
+  rewind(job: string, to: string, ack: string, ctx: ToolContext): Promise<string>
+  undoMerge(job: string, ack: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -141,6 +145,20 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     description: "Answer a worker's paused permission request (a note \"[jev-micromanager] A…: worker … is paused\" names it). id: the A-number. decision: once (let this call run), job (also this exact request for the rest of the job) or refuse. note: for a refusal, why, in one sentence for the worker. Allow only what clearly serves the worker's task and reaches nothing outside the project; anything else is the user's to decide, and a hard rule always is.",
     input: input("id", "decision", "note"),
     execute: guarded(([id, decision, note], ctx) => handlers.permission(id!, decision!, note!, ctx), "id", "decision", "note"),
+  })
+  draft.add({
+    id: "rewind_job",
+    name: "rewind_job",
+    description: "Move a job's branch back to a checkpoint: \"start\", the state after a merged task (\"T3\"), or \"before-rewind-<n>\" (a rewind undone). job: the job id, or empty for this session's job. to: empty lists the checkpoints and changes nothing. Without ack it shows what would leave the branch and which unfinished tasks would be given up, and changes nothing; with ack (the user's own words, repeated) it moves the branch, keeps the old tip as before-rewind-<n>, and deletes the unfinished tasks' worktrees. Refused while a worker of the job runs. The user's checkout is never touched (undo_merge).",
+    input: input("job", "to", "ack"),
+    execute: guarded(([job, to, ack], ctx) => handlers.rewind(job!, to!, ack!, ctx), "job", "to", "ack"),
+  })
+  draft.add({
+    id: "undo_merge",
+    name: "undo_merge",
+    description: "Take back the last merge_job of a job: the user's checkout goes back to where it was before that merge. Only while the checkout is exactly where the merge left it and has no uncommitted changes. job: the job id, or empty for this session's job. Without ack it shows which commits would leave the checkout and changes nothing; with ack (the user's own words, repeated) it moves it back. The commits stay on the job branch; merge_job brings them back.",
+    input: input("job", "ack"),
+    execute: guarded(([job, ack], ctx) => handlers.undoMerge(job!, ack!, ctx), "job", "ack"),
   })
   return [...TOOL_IDS]
 }

@@ -18,7 +18,10 @@ the fully code-driven design. The design is [docs/design.md](docs/design.md), it
 ./install.sh --remove
 ```
 
-Restart the OpenCode server afterwards (plugins load at start). Requires opencode v2 (tested with 2.0.18).
+Restart the OpenCode server afterwards (plugins load at start): the one your TUI attaches to, which here is the voice
+agent's hub (`systemctl --user restart voice-agent-hub`), not only the background service `opencode run` uses. The
+`plugin` record in the journal and the header of `job_status` name the plugin commit a server runs. Requires opencode
+v2 (tested with 2.0.18).
 
 ## Use
 
@@ -108,9 +111,25 @@ Jev and the plugin securing every task:
    | `merge_job` | fast-forward the job branch into your checkout — the one write it may make there. Shows what would land, refuses on a dirty checkout or unfinished tasks |
    | `discard_job` | give the branch and worktrees back to git; lists what it removes first |
    | `request_access` | vouch that a worker needs a path outside the project, for the permission path to see |
+   | `answer_permission` | answer a worker's paused permission request: once, for the job, or refuse |
+   | `rewind_job` | list the job's checkpoints, or move its branch back to one with your words; undone the same way |
+   | `undo_merge` | take back the last `merge_job` in your checkout, while it is still where that merge left it |
    | `stop_job` | stop the whole job; `run_job` resumes it |
 
-6. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
+6. **Checkpoints and rewind.** Every merged task is a commit `Tn: title` on `jev/<job>`, and the job remembers where
+   the branch started, so the branch is a row of checkpoints: `start`, then the state after each task. `rewind_job`
+   lists them and, with your words, moves the branch back to one. It keeps the old tip as
+   `refs/jev/<job>/before-rewind-<n>`, which is a checkpoint too, so a rewind is undone by rewinding to it. Tasks
+   whose change left the branch show as `undone` on the board; unfinished tasks are given up with their worktrees,
+   because a branch cut from the old tip would bring the undone commits back on its next merge. It is refused while
+   a worker of the job runs, and it never touches your checkout. `undo_merge` takes back the last `merge_job` there,
+   only while the checkout is exactly where that merge left it; the commits stay on the job branch. The conversation
+   itself is OpenCode's to rewind (undo or fork in the TUI); the plugin has no access to that.
+
+   **After a restart** the plugin knows the workers of the open jobs again from the job files: a worker continued by
+   its session finishes and merges as before, and the micromanager cannot start over on its work by accident.
+
+7. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
    after a planning session with you. You approve it, and `run_job` runs it.
 
 Jobs and task notes live in `.jev-micromanager/`, kept out of git through the repository's `.git/info/exclude` — found

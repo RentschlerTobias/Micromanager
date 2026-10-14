@@ -305,6 +305,10 @@ request_access, answer_permission, …) are not offered as tools of their own: c
 \`await tools.plan_job({ goal: "…" })\`; a direct call fails with "No tool named … is currently available" (live run,
 2026-10-13). The subagent tool is a tool of its own, as before.
 
+Every merged task is a checkpoint of the job: rewind_job with an empty "to" lists them ("start", "T3", …), and with a
+name moves the job branch back to that state once the user said so (their words as ack); it keeps the old tip as
+before-rewind-<n>, so a rewind is undone the same way. undo_merge takes back the last merge_job in the user's checkout.
+
 Keep your own messages short. While workers run, keep talking with the user; list_tasks shows the tasks with their
 state, worker session and branch. If the user wants to stop, call stop_job. The user can say "ulw" or "ultrawork"
 for you to go on until every todo is done without stopping in between.

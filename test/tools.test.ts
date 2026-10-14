@@ -22,7 +22,7 @@ function fakeDraft() {
 const ok = async () => "ok"
 // The user's own checkout, the directory the stand-in host below reports: what a worker must never be able to write.
 const PROJECT = "/home/t1dde/Fun/Projects/Repos/jev-micromanager"
-const noop = { tasks: ok, plan: ok, questions: ok, run: ok, status: ok, stop: ok, steer: ok, stopTask: ok, merge: ok, discard: ok, access: ok, permission: ok }
+const noop = { tasks: ok, plan: ok, questions: ok, run: ok, status: ok, stop: ok, steer: ok, stopTask: ok, merge: ok, discard: ok, access: ok, permission: ok, rewind: ok, undoMerge: ok }
 const byId = (added: Record<string, unknown>[], id: string) => {
   const tool = added.find((t) => t.id === id)!
   return { input: tool.input, run: tool.execute as (a: Record<string, unknown>, c: object) => Promise<{ content: string }> }
@@ -480,4 +480,93 @@ test("a delegation the hook cannot route is written down, and one that merely sa
   await delegationHook(mentions as never)
   assert.equal(mentions.input.command, "grep -rn subagent src/")
   assert.equal(journal().filter((e) => e.kind === "delegation-unrecognised").length, 1)
+})
+
+// A job with three merged tasks on its branch, and a fourth still unfinished in a worktree cut from the tip.
+function rewindRepo() {
+  const { project, branch } = repo()
+  const wt = join(project, ".jev-micromanager", "worktrees", "job-1")
+  const commit = (file: string, subject: string) => {
+    writeFileSync(join(wt, file), `${file}\n`)
+    execFileSync("git", ["-C", wt, "add", "-A"])
+    execFileSync("git", ["-C", wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", subject])
+    return execFileSync("git", ["-C", wt, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()
+  }
+  const t1 = execFileSync("git", ["-C", wt, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()
+  const t2 = commit("c.txt", "T2: add c")
+  const t3 = commit("d.txt", "T3: add d")
+  const t4wt = join(project, ".jev-micromanager", "worktrees", "job-1--T4")
+  execFileSync("git", ["-C", project, "worktree", "add", "-q", "-b", "jev/job-1--T4", t4wt, branch])
+  const base = execFileSync("git", ["-C", project, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()
+  const j = job({ integrationBranch: branch, integrationWorktree: wt, integrationBase: base })
+  j.tasks = [
+    task({ id: "T1", status: "merged" }),
+    task({ id: "T2", title: "add c", status: "merged" }),
+    task({ id: "T3", title: "add d", status: "merged" }),
+    task({ id: "T4", title: "add e", status: "running", worktree: t4wt, branch: "jev/job-1--T4" }),
+  ]
+  const tip = () => execFileSync("git", ["-C", wt, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()
+  return { project, branch, wt, j, t1, t2, t3, tip }
+}
+
+test("a job's checkpoints are its start and the state after each merged task", async () => {
+  const { checkpoints } = await import("../src/plugin.ts")
+  const { j, t1, t2, t3 } = rewindRepo()
+  const points = await checkpoints(j)
+  assert.deepEqual(points.map((c) => c.name), ["start", "T1", "T2", "T3"])
+  assert.deepEqual(points.slice(1).map((c) => c.commit), [t1, t2, t3])
+})
+
+test("rewind_job lists, shows, and only with the user's words moves the branch back, keeping the old tip", async () => {
+  const { rewindJob, checkpoints } = await import("../src/plugin.ts")
+  const { project, j, t1, t3, tip } = rewindRepo()
+  const dropped: string[] = []
+  const drop = async (t: import("../src/state.ts").Task) => { dropped.push(t.id) }
+  assert.match((await rewindJob(project, j, "", "", [], drop)).text, /- start .*\n- T1 .*\n- T2 .*\n- T3 /)
+  assert.match((await rewindJob(project, j, "T9", "", [], drop)).text, /has no checkpoint "T9"/)
+  const shown = await rewindJob(project, j, "T1", "", [], drop)
+  assert.equal(shown.wrote, false)
+  assert.match(shown.text, /T2: add c/)
+  assert.match(shown.text, /T3: add d/)
+  assert.match(shown.text, /T4 add e/, "the unfinished task that would be given up is named")
+  assert.equal(tip(), t3, "nothing moved without the user's words")
+  assert.match((await rewindJob(project, j, "T1", "yes go back", ["T4 (session ses_w4)"], drop)).text, /Not rewound: T4 \(session ses_w4\) still runs/)
+  const back = await rewindJob(project, j, "T1", "yes go back", [], drop)
+  assert.equal(back.wrote, true)
+  assert.equal(tip(), t1)
+  assert.deepEqual(j.tasks.filter((t) => t.undone).map((t) => `${t.id}:${t.undone}`), ["T2:T1", "T3:T1"])
+  assert.deepEqual(dropped, ["T4"], "a branch cut from the old tip is given up")
+  assert.match(back.text, /rewind_job to before-rewind-1 undoes this/)
+  assert.ok((await checkpoints(j)).some((c) => c.name === "before-rewind-1" && c.commit === t3))
+  // the rewind is undone by rewinding to the kept tip
+  const again = await rewindJob(project, j, "before-rewind-1", "undo that", [], drop)
+  assert.equal(tip(), t3)
+  assert.match(again.text, /Restored: T2, T3/)
+  assert.equal(j.tasks.some((t) => t.undone), false)
+})
+
+test("undo_merge takes back the last merge only while the checkout is where the merge left it", async () => {
+  const { mergeJobInto, undoMerge } = await import("../src/plugin.ts")
+  const { project, branch } = repo()
+  const j = job({ integrationBranch: branch, tasks: [task({ status: "merged" })] })
+  assert.match((await undoMerge(project, j, "")).text, /has not merged job job-1/)
+  const before = head(project)
+  const merged = await mergeJobInto(project, j, "")
+  assert.ok(merged.merge, "the merge says where it moved the checkout from and to")
+  j.merges = [merged.merge!]
+  const shown = await undoMerge(project, j, "")
+  assert.equal(shown.wrote, false)
+  assert.match(shown.text, /T1: add a flag/)
+  const undone = await undoMerge(project, j, "yes take it back")
+  assert.equal(undone.undid, true)
+  assert.equal(head(project), before)
+  assert.match(execFileSync("git", ["-C", project, "log", "--oneline", "-1", branch], { encoding: "utf8" }), /T1: add a flag/, "the commit is still on the job branch")
+  // merged again, then the checkout moves on: undo is refused, nothing is touched
+  j.merges = [(await mergeJobInto(project, j, "")).merge!]
+  writeFileSync(join(project, "z.txt"), "z\n")
+  execFileSync("git", ["-C", project, "add", "z.txt"])
+  execFileSync("git", ["-C", project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "the user's own work"])
+  const moved = head(project)
+  assert.match((await undoMerge(project, j, "yes")).text, /checkout moved on since the merge/)
+  assert.equal(head(project), moved)
 })

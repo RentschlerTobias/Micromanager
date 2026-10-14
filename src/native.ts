@@ -276,16 +276,34 @@ export class Native {
       const live = LIVE.has(task.status) && !this.#entries.get(`${job.id}/${id}`)?.ended
       if (live) throw new DelegationError(`Not started: ${id} still runs; stop it with stop_task first, then delegate again with "Replaces: ${id}".`)
       if (task.status === "merged") throw new DelegationError(`Not started: ${id} is merged, so there is nothing to replace; leave out "Replaces: ${id}" and say in the brief what to change on top of it.`)
-      const k = `${job.id}/${id}`
-      const entry = this.#entries.get(k)
-      if (task.status !== "cancelled") moveTask(task, "cancelled")
-      stage(task, "replace", "pass", "started over by a new task")
-      if (entry) {
-        await this.#dropWorktree(entry, task)
-        this.#entries.delete(k)
-      }
-      saveJob(project, job)
+      await this.discard(project, job, id, "replace", "started over by a new task")
     }
+  }
+
+  // A task given up for good: cancelled, and its worktree and branch gone, whatever change they held. For "Replaces:"
+  // and for rewind_job, which must not leave a branch cut from a tip it took back (the merge train would replay it).
+  async discard(project: string, job: Job, taskId: string, why: string, evidence: string): Promise<void> {
+    const task = job.tasks.find((t) => t.id === taskId)
+    if (!task) return
+    const k = `${job.id}/${taskId}`
+    const entry = this.#entries.get(k)
+    if (task.status !== "cancelled" && task.status !== "merged") moveTask(task, "cancelled")
+    stage(task, why, "pass", evidence)
+    if (entry) {
+      await this.#dropWorktree(entry, task)
+      this.#entries.delete(k)
+    } else if (task.worktree && task.branch) {
+      await removeTaskWorktree(project, { worktree: task.worktree, branch: task.branch }, this.#exec)
+      task.worktree = undefined
+      task.branch = undefined
+    }
+    saveJob(project, job)
+  }
+
+  // The job as this process holds it, when it holds it: the copy the plugin's tools must change, because this one is
+  // saved over the file every time a worker moves on.
+  current(project: string, jobId: string): Job | undefined {
+    return this.#jobs.get(key(project, jobId))
   }
 
   // The same work delegated a second time (live run, 2026-10-07: three tasks each removed the same pill from the same
@@ -576,7 +594,7 @@ export class Native {
   // The workers of a micromanager session that still run.
   running(parent: string): { session: string; task: string }[] {
     return [...this.#entries.values()]
-      .filter((e) => e.parent === parent && e.session)
+      .filter((e) => e.parent === parent && e.session && !e.ended)
       .filter((e) => ["running", "gating", "fixing"].includes(this.#job(e)?.tasks.find((t) => t.id === e.taskId)?.status ?? ""))
       .map((e) => ({ session: e.session!, task: e.taskId }))
   }

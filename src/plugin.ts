@@ -311,7 +311,7 @@ const done = (text: string): GitOutcome => ({ wrote: true, text })
 // merge_job: the one write the orchestrator may make in the user's checkout. It shows what would land, refuses a
 // checkout with uncommitted changes and a job with work left unfinished, and merges fast-forward only, so its own
 // checkout can never be left half merged, reset or behind.
-export async function mergeJobInto(project: string, job: Job, ack: string, run: Exec = exec): Promise<GitOutcome> {
+export async function mergeJobInto(project: string, job: Job, ack: string, run: Exec = exec): Promise<GitOutcome & { merge?: { from: string; to: string; at: string } }> {
   const branch = job.integrationBranch ?? `jev/${job.id}`
   const git = (...args: string[]) => run("git", ["-C", project, ...args], { cwd: project, timeoutMs: 15_000 })
   const there = await git("rev-parse", "--verify", "--quiet", `refs/heads/${branch}`)
@@ -329,13 +329,15 @@ export async function mergeJobInto(project: string, job: Job, ack: string, run: 
   if (open.length && !ack.trim()) {
     return said(`${head}\n\nNot merged: job ${job.id} has work that is not finished (${open.map((t) => `${t.id} ${t.title}: ${t.status}`).join("; ")}). Nothing was written. Show the user this list; only merge it anyway when they say so, and repeat their words as ack.`)
   }
+  const from = (await git("rev-parse", "HEAD")).stdout.trim()
   const merged = await git("merge", "--ff-only", branch)
   if (merged.code !== 0) {
     const why = merged.stderr.trim().split("\n").slice(-3).join(" ").trim()
     return said(`Not merged: ${branch} cannot be fast-forwarded into the checkout (${why}). Nothing was written and the checkout is exactly as it was; a merge or a rebase is the user's call.`)
   }
-  const now = (await git("rev-parse", "--short", "HEAD")).stdout.trim()
-  return done(`${head}\n\nMerged ${branch} into the checkout (fast-forward), now at ${now}. The branch and its worktrees are still registered: discard_job gives them back to git.`)
+  const to = (await git("rev-parse", "HEAD")).stdout.trim()
+  // What the merge did, for undo_merge: the caller keeps it on the job.
+  return { ...done(`${head}\n\nMerged ${branch} into the checkout (fast-forward), now at ${to.slice(0, 7)}. The branch and its worktrees are still registered: discard_job gives them back to git; undo_merge takes this merge back.`), merge: { from, to, at: new Date().toISOString() } }
 }
 
 // discard_job: the cleanup a real run left undone (six stale worktrees and branches). It never touches the user's
@@ -366,6 +368,123 @@ export async function discardJob(project: string, job: Job, ack: string, run: Ex
   }
   const where = gone.length ? `Deleted:\n${gone.map((g) => `- ${g}`).join("\n")}` : "Nothing was deleted."
   return done(`${where}${kept.length ? `\nLeft in place:\n${kept.map((k) => `- ${k}`).join("\n")}` : ""}\nThe checkout and every file in it were not touched.`)
+}
+
+// --- checkpoints: going back to an earlier state of a job, as Pi Durable goes back to an earlier entry ---------------
+//
+// Every merged task is a commit "Tn: title" on the job branch, and the job remembers where the branch started, so the
+// branch is a row of checkpoints already: "start", then the state after each task. rewind_job moves the branch back to
+// one. Before it does, it keeps the old tip as refs/jev/<job>/before-rewind-<n>, which is a checkpoint too, so a rewind
+// is undone by rewinding to that. It never touches the user's checkout; undo_merge takes back what merge_job put there.
+
+export interface Checkpoint {
+  readonly name: string // "start", "T3", "before-rewind-1"
+  readonly commit: string
+  readonly what: string
+}
+
+export async function checkpoints(job: Job, run: Exec = exec): Promise<Checkpoint[]> {
+  const wt = job.integrationWorktree
+  if (!wt || !job.integrationBase || !job.integrationBranch) return []
+  const git = (...args: string[]) => run("git", ["-C", wt, ...args], { cwd: wt, timeoutMs: 15_000 })
+  const out: Checkpoint[] = [{ name: "start", commit: job.integrationBase, what: "before the job's first merge" }]
+  const log = (await git("log", "--reverse", "--format=%H%x09%s", `${job.integrationBase}..${job.integrationBranch}`)).stdout
+  for (const line of log.split("\n").filter(Boolean)) {
+    const [commit = "", subject = ""] = line.split("\t")
+    const task = subject.match(/^(T\d+(?:\.\w+)?):/)?.[1]
+    if (!task) continue
+    // A task merged more than once (continued) is a checkpoint at its last commit: the state after it.
+    const at = out.findIndex((c) => c.name === task)
+    if (at >= 0) out.splice(at, 1)
+    out.push({ name: task, commit, what: `after ${subject}` })
+  }
+  const refs = (await git("for-each-ref", "--sort=refname", "--format=%(refname)%09%(objectname)", `refs/jev/${job.id}/`)).stdout
+  for (const line of refs.split("\n").filter(Boolean)) {
+    const [ref = "", commit = ""] = line.split("\t")
+    out.push({ name: ref.split("/").pop()!, commit, what: "the branch as it was before a rewind" })
+  }
+  return out
+}
+
+const listed = (points: readonly Checkpoint[]) => points.map((c) => `- ${c.name} (${c.commit.slice(0, 7)}): ${c.what}`).join("\n")
+
+// rewind_job. live: the workers of the job that still run. drop: gives up a task and its worktree for good
+// (native.discard). The job is changed in place; the caller saves it.
+export async function rewindJob(
+  project: string,
+  job: Job,
+  to: string,
+  ack: string,
+  live: readonly string[],
+  drop: (task: Task) => Promise<void>,
+  run: Exec = exec,
+): Promise<GitOutcome> {
+  const wt = job.integrationWorktree
+  const branch = job.integrationBranch
+  if (!wt || !branch || !job.integrationBase) return said(`Job ${job.id} has no branch yet: there is nothing to rewind.`)
+  const points = await checkpoints(job, run)
+  if (!to.trim()) return said(`The checkpoints of job ${job.id}, oldest first:\n${listed(points)}\nrewind_job with one of these names goes back to it after the user says so.`)
+  const target = points.find((c) => c.name.toLowerCase() === to.trim().toLowerCase())
+  if (!target) return said(`Job ${job.id} has no checkpoint "${to.trim()}". These exist:\n${listed(points)}`)
+  if (live.length) return said(`Not rewound: ${live.join(", ")} still run${live.length > 1 ? "" : "s"} on this job. Stop ${live.length > 1 ? "them" : "it"} with stop_task first; nothing was changed.`)
+  const git = (...args: string[]) => run("git", ["-C", wt, ...args], { cwd: wt, timeoutMs: 15_000 })
+  const tip = (await git("rev-parse", branch)).stdout.trim()
+  if (tip === target.commit) return said(`${branch} is at ${to.trim()} already; nothing to do.`)
+  const subjects = (range: string) => git("log", "--format=%h %s", range).then((r) => r.stdout.split("\n").filter(Boolean))
+  const leaving = await subjects(`${target.commit}..${tip}`)
+  const coming = await subjects(`${tip}..${target.commit}`) // a forward rewind, to a before-rewind ref
+  const ids = (lines: readonly string[]) => new Set(lines.map((l) => l.split(" ")[1]?.match(/^(T\d+(?:\.\w+)?):/)?.[1]).filter((id): id is string => Boolean(id)))
+  const undone = job.tasks.filter((t) => ids(leaving).has(t.id))
+  const restored = job.tasks.filter((t) => t.undone && ids(coming).has(t.id))
+  // A branch cut from the old tip would bring the commits that leave back on its next merge (the merge train rebases it
+  // onto the job branch), so unfinished tasks with a worktree are given up with the rewind.
+  const unfinished = job.tasks.filter((t) => t.worktree && t.status !== "merged" && t.status !== "cancelled")
+  const preview = [
+    `rewind_job would move ${branch} from ${tip.slice(0, 7)} back to ${target.name} (${target.commit.slice(0, 7)}).`,
+    leaving.length ? `These commits leave the branch (kept as before-rewind, so nothing is lost):\n${leaving.map((l) => `- ${l}`).join("\n")}` : "",
+    coming.length ? `These commits come back:\n${coming.map((l) => `- ${l}`).join("\n")}` : "",
+    unfinished.length ? `These unfinished tasks are given up, their worktrees and changes deleted:\n${unfinished.map((t) => `- ${t.id} ${t.title} (${t.worktree})`).join("\n")}` : "",
+    job.merges?.length ? "The user's checkout got this job's work through merge_job already; rewind_job does not touch it (undo_merge takes back the last merge)." : "Your checkout is not touched.",
+  ].filter(Boolean).join("\n")
+  if (!ack.trim()) return said(`${preview}\nNothing was changed. Show the user this, and repeat their words as ack to go on.`)
+  const dirty = (await git("status", "--porcelain")).stdout.trim()
+  if (dirty) return said(`Not rewound: the job's own worktree ${wt} has uncommitted changes, which a worker left there. Nothing was changed.\n${dirty}`)
+  const n = points.filter((c) => c.name.startsWith("before-rewind-")).length + 1
+  const keep = await git("update-ref", `refs/jev/${job.id}/before-rewind-${n}`, tip)
+  if (keep.code !== 0) return said(`Not rewound: the current tip could not be kept (${keep.stderr.trim()}). Nothing was changed.`)
+  const reset = await git("reset", "--hard", target.commit)
+  if (reset.code !== 0) return said(`Not rewound: ${reset.stderr.trim()}. The old tip is kept as before-rewind-${n}.`)
+  for (const t of unfinished) await drop(t)
+  for (const t of undone) {
+    t.undone = target.name
+    stage(t, "rewind", "pass", `undone by rewind_job to ${target.name}`)
+  }
+  for (const t of restored) {
+    t.undone = undefined
+    stage(t, "rewind", "pass", `restored by rewind_job to ${target.name}`)
+  }
+  return done(`${branch} is back at ${target.name} (${target.commit.slice(0, 7)}).${undone.length ? ` Undone: ${undone.map((t) => t.id).join(", ")}.` : ""}${restored.length ? ` Restored: ${restored.map((t) => t.id).join(", ")}.` : ""}${unfinished.length ? ` Given up: ${unfinished.map((t) => t.id).join(", ")}.` : ""} rewind_job to before-rewind-${n} undoes this.`)
+}
+
+// undo_merge: takes back the last merge_job, only while the checkout is exactly where that merge left it and clean.
+// The commits stay on the job branch, so merge_job can bring them back. Returns the merge it took back, for the caller
+// to drop from the job.
+export async function undoMerge(project: string, job: Job, ack: string, run: Exec = exec): Promise<GitOutcome & { undid?: boolean }> {
+  const last = job.merges?.at(-1)
+  if (!last) return said(`merge_job has not merged job ${job.id} into the checkout; there is nothing to undo.`)
+  const git = (...args: string[]) => run("git", ["-C", project, ...args], { cwd: project, timeoutMs: 15_000 })
+  const head = (await git("rev-parse", "HEAD")).stdout.trim()
+  if (head !== last.to) {
+    return said(`Not undone: the checkout moved on since the merge (it is at ${head.slice(0, 7)}, the merge left it at ${last.to.slice(0, 7)}), and going back would take later commits with it. Nothing was changed; this is the user's call.`)
+  }
+  const dirty = (await git("status", "--porcelain")).stdout.split("\n").filter(Boolean)
+  if (dirty.length) return said(`Not undone: the checkout has uncommitted changes. Nothing was changed.\n${dirty.slice(0, 20).join("\n")}`)
+  const leaving = (await git("log", "--oneline", `${last.from}..${last.to}`)).stdout.trim()
+  const preview = `undo_merge would move the checkout back from ${last.to.slice(0, 7)} to ${last.from.slice(0, 7)}, where it was before merge_job. These commits leave it (they stay on ${job.integrationBranch ?? "the job branch"}):\n${leaving}`
+  if (!ack.trim()) return said(`${preview}\nNothing was changed. Show the user this, and repeat their words as ack to go on.`)
+  const reset = await git("reset", "--keep", last.from)
+  if (reset.code !== 0) return said(`Not undone: ${reset.stderr.trim()}. The checkout is as it was.`)
+  return { ...done(`The checkout is back at ${last.from.slice(0, 7)}, as before merge_job. The commits are still on ${job.integrationBranch ?? "the job branch"}; merge_job brings them back.`), undid: true }
 }
 
 // request_access: the micromanager vouches that a worker of the job legitimately needs a path outside the project.
@@ -1281,7 +1400,36 @@ export default {
             if (!found) return "No job to merge. plan_job or start a worker first."
             if (scheduler.snapshot().running === found.id) return `Job ${found.id} is still running; merge it when it is done.`
             const out = await mergeJobInto(project, found, ack, exec)
-            record({ kind: "merge", sessionID: tctx.sessionID, job: found.id, branch: found.integrationBranch, merged: out.wrote, text: out.text.slice(-500) })
+            if (out.merge) {
+              // On the copy this process holds when it holds one: native saves that copy over the file (src/native.ts current).
+              const job = native.current(project, found.id) ?? found
+              job.merges = [...(job.merges ?? []), out.merge]
+              saveJob(project, job)
+            }
+            record({ kind: "merge", sessionID: tctx.sessionID, job: found.id, branch: found.integrationBranch, merged: out.wrote, ...(out.merge ?? {}), text: out.text.slice(-500) })
+            return out.text
+          },
+          rewind: async (id, to, ack, tctx) => {
+            const found = id.trim() ? loadSwept(id.trim()) : listSwept().find((j) => j.facilitator === tctx.sessionID) ?? listSwept()[0]
+            if (!found) return "No job to rewind. plan_job or start a worker first."
+            if (scheduler.snapshot().running === found.id) return `Job ${found.id} is running; stop_job first, then rewind it.`
+            const job = native.current(project, found.id) ?? found
+            const live = native.running(job.facilitator ?? "").map((w) => `${w.task} (session ${w.session})`)
+            const out = await rewindJob(project, job, to, ack, live, (t) => native.discard(project, job, t.id, "rewind", "given up by rewind_job"), exec)
+            if (out.wrote) saveJob(project, job)
+            record({ kind: "rewind", sessionID: tctx.sessionID, job: job.id, to: to.trim(), rewound: out.wrote, text: out.text.slice(-500) })
+            return out.text
+          },
+          undoMerge: async (id, ack, tctx) => {
+            const found = id.trim() ? loadSwept(id.trim()) : listSwept().find((j) => j.facilitator === tctx.sessionID) ?? listSwept()[0]
+            if (!found) return "No job whose merge could be undone."
+            const job = native.current(project, found.id) ?? found
+            const out = await undoMerge(project, job, ack, exec)
+            if (out.undid) {
+              job.merges = job.merges?.slice(0, -1)
+              saveJob(project, job)
+            }
+            record({ kind: "undo-merge", sessionID: tctx.sessionID, job: job.id, undone: out.wrote, text: out.text.slice(-500) })
             return out.text
           },
           discard: async (job, ack, tctx) => {
