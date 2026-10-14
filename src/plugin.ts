@@ -370,6 +370,34 @@ export async function discardJob(project: string, job: Job, ack: string, run: Ex
   return done(`${where}${kept.length ? `\nLeft in place:\n${kept.map((k) => `- ${k}`).join("\n")}` : ""}\nThe checkout and every file in it were not touched.`)
 }
 
+// --- an earlier session's open job, put to the user at the start of a new session --------------------------------
+//
+// A new micromanager session starts a job of its own, so the previous session's work was out of sight: tasks merged on
+// its branch that the checkout never got, and unfinished changes in worktrees. At the session's first turn the
+// micromanager is told about such a job and asks the user what to do with it. Nothing happens without their answer, and
+// "new" leaves everything as it is, so the next session asks again.
+export function openJobNote(job: Job, inCheckout: boolean): string {
+  const merged = job.tasks.filter((t) => t.status === "merged" && !t.undone)
+  const unfinished = job.tasks.filter((t) => t.worktree && t.status !== "merged")
+  const last = job.tasks.flatMap((t) => t.stages.map((s) => s.at)).filter(Boolean).sort().at(-1)
+  return [
+    `- ${job.id} (branch ${job.integrationBranch ?? "-"}${last ? `, last active ${last.slice(0, 16).replace("T", " ")} UTC` : ""}):`,
+    merged.length ? `  merged on its branch, ${inCheckout ? "already in the user's checkout" : "NOT in the user's checkout yet"}: ${merged.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
+    unfinished.length ? `  unfinished, with their changes in their worktrees: ${unfinished.map((t) => `${t.id} ${t.title}${t.session ? ` (session ${t.session})` : ""}`).join("; ")}` : "",
+  ].filter(Boolean).join("\n")
+}
+
+export function openJobsNote(notes: readonly string[], first: string): string {
+  return `[jev-micromanager] Before anything else this turn: this project has open work of an earlier micromanager session.
+${notes.join("\n")}
+Tell the user in two or three sentences what is there, and ask which of four they want (for each job, if there are several):
+- continue: this session takes the job over (take_over_job with job ${first}); its unfinished workers are continued with the subagent tool and their sessionID, and new workers land on the same branch.
+- merge: bring its branch into the user's checkout (merge_job with job ${first}); it shows what would land first.
+- discard: delete its branch and worktrees (discard_job with job ${first}); it lists what it deletes first. Unfinished changes are lost, and merged ones too unless they were merged into the checkout first.
+- new: leave it exactly as it is and start a fresh job in this session; nothing is deleted, and the next session asks again.
+Do what they choose before you start on their request, and do nothing of it without their answer. The tools are called inside execute.`
+}
+
 // --- checkpoints: going back to an earlier state of a job, as Pi Durable goes back to an earlier entry ---------------
 //
 // Every merged task is a commit "Tn: title" on the job branch, and the job remembers where the branch started, so the
@@ -1409,6 +1437,15 @@ export default {
             record({ kind: "merge", sessionID: tctx.sessionID, job: found.id, branch: found.integrationBranch, merged: out.wrote, ...(out.merge ?? {}), text: out.text.slice(-500) })
             return out.text
           },
+          takeOver: async (id, tctx) => {
+            if (!tctx.sessionID) return "take_over_job needs a session."
+            const r = native.takeOver(project, id.trim(), tctx.sessionID)
+            if (r.problem) return `Not taken over: ${r.problem}. Nothing was changed.`
+            const job = r.job!
+            const unfinished = job.tasks.filter((t) => t.worktree && t.status !== "merged")
+            record({ kind: "take-over", sessionID: tctx.sessionID, job: job.id })
+            return `This session runs job ${job.id} now (branch ${job.integrationBranch}); new workers land on that branch.${unfinished.length ? ` Unfinished, to continue with the subagent tool and their sessionID: ${unfinished.map((t) => `${t.id} ${t.title} (sessionID ${t.session})`).join("; ")}.` : ""}`
+          },
           rewind: async (id, to, ack, tctx) => {
             const found = id.trim() ? loadSwept(id.trim()) : listSwept().find((j) => j.facilitator === tctx.sessionID) ?? listSwept()[0]
             if (!found) return "No job to rewind. plan_job or start a worker first."
@@ -1540,6 +1577,23 @@ export default {
           return
         }
       }
+      // The first turn of a micromanager session that has no job yet: an earlier session's open work is put to the user.
+      if (!runnerSessions.has(sessionID) && !greeted.has(sessionID)) {
+        greeted.add(sessionID)
+        const agent = input.agent ?? ((await ctx.session.get({ sessionID }).catch(() => undefined)) as SessionRecord | undefined)?.agent
+        if (agent === MICROMANAGER.agent && !native.hasJob(project, sessionID)) {
+          const open = native.openJobs(project, sessionID).slice(-3)
+          if (open.length) {
+            const notes = await Promise.all(open.map(async (j) => {
+              const branch = j.integrationBranch
+              const inCheckout = branch ? (await exec("git", ["-C", project, "merge-base", "--is-ancestor", branch, "HEAD"], { cwd: project, timeoutMs: 10_000 }).catch(() => undefined))?.code === 0 : false
+              return openJobNote(j, inCheckout)
+            }))
+            steering.set(sessionID, openJobsNote(notes, open.at(-1)!.id))
+            record({ kind: "open-jobs", sessionID, jobs: open.map((j) => j.id) })
+          }
+        }
+      }
       const job = sessionJob(sessionID)
       if (!job) return
       // The answer to a grant question, before anything else this turn: it is a yes or a no about a path, and a turn
@@ -1574,6 +1628,8 @@ export default {
       }
     })
 
+    // Micromanager sessions whose first turn was looked at for an earlier session's open work.
+    const greeted = new Set<string>()
     // Jev drops the micromanager's old tool results it no longer needs before each of its turns (src/compact.ts).
     const compactor = new Compactor(decider, record)
     await ctx.session.hook("context", async (input) => {

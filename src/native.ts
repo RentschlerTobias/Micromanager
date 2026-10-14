@@ -93,7 +93,7 @@ interface Entry {
   readonly project: string
   readonly jobId: string
   taskId: string
-  readonly parent: string // the micromanager session
+  parent: string // the micromanager session; a later session that takes the job over becomes it
   readonly writer: boolean
   dir: string // where the worker works: its own worktree (writer) or the session branch's (reader), at the project offset
   worktree: string // the git worktree root of dir: what git commands need
@@ -192,6 +192,40 @@ export class Native {
       }
     }
     return adopted
+  }
+
+  // The open jobs of earlier micromanager sessions of this project: rolling, not finished, and with something left in
+  // them (a merged task, or a task with a worktree). A new session starts a job of its own, so without this the
+  // previous session's work was out of sight: merged tasks the checkout never got, unfinished changes in worktrees.
+  openJobs(project: string, parent: string): Job[] {
+    return listJobs(project)
+      .filter((j) => j.rolling && j.facilitator && j.facilitator !== parent && !["done", "stopped", "failed"].includes(j.phase))
+      .map((j) => this.#jobs.get(key(project, j.id)) ?? j)
+      .filter((j) => j.tasks.some((t) => (t.status === "merged" && !t.undone) || (t.worktree && t.status !== "merged")))
+  }
+
+  // Whether this micromanager session has a job of its own yet.
+  hasJob(project: string, parent: string): boolean {
+    return listJobs(project).some((j) => j.rolling && j.facilitator === parent && !["done", "stopped", "failed"].includes(j.phase))
+  }
+
+  // "Continue" at the start of a session: the earlier session's job becomes this session's. New workers land on the
+  // same branch, its unfinished workers can be continued by their sessions, and their notes and permission requests
+  // come to this session. Refused when this session started a job of its own already: two jobs of one session would
+  // split its work over two branches.
+  takeOver(project: string, jobId: string, parent: string): { job?: Job; problem?: string } {
+    if (this.hasJob(project, parent)) return { problem: "this session has a job of its own already; continue the earlier one in a new session, or merge or discard it" }
+    this.adopt(project)
+    const job = this.#jobs.get(key(project, jobId)) ?? listJobs(project).find((j) => j.id === jobId)
+    if (!job || !job.rolling) return { problem: `there is no open job ${jobId} of a micromanager session in this project` }
+    if (["done", "stopped", "failed"].includes(job.phase)) return { problem: `job ${jobId} is ${job.phase}` }
+    job.facilitator = parent
+    this.#jobs.set(key(project, job.id), job)
+    for (const entry of this.#entries.values()) {
+      if (entry.jobId === job.id && entry.project === project) entry.parent = parent
+    }
+    saveJob(project, job)
+    return { job }
   }
 
   // A new subagent call of the micromanager: the task, its worktree and the worker's brief. Throws a

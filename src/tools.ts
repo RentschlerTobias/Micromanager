@@ -17,6 +17,8 @@ export const TOOL_IDS = [
   "answer_permission",
   // Checkpoints: the job branch back to an earlier state, and the last merge_job taken back.
   "rewind_job", "undo_merge",
+  // An earlier session's open job, made this session's.
+  "take_over_job",
 ] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
@@ -45,6 +47,7 @@ export interface Handlers {
   permission(id: string, decision: string, note: string, ctx: ToolContext): Promise<string>
   rewind(job: string, to: string, ack: string, ctx: ToolContext): Promise<string>
   undoMerge(job: string, ack: string, ctx: ToolContext): Promise<string>
+  takeOver(job: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -152,6 +155,13 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     description: "Move a job's branch back to a checkpoint: \"start\", the state after a merged task (\"T3\"), or \"before-rewind-<n>\" (a rewind undone). job: the job id, or empty for this session's job. to: empty lists the checkpoints and changes nothing. Without ack it shows what would leave the branch and which unfinished tasks would be given up, and changes nothing; with ack (the user's own words, repeated) it moves the branch, keeps the old tip as before-rewind-<n>, and deletes the unfinished tasks' worktrees. Refused while a worker of the job runs. The user's checkout is never touched (undo_merge).",
     input: input("job", "to", "ack"),
     execute: guarded(([job, to, ack], ctx) => handlers.rewind(job!, to!, ack!, ctx), "job", "to", "ack"),
+  })
+  draft.add({
+    id: "take_over_job",
+    name: "take_over_job",
+    description: "Make an earlier micromanager session's open job this session's, after the user chose to continue it: new workers land on its branch, its unfinished workers are continued with the subagent tool and their sessionID, and their notes and permission requests come here. job: the job id the plugin's note named. Refused when this session started a job of its own already.",
+    input: input("job"),
+    execute: guarded(([job], ctx) => handlers.takeOver(job!, ctx), "job"),
   })
   draft.add({
     id: "undo_merge",

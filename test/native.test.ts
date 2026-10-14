@@ -443,3 +443,43 @@ test("after a restart the workers of open jobs are known again: continued, they 
   assert.match(r.text, /^Merged into jev\/.*checks passed: node -e "require\('\.\/add\.js'\)"/s)
   assert.equal(loadJob(project, d.job.id)!.tasks[0]!.status, "merged")
 })
+
+test("a new session sees the open job of an earlier one, and continuing it moves the job and its workers over", async () => {
+  const project = repo()
+  const native = new Native()
+  const d = await native.delegate(project, "ses_old", { agent: "coder", description: "Add the persona", prompt: "Add the persona.\nFiles: add.js\nChecks: test -f add.js" }, MODEL)
+  native.claim("ses_w1", child(d.prompt))
+  await native.ended("ses_w1", "the server restarted")
+  // the earlier session itself is not asked about its own job; a new one is
+  assert.deepEqual(native.openJobs(project, "ses_old").map((j) => j.id), [])
+  assert.deepEqual(native.openJobs(project, "ses_new").map((j) => j.id), [d.job.id])
+  assert.equal(native.hasJob(project, "ses_new"), false)
+  // continue: the job and the paused worker answer to the new session now
+  const taken = native.takeOver(project, d.job.id, "ses_new")
+  assert.equal(taken.job?.facilitator, "ses_new")
+  assert.equal(native.ownerOf("ses_w1")?.parent, "ses_new")
+  assert.equal(loadJob(project, d.job.id)!.facilitator, "ses_new")
+  assert.equal(native.job(project, "ses_new").id, d.job.id, "new workers land in the same job")
+  assert.deepEqual(native.openJobs(project, "ses_new"), [], "nothing left to ask about")
+  // a session with a job of its own cannot take over another
+  assert.match(native.takeOver(project, d.job.id, "ses_new").problem!, /has a job of its own already/)
+  assert.match(native.takeOver(project, "job-nope", "ses_third").problem!, /no open job job-nope/)
+})
+
+test("the note on an earlier session's job says what was merged, whether the checkout has it, and what is unfinished", async () => {
+  const { openJobNote, openJobsNote } = await import("../src/plugin.ts")
+  const project = repo()
+  const native = new Native()
+  const d = await native.delegate(project, "ses_old", { agent: "coder", description: "Add the persona", prompt: "Add the persona.\nFiles: add.js\nChecks: test -f add.js" }, MODEL)
+  native.claim("ses_w1", child(d.prompt))
+  const job = loadJob(project, d.job.id)!
+  job.tasks.push({ ...job.tasks[0]!, id: "T2", title: "Copy instruct files", status: "merged", worktree: undefined, session: "ses_w2" })
+  const note = openJobNote(job, false)
+  assert.match(note, /merged on its branch, NOT in the user's checkout yet: T2 Copy instruct files/)
+  assert.match(note, /unfinished, with their changes in their worktrees: T1 Add the persona \(session ses_w1\)/)
+  assert.match(openJobNote(job, true), /already in the user's checkout/)
+  const all = openJobsNote([note], job.id)
+  for (const choice of ["continue:", "merge:", "discard:", "new:"]) assert.ok(all.includes(`- ${choice}`), choice)
+  assert.match(all, new RegExp(`take_over_job with job ${job.id}`))
+  assert.match(all, /nothing is deleted, and the next session asks again/)
+})

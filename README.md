@@ -112,6 +112,7 @@ Jev and the plugin securing every task:
    | `discard_job` | give the branch and worktrees back to git; lists what it removes first |
    | `request_access` | vouch that a worker needs a path outside the project, for the permission path to see |
    | `answer_permission` | answer a worker's paused permission request: once, for the job, or refuse |
+   | `take_over_job` | make an earlier session's open job this session's, when you chose to continue it |
    | `rewind_job` | list the job's checkpoints, or move its branch back to one with your words; undone the same way |
    | `undo_merge` | take back the last `merge_job` in your checkout, while it is still where that merge left it |
    | `stop_job` | stop the whole job; `run_job` resumes it |
@@ -128,6 +129,12 @@ Jev and the plugin securing every task:
 
    **After a restart** the plugin knows the workers of the open jobs again from the job files: a worker continued by
    its session finishes and merges as before, and the micromanager cannot start over on its work by accident.
+
+   **A new session asks about the last one's work.** At the first turn of a micromanager session that has no job yet,
+   an earlier session's open job (merged tasks the checkout may not have, unfinished changes in worktrees) is put to
+   you with four choices: **continue** (`take_over_job`: this session runs the job, its workers can be continued),
+   **merge** (`merge_job`), **discard** (`discard_job`), or **new** (leave it as it is and start a fresh job; nothing is
+   deleted, and the next session asks again). Nothing happens before you answer.
 
 7. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
    after a planning session with you. You approve it, and `run_job` runs it.
