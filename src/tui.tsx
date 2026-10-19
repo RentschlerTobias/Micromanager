@@ -43,7 +43,7 @@ interface Context {
   }
   keymap: { layer(build: () => unknown): unknown }
   ui: {
-    slot(slot: { append: string; render: (input: any) => unknown }): unknown
+    slot(slot: { append?: string; prepend?: string; render: (input: any) => unknown }): unknown
     toast: { show(toast: { message: string; variant?: string }): void }
     router: { current(): { type: string; sessionID?: string } | undefined; navigate(to: { type: "session"; sessionID: string }): void }
     dialog: { select(input: { title: string; options: { title: string; value: string; description?: string; category?: string }[] }): Promise<string | undefined> }
@@ -117,7 +117,7 @@ async function pending(context: Context, sessions: readonly string[]): Promise<M
 function Progress(props: { context: Context; sessionID: string }) {
   const jobs = useJobs(props.context, () => props.sessionID)
   return (
-    <For each={jobs()}>
+    <For each={jobs().filter((j) => j.total > 0)}>
       {(job) => <text fg={props.context.theme.text.muted}>micromanager · {summaryLine(job)} · /tasks · /workers</text>}
     </For>
   )
@@ -137,13 +137,13 @@ function Checklist(props: { context: Context; sessionID: string }) {
   const timer = setInterval(() => void poll(), POLL_MS * 2)
   onCleanup(() => clearInterval(timer))
   return (
-    <For each={jobs()}>
+    <For each={jobs().filter((j) => j.total > 0)}>
       {(job) => {
         const groups = () => sidebarGroups(job, waiting())
         return (
           <box>
             <box flexDirection="row">
-              <text fg={colors.base}>{cut(job.title, 28)}</text>
+              <text fg={colors.base}>{cut(job.title, 26)}</text>
               <box flexGrow={1} />
               <text fg={colors.muted}>{job.phase}</text>
             </box>
@@ -270,7 +270,8 @@ export default Plugin.define({
   setup(raw: unknown) {
     const context = raw as Context
     context.ui.slot({ append: "session.composer.top", render: (input) => <Progress context={context} sessionID={input.sessionID} /> })
-    context.ui.slot({ append: "sidebar.content", render: (input) => <Checklist context={context} sessionID={input.sessionID} /> })
+    // prepend: at the top of the sidebar, above OpenCode's own context and MCP sections (appended, it was below the fold)
+    context.ui.slot({ prepend: "sidebar.content", render: (input) => <Checklist context={context} sessionID={input.sessionID} /> })
     context.ui.slot({ append: "session.panel", render: (panel) => (panel.name === PANEL ? <Agents context={context} panel={panel} /> : null) })
     context.ui.slot({
       append: "app",

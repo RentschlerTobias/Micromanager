@@ -70,7 +70,7 @@ export function view(job: Job, now = Date.now()): JobView {
   const ready = new Set(startable(job).map((t) => t.id))
   return {
     id: job.id,
-    title: job.goal.split("\n")[0]!,
+    title: job.rolling ? "Delegated tasks" : job.goal.split("\n")[0]!, // a rolling job's goal names the session id
     phase: job.phase,
     facilitator: job.facilitator,
     done: live.filter((t) => DONE.includes(t.status)).length,
