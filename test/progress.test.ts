@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { jobsFor, projectOf, summaryLine, taskChoices, todoLines, view } from "../src/progress.ts"
+import { elapsed, jobsFor, projectOf, shortModel, sidebarCounts, sidebarGroups, summaryLine, taskChoices, view } from "../src/progress.ts"
 import { newJob, type Job, type Task } from "../src/state.ts"
 
 const task = (id: string, status: Task["status"], extra: Partial<Task> = {}): Task => ({
@@ -52,18 +52,39 @@ test("/tasks offers the way back to the micromanager from a worker, and each tas
   assert.equal(taskChoices([v], "ses_micro")[0]!.title, "✔ T1 task T1", "no way back from the micromanager itself")
 })
 
-test("the sidebar's todo list puts running and stopped tasks first and counts the done ones", () => {
+test("the sidebar groups the job as a checklist: waiting, running, failed, next, done, each in plan order", () => {
+  const now = Date.parse("2026-10-19T12:00:00Z")
   const tasks = [
-    task("T1", "merged"), task("T2", "merged"),
-    task("T3", "running", { stages: [{ stage: "implement", result: "pass", at: new Date().toISOString() }] }),
-    task("T4", "escalated", { escalation: { kind: "too_hard", detail: "loop" } }),
-    ...["T5", "T6", "T7"].map((id) => task(id, "pending", { dependsOn: ["T3"] })),
+    task("T1", "merged"),
+    task("T2", "escalated", { escalation: { kind: "too_hard", detail: "loop" } }),
+    task("T3", "running", { model: "opencode-go/glm-5.3-flash", session: "ses_t3", stages: [{ stage: "delegate", result: "pass", at: "2026-10-19T11:56:00Z" }, { stage: "gate", result: "fail", at: "2026-10-19T11:59:00Z" }] }),
+    task("T4", "running", { model: "opencode-go/mimo-v2.6-pro", session: "ses_t4" }),
+    task("T5", "pending", { dependsOn: ["T3"] }),
+    task("T6", "pending"),
+    task("T7", "pending"),
+    task("T8", "pending"),
+    task("T9", "merged"),
   ]
-  const lines = todoLines(view(job("job-1", { tasks })), 2)
-  assert.deepEqual(lines.map((l) => l.text), ["▶ T3 task T3", "✖ T4 task T4", "· T5 task T5", "· T6 task T6", "  … 1 more open", "✔ 2 done"])
-  assert.match(lines[0]!.detail!, /^implement/)
-  assert.equal(lines[1]!.detail, "given up: loop")
-  assert.equal(lines[2]!.detail, undefined, "an open task's dependencies are noise in the sidebar")
-  const long = todoLines(view(job("job-1", { tasks: [task("T1", "escalated", { escalation: { kind: "too_hard", detail: "x".repeat(200) } })] })))
-  assert.equal(long[0]!.detail!.length, 60)
+  const groups = sidebarGroups(view(job("job-1", { tasks }), now), new Map([["ses_t4", "shell"]]), now)
+  assert.deepEqual(groups.map((g) => [g.name, g.count, g.lines.map((l) => `${l.id}${l.detail ? ` ${l.detail}` : ""}`)]), [
+    ["WAITING FOR YOU", 1, ["T4 shell"]],
+    ["RUNNING", 1, ["T3 glm 4m"]],
+    ["FAILED", 1, ["T2"]],
+    ["NEXT", 4, ["T6", "T7", "T8"]], // the startable ones; T5 waits for T3
+    ["DONE", 2, ["T1", "T9"]],
+  ])
+  assert.deepEqual(sidebarCounts(groups).map((c) => c.text), ["[✓]2", "[▸]1", "[!]1", "[✗]1", "[ ]4"])
+  const quiet = sidebarGroups(view(job("job-1", { tasks: [task("T1", "merged")] })))
+  assert.deepEqual(quiet.map((g) => g.name), ["DONE"], "an empty group is left out")
+})
+
+test("a running task shows its model's family and how long it runs", () => {
+  assert.equal(shortModel("opencode-go/deepseek-v4.1-flash"), "deeps")
+  assert.equal(shortModel("opencode-go/gemini-4-argon-contributor"), "gemin")
+  assert.equal(shortModel(undefined), "")
+  const now = Date.parse("2026-10-19T12:00:00Z")
+  assert.equal(elapsed("2026-10-19T11:59:51Z", now), "9s")
+  assert.equal(elapsed("2026-10-19T11:56:00Z", now), "4m")
+  assert.equal(elapsed("2026-10-19T10:48:00Z", now), "1.2h")
+  assert.equal(elapsed(undefined, now), "")
 })

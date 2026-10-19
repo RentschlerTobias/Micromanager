@@ -6,6 +6,8 @@
 // list, with every task's status and worker sessions; this reads it.
 
 import { detail, ICON } from "./board.ts"
+import { startable } from "./continuation.ts"
+import { family } from "./roles.ts"
 import type { Job, Task, TaskStatus } from "./state.ts"
 import { DIR, LEGACY_DIR } from "./store.ts"
 
@@ -21,10 +23,14 @@ export interface TaskRow {
   readonly status: TaskStatus
   readonly detail: string
   readonly session?: string // the newest session that worked on it: where "open" goes
+  readonly model?: string
+  readonly since?: string // when its current run started (ISO), for a running task
+  readonly startable: boolean // open, and every task it depends on is merged
 }
 
 export interface JobView {
   readonly id: string
+  readonly title: string // the job's goal, as the sidebar heads it
   readonly phase: Job["phase"]
   readonly facilitator?: string
   readonly done: number
@@ -53,10 +59,18 @@ export function jobsFor(jobs: readonly Job[], sessionID: string): Job[] {
   return open.length ? open : own.slice(0, 1)
 }
 
+// When a running task's current run started: its last start (delegate or classify), else its last stage.
+function startedAt(task: Task): string | undefined {
+  const starts = task.stages.filter((s) => s.stage === "delegate" || s.stage === "classify")
+  return (starts.at(-1) ?? task.stages.at(-1))?.at
+}
+
 export function view(job: Job, now = Date.now()): JobView {
   const live = job.tasks.filter((t) => !t.undone)
+  const ready = new Set(startable(job).map((t) => t.id))
   return {
     id: job.id,
+    title: job.goal.split("\n")[0]!,
     phase: job.phase,
     facilitator: job.facilitator,
     done: live.filter((t) => DONE.includes(t.status)).length,
@@ -70,6 +84,9 @@ export function view(job: Job, now = Date.now()): JobView {
       status: t.status,
       detail: detail(t, now),
       session: t.sessions?.at(-1) ?? t.session,
+      ...(t.model ? { model: t.model } : {}),
+      ...(RUNNING.includes(t.status) && startedAt(t) ? { since: startedAt(t) } : {}),
+      startable: ready.has(t.id),
     })),
   }
 }
@@ -92,27 +109,74 @@ export function taskChoices(views: readonly JobView[], sessionID: string): { tit
   return out
 }
 
-const DETAIL = 60 // a given-up task's reason can be a whole check command; the sidebar shows its start
+// The sidebar: the job as a checklist, grouped by what needs attention (the user, 2026-10-19: what runs, what is done
+// and what is open has to be clear at a glance). Groups in a fixed order, each in plan order; an empty group is left
+// out. "Waiting" is a task whose worker waits for the user (a permission or a question), read by the TUI.
+export type Mark = "waiting" | "running" | "failed" | "open" | "done"
 
-export interface TodoLine {
-  readonly text: string
-  readonly detail?: string // what a running or stopped task does or why it stopped; open and done ones have none
-  readonly muted?: boolean
+export const BOX: Record<Mark, string> = { waiting: "[!]", running: "[▸]", failed: "[✗]", open: "[ ]", done: "[✓]" }
+
+export interface SidebarLine {
+  readonly mark: Mark
+  readonly id: string
+  readonly title: string
+  readonly detail?: string // running: "glm 4m"; waiting: what it asks
+  readonly session?: string
 }
 
-// The sidebar's todo list, short enough for a job of forty tasks: what runs and what stopped first, then the next few
-// open tasks, and the done ones as a count (live: the full list of 42 pushed everything else out of the sidebar).
-export function todoLines(v: JobView, open = 6): TodoLine[] {
-  const by = (statuses: readonly TaskStatus[]) => v.rows.filter((r) => statuses.includes(r.status))
-  const cut = (text: string) => (text.length > DETAIL ? `${text.slice(0, DETAIL - 1)}…` : text)
-  const line = (r: TaskRow, detail = true): TodoLine => ({ text: `${r.icon} ${r.id} ${r.title}`, ...(detail && r.detail ? { detail: cut(r.detail) } : {}) })
-  const waiting = v.rows.filter((r) => !RUNNING.includes(r.status) && !FAILED.includes(r.status) && !DONE.includes(r.status))
-  const done = by(DONE)
-  return [
-    ...by(RUNNING).map((r) => line(r)),
-    ...by(FAILED).map((r) => line(r)),
-    ...waiting.slice(0, open).map((r) => line(r, false)),
-    ...(waiting.length > open ? [{ text: `  … ${waiting.length - open} more open`, muted: true }] : []),
-    ...(done.length ? [{ text: `✔ ${done.length} done`, muted: true }] : []),
+export interface SidebarGroup {
+  readonly mark: Mark
+  readonly name: string
+  readonly count: number // tasks in this state
+  readonly lines: readonly SidebarLine[] // the ones shown: all, except NEXT (the first few) and DONE (folded)
+}
+
+const NEXT = 3
+
+// "4m", "9s", "1.2h": how long a task has been running.
+export function elapsed(since: string | undefined, now = Date.now()): string {
+  if (!since) return ""
+  const s = Math.max(0, Math.round((now - Date.parse(since)) / 1000))
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : `${(s / 3600).toFixed(1)}h`
+}
+
+// A model as the sidebar names it: its family, at most five letters ("glm", "mimo", "deeps", "gemin").
+export function shortModel(model: string | undefined): string {
+  return model ? family(model).slice(0, 5) : ""
+}
+
+export function markOf(row: TaskRow, waiting: ReadonlySet<string>): Mark {
+  if (DONE.includes(row.status)) return "done"
+  if (FAILED.includes(row.status)) return "failed"
+  if (RUNNING.includes(row.status)) return row.session && waiting.has(row.session) ? "waiting" : "running"
+  return "open"
+}
+
+// waiting: the worker sessions that wait for the user, and what they ask ("shell", "a question").
+export function sidebarGroups(v: JobView, waiting: ReadonlyMap<string, string> = new Map(), now = Date.now()): SidebarGroup[] {
+  const asking = new Set(waiting.keys())
+  const line = (r: TaskRow, mark: Mark): SidebarLine => {
+    const detail = mark === "running" ? `${shortModel(r.model)} ${elapsed(r.since, now)}`.trim() : mark === "waiting" ? waiting.get(r.session!) : undefined
+    return { mark, id: r.id, title: r.title, ...(detail ? { detail } : {}), ...(r.session ? { session: r.session } : {}) }
+  }
+  const of = (mark: Mark) => v.rows.filter((r) => markOf(r, asking) === mark)
+  const open = of("open")
+  const next = [...open.filter((r) => r.startable), ...open.filter((r) => !r.startable)].slice(0, NEXT)
+  const groups: SidebarGroup[] = [
+    { mark: "waiting", name: "WAITING FOR YOU", count: of("waiting").length, lines: of("waiting").map((r) => line(r, "waiting")) },
+    { mark: "running", name: "RUNNING", count: of("running").length, lines: of("running").map((r) => line(r, "running")) },
+    { mark: "failed", name: "FAILED", count: of("failed").length, lines: of("failed").map((r) => line(r, "failed")) },
+    { mark: "open", name: "NEXT", count: open.length, lines: open.filter((r) => next.includes(r)).map((r) => line(r, "open")) },
+    { mark: "done", name: "DONE", count: of("done").length, lines: of("done").map((r) => line(r, "done")) },
   ]
+  return groups.filter((g) => g.count > 0)
+}
+
+// The counts under the job's name: "[✓]8 [▸]3 [!]1 [✗]2 [ ]28".
+export function sidebarCounts(groups: readonly SidebarGroup[]): { mark: Mark; text: string }[] {
+  const order: Mark[] = ["done", "running", "waiting", "failed", "open"]
+  return order.flatMap((mark) => {
+    const g = groups.find((x) => x.mark === mark)
+    return g ? [{ mark, text: `${BOX[mark]}${g.count}` }] : []
+  })
 }
