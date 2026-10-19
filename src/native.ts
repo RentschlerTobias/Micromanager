@@ -22,10 +22,10 @@ import {
 import { addDelegated, checkSetProblems, parseFiles } from "./plan.ts"
 import { WRITERS } from "./profile.ts"
 import { FIX_ROUNDS } from "./watchdog.ts"
-import { ROLES, roleByAgent, type Role } from "./roles.ts"
-import { moveTask, newJob, moveJob, stage, type Job, type Task } from "./state.ts"
+import { ROLES, roleByAgent, roleById, type Role } from "./roles.ts"
+import { isDone, moveTask, newJob, moveJob, stage, type Job, type Task } from "./state.ts"
 import { excludeFromGit, jobId, listJobs, saveJob } from "./store.ts"
-import { skillLine } from "./brief.ts"
+import { sharedNote, skillLine, taskAcceptance } from "./brief.ts"
 
 // The first line OpenCode puts before a new subagent's prompt; how the prompt hook tells a child's first turn.
 export const CHILD_PREFIX = "You are a subagent spawned by another session."
@@ -33,10 +33,11 @@ export const CHILD_PREFIX = "You are a subagent spawned by another session."
 export class DelegationError extends Error {}
 
 export interface Delegation {
-  readonly body: string // the prompt without the Files, Checks and Replaces lines
+  readonly body: string // the prompt without the Files, Checks, Replaces and Task lines
   readonly files: string // as written, parsed by parseFiles
   readonly checks: string[]
   readonly replaces: string[] // tasks this one deliberately starts over ("Replaces: T5")
+  readonly planned?: { readonly task: string; readonly job: string } // a planned task to start ("Task: T5 · job-…")
 }
 
 // The "Files:" and "Checks:" lines of a delegation, wherever they stand; the checks go on over the following lines
@@ -46,8 +47,16 @@ export function parseDelegation(prompt: string): Delegation {
   const checks: string[] = []
   const replaces: string[] = []
   let files = ""
+  let planned: Delegation["planned"]
   let inChecks = false
   for (const line of prompt.split("\n")) {
+    // Only the exact form run_job hands out (src/continuation.ts plannedLine): a prompt's own "Task: …" stays prose.
+    const t = line.match(/^\s*task:\s*(T\d+(?:\.\w+)*)\s*·\s*(job-[\w-]+)\s*$/i)
+    if (t) {
+      planned = { task: t[1]!.toUpperCase(), job: t[2]! }
+      inChecks = false
+      continue
+    }
     const f = line.match(/^\s*files:\s*(.*)$/i)
     const c = line.match(/^\s*checks:\s*(.*)$/i)
     const r = line.match(/^\s*replaces:\s*(.*)$/i)
@@ -66,7 +75,7 @@ export function parseDelegation(prompt: string): Delegation {
       body.push(line)
     }
   }
-  return { body: body.join("\n").trim(), files, checks, replaces }
+  return { body: body.join("\n").trim(), files, checks, replaces, ...(planned ? { planned } : {}) }
 }
 
 // How much two task texts are about the same thing: the share of their words they have in common (Jaccard over the
@@ -160,7 +169,7 @@ export class Native {
   adopt(project: string): string[] {
     const adopted: string[] = []
     for (const job of listJobs(project)) {
-      if (!job.rolling || !job.facilitator || ["done", "stopped", "failed"].includes(job.phase)) continue
+      if (!(job.rolling || job.native) || !job.facilitator || ["done", "stopped", "failed"].includes(job.phase)) continue
       const known = this.#jobs.get(key(project, job.id))
       if (known) continue
       this.#jobs.set(key(project, job.id), job)
@@ -241,6 +250,7 @@ export class Native {
     const role = roleByAgent(input.agent)
     if (!role) throw new DelegationError(`Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}), not ${input.agent || "none"}.`)
     const d = parseDelegation(input.prompt)
+    if (d.planned) return this.#planned(project, parent, role, d, d.planned, model)
     const parsed = parseFiles(d.files, project)
     if (parsed.problem) throw new DelegationError(`Not started: ${parsed.problem}`)
     const writer = WRITERS.has(role.id)
@@ -257,6 +267,19 @@ export class Native {
     await this.#replace(project, job, d.replaces)
     const duplicate = this.#duplicate(job, role, input.description.trim(), d.body, parsed.files, d.replaces)
     if (duplicate) throw new DelegationError(duplicate)
+    const rel = await this.#integrate(project, job)
+    const added = addDelegated(job, { title: input.description.trim() || d.body.split("\n")[0]!, prompt: d.body, files: parsed.files, dependsOn: [], checks: d.checks })
+    if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
+    const task = added.task
+    task.role = role.id
+    task.model = model
+    for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
+    stage(task, "delegate", "pass", `${role.agent} on ${model}`)
+    return this.#start(project, parent, job, task, role, model, d, d.checks, rel)
+  }
+
+  // The job's branch and its worktree, made at its first task. Returns the project's offset inside the repository.
+  async #integrate(project: string, job: Job): Promise<string> {
     if (!job.integrationWorktree) {
       excludeFromGit(project)
       const integration = await prepareIntegration(project, job.id, this.#exec)
@@ -270,15 +293,13 @@ export class Native {
     }
     // A job file written before the offset was tracked has none: git is asked once, so a job that predates this does
     // not keep sending its workers to the worktree root.
-    const rel = job.integrationRel ?? (job.integrationWorktree ? await repoRel(project, this.#exec) : "")
-    const added = addDelegated(job, { title: input.description.trim() || d.body.split("\n")[0]!, prompt: d.body, files: parsed.files, dependsOn: [], checks: d.checks })
-    if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
-    const task = added.task
-    task.role = role.id
-    task.model = model
-    for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
-    stage(task, "delegate", "pass", `${role.agent} on ${model}`)
-    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: taskDir(job.integrationWorktree!, rel), worktree: job.integrationWorktree!, rel, checks: d.checks }
+    return job.integrationRel ?? (job.integrationWorktree ? await repoRel(project, this.#exec) : "")
+  }
+
+  // A running task's entry, its worktree (writer) and the worker's brief.
+  async #start(project: string, parent: string, job: Job, task: Task, role: Role, model: string, d: Delegation, checks: string[], rel: string): Promise<Delegated> {
+    const writer = WRITERS.has(role.id)
+    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: taskDir(job.integrationWorktree!, rel), worktree: job.integrationWorktree!, rel, checks }
     if (writer) {
       const w = await prepareTaskWorktree(project, job.id, task.id, job.integrationBranch!, this.#exec, undefined, rel)
       entry.dir = w.dir
@@ -299,6 +320,80 @@ export class Native {
       job.integrationDirty ? `job ${job.id}: starts from commit ${job.integrationBase?.slice(0, 7) ?? "HEAD"} on ${job.integrationBranch}, and the working tree has uncommitted paths no worker will see (${job.integrationDirty})` : "",
     ].filter(Boolean)
     return { task, job, prompt: this.#brief(job, task, role, model, d, entry, graph), notes }
+  }
+
+  // run_job: a planned job runs on the micromanager's own workers from now on. The job's phase goes to execute and the
+  // session becomes its facilitator; nextStep (src/continuation.ts) then names the tasks to start.
+  runPlanned(project: string, jobId: string, parent: string): { job?: Job; problem?: string } {
+    const job = this.#jobs.get(key(project, jobId)) ?? listJobs(project).find((j) => j.id === jobId)
+    if (!job) return { problem: `there is no job ${jobId} in this project` }
+    if (job.rolling) return { problem: `${jobId} holds the tasks you delegated yourself; it has no plan to run` }
+    if (!job.tasks.length) return { problem: `${jobId} has no tasks yet; plan it with plan_job first` }
+    if (job.phase === "plan_gate") moveJob(job, "execute")
+    else if ((job.phase === "paused" || job.phase === "ask_user") && job.resumePhase === "execute") moveJob(job, "execute")
+    if (job.phase !== "execute") return { problem: `job ${jobId} is in phase ${job.phase}, not ready to run` }
+    job.native = true
+    if (job.facilitator !== parent) {
+      job.facilitator = parent
+      for (const entry of this.#entries.values()) if (entry.jobId === job.id && entry.project === project) entry.parent = parent
+    }
+    this.#jobs.set(key(project, job.id), job)
+    saveJob(project, job)
+    return { job }
+  }
+
+  // "Task: T5 · job-…": the micromanager starts a task of a planned job (run_job). The plan already says what it is:
+  // its role, files, acceptance points and checks; the prompt can add to it. A task that ran before (on the runner, or
+  // a worker that stopped) starts over in a fresh worktree; continuing its old worker is the way to keep its change.
+  async #planned(project: string, parent: string, role: Role, d: Delegation, planned: NonNullable<Delegation["planned"]>, model: string): Promise<Delegated> {
+    const job = this.#jobs.get(key(project, planned.job)) ?? listJobs(project).find((j) => j.id === planned.job)
+    if (!job) throw new DelegationError(`Not started: there is no job ${planned.job} in this project.`)
+    if (!job.native) throw new DelegationError(`Not started: job ${job.id} is not running on your workers; start it with run_job first.`)
+    if (job.facilitator && job.facilitator !== parent) throw new DelegationError(`Not started: job ${job.id} belongs to another micromanager session; run_job ${job.id} here takes it over.`)
+    if (job.phase !== "execute") throw new DelegationError(`Not started: job ${job.id} is ${job.phase}; run_job resumes it.`)
+    const task = job.tasks.find((t) => t.id === planned.task)
+    if (!task) throw new DelegationError(`Not started: job ${job.id} has no task ${planned.task}.`)
+    const agent = roleById(task.role)?.agent ?? task.role
+    if (task.role !== role.id) throw new DelegationError(`Not started: ${task.id} is a task for ${agent}; start it with agent ${agent}.`)
+    const k = `${job.id}/${task.id}`
+    const old = this.#entries.get(k)
+    if (LIVE.has(task.status) && old && !old.ended) throw new DelegationError(`Not started: ${task.id} runs already${old.session ? ` (session ${old.session})` : ""}; its report comes to you when it ends.`)
+    if (task.status === "merged" || task.status === "passed") throw new DelegationError(`Not started: ${task.id} is done already (${task.status}).`)
+    const byId = new Map(job.tasks.map((t) => [t.id, t]))
+    const waits = task.dependsOn.filter((id) => { const dep = byId.get(id); return !dep || !isDone(dep) })
+    if (waits.length) throw new DelegationError(`Not started: ${task.id} waits for ${waits.join(", ")}; start it when ${waits.length > 1 ? "they are" : "it is"} merged.`)
+    const checks = d.checks.length ? d.checks : [...new Set(taskAcceptance(job, task).map((a) => a.verify).filter((v): v is string => Boolean(v)))]
+    if (d.checks.length) {
+      const problem = checkSetProblems(d.checks, WRITERS.has(role.id))
+      if (problem) throw new DelegationError(`Not started: ${problem}`)
+    }
+    this.#jobs.set(key(project, job.id), job)
+    if (old) {
+      await this.#dropWorktree(old, task)
+      this.#entries.delete(k)
+    } else if (task.worktree && task.branch) {
+      await removeTaskWorktree(project, { worktree: task.worktree, branch: task.branch }, this.#exec).catch(() => undefined)
+      task.worktree = undefined
+      task.branch = undefined
+    }
+    restart(task)
+    task.model = model
+    task.attempts = 0
+    stage(task, "delegate", "pass", `${role.agent} on ${model}, planned task`)
+    const rel = await this.#integrate(project, job)
+    const acceptance = taskAcceptance(job, task).map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}${sharedNote(job, task, a.id)}`)
+    const body = [
+      `The job: ${job.goal}`,
+      "",
+      `Your task (${task.id}): ${task.title}`,
+      task.description,
+      "",
+      "Acceptance points:",
+      ...(acceptance.length ? acceptance : ["- none given"]),
+      job.decisions.length ? `\nDecisions that apply: ${job.decisions.map((x) => x.text).join("; ")}` : "",
+      d.body ? `\nFrom the micromanager: ${d.body}` : "",
+    ].filter((line) => line !== "").join("\n")
+    return this.#start(project, parent, job, task, role, model, { ...d, body }, checks, rel)
   }
 
   // "Replaces: T5": the micromanager starts T5's work over on purpose. T5 is cancelled and its worktree, with whatever
@@ -625,6 +720,13 @@ export class Native {
     return { note, parent: entry.parent }
   }
 
+  // The job a worker works for, as this process holds it.
+  jobOf(session: string): { project: string; job: Job } | undefined {
+    const entry = this.#entry(session)
+    const job = entry && this.#job(entry)
+    return entry && job ? { project: entry.project, job } : undefined
+  }
+
   // The workers of a micromanager session that still run.
   running(parent: string): { session: string; task: string }[] {
     return [...this.#entries.values()]
@@ -684,6 +786,22 @@ export class Native {
         : "End with your findings: they are your result. Add work you noticed that the request needs (follow-ups).",
     ].filter((line, i, all) => line !== "" || all[i - 1] !== "").join("\n").trim()
   }
+}
+
+// A planned task on its way to a worker, from wherever it stopped: open, given up, stopped, left running by a process
+// that ended, or cancelled by a sweep. Cancelled is final for the state machine, so a task started again on purpose
+// goes back to pending first.
+function restart(task: Task): void {
+  if (task.status === "cancelled") {
+    task.status = "pending"
+    stage(task, "restart", "pass", "started again by the micromanager")
+  }
+  if (LIVE.has(task.status)) moveTask(task, "escalated")
+  if (task.status === "blocked") moveTask(task, "running")
+  if (task.status === "escalated") moveTask(task, "running")
+  if (task.status === "pending") moveTask(task, "ready")
+  if (task.status === "ready") moveTask(task, "planned")
+  if (task.status === "planned") moveTask(task, "running")
 }
 
 function key(project: string, job: string): string {

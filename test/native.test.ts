@@ -7,8 +7,10 @@ import { test } from "node:test"
 
 import { segments } from "../src/decide.ts"
 import { CHILD_PREFIX, DelegationError, Native, parseDelegation, similarity } from "../src/native.ts"
+import { nextStep } from "../src/continuation.ts"
 import { roleByAgent } from "../src/roles.ts"
-import { loadJob } from "../src/store.ts"
+import { moveJob, newJob, type Task } from "../src/state.ts"
+import { loadJob, saveJob } from "../src/store.ts"
 import { FIX_ROUNDS } from "../src/watchdog.ts"
 
 function repo(): string {
@@ -53,6 +55,68 @@ test("the Files and Checks lines are read off the prompt", () => {
   const again = parseDelegation("Start over on the pill.\nReplaces: t5, T9\nFiles: slides.qmd\nChecks: true")
   assert.deepEqual(again.replaces, ["T5", "T9"])
   assert.equal(again.body, "Start over on the pill.")
+})
+
+test("a planned task is started by its Task line; a prose line that starts with Task stays in the brief", () => {
+  assert.deepEqual(parseDelegation("Task: T5 · job-20261019-115736-f651").planned, { task: "T5", job: "job-20261019-115736-f651" })
+  assert.deepEqual(parseDelegation("Task: t8.d1 · job-1\nMind the docstrings.").planned, { task: "T8.D1", job: "job-1" })
+  const prose = parseDelegation("Task: write the docs for the router.\nFiles: docs.md\nChecks: test -f docs.md")
+  assert.equal(prose.planned, undefined)
+  assert.match(prose.body, /^Task: write the docs/)
+})
+
+test("run_job runs a planned job on native workers: its tasks start by their Task line, in plan order, and go on by themselves", async () => {
+  const project = repo()
+  const native = new Native()
+  const job = newJob("job-20261019-120000-ab12", "add and document add.js")
+  for (const p of ["triage", "plan", "plan_gate"] as const) moveJob(job, p)
+  job.acceptance = [{ id: "A1", text: "add.js exists", verify: "test -f add.js" }, { id: "A2", text: "it is documented", verify: "grep -q add README.md" }]
+  const planned = (id: string, extra: Partial<Task>): Task => ({ id, title: `task ${id}`, description: `do ${id}`, role: "code", acceptance: [], dependsOn: [], files: [], wave: 0, status: "pending", attempts: 0, stages: [], signatures: [], ...extra })
+  job.tasks = [
+    planned("T1", { title: "write add.js", acceptance: ["A1"], files: ["add.js"] }),
+    planned("T2", { title: "document it", acceptance: ["A2"], files: ["README.md"], dependsOn: ["T1"] }),
+    planned("T3", { title: "explain it", role: "explore", dependsOn: ["T1"], status: "cancelled" }),
+  ]
+  saveJob(project, job)
+  const task = (id: string, agent = "coder") => ({ agent, description: `${id}`, prompt: `Task: ${id} · ${job.id}` })
+
+  await assert.rejects(native.delegate(project, "ses_mm", task("T1"), MODEL), /not running on your workers; start it with run_job first/)
+  const run = native.runPlanned(project, job.id, "ses_mm")
+  assert.equal(run.job?.phase, "execute")
+  assert.equal(run.job?.native, true)
+  const first = nextStep(run.job!, 3)!
+  assert.equal(first.kind, "start")
+  assert.match(first.text, /description "T1 write add\.js", prompt "Task: T1 · job-20261019-120000-ab12"/)
+  assert.doesNotMatch(first.text, /T2/, "T2 waits for T1")
+
+  await assert.rejects(native.delegate(project, "ses_mm", task("T2"), MODEL), /T2 waits for T1; start it when it is merged/)
+  await assert.rejects(native.delegate(project, "ses_mm", task("T1", "writer"), MODEL), /T1 is a task for coder; start it with agent coder/)
+  await assert.rejects(native.delegate(project, "ses_other", task("T1"), MODEL), /belongs to another micromanager session/)
+
+  const d = await native.delegate(project, "ses_mm", { ...task("T1"), prompt: `Task: T1 · ${job.id}\nKeep it one line.` }, MODEL)
+  assert.equal(d.task.status, "running")
+  assert.match(d.prompt, /Your task \(T1\): write add\.js\ndo T1/)
+  assert.match(d.prompt, /- A1: add\.js exists \(checked with: test -f add\.js\)/)
+  assert.match(d.prompt, /From the micromanager: Keep it one line\./)
+  assert.match(d.prompt, /Checks the plugin runs when you finish: test -f add\.js/, "the checks come from the plan")
+  await assert.rejects(native.delegate(project, "ses_mm", task("T1"), MODEL), /T1 runs already/)
+
+  const claimed = native.claim("ses_w1", child(d.prompt))!
+  writeFileSync(join(claimed.dir, "add.js"), "export const add = (a, b) => a + b\n")
+  const done = await native.finish("ses_w1", "wrote add.js")
+  assert.match(done.text, /^Merged into jev\/job-20261019-120000-ab12/)
+  await native.ended("ses_w1")
+  const owned = native.jobOf("ses_w1")!
+  assert.equal(owned.job.tasks[0]!.status, "merged")
+  const next = nextStep(owned.job, 3)!
+  assert.equal(next.kind, "start")
+  assert.deepEqual(next.kind === "start" && next.tasks.map((t) => t.id), ["T2"], "T3 was cancelled, and nothing needs it")
+
+  // a cancelled task can still be started again on purpose
+  const again = await native.delegate(project, "ses_mm", task("T3", "explorer"), MODEL)
+  assert.equal(again.task.status, "running")
+  assert.ok(again.task.stages.some((s) => s.stage === "restart"))
+  assert.equal(loadJob(project, job.id)?.tasks[2]!.status, "running", "saved")
 })
 
 test("two task texts about the same work are told apart from different work", () => {

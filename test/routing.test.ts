@@ -172,12 +172,11 @@ test("the config overrides chains and rejects unknown roles or bad models", asyn
 
 // --- the fallback: a model the host cannot run is skipped, and the skip is reported -------------------------
 
-// A catalog holding some of the four models; everything else is simply not there.
+// The host's model list holding some of the four models, as ctx.model.list() answers; everything else is not there.
+// An unrelated model is always in it: an empty list means the host has not said yet, not that nothing exists.
 function catalog(present: readonly string[]) {
   return {
-    transform: (fn: (draft: { model: { get: (p: string, m: string) => unknown } }) => void) => {
-      fn({ model: { get: (p, m) => (present.includes(`${p}/${m}`) ? { id: m } : undefined) } })
-    },
+    list: async () => ["other/model", ...present].map((m) => ({ providerID: m.split("/")[0], id: m.slice(m.indexOf("/") + 1), name: m })),
   }
 }
 
@@ -206,8 +205,23 @@ test("nothing is skipped when the catalog says nothing", async () => {
   // evidence that a model is missing, and treating it as one would move every role off its chain for no reason.
   assert.equal((await chooseModel(code, { vision: false })).model, MODELS.space)
   assert.equal((await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, modelAvailability())).model, MODELS.space)
-  const broken = modelAvailability({ transform: () => { throw new Error("catalog not ready") } })
+  const broken = modelAvailability({ list: () => { throw new Error("catalog not ready") } })
   assert.equal((await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, broken)).model, MODELS.space)
+  const empty = modelAvailability({ list: async () => [] })
+  assert.equal((await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, empty)).model, MODELS.space, "an empty list has not said anything yet")
+})
+
+test("the host's list is read once a minute, also in the hub's { data } shape", async () => {
+  let reads = 0
+  let clock = 0
+  const hub = { list: async () => { reads++; return { data: [{ providerID: "opencode-go", id: "glm-5.3-flash" }] } } }
+  const available = modelAvailability(hub, () => clock)
+  assert.equal(await available("opencode-go/glm-5.3-flash"), true)
+  assert.equal(await available("opencode-go/space-bunny"), false, "renamed to space-bunny-free on 2026-10-19: gone")
+  assert.equal(reads, 1)
+  clock = 61_000
+  await available("opencode-go/space-bunny")
+  assert.equal(reads, 2)
 })
 
 test("the review rule and the fallback are separate questions", async () => {

@@ -15,7 +15,7 @@ import { Jev, apiKey, redact } from "./jev.ts"
 import { record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
-import { probe } from "./registry.ts"
+import { probe, type Availability } from "./registry.ts"
 import { chooseModel, unknown as allAvailable, type Available } from "./routing.ts"
 import { MICROMANAGER, ROLES, roleByAgent, type Rule } from "./roles.ts"
 import { WRITERS } from "./profile.ts"
@@ -24,6 +24,7 @@ import { checkGuards } from "./gate.ts"
 import { Compactor } from "./compact.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
+import { nextStep } from "./continuation.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, reconcileJob, saveJob } from "./store.ts"
@@ -83,8 +84,10 @@ interface Context {
     list(args: { sessionID: string }): Promise<{ id: string; action: string; resources: readonly string[] }[]>
     reply(args: { sessionID: string; requestID: string; decision: "once" | "always" | "reject"; message?: string }): Promise<unknown>
   }
-  // The host model catalog: the only authority on which models exist (see modelAvailability).
-  catalog?: ModelCatalog
+  // The host's models: the only authority on which models exist (see modelAvailability). opencode 2.0.18 has no
+  // ctx.catalog; the plugin read one until 2026-10-19 and so never saw a model disappear (space-bunny was renamed and
+  // every role's first choice failed: "no JSON object found" from the planner, workers that never started).
+  model?: ModelCatalog
   location?: { directory?: string }
   app?: { log?(entry: { level: string; message: string }): unknown }
 }
@@ -140,6 +143,10 @@ interface Shared {
   code?: { commit: string; dirty: boolean | "unknown" } // the plugin code this server loaded
   asks: Asks // workers' paused permission requests, answered by the micromanager or the user (src/ask.ts)
   helperOf: Map<string, string> // helper session -> the writer it answers (src/helpers.ts)
+  // Micromanager sessions whose planned job moved on (a worker ended): at their next turn the plugin says what to start
+  // next, worked out then, so a task delegated in the meantime is not named again (src/continuation.ts). Shared: the
+  // worker's end is seen by the instance of its worktree, the micromanager's turn by the instance of its directory.
+  continuing: Map<string, string> // micromanager session -> job id
 }
 const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicromanager ??= {
   workerTasks: new Map(),
@@ -149,6 +156,7 @@ const SHARED: Shared = ((globalThis as { __jevMicromanager?: Shared }).__jevMicr
   workerDirs: new Map(),
   asks: new Asks(record),
   helperOf: new Map(),
+  continuing: new Map(),
   watchdog: new Watchdog(),
   stops: new Map(),
   ended: new Set(),
@@ -164,31 +172,38 @@ export function namedInTask(task: string | undefined, resources: readonly string
   return resources.length > 0 && resources.every((path) => taskNamesPath(task, path.replace(/\/\*+$/, "")))
 }
 
-// The bit of ctx.catalog this plugin uses, named so the routing code can be tested without a host.
+// The bit of ctx.model this plugin uses, named so the routing code can be tested without a host. list() answers with
+// the models of the host's providers, { providerID, id, … } each (GET /api/model on the hub).
 export interface ModelCatalog {
-  transform: (fn: (draft: { model: { get: (provider: string, model: string) => unknown } }) => void) => unknown
+  list: (input?: Record<string, unknown>) => Promise<unknown> | unknown
 }
 
-// Whether the host can run a model, from `ctx.catalog`. The host is the only authority here: the plugin's own registry
+const CATALOG_TTL_MS = 60_000 // a provider can lose its auth mid-session; one read per minute is enough to notice
+
+// Whether the host can run a model, from `ctx.model`. The host is the only authority here: the plugin's own registry
 // says what it hopes exists, and nothing else finds out about a lost account, an unauthenticated provider, or a
 // renamed id. It is what keeps a free model that stops being free from breaking every role at once.
 //
-// A failed read is "everything is available". An unreadable catalog is not evidence that a model is missing, and
-// treating it as one would quietly move every role off its chain for a reason that has nothing to do with the model.
-export function modelAvailability(catalog?: ModelCatalog): Available {
+// A failed or empty read is "everything is available". An unreadable list is not evidence that a model is missing (the
+// host's snapshot may precede its plugins' settlement), and treating it as one would quietly move every role off its
+// chain for a reason that has nothing to do with the model.
+export function modelAvailability(catalog?: ModelCatalog, now = () => Date.now()): Available {
   if (!catalog) return allAvailable
+  let cached: { at: number; ids: Promise<Set<string> | undefined> } | undefined
+  const read = async (): Promise<Set<string> | undefined> => {
+    const answer = (await (async () => catalog.list({}))().catch(() => undefined)) as unknown
+    const items = Array.isArray(answer) ? answer : Array.isArray((answer as { data?: unknown })?.data) ? (answer as { data: unknown[] }).data : []
+    const ids = items.flatMap((m) => {
+      const { providerID, id } = (m ?? {}) as { providerID?: unknown; id?: unknown }
+      return typeof providerID === "string" && typeof id === "string" ? [`${providerID}/${id}`] : []
+    })
+    return ids.length ? new Set(ids) : undefined
+  }
   return async (model: string): Promise<boolean> => {
-    const [provider = "", id = ""] = model.split("/")
-    if (!provider || !id) return true
-    try {
-      let present: unknown
-      await catalog.transform((draft) => {
-        present = draft.model.get(provider, id)
-      })
-      return present !== undefined
-    } catch {
-      return true
-    }
+    if (!model.includes("/")) return true
+    if (!cached || now() - cached.at > CATALOG_TTL_MS) cached = { at: now(), ids: read() }
+    const ids = await cached.ids
+    return ids === undefined || ids.has(model)
   }
 }
 
@@ -700,6 +715,8 @@ export default {
     const log = logger(ctx)
     const settings = loadSettings()
     const { cloudOnly, parallel, perModel, budget, notify, routing, floors, decisions, allowOutside, error } = settings
+    // Which models the host can run, read from ctx.model and kept for a minute (see modelAvailability).
+    const hostModels = modelAvailability(ctx.model)
     const registry = cloudOnly ? cloudRegistry(settings.registry) : settings.registry
     if (error) log("warn", `config ignored, defaults used: ${error}`)
 
@@ -770,7 +787,7 @@ export default {
       // auth, an id can be renamed. ctx.catalog.model.get() answers it, so the role's chain is walked rather than
       // taken at its first entry — otherwise a renamed free model breaks every role at once (the user's question,
       // 2026-10-07).
-      const routed = await routeDelegation(call, routing, undefined, modelAvailability(ctx.catalog))
+      const routed = await routeDelegation(call, routing, undefined, hostModels)
       if (routed?.skipped?.length) {
         record({
           kind: "routing",
@@ -1141,7 +1158,7 @@ export default {
     const helpers = new Helpers({
       session: ctx.session as unknown as SessionApi,
       caller: (sessionID) => native.writerOf(sessionID),
-      model: async (role) => (await chooseModel(role, { vision: false }, routing, undefined, modelAvailability(ctx.catalog))).model,
+      model: async (role) => (await chooseModel(role, { vision: false }, routing, undefined, hostModels)).model,
       started: (helper, caller, dir, brief) => {
         SHARED.helperOf.set(helper, caller)
         runnerSessions.add(helper)
@@ -1163,6 +1180,7 @@ export default {
     // What the micromanager must do in its next turn, per session; set from the user's turn or a job update, used by
     // every provider turn of that answer (steering through a system block, Phase A1), replaced at the user's next turn.
     const steering = new Map<string, string>()
+    const continuing = (SHARED.continuing ??= new Map()) // a server that loaded an older version of this module has none
     const notifier = new Notifier({
       mode: notify,
       synthetic: (sessionID, text, resume) => ctx.session.synthetic({ sessionID, text, resume }),
@@ -1181,7 +1199,13 @@ export default {
         registry,
         decider,
         policies: { global: decisions },
-        availability: cloudOnly ? undefined : () => probe(registry), // no local servers to ask
+        // The host's models, and with local models on the local servers' state too: the planner and the runner's own
+        // workers route over the registry, which names models the host may not have (any more).
+        availability: async () => {
+          const map = cloudOnly ? new Map<string, Availability>() : await probe(registry)
+          for (const m of registry) if (!(await hostModels(m.id))) map.set(m.id, { ...map.get(m.id), reachable: false })
+          return map
+        },
         progress: (text, task) => {
           log("info", text)
           if (job) notifier.progress(parentID, `${job}: ${text}`, task)
@@ -1295,7 +1319,7 @@ export default {
       try {
         installTools(draft, {
           tasks: async (id, tctx) => {
-            const job = tctx.sessionID ? listSwept().find((j) => j.facilitator === tctx.sessionID && j.rolling) : undefined
+            const job = tctx.sessionID ? listSwept().find((j) => j.facilitator === tctx.sessionID && (j.rolling || j.native)) : undefined
             if (!job) return "No worker started in this session yet."
             const task = id.trim() ? job.tasks.find((t) => t.id === id.trim()) : undefined
             if (id.trim() && !task) return `no task ${id.trim()}`
@@ -1340,19 +1364,19 @@ export default {
             return out.kind === "plan" ? planText(out.job) : out.text
           },
           questions: async (job, tree, tctx) => runner(tctx.sessionID).questions(job.trim(), tree),
+          // A planned job runs on the micromanager's own workers (src/continuation.ts): they are its children in the
+          // TUI, and the plan decides which tasks start next. The runner no longer starts a planned job's workers.
           run: async (id, note, tctx) => {
-            const job = loadSwept(id.trim())
-            if (!job) return `no job ${id.trim()}`
-            const ready = job.phase === "plan_gate" || job.phase === "execute" || ((job.phase === "paused" || job.phase === "ask_user") && job.resumePhase === "execute")
-            if (!ready) return `job ${job.id} is in phase ${job.phase}, not ready to run`
-            if (tctx.sessionID && !job.facilitator) {
-              job.facilitator = tctx.sessionID
-              saveJob(project, job)
-            }
-            const place = scheduler.enqueue(job.id, job.facilitator ?? tctx.sessionID, note.trim() || undefined)
-            return place === 0
-              ? `job ${job.id} runs now in the background. Updates arrive as [jev-micromanager] notes; tell the user and end your turn.`
-              : `job ${job.id} is queued at place ${place}; it starts when the jobs before it end. Tell the user and end your turn.`
+            const swept = loadSwept(id.trim())
+            if (!swept) return `no job ${id.trim()}`
+            if (!tctx.sessionID) return "run_job needs the micromanager's session."
+            if (scheduler.snapshot().running === swept.id) return `job ${swept.id} still runs on the plugin's own workers from before; stop_job ${swept.id} first, then run_job again.`
+            const r = native.runPlanned(project, swept.id, tctx.sessionID)
+            if (!r.job) return `job ${swept.id}: ${r.problem}`
+            const step = nextStep(r.job, parallel)
+            const answer = note.trim() ? `The user's answer for this job: ${note.trim()}\n\n` : ""
+            if (!step) return `${answer}job ${r.job.id} runs: its workers are still at work; the next tasks follow in a note when they end. Tell the user and end your turn.`
+            return `${answer}${step.text}`
           },
           status: async (id) => {
             const job = id.trim() ? loadSwept(id.trim()) : listSwept()[0]
@@ -1366,10 +1390,19 @@ export default {
             if (r.session) await ctx.session.interrupt({ sessionID: r.session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
             if (r.state === "stopping") return "The running job stops now and pauses; run_job resumes it."
             if (r.state === "dequeued") return "The job left the queue."
+            // A planned job on native workers pauses: no next tasks are named until run_job resumes it.
+            const planned = listSwept()
+              .filter((j) => j.native && j.phase === "execute" && (id.trim() ? j.id === id.trim() : j.facilitator === tctx.sessionID))
+              .map((j) => native.current(project, j.id) ?? j)
+            for (const j of planned) {
+              moveJob(j, "paused")
+              saveJob(project, j)
+            }
+            const paused = planned.length ? `Paused ${planned.map((j) => j.id).join(", ")}: no new tasks start until run_job resumes it. ` : ""
             // The session's own workers: interrupted; their changes stay in their worktrees.
             const workers = !id.trim() && tctx.sessionID ? native.running(tctx.sessionID) : []
             for (const w of workers) await ctx.session.interrupt({ sessionID: w.session }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
-            return workers.length ? `Stopped ${workers.map((w) => w.task).join(", ")}; their changes stay in their worktrees, and the subagent tool with a worker's sessionID continues it.` : "No such job running or waiting."
+            return workers.length ? `${paused}Stopped ${workers.map((w) => w.task).join(", ")}; their changes stay in their worktrees, and the subagent tool with a worker's sessionID continues it.` : paused || "No such job running or waiting."
           },
           // The controls a live run lacked: steer one worker, stop one task, merge or discard the branch, vouch for a path.
           // Each looks the task up over the whole project, because a task id is all the orchestrator has.
@@ -1656,6 +1689,10 @@ export default {
             ended.add(worker)
             void release(worker, "the worker that asked it has ended")
             if (note) void ctx.session.synthetic({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
+            // A planned job goes on by itself: the next ready tasks, or that it is done or stuck, at the micromanager's
+            // next turn, which the worker's report starts (src/continuation.ts).
+            const owned = native.jobOf(worker)
+            if (owned?.job.native) continuing.set(parent, owned.job.id)
             // Ultrawork: when the last worker of the session ended, the micromanager goes on with its todos.
             const wakes = ultrawork.get(parent)
             if (wakes !== undefined && wakes < 3 && native.running(parent).length === 0) {
@@ -1693,6 +1730,16 @@ export default {
       }
       const note = input.sessionID ? steering.get(input.sessionID) : undefined
       if (note && Array.isArray(input.system)) input.system.push({ type: "text", text: note })
+      const planned = input.sessionID ? continuing.get(input.sessionID) : undefined
+      if (planned && input.sessionID && Array.isArray(input.system)) {
+        continuing.delete(input.sessionID)
+        const job = native.current(project, planned) ?? loadJob(project, planned)
+        const step = job && nextStep(job, parallel)
+        if (step) {
+          input.system.push({ type: "text", text: step.text })
+          record({ kind: "continuation", sessionID: input.sessionID, job: planned, step: step.kind, tasks: step.kind === "start" ? step.tasks.map((t) => t.id) : [] })
+        }
+      }
     })
   },
 }

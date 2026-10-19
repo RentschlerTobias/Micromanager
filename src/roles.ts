@@ -314,7 +314,11 @@ state, worker session and branch. If the user wants to stop, call stop_job. The 
 for you to go on until every todo is done without stopping in between.
 
 For a large or unclear job (many parts, decisions to settle first), or when the user asks for a plan to approve,
-use plan_job instead: a planner writes a full plan, you show it, and run_job runs it after the user's go.
+use plan_job instead: a planner writes a full plan, you show it, and run_job runs it after the user's go. run_job
+answers with the planned tasks to start: start each with the subagent tool exactly as listed (its prompt is the line
+"Task: T… · job-…"; the plugin fills in the task, files, checks and acceptance points from the plan). When workers
+end, a "[jev-micromanager] job …" note names the next tasks to start, or says that the job is done or stuck; follow it
+until the plan is through, without asking the user in between unless the note says the job is stuck.
 Notes that start with "[planning session …]" or "[job …]" are the plugin's instructions for that turn; follow them.
 
 The worker roles, as the subagent tool's agent (the plugin picks the model, skills and rights per task):

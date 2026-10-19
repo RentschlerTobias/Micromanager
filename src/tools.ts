@@ -89,7 +89,7 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
   draft.add({
     id: "run_job",
     name: "run_job",
-    description: "Run a planned job after the user said go, or resume a stopped one. Takes the job id from plan_job; note is the user's answer when the job stopped for them (their words, or empty). The job is queued and runs in the background on its own git branch, independent tasks in parallel; this returns at once. Updates arrive later as [jev-micromanager] notes: do not wait or poll, end your turn and keep talking with the user.",
+    description: "Run a planned job after the user said go, or resume a paused one. Takes the job id from plan_job; note is the user's answer when the job stopped for them (their words, or empty). Answers with the planned tasks to start now: start each with the subagent tool exactly as listed, in one message. Later [jev-micromanager] job notes name the next ones as workers end; do not wait or poll.",
     input: input("job", "note"),
     execute: guarded(([job, note], ctx) => handlers.run(job!, note!, ctx), "job", "note"),
   })

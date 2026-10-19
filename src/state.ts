@@ -177,6 +177,7 @@ export interface Job {
   lessons: string[]
   later?: Later[] // follow-ups that did not become tasks
   rolling?: boolean // a micromanager session's job: the orchestrator delegates tasks into it while it runs (omo-hybrid)
+  native?: boolean // a planned job whose tasks the micromanager starts with the subagent tool (run_job, src/continuation.ts)
   merges?: { from: string; to: string; at: string }[] // what merge_job did to the user's checkout, for undo_merge
   created: string
   updated: string
