@@ -4,7 +4,7 @@
 
 import type { Job, Task } from "./state.ts"
 
-const ICON: Record<Task["status"], string> = {
+export const ICON: Record<Task["status"], string> = {
   pending: "·",
   ready: "○",
   planned: "▷",
@@ -30,7 +30,7 @@ function since(iso?: string, now = Date.now()): string {
 }
 
 // What a task does right now, or why it stopped.
-function detail(task: Task, now: number): string {
+export function detail(task: Task, now: number): string {
   const last = task.stages.at(-1)
   if (task.undone) return `undone (rewind to ${task.undone})`
   if (task.status === "blocked") return `waits: ${task.summary ?? ""}`
