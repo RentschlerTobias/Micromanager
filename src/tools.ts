@@ -19,6 +19,8 @@ export const TOOL_IDS = [
   "rewind_job", "undo_merge",
   // An earlier session's open job, made this session's.
   "take_over_job",
+  // The micromanager's todo list, kept in its job (src/native.ts todo).
+  "todo",
 ] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
@@ -48,6 +50,7 @@ export interface Handlers {
   rewind(job: string, to: string, ack: string, ctx: ToolContext): Promise<string>
   undoMerge(job: string, ack: string, ctx: ToolContext): Promise<string>
   takeOver(job: string, ctx: ToolContext): Promise<string>
+  todo(items: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -162,6 +165,13 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     description: "Make an earlier micromanager session's open job this session's, after the user chose to continue it: new workers land on its branch, its unfinished workers are continued with the subagent tool and their sessionID, and their notes and permission requests come here. job: the job id the plugin's note named. Refused when this session started a job of its own already.",
     input: input("job"),
     execute: guarded(([job], ctx) => handlers.takeOver(job!, ctx), "job"),
+  })
+  draft.add({
+    id: "todo",
+    name: "todo",
+    description: "Your todo list, kept in your job so it is never lost: write down the tasks you mean to start before you start them, and start each later with the subagent tool and the prompt line \"Task: T… · job-…\" (plus anything to add below it); the plugin fills in its brief, files and checks. items: a JSON list of {\"title\", \"agent\" (a role agent, coder if left out), \"files\" (what a writer may change, comma separated), \"checks\" (shell commands, one per line), \"after\" ([task ids it waits for, e.g. [\"T1\", \"T2\"]]), \"brief\" (what the worker needs to know)}; an entry {\"drop\": [\"T5\"]} removes open todos that are not needed any more. Empty: it only shows the list. When a worker ends, a note names the todos that can start.",
+    input: input("items"),
+    execute: guarded(([items], ctx) => handlers.todo(items!, ctx), "items"),
   })
   draft.add({
     id: "undo_merge",

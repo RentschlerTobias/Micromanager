@@ -69,8 +69,9 @@ test("the sidebar groups the job as a checklist: waiting, running, failed, next,
   assert.deepEqual(groups.map((g) => [g.name, g.count, g.lines.map((l) => `${l.id}${l.detail ? ` ${l.detail}` : ""}`)]), [
     ["WAITING FOR YOU", 1, ["T4 shell"]],
     ["RUNNING", 1, ["T3 glm 4m"]],
+    ["TODO", 3, ["T6", "T7", "T8"]], // can start
+    ["BLOCKED", 1, ["T5 ⧗ T3"]], // waits for T3, which runs
     ["FAILED", 1, ["T2"]],
-    ["NEXT", 4, ["T6", "T7", "T8"]], // the startable ones; T5 waits for T3
     ["DONE", 2, ["T1", "T9"]],
   ])
   assert.deepEqual(sidebarCounts(groups).map((c) => c.text), ["[✓]2", "[▸]1", "[!]1", "[✗]1", "[ ]4"])

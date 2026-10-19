@@ -26,6 +26,7 @@ export interface TaskRow {
   readonly model?: string
   readonly since?: string // when its current run started (ISO), for a running task
   readonly startable: boolean // open, and every task it depends on is merged
+  readonly waitsFor: readonly string[] // the tasks it depends on that are not merged yet
 }
 
 export interface JobView {
@@ -68,6 +69,7 @@ function startedAt(task: Task): string | undefined {
 export function view(job: Job, now = Date.now()): JobView {
   const live = job.tasks.filter((t) => !t.undone)
   const ready = new Set(startable(job).map((t) => t.id))
+  const byId = new Map(job.tasks.map((t) => [t.id, t]))
   return {
     id: job.id,
     title: job.rolling ? "Delegated tasks" : job.goal.split("\n")[0]!, // a rolling job's goal names the session id
@@ -87,6 +89,7 @@ export function view(job: Job, now = Date.now()): JobView {
       ...(t.model ? { model: t.model } : {}),
       ...(RUNNING.includes(t.status) && startedAt(t) ? { since: startedAt(t) } : {}),
       startable: ready.has(t.id),
+      waitsFor: t.dependsOn.filter((id) => { const dep = byId.get(id); return !dep || !DONE.includes(dep.status) }),
     })),
   }
 }
@@ -111,7 +114,8 @@ export function taskChoices(views: readonly JobView[], sessionID: string): { tit
 
 // The sidebar: the job as a checklist, grouped by what needs attention (the user, 2026-10-19: what runs, what is done
 // and what is open has to be clear at a glance). Groups in a fixed order, each in plan order; an empty group is left
-// out. "Waiting" is a task whose worker waits for the user (a permission or a question), read by the TUI.
+// out. "Waiting" is a task whose worker waits for the user (a permission or a question), read by the TUI. Open tasks
+// are TODO when they can start and BLOCKED while a task they need is not merged.
 export type Mark = "waiting" | "running" | "failed" | "open" | "done"
 
 export const BOX: Record<Mark, string> = { waiting: "[!]", running: "[▸]", failed: "[✗]", open: "[ ]", done: "[✓]" }
@@ -125,13 +129,15 @@ export interface SidebarLine {
 }
 
 export interface SidebarGroup {
+  readonly key: "waiting" | "running" | "todo" | "blocked" | "failed" | "done"
   readonly mark: Mark
   readonly name: string
   readonly count: number // tasks in this state
-  readonly lines: readonly SidebarLine[] // the ones shown: all, except NEXT (the first few) and DONE (folded)
+  readonly lines: readonly SidebarLine[] // the ones shown: all, except TODO and BLOCKED (the first few) and DONE (folded)
 }
 
-const NEXT = 3
+const SHOWN_TODO = 5
+const SHOWN_BLOCKED = 3
 
 // "4m", "9s", "1.2h": how long a task has been running.
 export function elapsed(since: string | undefined, now = Date.now()): string {
@@ -156,18 +162,22 @@ export function markOf(row: TaskRow, waiting: ReadonlySet<string>): Mark {
 export function sidebarGroups(v: JobView, waiting: ReadonlyMap<string, string> = new Map(), now = Date.now()): SidebarGroup[] {
   const asking = new Set(waiting.keys())
   const line = (r: TaskRow, mark: Mark): SidebarLine => {
-    const detail = mark === "running" ? `${shortModel(r.model)} ${elapsed(r.since, now)}`.trim() : mark === "waiting" ? waiting.get(r.session!) : undefined
+    const detail = mark === "running" ? `${shortModel(r.model)} ${elapsed(r.since, now)}`.trim()
+      : mark === "waiting" ? waiting.get(r.session!)
+      : mark === "open" && !r.startable && r.waitsFor.length ? `⧗ ${r.waitsFor.join(" ")}`
+      : undefined
     return { mark, id: r.id, title: r.title, ...(detail ? { detail } : {}), ...(r.session ? { session: r.session } : {}) }
   }
   const of = (mark: Mark) => v.rows.filter((r) => markOf(r, asking) === mark)
-  const open = of("open")
-  const next = [...open.filter((r) => r.startable), ...open.filter((r) => !r.startable)].slice(0, NEXT)
+  const todo = of("open").filter((r) => r.startable)
+  const blocked = of("open").filter((r) => !r.startable)
   const groups: SidebarGroup[] = [
-    { mark: "waiting", name: "WAITING FOR YOU", count: of("waiting").length, lines: of("waiting").map((r) => line(r, "waiting")) },
-    { mark: "running", name: "RUNNING", count: of("running").length, lines: of("running").map((r) => line(r, "running")) },
-    { mark: "failed", name: "FAILED", count: of("failed").length, lines: of("failed").map((r) => line(r, "failed")) },
-    { mark: "open", name: "NEXT", count: open.length, lines: open.filter((r) => next.includes(r)).map((r) => line(r, "open")) },
-    { mark: "done", name: "DONE", count: of("done").length, lines: of("done").map((r) => line(r, "done")) },
+    { key: "waiting", mark: "waiting", name: "WAITING FOR YOU", count: of("waiting").length, lines: of("waiting").map((r) => line(r, "waiting")) },
+    { key: "running", mark: "running", name: "RUNNING", count: of("running").length, lines: of("running").map((r) => line(r, "running")) },
+    { key: "todo", mark: "open", name: "TODO", count: todo.length, lines: todo.slice(0, SHOWN_TODO).map((r) => line(r, "open")) },
+    { key: "blocked", mark: "open", name: "BLOCKED", count: blocked.length, lines: blocked.slice(0, SHOWN_BLOCKED).map((r) => line(r, "open")) },
+    { key: "failed", mark: "failed", name: "FAILED", count: of("failed").length, lines: of("failed").map((r) => line(r, "failed")) },
+    { key: "done", mark: "done", name: "DONE", count: of("done").length, lines: of("done").map((r) => line(r, "done")) },
   ]
   return groups.filter((g) => g.count > 0)
 }
@@ -176,7 +186,7 @@ export function sidebarGroups(v: JobView, waiting: ReadonlyMap<string, string> =
 export function sidebarCounts(groups: readonly SidebarGroup[]): { mark: Mark; text: string }[] {
   const order: Mark[] = ["done", "running", "waiting", "failed", "open"]
   return order.flatMap((mark) => {
-    const g = groups.find((x) => x.mark === mark)
-    return g ? [{ mark, text: `${BOX[mark]}${g.count}` }] : []
+    const count = groups.filter((x) => x.mark === mark).reduce((n, g) => n + g.count, 0)
+    return count ? [{ mark, text: `${BOX[mark]}${count}` }] : []
   })
 }

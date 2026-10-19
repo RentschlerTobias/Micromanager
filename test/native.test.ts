@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import { segments } from "../src/decide.ts"
-import { CHILD_PREFIX, DelegationError, Native, parseDelegation, similarity } from "../src/native.ts"
+import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo, similarity } from "../src/native.ts"
 import { nextStep } from "../src/continuation.ts"
 import { roleByAgent } from "../src/roles.ts"
 import { moveJob, newJob, type Task } from "../src/state.ts"
@@ -117,6 +117,60 @@ test("run_job runs a planned job on native workers: its tasks start by their Tas
   assert.equal(again.task.status, "running")
   assert.ok(again.task.stages.some((s) => s.stage === "restart"))
   assert.equal(loadJob(project, job.id)?.tasks[2]!.status, "running", "saved")
+})
+
+test("the todo tool keeps the micromanager's list in its job; a todo is started by its Task line and the next ones follow", async () => {
+  const project = repo()
+  const native = new Native()
+  const r = native.todo(project, "ses_mm", [
+    { title: "write add.js", agent: "coder", files: "add.js", checks: "test -f add.js" },
+    { title: "document add", agent: "writer", files: "README.md", after: ["T1"] },
+    { title: "map the repo", agent: "explorer" },
+    { title: "", agent: "coder" },
+    { title: "bad agent", agent: "nobody" },
+    { title: "writer without files", agent: "coder" },
+    { title: "waits for nothing real", after: ["T9"], files: "x.js" },
+  ], [])
+  assert.deepEqual(r.added.map((t) => [t.id, t.role, t.status, t.dependsOn]), [["T1", "code", "pending", []], ["T2", "write", "pending", ["T1"]], ["T3", "explore", "pending", []]])
+  assert.equal(r.errors.length, 4)
+  assert.match(r.errors.join(" | "), /without a title.*nobody is not a role agent.*changes files.*no task T9/s)
+  assert.equal(r.job.rolling, true, "the session's own job")
+  assert.equal(loadJob(project, r.job.id)?.tasks.length, 3, "saved")
+  const step = nextStep(r.job, 3)!
+  assert.equal(step.kind, "start")
+  assert.deepEqual(step.kind === "start" && step.tasks.map((t) => t.id), ["T1", "T3"], "T2 waits for T1")
+  assert.match(step.text, /of your todo list/)
+
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "T1", prompt: `Task: T1 · ${r.job.id}` }, MODEL)
+  assert.match(d.prompt, /Checks the plugin runs when you finish: test -f add\.js/)
+  const claimed = native.claim("ses_w1", child(d.prompt))!
+  writeFileSync(join(claimed.dir, "add.js"), "export const add = (a, b) => a + b\n")
+  assert.match((await native.finish("ses_w1", "wrote add.js")).text, /^Merged/)
+  await native.ended("ses_w1")
+  const next = nextStep(native.jobOf("ses_w1")!.job, 3)!
+  assert.deepEqual(next.kind === "start" && next.tasks.map((t) => t.id), ["T2", "T3"])
+
+  const dropped = native.todo(project, "ses_mm", [], ["T3", "T1"])
+  assert.deepEqual(dropped.dropped, ["T3"])
+  assert.match(dropped.errors[0]!, /T1 is merged, not an open todo/)
+  assert.equal(nextStep(dropped.job, 3)?.kind, "start", "T2 still waits to be started")
+  assert.equal(nextStep({ ...dropped.job, tasks: dropped.job.tasks.filter((t) => t.id !== "T2") }, 3), undefined, "a session's own job is never \"done\" by itself")
+})
+
+test("the todo tool reads what models write: ids in prose, a numbered title, drops in the same list", () => {
+  const r = parseTodo(JSON.stringify([
+    { title: "T3: summary.txt — two sentences", agent: "writer", files: ["summary.txt"], checks: ["test -f summary.txt", "wc -l summary.txt"], after: "T1 and T2 merged" },
+    { drop: ["t5"] },
+    { title: "map", agent: "explorer", after: ["T1", "T2"] },
+  ]))
+  assert.ok(typeof r !== "string")
+  assert.deepEqual(r.ids, ["T5"])
+  assert.deepEqual(r.list.map((t) => [t.title, t.files, t.checks, t.after]), [
+    ["summary.txt — two sentences", "summary.txt", "test -f summary.txt\nwc -l summary.txt", ["T1", "T2"]],
+    ["map", undefined, undefined, ["T1", "T2"]],
+  ])
+  assert.deepEqual(parseTodo(""), { list: [], ids: [] })
+  assert.match(parseTodo("[{oops") as string, /^items is not a JSON list/)
 })
 
 test("two task texts about the same work are told apart from different work", () => {

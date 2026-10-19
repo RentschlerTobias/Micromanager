@@ -35,10 +35,12 @@ function call(job: Job, task: Task): string {
   return `- agent ${agent}, description "${task.id} ${task.title}", prompt "${plannedLine(task.id, job.id)}"`
 }
 
-// What the micromanager does next for a planned job on native workers; undefined while workers run and nothing new can
-// start, and for a job that is not one (a rolling job, or one the runner runs) or that was paused or stopped.
+// What the micromanager does next for a planned job on native workers, or for its session's own job when it wrote
+// todos (the todo tool); undefined while workers run and nothing new can start, for a job the runner runs, and for a
+// paused or stopped one. A session's own job only hears which todos can start: it is "done" whenever the micromanager
+// has nothing more in mind, which is not news.
 export function nextStep(job: Job, parallel: number): Step | undefined {
-  if (!job.native || HALTED.has(job.phase)) return undefined
+  if (!(job.native || job.rolling) || HALTED.has(job.phase)) return undefined
   const live = job.tasks.filter((t) => LIVE.has(t.status))
   const ready = startable(job).slice(0, Math.max(0, parallel - live.length))
   if (ready.length) {
@@ -46,14 +48,14 @@ export function nextStep(job: Job, parallel: number): Step | undefined {
       kind: "start",
       tasks: ready,
       text: [
-        `${HEADER} job ${job.id}: start ${ready.length === 1 ? "this planned task" : "these planned tasks"} now, in one message, with the subagent tool (background = true):`,
+        `${HEADER} job ${job.id}: start ${ready.length === 1 ? "this task" : "these tasks"} of your ${job.rolling ? "todo list" : "plan"} now, in one message, with the subagent tool (background = true):`,
         ...ready.map((t) => call(job, t)),
-        "The plugin gives each worker its task, files, checks and acceptance points from the plan; add to a prompt only what the plan does not say, below that line. Do not wait for them: the next tasks follow in a note like this one when they end.",
+        `The plugin gives each worker its task, files, checks and acceptance points from the ${job.rolling ? "todo" : "plan"}; add to a prompt only what it does not say, below that line. Do not wait for them: the next tasks follow in a note like this one when they end.`,
         live.length ? `Still running: ${live.map((t) => t.id).join(", ")}.` : "",
       ].filter(Boolean).join("\n"),
     }
   }
-  if (live.length) return undefined
+  if (live.length || !job.native) return undefined
   // A cancelled task is out of the plan, unless an open task still needs it.
   const needed = new Set(job.tasks.filter((t) => OPEN.has(t.status)).flatMap((t) => t.dependsOn))
   const left = job.tasks.filter((t) => !isDone(t) && !t.undone && (t.status !== "cancelled" || needed.has(t.id)))

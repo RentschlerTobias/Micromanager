@@ -17,14 +17,14 @@ import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe, type Availability } from "./registry.ts"
 import { chooseModel, unknown as allAvailable, type Available } from "./routing.ts"
-import { family, MICROMANAGER, ROLES, roleByAgent, type Rule } from "./roles.ts"
+import { family, MICROMANAGER, ROLES, roleByAgent, roleById, type Rule } from "./roles.ts"
 import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
 import { Compactor } from "./compact.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
-import { nextStep } from "./continuation.ts"
+import { nextStep, plannedLine, startable } from "./continuation.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
@@ -35,7 +35,7 @@ import { join, resolve } from "node:path"
 import { FINISH_ID, GRAPH_ID, HELPER_IDS, installFinishTool, installGraphTool, installHelperTools, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
-import { CHILD_PREFIX, DelegationError, Native, parseDelegation } from "./native.ts"
+import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo } from "./native.ts"
 import { seedFromJournal, Usage } from "./usage.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
@@ -1504,6 +1504,24 @@ export default {
             record({ kind: "take-over", sessionID: tctx.sessionID, job: job.id })
             return `This session runs job ${job.id} now (branch ${job.integrationBranch}); new workers land on that branch.${unfinished.length ? ` Unfinished, to continue with the subagent tool and their sessionID: ${unfinished.map((t) => `${t.id} ${t.title} (sessionID ${t.session})`).join("; ")}.` : ""}`
           },
+          todo: async (items, tctx) => {
+            if (!tctx.sessionID) return "todo needs a session."
+            const parsed = parseTodo(items)
+            if (typeof parsed === "string") return parsed
+            const { list, ids } = parsed
+            const r = native.todo(project, tctx.sessionID, list, ids)
+            record({ kind: "todo", sessionID: tctx.sessionID, job: r.job.id, added: r.added.map((t) => t.id), dropped: r.dropped, errors: r.errors })
+            const open = r.job.tasks.filter((t) => ["pending", "ready", "planned"].includes(t.status))
+            const ready = new Set(startable(r.job).map((t) => t.id))
+            return [
+              r.added.length ? `Added ${r.added.map((t) => `${t.id} ${t.title}`).join("; ")}.` : "",
+              r.dropped.length ? `Dropped ${r.dropped.join(", ")}.` : "",
+              r.errors.length ? `Not taken: ${r.errors.join("; ")}.` : "",
+              open.length
+                ? `Open todos of job ${r.job.id}:\n${open.map((t) => `- ${t.id} ${t.title} (${roleById(t.role)?.agent ?? t.role})${ready.has(t.id) ? " · can start" : ` · after ${t.dependsOn.join(", ")}`}`).join("\n")}\nStart one with the subagent tool and the prompt line "${plannedLine("T…", r.job.id)}".`
+                : `No open todos in job ${r.job.id}.`,
+            ].filter(Boolean).join("\n")
+          },
           rewind: async (id, to, ack, tctx) => {
             const found = id.trim() ? loadSwept(id.trim()) : listSwept().find((j) => j.facilitator === tctx.sessionID) ?? listSwept()[0]
             if (!found) return "No job to rewind. plan_job or start a worker first."
@@ -1717,7 +1735,7 @@ export default {
             // A planned job goes on by itself: the next ready tasks, or that it is done or stuck, at the micromanager's
             // next turn, which the worker's report starts (src/continuation.ts).
             const owned = native.jobOf(worker)
-            if (owned?.job.native) continuing.set(parent, owned.job.id)
+            if (owned && (owned.job.native || owned.job.rolling)) continuing.set(parent, owned.job.id)
             // Ultrawork: when the last worker of the session ended, the micromanager goes on with its todos.
             const wakes = ultrawork.get(parent)
             if (wakes !== undefined && wakes < 3 && native.running(parent).length === 0) {

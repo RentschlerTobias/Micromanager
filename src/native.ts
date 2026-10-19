@@ -121,6 +121,53 @@ export interface NativeDeps {
   readonly graphs?: Pick<Graphs, "get"> // the code graph an explorer starts from
 }
 
+// One entry of the todo tool: what the micromanager means to start later.
+export interface TodoItem {
+  readonly title?: string
+  readonly agent?: string // the role agent that will do it (coder when left out)
+  readonly files?: string // a writer's write scope, as a delegation's Files line
+  readonly checks?: string // shell commands, one per line
+  readonly after?: readonly string[] // task ids it waits for
+  readonly brief?: string // what the worker needs to know beyond the title
+}
+
+// Task ids in whatever a model wrote: ["T1", "T2"], "T1, T2", or "after T1 and T2 merged" (live run: the last one made
+// a task wait for a task "MERGED").
+export function taskIds(value: unknown): string[] {
+  return (Array.isArray(value) ? value.join(" ") : String(value ?? "")).toUpperCase().match(/\bT\d+(?:\.\w+)*/g) ?? []
+}
+
+// The todo tool's one argument: a JSON list of todos, with {"drop": [...]} entries for the ones to remove. A string
+// when it cannot be read: the answer to the micromanager.
+export function parseTodo(items: string): { list: TodoItem[]; ids: string[] } | string {
+  const list: TodoItem[] = []
+  const ids: string[] = []
+  if (!items.trim()) return { list, ids }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(items)
+  } catch (err) {
+    return `items is not a JSON list: ${err instanceof Error ? err.message : String(err)}. Nothing was changed.`
+  }
+  for (const x of Array.isArray(parsed) ? parsed : [parsed]) {
+    const o = (x ?? {}) as Record<string, unknown>
+    if (o.drop !== undefined) {
+      ids.push(...taskIds(o.drop))
+      if (!o.title) continue
+    }
+    const text = (v: unknown, join: string) => (v === undefined || v === null || v === "" ? undefined : Array.isArray(v) ? v.map(String).join(join) : String(v))
+    list.push({
+      title: String(o.title ?? "").replace(/^\s*T\d+(?:\.\w+)*\s*[:·.-]\s*/i, ""), // the plugin numbers todos itself
+      agent: text(o.agent, ""),
+      files: text(o.files, ", "),
+      checks: text(o.checks, "\n"),
+      after: taskIds(o.after),
+      brief: text(o.brief, "\n"),
+    })
+  }
+  return { list, ids }
+}
+
 export interface Delegated {
   readonly task: Task
   readonly job: Job
@@ -348,7 +395,7 @@ export class Native {
   async #planned(project: string, parent: string, role: Role, d: Delegation, planned: NonNullable<Delegation["planned"]>, model: string): Promise<Delegated> {
     const job = this.#jobs.get(key(project, planned.job)) ?? listJobs(project).find((j) => j.id === planned.job)
     if (!job) throw new DelegationError(`Not started: there is no job ${planned.job} in this project.`)
-    if (!job.native) throw new DelegationError(`Not started: job ${job.id} is not running on your workers; start it with run_job first.`)
+    if (!job.native && !job.rolling) throw new DelegationError(`Not started: job ${job.id} is not running on your workers; start it with run_job first.`)
     if (job.facilitator && job.facilitator !== parent) throw new DelegationError(`Not started: job ${job.id} belongs to another micromanager session; run_job ${job.id} here takes it over.`)
     if (job.phase !== "execute") throw new DelegationError(`Not started: job ${job.id} is ${job.phase}; run_job resumes it.`)
     const task = job.tasks.find((t) => t.id === planned.task)
@@ -718,6 +765,50 @@ export class Native {
     }
     saveJob(entry.project, job)
     return { note, parent: entry.parent }
+  }
+
+  // The todo tool: the micromanager writes down the tasks it means to start, as open tasks of its session's job, so the
+  // job file holds the whole list (the sidebar shows it; the continuation names the ready ones). v2 has no todowrite,
+  // and a list kept in the model's context was lost on compaction. Each is started later with "Task: T… · job-…".
+  todo(project: string, parent: string, items: readonly TodoItem[], drop: readonly string[]): { job: Job; added: Task[]; dropped: string[]; errors: string[] } {
+    const job = this.job(project, parent)
+    const errors: string[] = []
+    const added: Task[] = []
+    const dropped: string[] = []
+    for (const id of drop) {
+      const task = job.tasks.find((t) => t.id === id)
+      if (!task) errors.push(`${id}: no such task`)
+      else if (!["pending", "ready", "planned"].includes(task.status)) errors.push(`${id} is ${task.status}, not an open todo; stop_task stops a running one`)
+      else {
+        moveTask(task, "cancelled")
+        stage(task, "drop", "pass", "dropped from the todo list")
+        dropped.push(id)
+      }
+    }
+    for (const item of items) {
+      const title = item.title?.trim() ?? ""
+      const role = roleByAgent(item.agent ?? "") ?? (item.agent ? undefined : roleByAgent("coder"))
+      if (!title) { errors.push("a todo without a title"); continue }
+      if (!role) { errors.push(`${title}: ${item.agent} is not a role agent (${ROLES.map((r) => r.agent).join(", ")})`); continue }
+      const writer = WRITERS.has(role.id)
+      const parsed = parseFiles(item.files ?? "", project)
+      if (parsed.problem) { errors.push(`${title}: ${parsed.problem}`); continue }
+      if (writer && !parsed.files.length) { errors.push(`${title}: a ${role.agent} changes files; give the files it may change`); continue }
+      if (!writer && parsed.files.length) { errors.push(`${title}: ${role.agent} only reads; leave out files`); continue }
+      const checks = (item.checks ?? "").split("\n").map((c) => c.trim()).filter(Boolean)
+      const bad = checks.length ? checkSetProblems(checks, writer) : undefined
+      if (bad) { errors.push(`${title}: ${bad}`); continue }
+      const after = (item.after ?? []).map((id) => id.trim().toUpperCase()).filter(Boolean)
+      const unknown = after.filter((id) => !job.tasks.some((t) => t.id === id))
+      if (unknown.length) { errors.push(`${title}: no task ${unknown.join(", ")} to wait for`); continue }
+      const result = addDelegated(job, { title, prompt: item.brief?.trim() || title, files: parsed.files, dependsOn: after, checks })
+      if (!result.task) { errors.push(`${title}: ${result.errors!.join("; ")}`); continue }
+      result.task.role = role.id
+      stage(result.task, "todo", "pass", "written down by the micromanager")
+      added.push(result.task)
+    }
+    if (added.length || dropped.length) saveJob(project, job)
+    return { job, added, dropped, errors }
   }
 
   // The job a worker works for, as this process holds it.

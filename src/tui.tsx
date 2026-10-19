@@ -154,13 +154,12 @@ function Checklist(props: { context: Context; sessionID: string }) {
             </box>
             <For each={groups()}>
               {(group) => {
-                const folded = () => group.mark === "done" && !showDone()
-                const count = group.mark === "open" && group.lines.length < group.count
-                  ? `${group.lines.length} of ${group.count}`
-                  : group.mark === "done" ? `${group.count} ${showDone() ? "▾" : "▸"}` : String(group.count)
+                const folded = () => group.key === "done" && !showDone()
+                const count = group.key === "done" ? `${group.count} ${showDone() ? "▾" : "▸"}`
+                  : group.lines.length < group.count ? `${group.lines.length} of ${group.count}` : String(group.count)
                 return (
                   <box paddingTop={1}>
-                    <box flexDirection="row" onMouseUp={() => group.mark === "done" && setShowDone(!showDone())}>
+                    <box flexDirection="row" onMouseUp={() => group.key === "done" && setShowDone(!showDone())}>
                       <text fg={colors.base}>{group.name}</text>
                       <box flexGrow={1} />
                       <text fg={colors.muted}>{count}</text>
