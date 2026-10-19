@@ -17,7 +17,7 @@ import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe, type Availability } from "./registry.ts"
 import { chooseModel, unknown as allAvailable, type Available } from "./routing.ts"
-import { MICROMANAGER, ROLES, roleByAgent, type Rule } from "./roles.ts"
+import { family, MICROMANAGER, ROLES, roleByAgent, type Rule } from "./roles.ts"
 import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
@@ -35,7 +35,8 @@ import { join, resolve } from "node:path"
 import { FINISH_ID, GRAPH_ID, HELPER_IDS, installFinishTool, installGraphTool, installHelperTools, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
-import { CHILD_PREFIX, DelegationError, Native } from "./native.ts"
+import { CHILD_PREFIX, DelegationError, Native, parseDelegation } from "./native.ts"
+import { seedFromJournal, Usage } from "./usage.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
 // What the permission hook "evaluate" gets (opencode 2.0.18): the planned effect can be changed in place.
@@ -147,6 +148,7 @@ interface Shared {
   // next, worked out then, so a task delegated in the meantime is not named again (src/continuation.ts). Shared: the
   // worker's end is seen by the instance of its worktree, the micromanager's turn by the instance of its directory.
   continuing: Map<string, string> // micromanager session -> job id
+  usage?: Usage // the tasks each model got this week, for the least-used pick of a role's pool (src/usage.ts)
 }
 const SHARED: Shared = ((globalThis as { __micromanager?: Shared }).__micromanager ??= {
   workerTasks: new Map(),
@@ -717,6 +719,28 @@ export default {
     const { cloudOnly, parallel, perModel, budget, notify, routing, floors, decisions, allowOutside, error } = settings
     // Which models the host can run, read from ctx.model and kept for a minute (see modelAvailability).
     const hostModels = modelAvailability(ctx.model)
+    // A role's pool goes to its least-used model, by tasks per $ of its monthly budget (src/routing.ts). One count for
+    // every instance of the server, seeded from the journal's routing records of the week.
+    const usage = (SHARED.usage ??= new Usage(seedFromJournal()))
+    const goBudget = (model: string) => registry.find((m) => m.id === model)?.budget
+    // The families a delegation must leave: a task started again ("Task: T…" of a task that ran before, or
+    // "Replaces: T…") runs on another family than its failed attempt (the user, 2026-10-19).
+    const failedFamilies = (sessionID: string, prompt: string): string[] => {
+      if (!project) return []
+      const d = parseDelegation(prompt)
+      const before: (string | undefined)[] = []
+      if (d.planned) {
+        const job = native.current(project, d.planned.job) ?? loadJob(project, d.planned.job)
+        const task = job?.tasks.find((t) => t.id === d.planned!.task)
+        if (task?.sessions?.length) before.push(task.model)
+      }
+      if (d.replaces.length) {
+        const job = listJobs(project).find((j) => j.rolling && j.facilitator === sessionID && !["done", "stopped", "failed"].includes(j.phase))
+        const own = job && (native.current(project, job.id) ?? job)
+        for (const id of d.replaces) before.push(own?.tasks.find((t) => t.id === id)?.model)
+      }
+      return [...new Set(before.filter((m): m is string => Boolean(m)).map(family))]
+    }
     const registry = cloudOnly ? cloudRegistry(settings.registry) : settings.registry
     if (error) log("warn", `config ignored, defaults used: ${error}`)
 
@@ -787,7 +811,8 @@ export default {
       // auth, an id can be renamed. ctx.catalog.model.get() answers it, so the role's chain is walked rather than
       // taken at its first entry — otherwise a renamed free model breaks every role at once (the user's question,
       // 2026-10-07).
-      const routed = await routeDelegation(call, routing, undefined, hostModels)
+      const avoidFamilies = resumed ? [] : failedFamilies(call.sessionID, asked)
+      const routed = await routeDelegation(call, routing, undefined, hostModels, { usage, budget: goBudget, avoidFamilies })
       if (routed?.skipped?.length) {
         record({
           kind: "routing",
@@ -1158,7 +1183,7 @@ export default {
     const helpers = new Helpers({
       session: ctx.session as unknown as SessionApi,
       caller: (sessionID) => native.writerOf(sessionID),
-      model: async (role) => (await chooseModel(role, { vision: false }, routing, undefined, hostModels)).model,
+      model: async (role) => (await chooseModel(role, { vision: false }, routing, undefined, hostModels, { usage, budget: goBudget })).model,
       started: (helper, caller, dir, brief) => {
         SHARED.helperOf.set(helper, caller)
         runnerSessions.add(helper)

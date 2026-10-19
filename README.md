@@ -156,21 +156,40 @@ node ~/Fun/Projects/Repos/micromanager/src/cli.ts status --watch   # redraws eve
 Models come from a registry of the OpenCode Go models and your local ones (llama-swap, iGPU, NPU), local
 first when they can do the task (`src/registry.ts`).
 
-**Model choice.** `opencode-go/space-bunny` leads every role's chain (your choice, 2026-10-07: strong on code and
-free), and the three paid cloud models sit behind it as the fallbacks — `glm-5.3-flash`, `qwen3.8-flash`,
-`deepseek-v4.1-flash`. Two paths pick the model and they do not read the same thing: the native path
-(`chooseModel` in `src/routing.ts`) takes the first entry of the role's chain, and the runner's router
-(`route` in `src/registry.ts`) picks from the registry by tier, where the order of `DEFAULT_REGISTRY` decides.
-A review is the exception both paths honour: a reviewer never checks the work of its own model family, so a review
-of space-bunny's work goes to `glm-5.3-flash` — unless nothing else in the chain is available, in which case the
-rule is relaxed rather than handed a model that cannot run, and the reason says so.
+**Model choice.** Every role has a pool of OpenCode Go models (`src/roles.ts`), as chosen on 2026-10-19:
 
-**When space-bunny stops being free.** It will very likely not be called that any more, and a renamed or withdrawn
-model must not break every role at once. So the chain is walked, not read at its first entry: before a delegation the
-plugin asks the host's catalog (`ctx.catalog`) whether the model exists, and takes the first entry of the chain that
-does. A skip is journalled as a `routing` record whose reason names what was unavailable, so the change is visible
-rather than silent. If *nothing* in the chain is available the first entry is used anyway — a call against a missing
-model fails loudly, which beats quietly substituting something the role never asked for.
+| Role | Pool |
+|---|---|
+| coder | glm-5.3-flash, mimo-v2.6-pro, deepseek-v4.1-flash, step-5-preview |
+| tester | glm-5.3-flash, mimo-v2.6-pro, deepseek-v4.1-flash, step-5-preview, mimo-v2.6-flash |
+| debugger | glm-5.3-flash, claude-haiku-5-5, mimo-v2.6-pro, deepseek-v4.1-flash, step-5-preview |
+| writer | deepseek-v4.1-flash, mimo-v2.6-pro, glm-5.3-flash, step-5-preview, mimo-v2.6-flash |
+| researcher | deepseek-v4.1-flash, minimax-m3.1-flash-free, qwen3.8-flash, mimo-v2.6-flash |
+| explorer | minimax-m3.1-flash-free, deepseek-v4.1-flash, qwen3.8-flash, mimo-v2.6-flash |
+| designer | qwen3.8-flash, mimo-v2.6-pro, glm-5.3-flash |
+| planner, oracle | gemini-4-argon-contributor, glm-5.3-flash |
+| reviewer | gemini-4-argon-contributor, claude-haiku-5-5, deepseek-v4.1-flash |
+
+Each task gets the pool's **least-used** model: the tasks it got in the last seven days divided by its monthly
+budget on the Go plan (`budget` in `src/registry.ts`; a free model counts as $60), so the work spreads over the
+models, their budgets and their rate limits (`src/usage.ts`, seeded from the journal's routing records). The pool's
+order breaks ties. A task started again ("Task: T…" of a task that ran before, or "Replaces: T…") runs on another
+family than its failed attempt. The journal's `routing` record says why, e.g. "least used of code: mimo-v2.6-pro
+(0/$15) over glm-5.3-flash (1/$60), …".
+
+Two paths pick the model and they do not read the same thing: the native path (`chooseModel` in `src/routing.ts`)
+picks from the role's pool as above, and the runner's router (`route` in `src/registry.ts`, the planner of a
+planned job) picks from the registry by tier, with the pool's order breaking ties. A review is the exception both paths honour: a reviewer never
+checks the work of its own model family, and only the reviewer's pool members of another family are considered;
+when none of them is available the rule is relaxed rather than handed a model that cannot run, and the reason says
+so.
+
+**When a model disappears.** A renamed or withdrawn model (space-bunny led every chain until it left OpenCode Go on
+2026-10-19) must not break every role at once. So the plugin reads the host's model list (`ctx.model.list()`, once a
+minute) and picks only among the pool's models the host has. A skip
+is journalled as a `routing` record whose reason names what was unavailable, so the change is visible rather than
+silent. If *nothing* in the pool is available the first entry is used anyway — a call against a missing model fails
+loudly, which beats quietly substituting something the role never asked for.
 
 Set a chain yourself with `decisions.N5.model`, or one model per role in the config's `registry`; see the settings
 below.

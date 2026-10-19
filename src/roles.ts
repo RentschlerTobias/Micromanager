@@ -33,16 +33,20 @@ export interface Role {
   readonly models: readonly string[] // first model, then the fallback
 }
 
-// The only models routed to for now (user, 2026-10-01): coding, tool use + images, fast + cheap.
-//
-// space-bunny leads every chain since 2026-10-07 (the user's choice): strong on code and free, so it is the first
-// model every role gets and the others are its fallback. The three cloud models stay registered because they are
-// what the fallbacks use, and because `review` needs a second family — see there.
+// The cloud models the roles route to: OpenCode Go, as the user chose them on 2026-10-19 (space-bunny, which led
+// every role until then, left OpenCode Go). A role's `models` is a pool, not a fixed order: each task gets the pool's
+// least-used model, weighted by its monthly Go budget (src/routing.ts, src/usage.ts), so the work spreads over the
+// models, their budgets and their rate limits. The order breaks ties and is the fallback when the usage is unknown.
 export const MODELS = {
-  space: "opencode-go/space-bunny",
   glm: "opencode-go/glm-5.3-flash",
-  qwen: "opencode-go/qwen3.8-flash",
   deepseek: "opencode-go/deepseek-v4.1-flash",
+  mimo: "opencode-go/mimo-v2.6-pro",
+  mimoFlash: "opencode-go/mimo-v2.6-flash",
+  minimax: "opencode-go/minimax-m3.1-flash-free",
+  gemini: "opencode-go/gemini-4-argon-contributor",
+  qwen: "opencode-go/qwen3.8-flash",
+  haiku: "opencode-go/claude-haiku-5-5",
+  step: "opencode-go/step-5-preview",
 } as const
 
 // The model family, so a reviewer never checks its own family's work.
@@ -161,56 +165,56 @@ Be quick: when you have the code_graph tool, ask it who calls or uses what befor
 what you saw beats reading every file.
 ${READER_SHELL}`,
     [...noWrite, ...readShell, ...noWeb, ...noDelegation],
-    [MODELS.space, MODELS.deepseek, MODELS.qwen],
+    [MODELS.minimax, MODELS.deepseek, MODELS.qwen, MODELS.mimoFlash],
   ),
   role(
     "research",
     "Read-only with web access: docs, APIs, other repositories, current information.",
     `Look up documentation and sources on the web. Cite the URLs you used. Change nothing in the project.\n${READER_SHELL}`,
     [...noWrite, ...readShell, ...noDelegation],
-    [MODELS.space, MODELS.deepseek, MODELS.qwen],
+    [MODELS.deepseek, MODELS.minimax, MODELS.qwen, MODELS.mimoFlash],
   ),
   role(
     "plan",
     "Read-only: split a problem into steps with acceptance points; no code.",
     `Produce a short plan: steps, acceptance points per step, risks. Write no code.\n${READER_SHELL}`,
     [...noWrite, ...readShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
-    [MODELS.space, MODELS.qwen, MODELS.glm],
+    [MODELS.gemini, MODELS.glm],
   ),
   role(
     "code",
     "Implements and refactors code.",
     "Implement the sub-task with the smallest change that meets the acceptance points. Match the surrounding code. Run the project's own tests and linters to check your work; the rest of the shell is asked about.",
     [...askShell, ...runAndRead, ...noWeb, ...noDelegation],
-    [MODELS.space, MODELS.glm, MODELS.qwen],
+    [MODELS.glm, MODELS.mimo, MODELS.deepseek, MODELS.step],
   ),
   role(
     "test",
     "Writes and runs tests.",
     "Write or update tests for the sub-task and run them. Report the exact results.",
     [...askShell, ...runAndRead, ...noWeb, ...noDelegation],
-    [MODELS.space, MODELS.glm, MODELS.deepseek],
+    [MODELS.glm, MODELS.mimo, MODELS.deepseek, MODELS.step, MODELS.mimoFlash],
   ),
   role(
     "visual",
     "UI, CSS, layouts, screenshots (has image input).",
     "Work on the user interface. When given screenshots, describe what you see before changing anything.",
     [...askShell, ...runAndRead, ...noWeb, ...noDelegation],
-    [MODELS.space, MODELS.qwen],
+    [MODELS.qwen, MODELS.mimo, MODELS.glm],
   ),
   role(
     "write",
     "Docs, README, comments, commit and PR texts.",
     "Write clear, short English prose. Change only documentation files unless told otherwise.",
     [...askShell, ...runAndRead, ...noWeb, ...noDelegation],
-    [MODELS.space, MODELS.deepseek, MODELS.qwen],
+    [MODELS.deepseek, MODELS.mimo, MODELS.glm, MODELS.step, MODELS.mimoFlash],
   ),
   role(
     "debug",
     "Reproduces a failure and finds its cause; edits only with approval.",
     "Reproduce the failure, find the root cause, and explain it with evidence. Propose the fix before applying it.",
     [...WRITE_TOOLS.map((tool) => rule(tool, "ask")), ...askShell, ...runAndRead, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
-    [MODELS.space, MODELS.glm, MODELS.qwen],
+    [MODELS.glm, MODELS.haiku, MODELS.mimo, MODELS.deepseek, MODELS.step],
   ),
   role(
     "review",
@@ -219,14 +223,14 @@ ${READER_SHELL}`,
 with JSON: {"verdict": "PASS" | "FAIL", "checks": [{"point": "...", "met": true | false, "evidence": "..."}],
 "fixes": ["..."]}.`,
     [...noWrite, ...readShell, ...runAndRead, ...noWeb, ...noDelegation],
-    [MODELS.space, MODELS.glm, MODELS.qwen], // space-bunny writes, so a reviewer must be another family
+    [MODELS.gemini, MODELS.haiku, MODELS.deepseek],
   ),
   role(
     "oracle",
     "Read-only: hard decisions, architecture, trade-offs.",
     `Weigh the options for the question with evidence from the code. Give one recommendation and why.\n${READER_SHELL}`,
     [...noWrite, ...readShell, ...WEB_TOOLS.map((tool) => rule(tool, "ask")), ...noDelegation],
-    [MODELS.space, MODELS.qwen, MODELS.glm],
+    [MODELS.gemini, MODELS.glm],
   ),
 ]
 

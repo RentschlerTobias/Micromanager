@@ -1,5 +1,6 @@
-// Picks the model for a sub-agent call: the role's first model, unless the sub-task needs something only
-// another model has (images), or it is a review (never the worker's own model family).
+// Picks the model for a sub-agent call from the role's pool: the least-used model, weighted by its monthly budget
+// (src/usage.ts), unless the sub-task needs something only another model has (images), or it is a review (never the
+// worker's own model family). Without usage the pool's order decides: its first available model.
 
 import { MODELS, family, type Role, type RoleId } from "./roles.ts"
 
@@ -25,6 +26,16 @@ export function chain(role: Role, routing: Routing = DEFAULT_ROUTING): readonly 
   const models = routing.models[role.id]
   return models && models.length > 0 ? models : role.models
 }
+
+// What spreads the work over a pool: the tasks each model got lately and its monthly budget in $. A free model has no
+// budget and is weighted as FREE_BUDGET, or it would win every pick of its pools.
+export interface Spread {
+  readonly usage?: { count(model: string): number; record(model: string): void }
+  readonly budget?: (model: string) => number | undefined
+  readonly avoidFamilies?: readonly string[] // a task started again: not the family its failed attempt ran on
+}
+
+export const FREE_BUDGET = 60
 
 export interface Choice {
   readonly model: string
@@ -58,14 +69,38 @@ async function firstAvailable(models: readonly string[], available: Available): 
   return { model: models[0] ?? MODELS.deepseek, skipped }
 }
 
+// The least-used available model of a list, by tasks per $ of budget; ties go to the list's order. Without usage, the
+// first available one. The picked model is counted.
+async function leastUsed(models: readonly string[], available: Available, spread: Spread): Promise<{ model: string; skipped: string[]; spread?: string }> {
+  const { usage, budget = () => undefined } = spread
+  if (!usage) return firstAvailable(models, available)
+  const ready: string[] = []
+  const skipped: string[] = []
+  for (const model of models) (await available(model) ? ready : skipped).push(model)
+  if (!ready.length) return firstAvailable(models, available)
+  const weight = (m: string) => budget(m) ?? FREE_BUDGET
+  const score = (m: string) => usage.count(m) / weight(m)
+  const model = ready.reduce((best, m) => (score(m) < score(best) ? m : best))
+  usage.record(model)
+  const show = (m: string) => `${m.split("/").pop()} (${usage.count(m) - (m === model ? 1 : 0)}/$${weight(m)})`
+  const others = ready.filter((m) => m !== model)
+  return { model, skipped, spread: `${show(model)}${others.length ? ` over ${others.map(show).join(", ")}` : ""}` }
+}
+
 export async function chooseModel(
   role: Role,
   needs: Needs,
   routing: Routing = DEFAULT_ROUTING,
   workerModel?: string, // for a review: the model whose work is checked
   available: Available = unknown,
+  spread: Spread = {},
 ): Promise<Choice> {
-  const models = chain(role, routing)
+  const all = chain(role, routing)
+  // A task started again leaves the family its failed attempt ran on, while the pool has another one.
+  const avoid = spread.avoidFamilies ?? []
+  const fresh = all.filter((m) => !avoid.includes(family(m)))
+  const avoided = fresh.length > 0 && fresh.length < all.length
+  const models = avoided ? fresh : all
   if (needs.vision && role.id !== "review") {
     const vision = await firstAvailable([routing.vision], available)
     return { model: vision.model, reason: "needs image input", ...(vision.skipped.length ? { skipped: vision.skipped } : {}) }
@@ -78,20 +113,21 @@ export async function chooseModel(
     // Another family is preferred, but never at the cost of a model that does not exist: if none of the other
     // family is available, the worker's own family is taken and the reason says the rule was relaxed. The reverse
     // would hand a review to a model that cannot run.
-    const fromOther = other.length > 0 ? await firstAvailable(other, available) : undefined
-    const left = fromOther ? fromOther.skipped.length < other.length : false
-    const picked = left && fromOther ? fromOther : await firstAvailable(same, available)
-    const reason = picked === fromOther && left
-      ? `another family than the worker (${family(workerModel)})`
-      : other.length > 0 && !left
+    const left = other.length > 0 && (await Promise.all(other.map((m) => available(m)))).some(Boolean)
+    const picked = await leastUsed(left ? other : same.length ? same : other, available, spread)
+    const reason = left
+      ? `another family than the worker (${family(workerModel)})${picked.spread ? `; least used: ${picked.spread}` : ""}`
+      : other.length > 0
         ? `no other family available; reviewing with the worker's own (${family(workerModel)})`
         : `first available model for ${role.id}`
     return { model: picked.model, reason, ...(picked.skipped.length ? { skipped: picked.skipped } : {}) }
   }
-  const picked = await firstAvailable(models, available)
+  const picked = await leastUsed(models, available, spread)
   return {
     model: picked.model,
-    reason: picked.skipped.length ? `first available model for ${role.id}` : `first model for ${role.id}`,
+    reason: picked.spread
+      ? `least used of ${role.id}: ${picked.spread}${avoided ? ` (not ${avoid.join(", ")}: the failed attempt's family)` : ""}`
+      : picked.skipped.length ? `first available model for ${role.id}` : `first model for ${role.id}`,
     ...(picked.skipped.length ? { skipped: picked.skipped } : {}),
   }
 }

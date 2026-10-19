@@ -7,37 +7,34 @@ import { modelAvailability } from "../src/plugin.ts"
 import { family, MODELS, ROLES, roleById } from "../src/roles.ts"
 import { DEFAULT_ROUTING, chooseModel, guessNeeds } from "../src/routing.ts"
 
-// The three paid cloud models: everything a role keeps behind space-bunny.
-const PAID = new Set<string>([MODELS.glm, MODELS.qwen, MODELS.deepseek])
 
 test("a role's first model, images to the vision model, a review in another family", async () => {
   const code = roleById("code")!
-  assert.equal((await chooseModel(code, { vision: false })).model, MODELS.space, "space-bunny leads every chain")
+  assert.equal((await chooseModel(code, { vision: false })).model, MODELS.glm, "glm-5.3-flash writes")
   assert.equal((await chooseModel(code, guessNeeds("fix the layout shown in the screenshot"))).model, MODELS.qwen)
   const review = roleById("review")!
-  // The rule is "not the worker's own family", not "not space-bunny": reviewing qwen or glm work with space-bunny
-  // is a different family and free, so it is allowed. Only a review OF space-bunny has to leave the family.
-  assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.qwen)).model, MODELS.space)
-  assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.glm)).model, MODELS.space)
-  assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.deepseek)).model, MODELS.space)
-  // space-bunny writes almost everything, so a review of its work has to be another family: the rule finds the
-  // first entry in the chain whose family differs, which is what keeps a reviewer from checking its own output.
-  assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.space)).model, MODELS.glm)
-  assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.space)).reason,
-    "another family than the worker (space)", "and it says which family it avoided")
-  assert.notEqual(family(MODELS.space), family(MODELS.glm))
-  assert.notEqual(family(MODELS.space), family(MODELS.qwen))
-  assert.notEqual(family(MODELS.space), family(MODELS.deepseek))
+  // Gemini's family writes nothing, so it reviews every writer's work, Haiku's too (a debugger may run on Haiku)...
+  for (const writer of [MODELS.glm, MODELS.mimo, MODELS.deepseek, MODELS.step, MODELS.haiku]) {
+    assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, writer)).model, MODELS.gemini)
+  }
+  // ...and the rule still holds when Gemini did the work itself (it plans): the pool's next family, which is what
+  // keeps a reviewer from checking its own output.
+  assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.gemini)).model, MODELS.haiku)
+  assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.gemini)).reason,
+    "another family than the worker (gemini)", "and it says which family it avoided")
 })
 
-test("every role leads with space-bunny and keeps a fallback behind it", () => {
+test("every role keeps a fallback, and the models that write are never the reviewer's first", () => {
+  const writers = new Set(["code", "test", "write", "debug", "visual"].flatMap((id) => roleById(id)!.models.slice(0, 1)))
   for (const role of ROLES) {
-    assert.equal(role.models[0], MODELS.space, `${role.id} leads with space-bunny`)
     assert.ok(role.models.length > 1, `${role.id} keeps a fallback`)
     assert.equal(new Set(role.models).size, role.models.length, `${role.id}: no model twice in its chain`)
-    // The fallbacks are the three paid cloud models, which is what a review of space-bunny's work falls back to.
-    for (const m of role.models.slice(1)) assert.ok(PAID.has(m), `${role.id}: ${m}`)
+    assert.ok(role.models.every((m) => m.startsWith("opencode-go/")), `${role.id}: OpenCode Go only`)
   }
+  assert.ok(!writers.has(roleById("review")!.models[0]!))
+  assert.ok(![...writers].some((m) => family(m) === family(roleById("review")!.models[0]!)))
+  // the free model only reads: a model that may vanish costs a fallback there, not a half-written change
+  for (const id of ["code", "test", "write", "debug", "visual"]) assert.ok(!roleById(id)!.models.includes(MODELS.minimax), id)
 })
 
 test("the micromanager's subagent call gets the routed model, runs in the background, carries a header", async () => {
@@ -47,10 +44,10 @@ test("the micromanager's subagent call gets the routed model, runs in the backgr
     input: { agent: "coder", model: "opencode-go/kimi-k3", prompt: "Add a --verbose flag.", background: false },
   }
   const routed = await routeSubagentCall(call, DEFAULT_ROUTING)
-  assert.deepEqual(routed, { role: "code", model: MODELS.space, reason: "first model for code" })
-  assert.equal(call.input.model, MODELS.space) // the model the micromanager asked for is overridden
+  assert.deepEqual(routed, { role: "code", model: MODELS.glm, reason: "first model for code" })
+  assert.equal(call.input.model, MODELS.glm) // the model the micromanager asked for is overridden
   assert.equal(call.input.background, true)
-  assert.ok(String(call.input.prompt).startsWith(`${HEADER} role: code · model: ${MODELS.space}\n\nAdd a --verbose flag.`))
+  assert.ok(String(call.input.prompt).startsWith(`${HEADER} role: code · model: ${MODELS.glm}\n\nAdd a --verbose flag.`))
   await routeSubagentCall(call, DEFAULT_ROUTING)
   assert.equal(String(call.input.prompt).split(HEADER).length, 2) // the header only once
 })
@@ -94,8 +91,8 @@ test("a delegation from another agent produces the same task and worktree as the
   // Both route to the same role and the same model, and both rewrite the call the same way — so one delegation still
   // makes one task and one worktree, whichever agent made it.
   assert.deepEqual(await routeDelegation(direct, DEFAULT_ROUTING), await routeDelegation(alternate, DEFAULT_ROUTING))
-  assert.equal(direct.input.model, MODELS.space)
-  assert.equal(alternate.input.model, MODELS.space)
+  assert.equal(direct.input.model, MODELS.glm)
+  assert.equal(alternate.input.model, MODELS.glm)
   assert.equal(direct.input.background, true)
   assert.equal(alternate.input.background, true)
   assert.equal(String(alternate.input.prompt), String(direct.input.prompt))
@@ -183,32 +180,32 @@ function catalog(present: readonly string[]) {
 const code = roleById("code")!
 
 test("a model the host does not have is skipped and the chain is walked down", async () => {
-  const gone = modelAvailability(catalog([MODELS.glm, MODELS.deepseek]))
+  const gone = modelAvailability(catalog([MODELS.mimo, MODELS.deepseek]))
   const picked = await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, gone)
-  assert.equal(picked.model, MODELS.glm, "space-bunny is gone, so the next available entry wins")
-  assert.deepEqual(picked.skipped, [MODELS.space], "and the one it skipped is named")
+  assert.equal(picked.model, MODELS.mimo, "glm-5.3-flash is gone, so the next available entry wins")
+  assert.deepEqual(picked.skipped, [MODELS.glm], "and the one it skipped is named")
   assert.match(picked.reason, /first available model/, "the reason says it fell back, so the journal shows it")
 })
 
 test("every model gone: the first is used anyway and the whole chain is reported", async () => {
   const none = modelAvailability(catalog([]))
   const picked = await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, none)
-  assert.equal(picked.model, MODELS.space, "a call against a missing model fails loudly rather than silently moving")
+  assert.equal(picked.model, MODELS.glm, "a call against a missing model fails loudly rather than silently moving")
   assert.deepEqual(picked.skipped, code.models, "every entry was tried")
 })
 
 test("nothing is skipped when the catalog says nothing", async () => {
   const ok = await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, modelAvailability(catalog(Object.values(MODELS))))
-  assert.equal(ok.model, MODELS.space)
+  assert.equal(ok.model, MODELS.glm)
   assert.equal(ok.skipped, undefined, "the ordinary case carries no skipped list at all")
   // No catalog at all, and a catalog that throws: both mean "assume it is there". An unreadable catalog is not
   // evidence that a model is missing, and treating it as one would move every role off its chain for no reason.
-  assert.equal((await chooseModel(code, { vision: false })).model, MODELS.space)
-  assert.equal((await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, modelAvailability())).model, MODELS.space)
+  assert.equal((await chooseModel(code, { vision: false })).model, MODELS.glm)
+  assert.equal((await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, modelAvailability())).model, MODELS.glm)
   const broken = modelAvailability({ list: () => { throw new Error("catalog not ready") } })
-  assert.equal((await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, broken)).model, MODELS.space)
+  assert.equal((await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, broken)).model, MODELS.glm)
   const empty = modelAvailability({ list: async () => [] })
-  assert.equal((await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, empty)).model, MODELS.space, "an empty list has not said anything yet")
+  assert.equal((await chooseModel(code, { vision: false }, DEFAULT_ROUTING, undefined, empty)).model, MODELS.glm, "an empty list has not said anything yet")
 })
 
 test("the host's list is read once a minute, also in the hub's { data } shape", async () => {
@@ -226,19 +223,19 @@ test("the host's list is read once a minute, also in the hub's { data } shape", 
 
 test("the review rule and the fallback are separate questions", async () => {
   const review = roleById("review")!
-  // A review of space-bunny's work leaves the family when it can...
-  assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.space)).model, MODELS.glm)
-  // ...and when the whole other-family half of the chain is gone it takes what is left rather than nothing.
-  const onlySpace = modelAvailability(catalog([MODELS.space]))
-  const picked = await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.space, onlySpace)
-  assert.equal(picked.model, MODELS.space, "a working model beats a family rule")
+  // A review of Gemini's work (it plans) leaves the family when it can...
+  assert.equal((await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.gemini)).model, MODELS.haiku)
+  // ...and when the whole other-family half of the pool is gone it takes what is left rather than nothing.
+  const onlyGemini = modelAvailability(catalog([MODELS.gemini]))
+  const picked = await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.gemini, onlyGemini)
+  assert.equal(picked.model, MODELS.gemini, "a working model beats a family rule")
   assert.match(picked.reason, /no other family available/, "and the reason says the rule was relaxed, not kept")
-  // When the other family IS available the rule stands and nothing is reported as skipped.
-  const both = modelAvailability(catalog([MODELS.space, MODELS.glm]))
-  const kept = await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.space, both)
-  assert.equal(kept.model, MODELS.glm)
-  assert.match(kept.reason, /another family than the worker \(space\)/)
-  assert.equal(kept.skipped, undefined)
+  // When the other family IS available the rule stands.
+  const both = modelAvailability(catalog([MODELS.gemini, MODELS.deepseek]))
+  const kept = await chooseModel(review, { vision: false }, DEFAULT_ROUTING, MODELS.gemini, both)
+  assert.equal(kept.model, MODELS.deepseek)
+  assert.match(kept.reason, /another family than the worker \(gemini\)/)
+  assert.deepEqual(kept.skipped, [MODELS.haiku], "Haiku is not in this host's list, and that is reported")
 })
 
 test("the delegation rewrites the call to the available model and reports what it skipped", async () => {
@@ -247,9 +244,9 @@ test("the delegation rewrites the call to the available model and reports what i
     agent: "micromanager",
     input: { agent: "coder", prompt: "Add a --verbose flag." },
   }
-  const gone = modelAvailability(catalog([MODELS.glm]))
+  const gone = modelAvailability(catalog([MODELS.mimo]))
   const routed = await routeDelegation(call, DEFAULT_ROUTING, undefined, gone)
-  assert.equal(call.input.model, MODELS.glm, "the call carries a model that exists, not the one that does not")
-  assert.deepEqual(routed?.skipped, [MODELS.space])
-  assert.match(String(call.input.prompt), /role: code · model: opencode-go\/glm-5\.3-flash/, "the brief names what it will run on")
+  assert.equal(call.input.model, MODELS.mimo, "the call carries a model that exists, not the one that does not")
+  assert.deepEqual(routed?.skipped, [MODELS.glm])
+  assert.match(String(call.input.prompt), /role: code · model: opencode-go\/mimo-v2\.6-pro/, "the brief names what it will run on")
 })

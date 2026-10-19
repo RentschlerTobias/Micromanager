@@ -21,6 +21,7 @@ export interface ModelEntry {
   readonly swapGroup?: string // models that share one GPU through llama-swap
   readonly disabled?: boolean // known but not routed to
   readonly note?: string
+  readonly budget?: number // the monthly usage limit in $ on the $10 OpenCode Go plan; absent for a free model
 }
 
 const TIER_RANK: Record<Tier, number> = { quick: 0, agent: 1, deep: 2 }
@@ -28,10 +29,16 @@ const TIER_RANK: Record<Tier, number> = { quick: 0, agent: 1, deep: 2 }
 // Cloud models (OpenCode Go) and the local fleet of ~/Models/bench/ROSTER.md (2026-10-04). Local models run with
 // a 16k context. The NPU is reserved for Whisper plus one small quick model (Phase A).
 export const DEFAULT_REGISTRY: readonly ModelEntry[] = [
-  { id: MODELS.space, location: "cloud", device: "cloud", censored: true, family: "space", tier: "agent", vision: true, ctx: 200000, note: "free and strong on code; leads every role's chain since 2026-10-07" },
-  { id: MODELS.glm, location: "cloud", device: "cloud", censored: true, family: "glm", tier: "agent", vision: false, ctx: 128000 },
-  { id: MODELS.qwen, location: "cloud", device: "cloud", censored: true, family: "qwen", tier: "agent", vision: true, ctx: 128000 },
-  { id: MODELS.deepseek, location: "cloud", device: "cloud", censored: true, family: "deepseek", tier: "agent", vision: false, ctx: 128000 },
+  // Vision and context as the host lists them (GET /api/model), budgets from opencode.ai/docs/go (2026-10-19).
+  { id: MODELS.glm, location: "cloud", device: "cloud", censored: true, family: "glm", tier: "agent", vision: true, ctx: 1000000, budget: 60 },
+  { id: MODELS.deepseek, location: "cloud", device: "cloud", censored: true, family: "deepseek", tier: "agent", vision: true, ctx: 1000000, budget: 80 },
+  { id: MODELS.mimo, location: "cloud", device: "cloud", censored: true, family: "mimo", tier: "agent", vision: true, ctx: 1048576, budget: 15 },
+  { id: MODELS.mimoFlash, location: "cloud", device: "cloud", censored: true, family: "mimo", tier: "agent", vision: true, ctx: 1048576, budget: 60 },
+  { id: MODELS.gemini, location: "cloud", device: "cloud", censored: true, family: "gemini", tier: "agent", vision: true, ctx: 1048576, budget: 60, note: "doubled for a limited time ($30 normally)" },
+  { id: MODELS.step, location: "cloud", device: "cloud", censored: true, family: "step", tier: "agent", vision: true, ctx: 1000000, budget: 60, note: "quadrupled for a limited time ($15 normally)" },
+  { id: MODELS.qwen, location: "cloud", device: "cloud", censored: true, family: "qwen", tier: "agent", vision: true, ctx: 1000000, budget: 30 },
+  { id: MODELS.haiku, location: "cloud", device: "cloud", censored: true, family: "claude", tier: "agent", vision: true, ctx: 1000000, budget: 15 },
+  { id: MODELS.minimax, location: "cloud", device: "cloud", censored: true, family: "minimax", tier: "agent", vision: true, ctx: 1000000, note: "free for a limited time" },
   { id: "llamaswap/oss-u", location: "local", device: "cuda", censored: false, family: "gpt-oss", tier: "deep", vision: false, ctx: 16384, tokPerSec: 53, swapGroup: "cuda0" },
   { id: "llamaswap/ornith-u", location: "local", device: "cuda", censored: false, family: "ornith", tier: "agent", vision: true, ctx: 16384, tokPerSec: 40, swapGroup: "cuda0" },
   { id: "llamaswap/ornith-u-s", location: "local", device: "cuda", censored: false, family: "ornith", tier: "agent", vision: true, ctx: 16384, tokPerSec: 45, swapGroup: "cuda0" },

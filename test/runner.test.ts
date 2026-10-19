@@ -1122,9 +1122,9 @@ test("cloud only: guards ask cloud Jev, no local model is routed, and a local-on
   assert.equal(parseCloudOnly('{"cloudOnly": false}'), false)
   const reg = cloudRegistry(DEFAULT_REGISTRY)
   assert.ok(reg.filter((m) => m.location === "local").every((m) => m.disabled))
-  // Cloud only leaves the three paid models plus space-bunny; every local one is disabled. The router picks from the
+  // Cloud only leaves the OpenCode Go models; every local one is disabled. The router picks from the
   // registry by tier, so the leading cloud entry is what a plan gets.
-  assert.equal(route(reg, { role: "plan", difficulty: 0.7 }).model, MODELS.space)
+  assert.equal(route(reg, { role: "plan", difficulty: 0.7 }).model, MODELS.gemini)
   assert.doesNotMatch(gateQuestion({ flagged: ["sensitive"], scores: { sensitive: 0.8 }, checked: true }, true), /always local/)
 
   const project = repo()
