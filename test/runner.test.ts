@@ -90,6 +90,21 @@ test("plan -> run: tasks pass their checks one by one and land as commits on the
   assert.equal((worker.location as { directory: string }).directory, done.integrationWorktree)
 })
 
+test("the planner and the workers name their micromanager in the metadata, because the host drops parentID", async () => {
+  const project = repo()
+  const fake = fakeSession({ worker: writeFiles })
+  const r = runner(project, fake.api, { parentID: "ses_micro" })
+  const { job } = await r.plan("add an add function")
+  await r.run(job.id)
+  const planner = fake.created.find((c) => c.agent === "planner")!
+  assert.deepEqual(planner.metadata, { jevMicromanager: { parent: "ses_micro", job: job.id } })
+  const worker = fake.created.find((c) => c.agent === "coder")!
+  assert.deepEqual(worker.metadata, { jevMicromanager: { parent: "ses_micro", job: job.id, task: "T1" } })
+  const alone = fakeSession({ worker: writeFiles })
+  await runner(repo(), alone.api).plan("add an add function")
+  assert.equal(alone.created[0]!.metadata, undefined, "no micromanager, nothing to name")
+})
+
 test("a failing check climbs the ladder: fix rounds, a fresh session on another family, then the task is given up", async () => {
   const project = repo()
   let rounds = 0

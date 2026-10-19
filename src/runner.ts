@@ -1309,6 +1309,13 @@ export class Runner {
     return skillsFor(stage, task.profile, task.pipeline, this.#d.installedSkills ?? new Set())
   }
 
+  // OpenCode 2.0.18's plugin session.create drops parentID, so these sessions are not children of the micromanager in
+  // OpenCode's eyes. The metadata names it instead, for the clients that list sessions: oc-voice treats a session with
+  // a parent there as a sub-agent and does not announce it as one of the user's own.
+  #origin(job: Job, task?: Task): Record<string, unknown> {
+    return this.#d.parentID ? { metadata: { jevMicromanager: { parent: this.#d.parentID, job: job.id, ...(task ? { task: task.id } : {}) } } } : {}
+  }
+
   async #plannerSession(job: Job, model: string): Promise<{ id: string }> {
     const s = await this.#d.session.create({
       ...(this.#d.parentID ? { parentID: this.#d.parentID } : {}),
@@ -1316,6 +1323,7 @@ export class Runner {
       agent: roleById("plan")!.agent,
       model: toModel(model),
       location: { directory: this.#d.project },
+      ...this.#origin(job),
     })
     this.#d.watch?.(s.id, 40)
     return s
@@ -1332,6 +1340,7 @@ export class Runner {
       model: toModel(model),
       location: { directory: this.#dir(job, task) },
       ...(rules.length ? { permissions: rules } : {}),
+      ...this.#origin(job, task),
     })
     task.session = s.id
     task.sessions = [...(task.sessions ?? []), s.id]
