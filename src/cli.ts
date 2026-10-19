@@ -28,7 +28,7 @@ export async function main(argv: readonly string[]): Promise<number> {
       const jobs = listJobs(project)
       const shown = args.includes("--all") ? jobs : jobs.slice(0, 1)
       const width = Math.max(80, (process.stdout.columns ?? 120) - 2)
-      return shown.length ? shown.map((j) => board(j, width)).join("\n\n") : `no jev-micromanager job in ${project}`
+      return shown.length ? shown.map((j) => board(j, width)).join("\n\n") : `no micromanager job in ${project}`
     }
     if (!args.includes("--watch")) {
       console.log(draw())

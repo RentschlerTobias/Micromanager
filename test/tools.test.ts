@@ -21,7 +21,7 @@ function fakeDraft() {
 
 const ok = async () => "ok"
 // The user's own checkout, the directory the stand-in host below reports: what a worker must never be able to write.
-const PROJECT = "/home/t1dde/Fun/Projects/Repos/jev-micromanager"
+const PROJECT = "/home/t1dde/Fun/Projects/Repos/micromanager"
 const noop = { tasks: ok, plan: ok, questions: ok, run: ok, status: ok, stop: ok, steer: ok, stopTask: ok, merge: ok, discard: ok, access: ok, permission: ok, rewind: ok, undoMerge: ok, takeOver: ok }
 const byId = (added: Record<string, unknown>[], id: string) => {
   const tool = added.find((t) => t.id === id)!
@@ -341,7 +341,7 @@ test("a job load sweeps a stale task to a terminal state and reports the leftove
 test("request_access asks the user about a refused path rather than answering for them, and vouches for an ordinary one", async () => {
   const { vouchAccess, vouchText } = await import("../src/plugin.ts")
   const j = job()
-  const PROJECT = "/home/t1dde/Fun/Projects/Repos/jev-micromanager"
+  const PROJECT = "/home/t1dde/Fun/Projects/Repos/micromanager"
   // ~/.ssh is layer 1 of decide.ts: no layer may pass it, and a vouch from the orchestrator is not a layer above that.
   // What changed is not the rule but who answers it: the tool used to refuse, which meant the one place built to ask
   // the user was the one place that never did. It now puts the question to them, with the path and the reason.
@@ -411,7 +411,7 @@ async function loadedPlugin(t: { after(fn: () => void): void }, sessions: Record
     else process.env.XDG_STATE_HOME = before
   })
   await plugin.setup(ctx as never)
-  const journal = () => readJournal(`${process.env.XDG_STATE_HOME}/jev-micromanager/decisions.jsonl`)
+  const journal = () => readJournal(`${process.env.XDG_STATE_HOME}/micromanager/decisions.jsonl`)
   const evaluate = take("perm:evaluate")!
   const run = async (sessionID: string, agent: string, action: string) => {
     const e = { sessionID, agent, action, resources: ["x"], effect: "allow", message: undefined as string | undefined }

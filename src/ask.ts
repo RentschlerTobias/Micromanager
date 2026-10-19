@@ -153,7 +153,7 @@ export class Asks {
 export function askNote(ask: PendingAsk, timeoutMs = ASK_TIMEOUT_MS): string {
   const what = `${ask.action}: ${ask.resources.join(" | ").slice(0, 600)}`
   const minutes = Math.round(timeoutMs / 60_000)
-  const head = `[jev-micromanager] ${ask.id}: worker ${ask.task} (${ask.agent}, session ${ask.sessionID}) is paused on a permission request until it is answered.\nRequest: ${what}\nWhy it was not decided automatically: ${ask.reason}`
+  const head = `[micromanager] ${ask.id}: worker ${ask.task} (${ask.agent}, session ${ask.sessionID}) is paused on a permission request until it is answered.\nRequest: ${what}\nWhy it was not decided automatically: ${ask.reason}`
   const end = `Without an answer it is refused in ${minutes} minutes and the worker carries on without it.`
   if (ask.hard) {
     return `${head}\nThis is a hard rule: only the user can allow it. Show them the request and why the worker wants it, in one or two sentences, ask "yes, yes always (for this job) or no?", call no tool and end your turn. Their answer reaches the plugin by itself. ${end}`

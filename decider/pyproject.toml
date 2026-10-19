@@ -1,7 +1,7 @@
 [project]
 name = "jev-decider"
 version = "0.1.0"
-description = "Local GLiNER2 decision server for jev-micromanager, speaking the TypeSafe Jev wire format"
+description = "Local GLiNER2 decision server for micromanager, speaking the TypeSafe Jev wire format"
 requires-python = ">=3.12"
 dependencies = [
     "gliner2[local]>=2.0.0",

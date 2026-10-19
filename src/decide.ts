@@ -27,6 +27,7 @@ import { basename, dirname, isAbsolute, join, normalize } from "node:path"
 import type { Decision, Jev, Question } from "./jev.ts"
 import { WRITERS } from "./profile.ts"
 import { MICROMANAGER, roleByAgent } from "./roles.ts"
+import { stateDir } from "./store.ts"
 
 export interface PermissionRequest {
   readonly sessionID: string
@@ -402,11 +403,12 @@ export function readsOnlyInside(request: PermissionRequest, root: string): boole
   )
 }
 
-// The task worktree a directory lies in (<project>/.jev-micromanager/worktrees/<job>--T<id>), or undefined. Only a task's
+// The task worktree a directory lies in (<project>/.micromanager/worktrees/<job>--T<id>, or .jev-micromanager in a
+// project from before the rename), or undefined. Only a task's
 // own worktree, never the job's integration worktree: that one is the merge train's target and the readers' tree, so
 // nothing may change it outside a merge. A project inside a larger repository works in <worktree>/<rel>; the area is
 // the whole worktree either way.
-const TASK_WORKTREE = /^(.*\/\.jev-micromanager\/worktrees\/[^/]+--T[\w.]+)(?:\/|$)/
+const TASK_WORKTREE = /^(.*\/\.(?:jev-)?micromanager\/worktrees\/[^/]+--T[\w.]+)(?:\/|$)/
 
 export function taskWorktree(directory: string | undefined): string | undefined {
   return directory ? normalizeOutside(directory).match(TASK_WORKTREE)?.[1] : undefined
@@ -478,11 +480,11 @@ export function riskClass(request: PermissionRequest): "read" | "write" {
   return request.action === "shell" && readsOnly(request.resources) ? "read" : "write"
 }
 
-// The job's own area: any worktree under <directory>/.jev-micromanager/worktrees/, this job's integration worktree
+// The job's own area: any worktree under <directory>/.micromanager/worktrees/ (src/store.ts stateDir), this job's integration worktree
 // included. Compared segment by segment, so a sibling that merely starts with the same name is outside.
 export function inJobArea(directory: string | undefined, path: string): boolean {
   if (!directory) return false
-  const area = normalizeOutside(join(directory, ".jev-micromanager", "worktrees"))
+  const area = normalizeOutside(join(directory, stateDir(directory), "worktrees"))
   return under(normalizeOutside(path), area)
 }
 

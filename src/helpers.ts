@@ -79,7 +79,7 @@ export class Helpers {
       agent: r.agent,
       model: toModel(model),
       location: { directory: caller.dir },
-      metadata: { jevMicromanager: { helperOf: callerSession, task: caller.label } },
+      metadata: { micromanager: { helperOf: callerSession, task: caller.label } },
     })
     this.#d.started(s.id, callerSession, caller.dir, brief)
     const start = Date.now()

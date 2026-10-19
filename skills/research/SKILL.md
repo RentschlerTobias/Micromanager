@@ -1,10 +1,10 @@
 ---
 name: research
-description: Answer a research question from primary sources and cite every claim. Use when a jev-micromanager task asks you to research something, or a note starts with "[jev-micromanager] research for task".
+description: Answer a research question from primary sources and cite every claim. Use when a micromanager task asks you to research something, or a note starts with "[micromanager] research for task".
 license: MIT
 metadata:
   source: https://github.com/mattpocock/skills/blob/24fe0ef7737efae15c87225755e9f6f5965e4888/skills/engineering/research/SKILL.md
-  adapted: for a jev-micromanager worker, which reads itself instead of starting a background agent
+  adapted: for a micromanager worker, which reads itself instead of starting a background agent
 ---
 
 # Research

@@ -5,7 +5,7 @@
 import { execFile } from "node:child_process"
 import { join, relative, resolve, sep } from "node:path"
 
-import { DIR } from "./store.ts"
+import { stateDir } from "./store.ts"
 import type { Job, Task } from "./state.ts"
 
 // Git always materialises a worktree of the REPOSITORY ROOT, never of the directory the plugin asked from. A project
@@ -105,7 +105,7 @@ export async function prepareIntegration(project: string, jobId: string, run: Ex
   // Before the worktree exists: its own checkout must not be counted as the user's uncommitted work.
   const { dirty, summary } = await dirtyPaths(project, run)
   const branch = `jev/${jobId}`
-  const worktree = join(project, DIR, "worktrees", jobId)
+  const worktree = join(project, stateDir(project), "worktrees", jobId)
   const added = await run("git", ["worktree", "add", "-q", "-b", branch, worktree, "HEAD"], { cwd: project })
   if (added.code !== 0) throw new IntegrationError(`git worktree add failed: ${added.stderr.trim()}`)
   return { branch, worktree, base: head.stdout.trim(), rel, dirty, dirtySummary: summary }
@@ -130,7 +130,7 @@ export async function changedFiles(worktree: string, run: Exec = exec, rel = "")
 export async function commitTask(worktree: string, subject: string, body: string, run: Exec = exec): Promise<string | undefined> {
   if ((await changedFiles(worktree, run)).length === 0) return undefined
   await run("git", ["add", "-A"], { cwd: worktree })
-  const commit = await run("git", ["-c", "user.name=jev-micromanager", "-c", "user.email=jev-micromanager@localhost", "commit", "-q", "-m", subject, "-m", body], { cwd: worktree })
+  const commit = await run("git", ["-c", "user.name=micromanager", "-c", "user.email=micromanager@localhost", "commit", "-q", "-m", subject, "-m", body], { cwd: worktree })
   if (commit.code !== 0) throw new IntegrationError(`git commit failed: ${commit.stderr.trim()}`)
   return (await run("git", ["rev-parse", "--short", "HEAD"], { cwd: worktree })).stdout.trim()
 }
@@ -207,7 +207,7 @@ export interface TaskWorktree {
 // place for it (a continued worker keeps its session's directory). rel: the project's offset inside the worktree.
 export async function prepareTaskWorktree(project: string, jobId: string, taskId: string, from: string, run: Exec = exec, at?: string, rel = ""): Promise<TaskWorktree> {
   const branch = `jev/${jobId}--${taskId}`
-  const worktree = at ?? join(project, DIR, "worktrees", `${jobId}--${taskId}`)
+  const worktree = at ?? join(project, stateDir(project), "worktrees", `${jobId}--${taskId}`)
   await removeTaskWorktree(project, { branch, worktree }, run) // a leftover of an interrupted run
   // Before the checkout exists, so the plugin never reports its own worktree as the user's uncommitted work.
   const { dirty, summary } = await dirtyPaths(project, run)
@@ -231,7 +231,7 @@ export async function rebaseTask(w: Pick<TaskWorktree, "worktree">, integrationB
   const base = (await run("git", ["merge-base", "HEAD", integrationBranch], { cwd: w.worktree })).stdout.trim()
   const tip = (await run("git", ["rev-parse", integrationBranch], { cwd: w.worktree })).stdout.trim()
   if (base === tip) return { ok: true, moved: false }
-  const rebased = await run("git", ["-c", "user.name=jev-micromanager", "-c", "user.email=jev-micromanager@localhost", "rebase", "-q", integrationBranch], { cwd: w.worktree })
+  const rebased = await run("git", ["-c", "user.name=micromanager", "-c", "user.email=micromanager@localhost", "rebase", "-q", integrationBranch], { cwd: w.worktree })
   if (rebased.code === 0) return { ok: true, moved: true }
   const files = (await run("git", ["diff", "--name-only", "--diff-filter=U"], { cwd: w.worktree })).stdout.trim().split("\n").filter(Boolean)
   await run("git", ["rebase", "--abort"], { cwd: w.worktree })

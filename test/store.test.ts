@@ -1,13 +1,13 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 
 import { matchShortcut, resolvePolicy, validatePolicies } from "../src/policy.ts"
 import { newJob } from "../src/state.ts"
-import { excludeFromGit, jobId, listJobs, loadJob, reconcileJob, saveJob, saveNote } from "../src/store.ts"
+import { excludeFromGit, jobId, LEGACY_DIR, listJobs, loadJob, reconcileJob, saveJob, saveNote, stateDir } from "../src/store.ts"
 
 test("jobs round-trip through their file, newest first", () => {
   const project = mkdtempSync(join(tmpdir(), "jd-store-"))
@@ -29,7 +29,7 @@ test("the state directory is excluded from git once, and only in a repository", 
     assert.equal(excludeFromGit(project), true)
     assert.equal(excludeFromGit(project), true)
     const lines = readFileSync(join(project, ".git", "info", "exclude"), "utf8").split("\n")
-    assert.equal(lines.filter((l) => l === ".jev-micromanager/").length, 1)
+    assert.equal(lines.filter((l) => l === ".micromanager/").length, 1)
   } finally {
     rmSync(project, { recursive: true, force: true })
   }
@@ -44,11 +44,11 @@ test("the exclude file of the repository is found when the project is a subdirec
     mkdirSync(project, { recursive: true })
     assert.equal(excludeFromGit(project), true)
     const exclude = readFileSync(join(root, ".git", "info", "exclude"), "utf8")
-    assert.match(exclude, /^\.jev-micromanager\/$/m)
+    assert.match(exclude, /^\.micromanager\/$/m)
     assert.match(exclude, /^\.opencode\/memory\/$/m)
     assert.equal(excludeFromGit(project), true, "idempotent")
     const lines = readFileSync(join(root, ".git", "info", "exclude"), "utf8").split("\n")
-    assert.equal(lines.filter((l) => l === ".jev-micromanager/").length, 1)
+    assert.equal(lines.filter((l) => l === ".micromanager/").length, 1)
     assert.equal(lines.filter((l) => l === ".opencode/memory/").length, 1)
   } finally {
     rmSync(root, { recursive: true, force: true })
@@ -66,7 +66,7 @@ test("the exclude file of a worktree checkout is the main repository's", () => {
     const wt = join(root, "wt")
     execFileSync("git", ["-C", root, "worktree", "add", "-q", wt])
     assert.equal(excludeFromGit(wt), true)
-    assert.match(readFileSync(join(root, ".git", "info", "exclude"), "utf8"), /^\.jev-micromanager\/$/m)
+    assert.match(readFileSync(join(root, ".git", "info", "exclude"), "utf8"), /^\.micromanager\/$/m)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -76,11 +76,28 @@ test("a corrupt job file is skipped and the good ones are still listed", () => {
   const project = mkdtempSync(join(tmpdir(), "jd-corrupt-"))
   try {
     saveJob(project, newJob("job-a", "first", new Date("2026-10-04T10:00:00Z")))
-    writeFileSync(join(project, ".jev-micromanager", "jobs", "job-broken.json"), "{ half a fi")
+    writeFileSync(join(project, ".micromanager", "jobs", "job-broken.json"), "{ half a fi")
     assert.deepEqual(listJobs(project).map((j) => j.id), ["job-a"])
     assert.equal(loadJob(project, "job-broken"), undefined)
   } finally {
     rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test("a project from before the rename keeps its .jev-micromanager directory; a new one gets .micromanager", () => {
+  const old = mkdtempSync(join(tmpdir(), "jd-legacy-"))
+  const fresh = mkdtempSync(join(tmpdir(), "jd-fresh-"))
+  try {
+    mkdirSync(join(old, LEGACY_DIR, "jobs"), { recursive: true })
+    saveJob(old, newJob("job-old", "goal"))
+    assert.ok(existsSync(join(old, ".jev-micromanager", "jobs", "job-old.json")), "its jobs stay where its worktrees are")
+    assert.deepEqual(listJobs(old).map((j) => j.id), ["job-old"])
+    assert.equal(stateDir(fresh), ".micromanager")
+    saveJob(fresh, newJob("job-new", "goal"))
+    assert.ok(existsSync(join(fresh, ".micromanager", "jobs", "job-new.json")))
+  } finally {
+    rmSync(old, { recursive: true, force: true })
+    rmSync(fresh, { recursive: true, force: true })
   }
 })
 

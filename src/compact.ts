@@ -50,7 +50,7 @@ export const DEFAULT_COMPACT: CompactOptions = { keepTurns: 2, minChars: 800, st
 const valueOf = (p: Part) => (typeof p.result?.value === "string" ? p.result.value : p.result?.value === undefined ? "" : JSON.stringify(p.result.value))
 
 export function stub(c: Pick<Candidate, "tool" | "input" | "size">): string {
-  return `[jev-micromanager: this earlier ${c.tool} result (${c.size} characters; ${c.input.slice(0, 120)}) was dropped from your context, as it is no longer needed; call the tool again if you need it]`
+  return `[micromanager: this earlier ${c.tool} result (${c.size} characters; ${c.input.slice(0, 120)}) was dropped from your context, as it is no longer needed; call the tool again if you need it]`
 }
 
 // Old, large tool results, with their call's input and their age in assistant turns.
@@ -70,7 +70,7 @@ export function candidates(messages: readonly Message[], o: CompactOptions = DEF
   for (const { part, at } of seen) {
     const text = valueOf(part)
     const age = assistantTurns - at
-    if (age < o.keepTurns || text.length < o.minChars || text.startsWith("[jev-micromanager: this earlier")) continue
+    if (age < o.keepTurns || text.length < o.minChars || text.startsWith("[micromanager: this earlier")) continue
     out.push({ id: part.id!, tool: part.name ?? "tool", input: inputs.get(part.id!) ?? "", size: text.length, age, head: text.slice(0, 400) })
   }
   return out

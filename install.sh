@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install jev-micromanager into OpenCode (a symlink, so the repo stays the source), or remove it:
-#   ./install.sh            link src/plugin.ts into ~/.config/opencode/plugins/jev-micromanager.ts, and write the TUI
+# Install micromanager into OpenCode (a symlink, so the repo stays the source), or remove it:
+#   ./install.sh            link src/plugin.ts into ~/.config/opencode/plugins/micromanager.ts, and write the TUI
 #                           package ~/.config/opencode/micromanager-tui/ (job progress in the TUI, src/tui.tsx) into
 #                           the "plugins" of ~/.config/opencode/cli.json
 #   ./install.sh --remove   remove both
@@ -10,7 +10,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 PLUGINS="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"
-LINK="$PLUGINS/jev-micromanager.ts"
+LINK="$PLUGINS/micromanager.ts"
 
 SKILLS="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills"
 CLI="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/cli.json"
@@ -70,6 +70,11 @@ if [[ "${1:-}" == "--remove" ]]; then
 fi
 
 mkdir -p "$PLUGINS"
+# The link's name before 2026-10-19: two links to the same plugin would load it twice.
+OLD_LINK="$PLUGINS/jev-micromanager.ts"
+if [[ -L "$OLD_LINK" && "$(readlink -f "$OLD_LINK")" == "$(readlink -f "$REPO/src/plugin.ts")" ]]; then
+  rm "$OLD_LINK" && echo "removed the old link $OLD_LINK"
+fi
 if [[ -e "$LINK" && ! -L "$LINK" ]]; then
   echo "$LINK exists and is not our link; not touching it" >&2
   exit 1

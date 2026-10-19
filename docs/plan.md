@@ -1,4 +1,4 @@
-# jev-micromanager: an OpenCode orchestrator driven by Jev
+# micromanager: an OpenCode orchestrator driven by Jev
 
 Status (2026-10-04): Phase 0 (spike) and Phase 1 done, and Jev on permission requests works (part of the old
 Phases 2 and 3). The design was reworked on 2026-10-03/04: [design.md](design.md) is now the design and
@@ -28,7 +28,7 @@ the oc-voice project (session board, permission phrasing, Jev client) are reused
 dependencies.
 
 Decisions (user, 2026-10-01):
-- **Own OpenCode v2 plugin** in its own repo (`~/Fun/Projects/Repos/jev-micromanager`), not OmO itself.
+- **Own OpenCode v2 plugin** in its own repo (`~/Fun/Projects/Repos/micromanager`), not OmO itself.
 - **Models: OpenCode Go only**, for now three: glm-5.3-flash, qwen3.8-flash, deepseek-v4.1-flash (local
   models later).
 - **Worker starts are confirmed by the user** for now (each worker individually, in the TUI); Jev's
@@ -187,7 +187,7 @@ Sources are listed at the end of design.md.
 
 ## Phase A results (spikes against private standalone servers, opencode 2.0.18, 2026-10-04)
 **Setup.**
-- A spike plugin in its own `XDG_CONFIG_HOME`, so neither the jev-micromanager plugin nor the user's hub was
+- A spike plugin in its own `XDG_CONFIG_HOME`, so neither the micromanager plugin nor the user's hub was
   touched.
 - `opencode run --standalone` in a throwaway git project.
 - Every session was deleted afterwards.
@@ -702,7 +702,7 @@ its child sessions, and OpenCode wakes it with each worker's report.
    the checks run in the worktree. A failure goes back to the worker with the output; a pass commits, and the merge
    train rebases onto the session branch (checks again when it moved) and fast-forwards it. A conflict goes back to
    the worker.
-5. On the merge, a quiet note "[jev-micromanager] T… merged into …" goes into the micromanager's session; OpenCode's
+5. On the merge, a quiet note "[micromanager] T… merged into …" goes into the micromanager's session; OpenCode's
    notification with the worker's report follows and wakes it.
 6. When the worker's run ends (`session.wait`, started from its first context hook): a merged writer's worktree is
    removed; a writer that did not get through `finish_task` (or was stopped by the watchdog) is reported, its change

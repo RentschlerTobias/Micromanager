@@ -39,7 +39,7 @@ test("Jev decides per result; dropped ones become a stub and stay dropped in lat
   const msgs = history([{ tool: "list_tasks", size: 9000 }, { tool: "list_tasks", size: 9000 }, { tool: "read", size: 100 }, { tool: "read", size: 100 }])
   const r = await comp.apply("ses_1", msgs)
   assert.equal(r.asked, 2)
-  assert.match(value(msgs, "c0"), /^\[jev-micromanager: this earlier list_tasks result \(9000 characters; \{"id":"T0"\}\) was dropped/)
+  assert.match(value(msgs, "c0"), /^\[micromanager: this earlier list_tasks result \(9000 characters; \{"id":"T0"\}\) was dropped/)
   assert.match(value(msgs, "c1"), /^R1 x/, "the one Jev called needed stays")
   assert.ok(r.removed > 8000)
   // the next turn rebuilds the history from scratch: T0 is dropped again without asking, T1 is not asked again yet

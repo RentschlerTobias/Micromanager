@@ -111,7 +111,7 @@ test("a delegation from another agent produces the same task and worktree as the
 })
 
 test("an unclaimed child of a micromanager session cannot write; every other session can", () => {
-  const checkout = "/home/t1dde/Fun/Projects/Repos/jev-micromanager"
+  const checkout = "/home/t1dde/Fun/Projects/Repos/micromanager"
   // The live run: a child of the micromanager session with no task, no worktree, no claim and no move, writing into
   // the user's checkout while nothing complained.
   const unclaimed: ChildSession = { sessionID: "ses_child", parent: "ses_micro", parentIsMicromanager: true, job: "job-1", directory: checkout }

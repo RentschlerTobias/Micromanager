@@ -1,6 +1,6 @@
-// ~/.config/opencode/jev-micromanager.jsonc: optional overrides of the routing (JSON with // comments).
+// ~/.config/opencode/micromanager.jsonc: optional overrides of the routing (JSON with // comments).
 
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -11,9 +11,12 @@ import { DEFAULT_ROUTING, type Routing } from "./routing.ts"
 import { roleById, type RoleId } from "./roles.ts"
 import type { NotifyMode } from "./scheduler.ts"
 
+// The name before 2026-10-19 (jev-micromanager.jsonc) is still read while the new one does not exist.
 export function configPath(): string {
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config")
-  return join(base, "opencode", "jev-micromanager.jsonc")
+  const path = join(base, "opencode", "micromanager.jsonc")
+  const old = join(base, "opencode", "jev-micromanager.jsonc")
+  return !existsSync(path) && existsSync(old) ? old : path
 }
 
 export function stripComments(text: string): string {

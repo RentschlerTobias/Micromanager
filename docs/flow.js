@@ -1,8 +1,8 @@
-// jev-micromanager flow: how the plugin routes a sub-agent call and how it decides a permission request.
+// micromanager flow: how the plugin routes a sub-agent call and how it decides a permission request.
 //
 // Two lanes, like the oc-voice flow page: the decision chart is static (it mirrors src/routing.ts and
 // src/decide.ts); the highlight and the detail panel come from the decision journal
-// (${XDG_STATE_HOME:-~/.local/state}/jev-micromanager/decisions.jsonl), one JSON object per line.
+// (${XDG_STATE_HOME:-~/.local/state}/micromanager/decisions.jsonl), one JSON object per line.
 "use strict";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -25,7 +25,7 @@ const NODES = {
   model: { t: "Model chosen", s: "vision · other family · first", x: 1060, y: 110, cat: "route",
     e: "The role's first model, the vision model for image input, or — for a review — the first model of another family than the worker's." },
   worker: { t: "Worker runs", s: "foreground session", x: 1300, y: 110, cat: "entry",
-    e: "The sub-agent session runs on the chosen model with the role's rights and the prompt carrying a [jev-micromanager] header." },
+    e: "The sub-agent session runs on the chosen model with the role's rights and the prompt carrying a [micromanager] header." },
 
   // permission decision (src/decide.ts, src/plugin.ts) — the order is decide()'s own, top to bottom.
   ask: { t: "Permission ask", s: "effect = ask · our agents", x: 100, y: 500, cat: "entry",
@@ -230,7 +230,7 @@ function label(e) {
 }
 
 const said = (e) => {
-  if (e.kind === "routing") return `${e.requested ?? e.role}: ${(e.prompt ?? "").replace("[jev-micromanager]", "").trim()}`;
+  if (e.kind === "routing") return `${e.requested ?? e.role}: ${(e.prompt ?? "").replace("[micromanager]", "").trim()}`;
   if (!e.charted) return `${e.kind}${e.signal ? ` · ${e.signal}` : ""}${e.reason ? ` · ${e.reason}` : ""}`;
   return `${e.agent ?? "?"} · ${e.action ?? "?"}`;
 };
@@ -373,7 +373,7 @@ function renderDetail(e) {
     return;
   }
   if (e.kind === "routing") {
-    parts.push(step(++n, "entry", "Delegated", `<div class="big">${esc(truncate((e.prompt ?? "").replace("[jev-micromanager]", "").trim(), 400))}</div>
+    parts.push(step(++n, "entry", "Delegated", `<div class="big">${esc(truncate((e.prompt ?? "").replace("[micromanager]", "").trim(), 400))}</div>
       <div class="kv">${esc(e.agent ?? "micromanager")} → ${esc(e.requested ?? e.role)}</div>`));
     parts.push(step(++n, "route", "Routed", `<div>role <b>${esc(e.role)}</b> → ${chip(short(e.model), "route")}</div>
       <div class="kv">${esc(e.reason ?? "")}</div>`));

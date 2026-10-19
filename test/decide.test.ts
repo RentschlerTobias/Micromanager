@@ -281,9 +281,9 @@ test("a task names a path for reading, not for writing", async () => {
 
 test("outside the project: the job's own area is allowed, an unvouched path is the user's", async () => {
   const jev = fakeJev(decision("allow", 1, 0, 0))
-  const inArea = await decide(jev, req("external_directory", ["/p/.jev-micromanager/worktrees/job-a/src/x.ts"], "explorer"))
+  const inArea = await decide(jev, req("external_directory", ["/p/.micromanager/worktrees/job-a/src/x.ts"], "explorer"))
   assert.deepEqual([inArea.verdict, inArea.reason], ["allow", "inside the job's own worktrees"])
-  const notArea = await decide(jev, req("external_directory", ["/p/.jev-micromanager/worktrees-old/src/x.ts"], "explorer"))
+  const notArea = await decide(jev, req("external_directory", ["/p/.micromanager/worktrees-old/src/x.ts"], "explorer"))
   assert.equal(notArea.verdict, "user", "a sibling that shares the name is not the area")
   const task = "summarise /data/notes/README.md"
   assert.equal((await decide(jev, req("external_directory", ["/data/notes"], "explorer", task))).verdict, "allow")
@@ -404,7 +404,7 @@ test("allowOutside is validated like every other setting, and a bad value says w
   const { tmpdir } = await import("node:os")
   const { join } = await import("node:path")
   const dir = mkdtempSync(`${tmpdir()}/mm-config-`)
-  const path = join(dir, "jev-micromanager.jsonc")
+  const path = join(dir, "micromanager.jsonc")
   writeFileSync(path, '{ "allowOutside": ["relative/path"] } // a hand-written config')
   const bad = loadSettings(path)
   assert.match(String(bad.error), /allowOutside entries must be absolute/)

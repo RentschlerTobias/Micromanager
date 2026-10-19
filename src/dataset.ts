@@ -80,7 +80,7 @@ export function openJevRows(entries: readonly Entry[]): Record<string, unknown>[
       id: `${row.entry.id}/${row.qid}`,
       group_id: group,
       split: splitOf(group),
-      source: "jev-micromanager",
+      source: "micromanager",
       state: row.entry.state,
       question: row.question.instructions,
       kind: row.question.type,

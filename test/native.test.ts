@@ -174,7 +174,7 @@ test("a writer works in its own worktree; failing checks go back to it, passing 
   const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "add add.js", prompt: "Create add.js.\nFiles: add.js\nChecks: node -e \"require('./add.js')\"" }, MODEL)
   assert.equal(d.task.id, "T1")
   assert.equal(d.task.status, "running")
-  assert.match(d.prompt, /^\[jev-micromanager\] task T1 · job job-\S+ · role code · model opencode-go\/glm-5.3-flash\n\nCreate add.js\./)
+  assert.match(d.prompt, /^\[micromanager\] task T1 · job job-\S+ · role code · model opencode-go\/glm-5.3-flash\n\nCreate add.js\./)
   assert.match(d.prompt, /Files you may change: add\.js/)
   assert.match(d.prompt, /Checks the plugin runs when you finish: node -e "require/)
   assert.match(d.prompt, /call finish_task/)
@@ -182,7 +182,7 @@ test("a writer works in its own worktree; failing checks go back to it, passing 
 
   assert.equal(native.claim("ses_w1", d.prompt), undefined, "only a child's first prompt claims")
   const claimed = native.claim("ses_w1", child(d.prompt))!
-  assert.equal(claimed.dir, join(project, ".jev-micromanager", "worktrees", `${d.job.id}--T1`))
+  assert.equal(claimed.dir, join(project, ".micromanager", "worktrees", `${d.job.id}--T1`))
   assert.equal(claimed.parent, "ses_mm")
   assert.equal(git(claimed.dir, "branch", "--show-current"), `jev/${d.job.id}--T1`)
   assert.equal(native.claim("ses_w2", child(d.prompt)), undefined, "a task is claimed once")
@@ -202,7 +202,7 @@ test("a writer works in its own worktree; failing checks go back to it, passing 
   writeFileSync(join(claimed.dir, "add.js"), "export const add = (a, b) => a + b\n")
   const green = await native.finish("ses_w1", "wrote add.js")
   assert.match(green.text, new RegExp(`^Merged into jev/${d.job.id} as [0-9a-f]+; checks passed: node -e "require\\(\\'\\./add\\.js\\'\\)"\\. Now end with your short report\\.$`))
-  assert.match(green.note!, /^\[jev-micromanager\] T1 add add\.js: merged into jev\/\S+ \([0-9a-f]+\); checks passed/)
+  assert.match(green.note!, /^\[micromanager\] T1 add add\.js: merged into jev\/\S+ \([0-9a-f]+\); checks passed/)
   assert.equal(green.parent, "ses_mm")
   assert.equal(readFileSync(join(d.job.integrationWorktree!, "add.js"), "utf8"), "export const add = (a, b) => a + b\n")
   assert.ok(!existsSync(join(project, "add.js")), "the user's checkout is untouched")
@@ -415,7 +415,7 @@ test("a writer that ends without finishing is reported; continued, it finishes i
   const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "a", prompt: "x\nFiles: a.js\nChecks: test -f a.js" }, MODEL)
   const dir = native.claim("ses_w", child(d.prompt))!.dir
   const end = await native.ended("ses_w", "loop: the same edit 5 times")
-  assert.match(end!.note!, /^\[jev-micromanager\] T1 a: its worker ended \(loop: the same edit 5 times\) without passing finish_task, so nothing was checked or merged; its change is still in \S+\. Continue it with the subagent tool and sessionID ses_w/)
+  assert.match(end!.note!, /^\[micromanager\] T1 a: its worker ended \(loop: the same edit 5 times\) without passing finish_task, so nothing was checked or merged; its change is still in \S+\. Continue it with the subagent tool and sessionID ses_w/)
   assert.ok(existsSync(dir))
   assert.equal((await native.resume("ses_w"))!.id, "T1")
   writeFileSync(join(dir, "a.js"), "a\n")

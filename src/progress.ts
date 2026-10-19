@@ -7,7 +7,7 @@
 
 import { detail, ICON } from "./board.ts"
 import type { Job, Task, TaskStatus } from "./state.ts"
-import { DIR } from "./store.ts"
+import { DIR, LEGACY_DIR } from "./store.ts"
 
 const ENDED: readonly Job["phase"][] = ["done", "stopped", "failed"]
 const RUNNING: readonly TaskStatus[] = ["running", "gating", "reviewing", "fixing"]
@@ -34,10 +34,11 @@ export interface JobView {
   readonly rows: readonly TaskRow[]
 }
 
-// The project a session works in: a worker's worktree lies inside the project, under .jev-micromanager/worktrees/.
+// The project a session works in: a worker's worktree lies inside the project, under .micromanager/worktrees/ (or the
+// directory's old name, in a project from before the rename).
 export function projectOf(directory: string): string {
-  const at = directory.indexOf(`/${DIR}/`)
-  return at === -1 ? directory : directory.slice(0, at)
+  const at = [DIR, LEGACY_DIR].map((dir) => directory.indexOf(`/${dir}/`)).find((i) => i !== -1)
+  return at === undefined ? directory : directory.slice(0, at)
 }
 
 const worksOn = (task: Task, sessionID: string) => task.session === sessionID || (task.sessions ?? []).includes(sessionID)

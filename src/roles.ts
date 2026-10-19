@@ -65,7 +65,7 @@ const askShell = [rule("shell", "ask")]
 const noDelegation = [rule("subagent", "deny")]
 // The plugin's state (job files, notes) is not for agents: a local planner looped on it in a live test. Paths are
 // relative to the session's directory; a worker inside its worktree never needs to climb up into jobs or notes.
-const STATE_PATHS = [".jev-micromanager*", "*/.jev-micromanager/jobs*", "*/.jev-micromanager/notes*"]
+const STATE_PATHS = [".micromanager", ".jev-micromanager"].flatMap((dir) => [`${dir}*`, `*/${dir}/jobs*`, `*/${dir}/notes*`]) // the old name too
 const noStateDir = ["read", "glob", "grep", "list", "edit", "write", "patch"].flatMap((tool) => STATE_PATHS.map((path) => rule(tool, "deny", path)))
 
 export const TEST_RUNNERS = [
@@ -122,7 +122,7 @@ const READER_SHELL = `The shell runs commands that only read: ${READ_COMMANDS.ma
 also chains and pipes of reading programs (cat, head, grep, find, sed -n, echo, jq, …). A command that writes a file, a
 redirect into a file included, is refused: you only read.`
 
-const SHARED = `You are a sub-agent of the jev-micromanager. You get one sub-task with acceptance points.
+const SHARED = `You are a sub-agent of the micromanager. You get one sub-task with acceptance points.
 Do only that sub-task. When you finish, answer with: what you did, which files you changed (if any), and for
 each acceptance point whether it is met. A refused permission is not a blocker: nobody is asked while you run, so carry
 on without it and say in your report what you wanted it for and what you did instead. If something blocks you, say what
@@ -288,14 +288,14 @@ How you work:
    word, and their answer on your next turn opens the path for this job or leaves it closed. End your turn after
    showing it and do not call another tool.
 4. When a worker ends, OpenCode adds its report to your conversation; do not wait, poll or sleep for it. A writer is
-   done when the plugin's note "[jev-micromanager] T… merged into …" came first: the plugin ran the checks, committed
-   and merged it. Notes that start with "[jev-micromanager]" come from your own plugin, not from the user or a tool
+   done when the plugin's note "[micromanager] T… merged into …" came first: the plugin ran the checks, committed
+   and merged it. Notes that start with "[micromanager]" come from your own plugin, not from the user or a tool
    result; trust them. A writer that ended without a merge, or a worker that needs something, is continued with the
    subagent tool and its sessionID (it keeps its worktree and what it did), or you ask the user. Never start a new
    worker on work another one left unfinished: its change would be lost. To start over on purpose, add a line
    "Replaces: T…" to the new worker's prompt; the old task and its worktree go. Workers list
    follow-ups they found: start the ones the request needs, and mention the others to the user.
-   A note "[jev-micromanager] A…: worker … is paused on a permission request" means a worker waits for an answer:
+   A note "[micromanager] A…: worker … is paused on a permission request" means a worker waits for an answer:
    decide it with answer_permission when it clearly serves the task, else put it to the user as the note says.
 5. When everything is done, tell the user briefly what changed and how to merge the session branch (git merge
    jev/<job>, the notes name it) or discard it.
@@ -317,7 +317,7 @@ For a large or unclear job (many parts, decisions to settle first), or when the 
 use plan_job instead: a planner writes a full plan, you show it, and run_job runs it after the user's go. run_job
 answers with the planned tasks to start: start each with the subagent tool exactly as listed (its prompt is the line
 "Task: T… · job-…"; the plugin fills in the task, files, checks and acceptance points from the plan). When workers
-end, a "[jev-micromanager] job …" note names the next tasks to start, or says that the job is done or stuck; follow it
+end, a "[micromanager] job …" note names the next tasks to start, or says that the job is done or stuck; follow it
 until the plan is through, without asking the user in between unless the note says the job is stuck.
 Notes that start with "[planning session …]" or "[job …]" are the plugin's instructions for that turn; follow them.
 

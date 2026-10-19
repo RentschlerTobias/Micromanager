@@ -46,7 +46,7 @@ export function detail(task: Task, now: number): string {
 export function board(job: Job, width = 110, now = Date.now(), plugin?: string): string {
   const done = job.tasks.filter((t) => (t.status === "merged" || t.status === "passed") && !t.undone).length
   const head = [
-    `┌─ jev-micromanager · ${job.id} · ${job.rolling ? "session tasks" : "planned job"} · ${job.phase}${job.resumePhase ? ` (from ${job.resumePhase})` : ""}`,
+    `┌─ micromanager · ${job.id} · ${job.rolling ? "session tasks" : "planned job"} · ${job.phase}${job.resumePhase ? ` (from ${job.resumePhase})` : ""}`,
     `│  branch ${job.integrationBranch ?? "-"}${plugin ? ` · plugin ${plugin}` : ""} · ${done}/${job.tasks.length} done · tokens ${k(job.counters.tokens)} · requests ${job.counters.requests ?? 0}${job.counters.cost ? ` · $${job.counters.cost.toFixed(2)}` : ""}`,
     `├${"─".repeat(Math.min(width, 100))}`,
   ]

@@ -12,6 +12,7 @@ const job = (id: string, extra: Partial<Job> = {}): Job => ({ ...newJob(id, "goa
 
 test("a worker's worktree belongs to the project it lies in", () => {
   assert.equal(projectOf("/home/u/tutorials/.jev-micromanager/worktrees/job-1--T3/reinforcementLearning"), "/home/u/tutorials")
+  assert.equal(projectOf("/home/u/tutorials/.micromanager/worktrees/job-1--T3"), "/home/u/tutorials")
   assert.equal(projectOf("/home/u/tutorials"), "/home/u/tutorials")
 })
 

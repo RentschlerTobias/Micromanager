@@ -39,7 +39,7 @@ export interface Routed {
   readonly skipped?: readonly string[]
 }
 
-export const HEADER = "[jev-micromanager]"
+export const HEADER = "[micromanager]"
 
 // The role a call delegates to, when it delegates to one of this plugin's own role agents; undefined otherwise.
 //

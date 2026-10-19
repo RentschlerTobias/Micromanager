@@ -1,4 +1,4 @@
-# jev-micromanager design: job state, planning session, Jev's decision tree
+# micromanager design: job state, planning session, Jev's decision tree
 
 Status (2026-10-04): design agreed, Phase A spikes done (§17), extended the same day by local vs cloud routing, censored vs uncensored
 guards, decision backends (cloud Jev or local GLiNER) and user overrides (§19–§22). Implementation follows in the phases listed in [plan.md](plan.md). The flow
@@ -771,7 +771,7 @@ harness retried such runs; the plugin itself is not involved.
 
 Every local model is configured with a 16k context.
 
-**Registry.** `models` in `jev-micromanager.jsonc`. By default it is generated from the providers in `opencode.json`,
+**Registry.** `models` in `micromanager.jsonc`. By default it is generated from the providers in `opencode.json`,
 with fields added by hand. One entry per model:
 - `id`, `provider`;
 - `location` (local | cloud), `device` (cuda | igpu | npu | cloud);

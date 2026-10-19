@@ -1313,7 +1313,7 @@ export class Runner {
   // OpenCode's eyes. The metadata names it instead, for the clients that list sessions: oc-voice treats a session with
   // a parent there as a sub-agent and does not announce it as one of the user's own.
   #origin(job: Job, task?: Task): Record<string, unknown> {
-    return this.#d.parentID ? { metadata: { jevMicromanager: { parent: this.#d.parentID, job: job.id, ...(task ? { task: task.id } : {}) } } } : {}
+    return this.#d.parentID ? { metadata: { micromanager: { parent: this.#d.parentID, job: job.id, ...(task ? { task: task.id } : {}) } } } : {}
   }
 
   async #plannerSession(job: Job, model: string): Promise<{ id: string }> {
@@ -1465,7 +1465,7 @@ export function taskReport(job: Job, task: Task): string {
     task.status === "merged" && task.summary ? `  report: ${task.summary.replace(/\s+/g, " ").slice(-400)}` : "",
     follow.length ? `  follow-ups the worker found (yours to decide):\n${follow.join("\n")}` : "",
     task.sessions?.length ? `  sessions: ${task.sessions.join(", ")} (open one with: opencode -s <id>)` : "",
-    `  notes: .jev-micromanager/notes/${job.id}/${task.id}.md`,
+    `  notes: notes/${job.id}/${task.id}.md in the project's .micromanager directory`,
   ].filter(Boolean).join("\n")
 }
 

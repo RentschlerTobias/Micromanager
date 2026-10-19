@@ -1,10 +1,10 @@
 ---
 name: receiving-code-review
-description: Use when a jev-micromanager fix round brings review findings, before changing anything - requires checking each finding against the code, not blind implementation or performative agreement.
+description: Use when a micromanager fix round brings review findings, before changing anything - requires checking each finding against the code, not blind implementation or performative agreement.
 license: MIT
 metadata:
   source: https://github.com/obra/superpowers/blob/8ca22dba9a94f28898bbce59f2537ff4d87c747d/skills/receiving-code-review/SKILL.md
-  adapted: for a jev-micromanager worker; findings come from a reviewer of another model family through the plugin
+  adapted: for a micromanager worker; findings come from a reviewer of another model family through the plugin
 ---
 
 # Receiving Code Review

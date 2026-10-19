@@ -18,14 +18,22 @@ export {
   type ReconcileResult,
 } from "./state.ts"
 
-export const DIR = ".jev-micromanager"
+export const DIR = ".micromanager"
+// The directory's name before 2026-10-19. A project that has it keeps using it: its jobs, notes and git worktrees live
+// there, and moving a worktree under a running worker would pull the directory out from under it.
+export const LEGACY_DIR = ".jev-micromanager"
+
+// The project's state directory: the old one while the project has it and not the new one.
+export function stateDir(project: string): string {
+  return existsSync(join(project, LEGACY_DIR)) && !existsSync(join(project, DIR)) ? LEGACY_DIR : DIR
+}
 
 export function jobsDir(project: string): string {
-  return join(project, DIR, "jobs")
+  return join(project, stateDir(project), "jobs")
 }
 
 export function notesDir(project: string, jobId: string): string {
-  return join(project, DIR, "notes", jobId)
+  return join(project, stateDir(project), "notes", jobId)
 }
 
 function atomicWrite(path: string, text: string): void {
@@ -65,7 +73,7 @@ export function excludeFromGit(project: string): boolean {
   // atomicWrite creates the directory: a bare or hand-made repo can lack .git/info entirely.
   const exclude = join(common, "info", "exclude")
   let current = existsSync(exclude) ? readFileSync(exclude, "utf8") : ""
-  for (const entry of [`${DIR}/`, ".opencode/memory/"]) {
+  for (const entry of [`${stateDir(project)}/`, ".opencode/memory/"]) {
     if (current.split("\n").some((line) => line.trim() === entry || line.trim() === entry.slice(0, -1))) continue
     current = `${current}${current && !current.endsWith("\n") ? "\n" : ""}${entry}\n`
     atomicWrite(exclude, current)

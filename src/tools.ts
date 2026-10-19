@@ -89,7 +89,7 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
   draft.add({
     id: "run_job",
     name: "run_job",
-    description: "Run a planned job after the user said go, or resume a paused one. Takes the job id from plan_job; note is the user's answer when the job stopped for them (their words, or empty). Answers with the planned tasks to start now: start each with the subagent tool exactly as listed, in one message. Later [jev-micromanager] job notes name the next ones as workers end; do not wait or poll.",
+    description: "Run a planned job after the user said go, or resume a paused one. Takes the job id from plan_job; note is the user's answer when the job stopped for them (their words, or empty). Answers with the planned tasks to start now: start each with the subagent tool exactly as listed, in one message. Later [micromanager] job notes name the next ones as workers end; do not wait or poll.",
     input: input("job", "note"),
     execute: guarded(([job, note], ctx) => handlers.run(job!, note!, ctx), "job", "note"),
   })
@@ -145,7 +145,7 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
   draft.add({
     id: "answer_permission",
     name: "answer_permission",
-    description: "Answer a worker's paused permission request (a note \"[jev-micromanager] A…: worker … is paused\" names it). id: the A-number. decision: once (let this call run), job (also this exact request for the rest of the job) or refuse. note: for a refusal, why, in one sentence for the worker. Allow only what clearly serves the worker's task and reaches nothing outside the project; anything else is the user's to decide, and a hard rule always is.",
+    description: "Answer a worker's paused permission request (a note \"[micromanager] A…: worker … is paused\" names it). id: the A-number. decision: once (let this call run), job (also this exact request for the rest of the job) or refuse. note: for a refusal, why, in one sentence for the worker. Allow only what clearly serves the worker's task and reaches nothing outside the project; anything else is the user's to decide, and a hard rule always is.",
     input: input("id", "decision", "note"),
     execute: guarded(([id, decision, note], ctx) => handlers.permission(id!, decision!, note!, ctx), "id", "decision", "note"),
   })

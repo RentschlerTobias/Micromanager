@@ -608,7 +608,7 @@ export class Native {
         stage(task, "gate", "fail", failed.map((f) => f.command).join(", "))
         moveTask(task, "blocked")
         task.summary = `its checks still fail after ${FIX_ROUNDS} fix round(s): ${failed.map((f) => f.command).join(", ")}`
-        const note = `[jev-micromanager] ${task.id} ${task.title}: its worker hit the limit of ${FIX_ROUNDS} fix rounds with the checks still failing (${failed.map((f) => f.command).join(", ")}). If the check is what is wrong -- a path that does not exist in the worktree, a command the gate refuses -- correct the task with steer_task and its sessionID ${session} rather than starting a new worker.`
+        const note = `[micromanager] ${task.id} ${task.title}: its worker hit the limit of ${FIX_ROUNDS} fix rounds with the checks still failing (${failed.map((f) => f.command).join(", ")}). If the check is what is wrong -- a path that does not exist in the worktree, a command the gate refuses -- correct the task with steer_task and its sessionID ${session} rather than starting a new worker.`
         saveJob(entry.project, job)
         return {
           text: `Your checks still fail after ${FIX_ROUNDS} rounds, so I am stopping here rather than spending the rest of your budget on them:\n\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}\n\nIf the work is done and the CHECK is what cannot be satisfied here, say so plainly in your report. If the work is not done, name what is missing.`,
@@ -632,7 +632,7 @@ export class Native {
       saveJob(entry.project, job)
       return {
         text: `Your checks pass, but you changed no file, so there is nothing to commit and nothing was verified. If the task was already done by someone else, say so in your report. Otherwise make the change the task asked for and call finish_task again.`,
-        note: `[jev-micromanager] ${task.id} ${task.title}: its checks passed but it changed no file, so nothing was committed. Continue it with the subagent tool and sessionID ${session}, or tell the user.`,
+        note: `[micromanager] ${task.id} ${task.title}: its checks passed but it changed no file, so nothing was committed. Continue it with the subagent tool and sessionID ${session}, or tell the user.`,
         parent: entry.parent,
       }
     }
@@ -650,7 +650,7 @@ export class Native {
     const checks = entry.checks.length ? `checks passed: ${entry.checks.join("; ")}` : "no checks were given"
     return {
       text: `Merged into ${job.integrationBranch}${head ? ` as ${head}` : " (nothing to commit)"}; ${checks}. Now end with your short report.`,
-      note: `[jev-micromanager] ${task.id} ${task.title}: merged into ${job.integrationBranch}${head ? ` (${head})` : ", nothing changed"}; ${checks}.`,
+      note: `[micromanager] ${task.id} ${task.title}: merged into ${job.integrationBranch}${head ? ` (${head})` : ", nothing changed"}; ${checks}.`,
       parent: entry.parent,
     }
   }
@@ -714,7 +714,7 @@ export class Native {
       await this.#dropWorktree(entry, task)
     } else {
       stage(task, "end", "fail", reason ?? "ended without finish_task")
-      note = `[jev-micromanager] ${task.id} ${task.title}: its worker ended${reason ? ` (${reason})` : ""} without passing finish_task, so nothing was checked or merged; its change is still in ${entry.dir}. Continue it with the subagent tool and sessionID ${session} to finish, or tell the user.`
+      note = `[micromanager] ${task.id} ${task.title}: its worker ended${reason ? ` (${reason})` : ""} without passing finish_task, so nothing was checked or merged; its change is still in ${entry.dir}. Continue it with the subagent tool and sessionID ${session} to finish, or tell the user.`
     }
     saveJob(entry.project, job)
     return { note, parent: entry.parent }
@@ -819,7 +819,7 @@ function dirtyNote(job: Job, writer: boolean): string {
 
 // "<job>/<task>" from a brief's header line.
 function tokenOf(text: string): string | undefined {
-  const m = text.match(/\[jev-micromanager\] task (T\d+) · job (\S+) ·/)
+  const m = text.match(/\[micromanager\] task (T\d+) · job (\S+) ·/)
   return m ? `${m[2]}/${m[1]}` : undefined
 }
 

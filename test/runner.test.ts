@@ -83,8 +83,8 @@ test("plan -> run: tasks pass their checks one by one and land as commits on the
   assert.match(log, /T2: write notes\nT1: write add.js\ninit/)
   assert.equal(existsSync(join(project, "add.js")), false, "the user's checkout is untouched")
   assert.equal(loadJob(project, job.id)?.phase, "integrate")
-  assert.match(readFileSync(join(project, ".git", "info", "exclude"), "utf8"), /\.jev-micromanager\//)
-  assert.match(readFileSync(join(project, ".jev-micromanager", "notes", job.id, "T1.md"), "utf8"), /test -f add.js \(exit 0\)/)
+  assert.match(readFileSync(join(project, ".git", "info", "exclude"), "utf8"), /\.micromanager\//)
+  assert.match(readFileSync(join(project, ".micromanager", "notes", job.id, "T1.md"), "utf8"), /test -f add.js \(exit 0\)/)
   // workers run inside the job's worktree, on the routed model, with their role's agent
   const worker = fake.created.find((c) => c.agent === "coder")!
   assert.equal((worker.location as { directory: string }).directory, done.integrationWorktree)
@@ -97,9 +97,9 @@ test("the planner and the workers name their micromanager in the metadata, becau
   const { job } = await r.plan("add an add function")
   await r.run(job.id)
   const planner = fake.created.find((c) => c.agent === "planner")!
-  assert.deepEqual(planner.metadata, { jevMicromanager: { parent: "ses_micro", job: job.id } })
+  assert.deepEqual(planner.metadata, { micromanager: { parent: "ses_micro", job: job.id } })
   const worker = fake.created.find((c) => c.agent === "coder")!
-  assert.deepEqual(worker.metadata, { jevMicromanager: { parent: "ses_micro", job: job.id, task: "T1" } })
+  assert.deepEqual(worker.metadata, { micromanager: { parent: "ses_micro", job: job.id, task: "T1" } })
   const alone = fakeSession({ worker: writeFiles })
   await runner(repo(), alone.api).plan("add an add function")
   assert.equal(alone.created[0]!.metadata, undefined, "no micromanager, nothing to name")

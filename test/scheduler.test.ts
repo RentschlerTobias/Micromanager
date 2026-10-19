@@ -93,10 +93,10 @@ test("the notifier batches progress quietly and wakes the micromanager with a tr
   n.progress("ses_1", "T2 started")
   assert.equal(sent.length, 0, "progress waits for the flush")
   await n.finished("ses_1", "job-1", "needs_user", "job job-1: ask_user\nwhy: T2 needs the user")
-  assert.deepEqual(sent.map(([, t, r]) => [t.split("\n")[0], r]), [["[jev-micromanager] progress:", false], ["[jev-micromanager] job needs you: job-1 (details in the plugin's system note)", true]])
+  assert.deepEqual(sent.map(([, t, r]) => [t.split("\n")[0], r]), [["[micromanager] progress:", false], ["[micromanager] job needs you: job-1 (details in the plugin's system note)", true]])
   assert.match(sent[0]![1], /- T1 passed\n- T2 started/)
   assert.match(notes[0]![1], /comes from your own plugin[\s\S]*why: T2 needs the user/)
-  assert.deepEqual(desktop, ["jev-micromanager: job needs you"], "per-task desktop notes only in tasks mode")
+  assert.deepEqual(desktop, ["micromanager: job needs you"], "per-task desktop notes only in tasks mode")
 })
 
 test("tasks mode adds a desktop note per task; off sends none", async () => {

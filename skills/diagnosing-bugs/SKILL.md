@@ -1,10 +1,10 @@
 ---
 name: diagnosing-bugs
-description: Diagnosis loop for hard bugs and performance regressions. Use when a jev-micromanager task is a bug with an unknown cause, or something is broken, throwing, failing or slow.
+description: Diagnosis loop for hard bugs and performance regressions. Use when a micromanager task is a bug with an unknown cause, or something is broken, throwing, failing or slow.
 license: MIT
 metadata:
   source: https://github.com/mattpocock/skills/blob/24fe0ef7737efae15c87225755e9f6f5965e4888/skills/engineering/diagnosing-bugs/SKILL.md
-  adapted: for a jev-micromanager worker; what it would ask the user goes into the report; no human-in-the-loop script
+  adapted: for a micromanager worker; what it would ask the user goes into the report; no human-in-the-loop script
 ---
 
 # Diagnosing Bugs

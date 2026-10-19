@@ -1,7 +1,7 @@
 # Third-party skills
 
 Adapted copies of MIT-licensed skills; each SKILL.md names its source file and commit in its frontmatter. The
-adaptations turn them into leaf skills for jev-micromanager workers: a worker does its own task, never starts other
+adaptations turn them into leaf skills for micromanager workers: a worker does its own task, never starts other
 agents, and puts what it would ask the user into its report.
 
 | Skill | Source |
