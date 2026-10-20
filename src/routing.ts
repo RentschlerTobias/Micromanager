@@ -22,6 +22,12 @@ export function guessNeeds(prompt: string): Needs {
   return { vision: IMAGE.test(prompt) }
 }
 
+// The user's picks from the TUI (src/config.ts loadPicks) over the config's routing: a picked role's pool replaces its
+// pool, a picked vision model the vision model.
+export function withPicks(base: Routing, picks: { readonly models: Routing["models"]; readonly vision?: string }): Routing {
+  return { models: { ...base.models, ...picks.models }, vision: picks.vision ?? base.vision }
+}
+
 export function chain(role: Role, routing: Routing = DEFAULT_ROUTING): readonly string[] {
   const models = routing.models[role.id]
   return models && models.length > 0 ? models : role.models

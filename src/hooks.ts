@@ -2,7 +2,7 @@
 // background (OpenCode notifies the micromanager when the worker ends; src/native.ts keeps writers in worktrees).
 
 import { chooseModel, guessNeeds, type Available, type Routing, type Spread } from "./routing.ts"
-import { MICROMANAGER, ROLES, roleByAgent, type Role } from "./roles.ts"
+import { MICROMANAGER, ROLES, roleByAgent, type Role, type RoleId } from "./roles.ts"
 
 export interface ToolCall {
   tool: string
@@ -32,7 +32,7 @@ export const DELEGATION_TOOL = "subagent"
 export const DELEGATION_TOOLS: readonly string[] = [DELEGATION_TOOL]
 
 export interface Routed {
-  readonly role: string
+  readonly role: RoleId
   readonly model: string
   readonly reason: string
   // The chain entries the host cannot run. Absent unless the catalog said so, so an ordinary delegation is unchanged.

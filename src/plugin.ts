@@ -7,7 +7,7 @@
 import { execFile } from "node:child_process"
 
 import { installAgents, type AgentDraft } from "./agents.ts"
-import { cloudRegistry, configPath, loadSettings } from "./config.ts"
+import { cloudRegistry, configPath, loadPicks, loadSettings } from "./config.ts"
 import { allowedOutside, decide, forbiddenOutside, forbiddenOutsideWhat, inJobArea, normalizeOutside, taskNamesPath, ALLOW_OUTSIDE_REASON, GRANT_OUTSIDE_REASON, REFUSED_OUTSIDE_REASON, type PermissionRequest } from "./decide.ts"
 import { injected, injectionScore } from "./gate.ts"
 import { backstop, DELEGATION_TOOLS, delegationRole, notRouted, resultText, rewriteResult, routeDelegation, unownedDelegation, type ChildSession, type ToolCall } from "./hooks.ts"
@@ -16,7 +16,7 @@ import { record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe, type Availability } from "./registry.ts"
-import { chooseModel, unknown as allAvailable, type Available } from "./routing.ts"
+import { chooseModel, unknown as allAvailable, withPicks, type Available } from "./routing.ts"
 import { family, MICROMANAGER, ROLES, roleByAgent, roleById, type Rule } from "./roles.ts"
 import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
@@ -723,6 +723,8 @@ export default {
     // every instance of the server, seeded from the journal's routing records of the week.
     const usage = (SHARED.usage ??= new Usage(seedFromJournal()))
     const goBudget = (model: string) => registry.find((m) => m.id === model)?.budget
+    // The pools the user picked in the TUI, read at each delegation: a pick holds from the next task on, no restart.
+    const routingNow = () => withPicks(routing, loadPicks())
     // The families a delegation must leave: a task started again ("Task: T…" of a task that ran before, or
     // "Replaces: T…") runs on another family than its failed attempt (the user, 2026-10-19).
     const failedFamilies = (sessionID: string, prompt: string): string[] => {
@@ -812,7 +814,10 @@ export default {
       // taken at its first entry — otherwise a renamed free model breaks every role at once (the user's question,
       // 2026-10-07).
       const avoidFamilies = resumed ? [] : failedFamilies(call.sessionID, asked)
-      const routed = await routeDelegation(call, routing, undefined, hostModels, { usage, budget: goBudget, avoidFamilies })
+      const picks = loadPicks()
+      const routed = await routeDelegation(call, withPicks(routing, picks), undefined, hostModels, { usage, budget: goBudget, avoidFamilies })
+      // Whether the pool was the user's own pick in the TUI, so the journal tells a pick from the default.
+      const picked = routed && (picks.models[routed.role] || (picks.vision && routed.model === picks.vision)) ? { picked: true } : {}
       if (routed?.skipped?.length) {
         record({
           kind: "routing",
@@ -867,6 +872,7 @@ export default {
         requested: String(call.input.agent ?? ""),
         model: routed.model,
         reason: routed.reason,
+        ...picked,
         prompt: String(call.input.prompt ?? "").slice(0, 300),
       })
       log("info", `${d.task.id} ${routed.role} -> ${routed.model} (${routed.reason})${d.task.worktree ? ` in ${d.task.worktree}` : ""}`)
@@ -1183,7 +1189,7 @@ export default {
     const helpers = new Helpers({
       session: ctx.session as unknown as SessionApi,
       caller: (sessionID) => native.writerOf(sessionID),
-      model: async (role) => (await chooseModel(role, { vision: false }, routing, undefined, hostModels, { usage, budget: goBudget })).model,
+      model: async (role) => (await chooseModel(role, { vision: false }, routingNow(), undefined, hostModels, { usage, budget: goBudget })).model,
       started: (helper, caller, dir, brief) => {
         SHARED.helperOf.set(helper, caller)
         runnerSessions.add(helper)

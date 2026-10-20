@@ -1,11 +1,15 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { parseRouting, stripComments } from "../src/config.ts"
+import { mkdtempSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+import { loadPicks, NO_PICKS, parsePicks, parseRouting, savePicks, stripComments } from "../src/config.ts"
 import { backstop, DELEGATION_TOOLS, delegationRole, HEADER, notRouted, routeDelegation, routeSubagentCall, unownedDelegation, type ChildSession } from "../src/hooks.ts"
 import { modelAvailability } from "../src/plugin.ts"
 import { family, MODELS, ROLES, roleById } from "../src/roles.ts"
-import { DEFAULT_ROUTING, chooseModel, guessNeeds } from "../src/routing.ts"
+import { DEFAULT_ROUTING, chooseModel, guessNeeds, withPicks } from "../src/routing.ts"
 
 
 test("a role's first model, images to the vision model, a review in another family", async () => {
@@ -165,6 +169,29 @@ test("the config overrides chains and rejects unknown roles or bad models", asyn
   assert.throws(() => parseRouting('{"models": {"coder": ["a/b"]}}'), /unknown role/)
   assert.throws(() => parseRouting('{"models": {"code": ["glm"]}}'), /provider\/model/)
   assert.equal(stripComments('{"url": "http://x//y"} // c'), '{"url": "http://x//y"} \n')
+})
+
+test("the TUI's picks replace a role's pool and the vision model, over the config's", async () => {
+  const config = parseRouting('{"models": {"code": ["opencode-go/deepseek-v4.1-flash"], "review": ["opencode-go/claude-haiku-5-5"]}}')
+  const routing = withPicks(config, { models: { code: [MODELS.mimo] }, vision: MODELS.glm })
+  assert.equal((await chooseModel(roleById("code")!, { vision: false }, routing)).model, MODELS.mimo, "the pick wins over the config")
+  assert.equal((await chooseModel(roleById("review")!, { vision: false }, routing)).model, MODELS.haiku, "an unpicked role keeps the config's pool")
+  assert.equal((await chooseModel(roleById("code")!, { vision: true }, routing)).model, MODELS.glm)
+  assert.deepEqual(withPicks(config, NO_PICKS), config)
+})
+
+test("the picks file: written whole, read again only when it changed, ignored when broken", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "mm-picks-")), "micromanager-models.json")
+  assert.deepEqual(loadPicks(path), NO_PICKS, "no file: no picks")
+  savePicks({ models: { code: [MODELS.glm, MODELS.mimo] } }, path)
+  assert.deepEqual(loadPicks(path).models.code, [MODELS.glm, MODELS.mimo])
+  savePicks({ models: { test: [MODELS.step] }, vision: MODELS.qwen }, path)
+  assert.deepEqual(loadPicks(path), { models: { test: [MODELS.step] }, vision: MODELS.qwen }, "a change is read")
+  writeFileSync(path, "{ not json")
+  assert.deepEqual(loadPicks(path), NO_PICKS)
+  assert.throws(() => parsePicks('{"models": {"coder": ["a/b"]}}'), /unknown role/)
+  assert.throws(() => parsePicks('{"models": {"code": []}}'), /non-empty/)
+  assert.throws(() => parsePicks('{"vision": "qwen"}'), /provider\/model/)
 })
 
 // --- the fallback: a model the host cannot run is skipped, and the skip is reported -------------------------

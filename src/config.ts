@@ -1,8 +1,8 @@
 // ~/.config/opencode/micromanager.jsonc: optional overrides of the routing (JSON with // comments).
 
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 import { DEFAULT_FLOORS, type Floors } from "./decide.ts"
 import { validatePolicies, type PolicySet } from "./policy.ts"
@@ -42,10 +42,10 @@ export function stripComments(text: string): string {
   return out
 }
 
-export function parseRouting(text: string): Routing {
-  const raw = JSON.parse(stripComments(text)) as { models?: Record<string, unknown>; vision?: unknown }
+// "models": a pool per role id, each a non-empty list of "provider/model" strings.
+function parseModels(raw: Record<string, unknown> | undefined): Partial<Record<RoleId, readonly string[]>> {
   const models: Partial<Record<RoleId, readonly string[]>> = {}
-  for (const [id, value] of Object.entries(raw.models ?? {})) {
+  for (const [id, value] of Object.entries(raw ?? {})) {
     const role = roleById(id)
     if (!role) throw new Error(`unknown role ${JSON.stringify(id)} in models`)
     if (!Array.isArray(value) || value.length === 0 || !value.every((m) => typeof m === "string" && m.includes("/"))) {
@@ -53,8 +53,65 @@ export function parseRouting(text: string): Routing {
     }
     models[role.id] = value
   }
+  return models
+}
+
+export function parseRouting(text: string): Routing {
+  const raw = JSON.parse(stripComments(text)) as { models?: Record<string, unknown>; vision?: unknown }
   const vision = typeof raw.vision === "string" && raw.vision.includes("/") ? raw.vision : DEFAULT_ROUTING.vision
-  return { models, vision }
+  return { models: parseModels(raw.models), vision }
+}
+
+// ~/.config/opencode/micromanager-models.json: the models the user picked per role in the TUI's MODELS section
+// (src/tui.tsx). Only the TUI writes it, so the hand-written micromanager.jsonc keeps its comments. The server reads it
+// at each delegation, so a pick holds from the next task on, without a restart of the hub. It wins over "models" and
+// "vision" of micromanager.jsonc (src/routing.ts withPicks).
+export interface Picks {
+  readonly models: Partial<Record<RoleId, readonly string[]>>
+  readonly vision?: string
+}
+
+export const NO_PICKS: Picks = { models: {} }
+
+export function picksPath(): string {
+  return join(dirname(configPath()), "micromanager-models.json")
+}
+
+export function parsePicks(text: string): Picks {
+  const raw = JSON.parse(text) as { models?: Record<string, unknown>; vision?: unknown }
+  if (raw.vision !== undefined && (typeof raw.vision !== "string" || !raw.vision.includes("/"))) throw new Error('vision must be a "provider/model" string')
+  return { models: parseModels(raw.models), ...(typeof raw.vision === "string" ? { vision: raw.vision } : {}) }
+}
+
+// Read again only when the file changed: the server asks at every delegation, the TUI at every poll.
+let cachedPicks: { path: string; stamp: string; picks: Picks } | undefined
+
+// A missing or broken file means no picks: the pools of roles.ts and micromanager.jsonc route as before.
+export function loadPicks(path = picksPath()): Picks {
+  let stamp: string
+  try {
+    const st = statSync(path)
+    stamp = `${st.mtimeMs}:${st.size}`
+  } catch {
+    return NO_PICKS
+  }
+  if (cachedPicks?.path === path && cachedPicks.stamp === stamp) return cachedPicks.picks
+  let picks: Picks
+  try {
+    picks = parsePicks(readFileSync(path, "utf8"))
+  } catch {
+    picks = NO_PICKS
+  }
+  cachedPicks = { path, stamp, picks }
+  return picks
+}
+
+// Written to a temporary file and renamed, so a delegation never reads half a file.
+export function savePicks(picks: Picks, path = picksPath()): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, `${JSON.stringify(picks, null, 2)}\n`)
+  renameSync(tmp, path)
 }
 
 export function parseFloors(text: string): Floors {
