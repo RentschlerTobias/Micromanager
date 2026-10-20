@@ -5,6 +5,8 @@
 // - In the sidebar: the job as a checklist, grouped by what needs attention (src/progress.ts sidebarGroups).
 // - /workers: a session panel with every recent session and its workers, as herdr shows agents (src/switcher.ts).
 // - /tasks: pick a task to open its worker session, or go back to the micromanager from a worker.
+// - In the sidebar, below the checklist, and /pools: the models each worker role may run on, picked in a popup like
+//   /model (src/pools.ts). The picks go to a file the server reads at each delegation (src/config.ts loadPicks).
 //
 // The job file is the source of the checklist: it holds every task and its sessions, also those of a planned job,
 // whose workers are not children of the micromanager in OpenCode's eyes. Keymap layers only work inside a rendered
@@ -13,10 +15,13 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { createSignal, For, onCleanup, Show } from "solid-js"
 
+import { loadPicks, loadSettings, savePicks } from "./config.ts"
+import { agentOptions, modelOptions, poolRows, RESET, shortNames, toggle, updatePicks, VISION, type CatalogModel, type PoolRow } from "./pools.ts"
 import { BOX, jobsFor, projectOf, sidebarCounts, sidebarGroups, summaryLine, taskChoices, view, type JobView, type Mark } from "./progress.ts"
 import { listJobs } from "./store.ts"
 import { agentRows, agentSummary, type AgentRow, type SessionFacts, type Tag } from "./switcher.ts"
 import type { Job } from "./state.ts"
+import { seedFromJournal } from "./usage.ts"
 
 const POLL_MS = 2_000
 const PANEL = "micromanager.agents"
@@ -35,6 +40,7 @@ interface Context {
       active(input: Record<string, unknown>): Promise<unknown>
       interrupt(input: { sessionID: string }): Promise<unknown>
     }
+    model: { list(input: Record<string, unknown>): Promise<unknown> }
     permission: {
       list(input: { sessionID: string }): Promise<unknown>
       reply(input: { sessionID: string; requestID: string; decision: "once" | "reject" }): Promise<unknown>
@@ -46,8 +52,11 @@ interface Context {
     slot(slot: { append?: string; prepend?: string; render: (input: any) => unknown }): unknown
     toast: { show(toast: { message: string; variant?: string }): void }
     router: { current(): { type: string; sessionID?: string } | undefined; navigate(to: { type: "session"; sessionID: string }): void }
-    dialog: { select(input: { title: string; options: { title: string; value: string; description?: string; category?: string }[] }): Promise<string | undefined> }
+    // opencode 2.0.18 passes a plugin's select only title, placeholder, options and current: no actions, no search.
+    dialog: { select(input: { title: string; placeholder?: string; current?: string; options: { title: string; value: string; description?: string; category?: string }[] }): Promise<string | undefined> }
     panel: { open(name: string): void }
+    // Read only: a plugin cannot set the session's model (the TUI sends its own pick with every prompt), /model does.
+    model: { current(): { providerID: string; modelID: string } | undefined }
   }
 }
 
@@ -187,6 +196,83 @@ function Checklist(props: { context: Context; sessionID: string }) {
   )
 }
 
+// The session's model, which is the micromanager's when it runs in this session.
+function sessionModel(context: Context): string | undefined {
+  const m = context.ui.model.current()
+  return m ? `${m.providerID}/${m.modelID}` : undefined
+}
+
+function rows(): PoolRow[] {
+  return poolRows(loadSettings().routing, loadPicks())
+}
+
+// The MODELS section: folded to one line, unfolded a line per role with its pool; a click on a role opens its popup.
+function Pools(props: { context: Context }) {
+  const context = props.context
+  const colors = palette(context)
+  const [open, setOpen] = createSignal(false)
+  const [pools, setPools] = createSignal<PoolRow[]>(rows())
+  const [model, setModel] = createSignal(sessionModel(context))
+  const timer = setInterval(() => { setPools(rows()); setModel(sessionModel(context)) }, POLL_MS)
+  onCleanup(() => clearInterval(timer))
+  const line = (name: string, models: string, mark: string, onClick: () => void) => (
+    <box flexDirection="row" onMouseUp={onClick}>
+      <text fg={colors.base}>{name.padEnd(13)}</text>
+      <text fg={colors.muted}>{cut(models, 20)}</text>
+      <box flexGrow={1} />
+      <text fg={colors.mark.running}>{mark}</text>
+    </box>
+  )
+  return (
+    <box paddingTop={1}>
+      <box flexDirection="row" onMouseUp={() => setOpen(!open())}>
+        <text fg={colors.base}>MODELS</text>
+        <box flexGrow={1} />
+        <text fg={colors.muted}>{open() ? "/pools ▾" : "/pools ▸"}</text>
+      </box>
+      <Show when={open()}>
+        {line("micromanager", model()?.split("/").pop() ?? "", "", () => context.ui.toast.show({ message: "The micromanager runs on this session's model: change it with /model." }))}
+        <For each={pools()}>{(row) => line(row.agent, shortNames(row.models).join(" "), row.own ? "✎" : "", () => void pickModels(context, row.key))}</For>
+      </Show>
+    </box>
+  )
+}
+
+// The popup: step 1 picks the agent, step 2 its models. A plugin's select has no keys of its own, so ↵ checks or
+// unchecks a model and the popup opens again on it; esc ends. Every change is saved at once.
+async function pickModels(context: Context, key?: PoolRow["key"]): Promise<void> {
+  if (!key) {
+    const chosen = await context.ui.dialog.select({ title: "Micromanager: models per agent", placeholder: "agent", options: agentOptions(rows(), sessionModel(context)) })
+    if (chosen === "micromanager") return context.ui.toast.show({ message: "The micromanager runs on this session's model: change it with /model." })
+    if (!chosen) return
+    key = chosen as PoolRow["key"]
+  }
+  const catalog = items(await context.client.model.list({}).catch(() => undefined)) as CatalogModel[]
+  const settings = loadSettings()
+  const weekly = new Map<string, number>()
+  for (const pick of seedFromJournal()) weekly.set(pick.model, (weekly.get(pick.model) ?? 0) + 1)
+  const budget = (model: string) => settings.registry.find((m) => m.id === model)?.budget
+  let current: string | undefined
+  for (;;) {
+    const row = poolRows(settings.routing, loadPicks()).find((r) => r.key === key)
+    if (!row) return
+    const title = key === VISION ? "vision · ↵ picks the image model" : `${row.agent} · ↵ check · esc done`
+    const chosen = await context.ui.dialog.select({ title, placeholder: "model", current, options: modelOptions(catalog, row, (m) => weekly.get(m) ?? 0, budget) })
+    if (!chosen) return
+    current = chosen
+    const models = chosen === RESET ? RESET : toggle(row, chosen)
+    if (!models) {
+      context.ui.toast.show({ message: `${row.agent} needs at least one model.` })
+      continue
+    }
+    savePicks(updatePicks(loadPicks(), settings.routing, key, models))
+    if (key === VISION || chosen === RESET) {
+      context.ui.toast.show({ message: `${row.agent}: ${shortNames(poolRows(settings.routing, loadPicks()).find((r) => r.key === key)!.models).join(" ")}`, variant: "success" })
+      return
+    }
+  }
+}
+
 // The agent switcher: every recent session with its workers, live; keys move, open, stop and answer.
 function Agents(props: { context: Context; panel: { sessionID: string; focused?: boolean; close(): void } }) {
   const context = props.context
@@ -270,7 +356,15 @@ export default Plugin.define({
     const context = raw as Context
     context.ui.slot({ append: "session.composer.top", render: (input) => <Progress context={context} sessionID={input.sessionID} /> })
     // prepend: at the top of the sidebar, above OpenCode's own context and MCP sections (appended, it was below the fold)
-    context.ui.slot({ prepend: "sidebar.content", render: (input) => <Checklist context={context} sessionID={input.sessionID} /> })
+    context.ui.slot({
+      prepend: "sidebar.content",
+      render: (input) => (
+        <box>
+          <Checklist context={context} sessionID={input.sessionID} />
+          <Pools context={context} />
+        </box>
+      ),
+    })
     context.ui.slot({ append: "session.panel", render: (panel) => (panel.name === PANEL ? <Agents context={context} panel={panel} /> : null) })
     context.ui.slot({
       append: "app",
@@ -280,6 +374,7 @@ export default Plugin.define({
           commands: [
             { id: "micromanager.tasks", title: "Micromanager: open a task's session", group: "Micromanager", palette: true, slash: { name: "tasks" }, run: () => openTask(context) },
             { id: "micromanager.agents", title: "Micromanager: agents", group: "Micromanager", palette: true, slash: { name: "workers" }, run: () => context.ui.panel.open(PANEL) },
+            { id: "micromanager.pools", title: "Micromanager: models per agent", group: "Micromanager", palette: true, slash: { name: "pools" }, run: () => pickModels(context) },
           ],
         }))
         return null

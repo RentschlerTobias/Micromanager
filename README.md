@@ -194,6 +194,13 @@ loudly, which beats quietly substituting something the role never asked for.
 Set a chain yourself with `decisions.N5.model`, or one model per role in the config's `registry`; see the settings
 below.
 
+**Picking the pools in the TUI.** The sidebar's MODELS section (click it to unfold) shows each worker role's pool and
+the vision model; a click on a role, or `/pools`, opens a popup like `/model` with every model the host runs, the
+pool's members checked. ↵ checks or unchecks a model, "back to the default" drops the pick, a pool never becomes
+empty. The picks go to `~/.config/opencode/micromanager-models.json`, which the server reads at each delegation, so
+they hold from the next task on without a restart; they win over `models` in `micromanager.jsonc`, and the journal's
+`routing` record says `picked: true`. The micromanager itself runs on the session's model: change that with `/model`.
+
 Permission requests go to Jev first and to you when Jev is not sure (`src/decide.ts`). Some phases of the design
 are still to come: see docs/plan.md.
 
