@@ -649,6 +649,8 @@ export class Native {
       if (task.status === "passed") moveTask(task, "escalated") // a reader asked again
       moveTask(task, "running")
     }
+    // The sidebar tells a stopped worker by its last stage ("end"): continuing it runs again.
+    stage(task, "resume", "pass", `continued in session ${session}`)
     if (entry.writer && entry.removed) {
       // The session keeps its directory, so the worktree comes back where it was: the worktree root, which is what git
       // registers, not the project directory inside it.

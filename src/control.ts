@@ -18,6 +18,7 @@ export interface Control extends Partial<JobOptions> {
   readonly stopped?: boolean // STOP: nothing starts and nothing is woken until the user starts it again
   readonly pause?: string // why auto-continue does not wake the micromanager now: "waits for you", "no progress"
   readonly wakes?: number // auto-continue wakes in a row without progress
+  readonly seen?: string // the job's progress at the last wake ("done:started"), to tell a wake without progress
 }
 
 export function controlPath(project: string, jobId: string): string {

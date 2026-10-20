@@ -24,8 +24,8 @@ import { checkGuards } from "./gate.ts"
 import { Compactor } from "./compact.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
-import { nextStep, plannedLine, startable } from "./continuation.ts"
-import { saveLastOptions, updateControl } from "./control.ts"
+import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
+import { isStarted, lastOptions, loadControl, optionsOf, saveLastOptions, updateControl } from "./control.ts"
 import { accessForm, answersOf, formInput, readForm, type Question } from "./forms.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
@@ -861,7 +861,6 @@ export default {
       }
       const d = await native.delegate(project, call.sessionID, { agent: String(call.input.agent ?? ""), description: String(call.input.description ?? ""), prompt: asked }, routed.model)
       call.input.prompt = d.prompt
-      ultrawork.has(call.sessionID) && ultrawork.set(call.sessionID, 0)
       tasks.set(String(call.input.agent), asked)
       // What the router decided, next to the permission decisions, so /flow can show the whole path. `agent` is the
       // caller, which is not always the micromanager: that is how an operator sees, from the journal alone, which
@@ -1222,9 +1221,48 @@ export default {
         execFile("notify-send", ["-a", "micromanager", title, body], (err) => { if (err) log("info", `no desktop notification: ${err.message}`) })
       },
     })
-    // The sessions in ultrawork mode (the user said "ulw"/"ultrawork"), with how often their micromanager was woken
-    // without starting a worker.
-    const ultrawork = new Map<string, number>()
+    // Auto-continue (src/continuation.ts autoStep): the micromanager sessions whose turn end is awaited, and when the user
+    // last typed in each, so a wake never talks over them.
+    const awaiting = new Set<string>()
+    const lastPrompt = new Map<string, number>()
+    const AUTO_DELAY_MS = 4_000
+    // The session's open job that auto-continue drives: its own todo job or a planned job it runs, newest first.
+    const autoJob = (sessionID: string): Job | undefined => {
+      const found = listSwept().filter((j) => j.facilitator === sessionID && (j.rolling || j.native) && !["done", "stopped", "failed"].includes(j.phase))
+        .sort((a, b) => b.updated.localeCompare(a.updated))[0]
+      return found && project ? (native.current(project, found.id) ?? found) : undefined
+    }
+    const optionsFor = (job: Job) => optionsOf(loadControl(project!, job.id), lastOptions(project!))
+    // The turn of a micromanager session ended: wake it if its job runs on auto and nothing else will.
+    const onIdle = async (sessionID: string, idleAt: number): Promise<void> => {
+      if (!project || (lastPrompt.get(sessionID) ?? 0) > idleAt) return
+      const job = autoJob(sessionID)
+      if (!job) return
+      const control = loadControl(project, job.id)
+      // Only on the user's word (the start form, the sidebar, "ulw"): a job from before the form never wakes by itself.
+      if (control.auto !== true || control.pause || !isStarted(job, control)) return
+      const step = autoStep(job, native.running(sessionID).length, optionsFor(job).parallel, control)
+      if (!step) return
+      if (step.kind === "wake") updateControl(project, job.id, { seen: step.seen, wakes: step.wakes })
+      else if (step.kind === "done") updateControl(project, job.id, { auto: false, pause: undefined })
+      else updateControl(project, job.id, { pause: step.pause })
+      record({ kind: "auto", sessionID, job: job.id, step: step.kind, ...(step.kind === "pause" ? { pause: step.pause } : {}) })
+      // Done: the micromanager's own last turn already told the user (live run, 2026-10-20: a wake for the summary made
+      // it say everything twice), so auto-continue only goes off.
+      if (step.kind === "done") return
+      await ctx.session.synthetic({ sessionID, text: step.text, resume: true }).catch((err: unknown) => log("warn", `auto-continue failed: ${String(err)}`))
+    }
+    const awaitTurn = (sessionID: string): void => {
+      if (awaiting.has(sessionID)) return
+      awaiting.add(sessionID)
+      void ctx.session.wait({ sessionID })
+        .then(() => {
+          awaiting.delete(sessionID)
+          const at = Date.now()
+          setTimeout(() => void onIdle(sessionID, at).catch((err: unknown) => log("warn", `auto-continue failed: ${String(err)}`)), AUTO_DELAY_MS)
+        })
+        .catch(() => awaiting.delete(sessionID))
+    }
     const runner = (parentID?: string, job?: string, cancel?: Cancel) =>
       new Runner({
         session: ctx.session,
@@ -1292,6 +1330,8 @@ export default {
       const form = answers && readForm((call.input.questions ?? []) as Partial<Question>[], answers)
       if (!form || !project) return
       record({ kind: "form", sessionID, form })
+      const auto = autoJob(sessionID)
+      if (auto) updateControl(project, auto.id, { pause: undefined, wakes: 0 }) // the user answered: auto-continue may go on
       const tell = (text: string) => rewriteResult(call.result, (was) => `${was}\n[micromanager] ${text}`)
       if (form.kind === "start") {
         const job = native.job(project, sessionID)
@@ -1451,7 +1491,7 @@ export default {
             if (scheduler.snapshot().running === swept.id) return `job ${swept.id} still runs on the plugin's own workers from before; stop_job ${swept.id} first, then run_job again.`
             const r = native.runPlanned(project, swept.id, tctx.sessionID)
             if (!r.job) return `job ${swept.id}: ${r.problem}`
-            const step = nextStep(r.job, parallel)
+            const step = nextStep(r.job, optionsFor(r.job).parallel ? parallel : 1)
             const answer = note.trim() ? `The user's answer for this job: ${note.trim()}\n\n` : ""
             if (!step) return `${answer}job ${r.job.id} runs: its workers are still at work; the next tasks follow in a note when they end. Tell the user and end your turn.`
             return `${answer}${step.text}`
@@ -1693,8 +1733,15 @@ export default {
       // A note is replaced at the user's next turn. A worker's prompts are its own continuations, not the user's: clearing
       // the note there would drop a steer_task note before the worker ever saw it (the prompt hook runs first).
       if (!runnerSessions.has(sessionID)) steering.delete(sessionID)
-      if (/\b(ulw|ultrawork)\b/i.test(text)) ultrawork.set(sessionID, 0)
-      else if (/^\s*stop\b/i.test(text)) ultrawork.delete(sessionID)
+      // The user typed: a wake waits for the next turn end, a pause is over, and "ulw" / "stop" switch auto-continue.
+      if (!runnerSessions.has(sessionID)) {
+        lastPrompt.set(sessionID, Date.now())
+        const auto = autoJob(sessionID)
+        if (auto && project) {
+          const on = /\b(ulw|ultrawork)\b/i.test(text) ? true : /^\s*stop\b/i.test(text) ? false : undefined
+          updateControl(project, auto.id, { pause: undefined, wakes: 0, ...(on === undefined ? {} : { auto: on }) })
+        }
+      }
       // The user's answer to a worker's paused request (src/ask.ts): read from their own turn, never from the
       // micromanager's word, so it is the one way a hard rule opens. It answers the oldest request still waiting.
       const waiting = runnerSessions.has(sessionID) ? undefined : SHARED.asks.oldest(sessionID)
@@ -1790,12 +1837,6 @@ export default {
             // next turn, which the worker's report starts (src/continuation.ts).
             const owned = native.jobOf(worker)
             if (owned && (owned.job.native || owned.job.rolling)) continuing.set(parent, owned.job.id)
-            // Ultrawork: when the last worker of the session ended, the micromanager goes on with its todos.
-            const wakes = ultrawork.get(parent)
-            if (wakes !== undefined && wakes < 3 && native.running(parent).length === 0) {
-              ultrawork.set(parent, wakes + 1)
-              steering.set(parent, "[micromanager] Ultrawork is on: go on with your open todos now; start the next workers instead of waiting, and ask the user only what only they can decide. When every todo is done, give the final summary.")
-            }
           })
         }
         if (input.sessionID && watchdog.watching(input.sessionID)) {
@@ -1827,6 +1868,7 @@ export default {
       }
       const note = input.sessionID ? steering.get(input.sessionID) : undefined
       if (note && Array.isArray(input.system)) input.system.push({ type: "text", text: note })
+      if (input.sessionID) awaitTurn(input.sessionID)
       // A job that waits for the user while no form asks them (the user, 2026-10-20: a waiting job went unnoticed for a
       // day): the micromanager is told to ask with the question tool.
       if (input.sessionID && Array.isArray(input.system)) {
@@ -1838,7 +1880,7 @@ export default {
       if (planned && input.sessionID && Array.isArray(input.system)) {
         continuing.delete(input.sessionID)
         const job = native.current(project, planned) ?? loadJob(project, planned)
-        const step = job && nextStep(job, parallel)
+        const step = job && nextStep(job, optionsFor(job).parallel ? parallel : 1)
         if (step) {
           input.system.push({ type: "text", text: step.text })
           record({ kind: "continuation", sessionID: input.sessionID, job: planned, step: step.kind, tasks: step.kind === "start" ? step.tasks.map((t) => t.id) : [] })

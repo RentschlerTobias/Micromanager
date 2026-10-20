@@ -88,3 +88,48 @@ export function nextStep(job: Job, parallel: number): Step | undefined {
     ].filter(Boolean).join("\n"),
   }
 }
+
+// Auto-continue (the user, 2026-10-20, like Sisyphus' todo continuation): when the micromanager's turn ends while todos
+// are open and no worker runs, nothing else would wake it, so the plugin does. What to say, or why to pause instead:
+// - every todo done: the final summary, and auto-continue goes off;
+// - todos that can start: start them (all, or the next one when Parallel is off), unless two wakes in a row brought no
+//   progress, then it pauses and asks the user;
+// - only blocked, stopped or failed work left: it pauses and asks the user how to go on.
+// A running worker needs no wake (its report starts the next turn), and a form waiting for the user keeps the turn open.
+export type AutoStep =
+  | { readonly kind: "wake"; readonly text: string; readonly seen: string; readonly wakes: number }
+  | { readonly kind: "done"; readonly text: string }
+  | { readonly kind: "pause"; readonly pause: string; readonly text: string }
+
+export function autoStep(job: Job, running: number, parallel: boolean, last: { seen?: string; wakes?: number } = {}): AutoStep | undefined {
+  if (running > 0) return undefined
+  const ended = (t: Task) => LIVE.has(t.status) && t.stages.at(-1)?.stage === "end"
+  const open = job.tasks.filter((t) => OPEN.has(t.status))
+  const stopped = job.tasks.filter((t) => ended(t) || ["escalated", "blocked"].includes(t.status)).filter((t) => !t.replacedBy)
+  const ready = startable(job)
+  if (!open.length && !stopped.length) {
+    return { kind: "done", text: `${HEADER} auto-continue: every todo of job ${job.id} is done. Give the user the final summary: what changed, and that merge_job brings it into their checkout once they say so.` }
+  }
+  const askUser = "Ask the user with the question tool how to go on (a form; their answer comes back to you)."
+  const list = (tasks: readonly Task[]) => tasks.map((t) => `${t.id} ${t.title} (${t.status}${ended(t) ? ", its worker ended unfinished" : ""})`).join("; ")
+  if (!ready.length) {
+    return { kind: "pause", pause: "waits for you", text: `${HEADER} auto-continue: job ${job.id} cannot go on by itself. ${stopped.length ? `Stopped or failed: ${list(stopped)}. ` : ""}${open.length ? `Waiting on those: ${open.map((t) => `${t.id} (after ${t.dependsOn.join(", ")})`).join("; ")}. ` : ""}${askUser}` }
+  }
+  const seen = `${job.tasks.filter(isDone).length}:${job.tasks.filter((t) => t.stages.some((s) => s.stage === "delegate")).length}`
+  const wakes = seen === last.seen ? (last.wakes ?? 0) + 1 : 0
+  if (wakes >= 2) {
+    return { kind: "pause", pause: "no progress", text: `${HEADER} auto-continue paused: two wakes in a row started no todo of job ${job.id} and finished none, though ${ready.map((t) => t.id).join(", ")} can start. ${askUser}` }
+  }
+  const now = parallel ? ready : ready.slice(0, 1)
+  return {
+    kind: "wake",
+    seen,
+    wakes,
+    text: [
+      `${HEADER} auto-continue: job ${job.id} goes on. Start ${now.length > 1 ? "these todos now, in one message" : "this todo now"}, with the subagent tool (background = true):`,
+      ...now.map((t) => call(job, t)),
+      stopped.length ? `Also stopped: ${list(stopped)}: continue a worker with its sessionID when its change is worth keeping, or write a todo that replaces it.` : "",
+      "Ask the user only what only they can decide, with the question tool.",
+    ].filter(Boolean).join("\n"),
+  }
+}

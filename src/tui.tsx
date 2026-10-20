@@ -5,6 +5,8 @@
 // - In the sidebar: the job as a checklist, grouped by what needs attention (src/progress.ts sidebarGroups).
 // - /workers: a session panel with every recent session and its workers, as herdr shows agents (src/switcher.ts).
 // - /tasks: pick a task to open its worker session, or go back to the micromanager from a worker.
+// - Under the job's header: its options as toggles (auto-continue, parallel, review) and STOP, which interrupts the
+//   micromanager and every worker of the job at once; /auto, /parallel and /stop do the same (src/control.ts).
 // - In the sidebar, below the checklist, and /pools: the models each worker role may run on, picked in a popup like
 //   /model (src/pools.ts). The picks go to a file the server reads at each delegation (src/config.ts loadPicks).
 //
@@ -16,6 +18,7 @@ import { Plugin } from "@opencode/plugin/tui"
 import { createSignal, For, onCleanup, Show } from "solid-js"
 
 import { loadPicks, loadSettings, savePicks } from "./config.ts"
+import { lastOptions, loadControl, optionsOf, updateControl, type Control } from "./control.ts"
 import { agentOptions, modelOptions, poolRows, RESET, shortNames, toggle, updatePicks, VISION, type CatalogModel, type PoolRow } from "./pools.ts"
 import { BOX, foldedLine, jobsFor, projectOf, resolver, sessionJobs, sidebarCounts, sidebarGroups, summaryLine, taskChoices, view, type JobView, type Mark, type SidebarGroup } from "./progress.ts"
 import { listJobs } from "./store.ts"
@@ -53,7 +56,10 @@ interface Context {
     toast: { show(toast: { message: string; variant?: string }): void }
     router: { current(): { type: string; sessionID?: string } | undefined; navigate(to: { type: "session"; sessionID: string }): void }
     // opencode 2.0.18 passes a plugin's select only title, placeholder, options and current: no actions, no search.
-    dialog: { select(input: { title: string; placeholder?: string; current?: string; options: { title: string; value: string; description?: string; category?: string }[] }): Promise<string | undefined> }
+    dialog: {
+      select(input: { title: string; placeholder?: string; current?: string; options: { title: string; value: string; description?: string; category?: string }[] }): Promise<string | undefined>
+      confirm(input: { title: string; message: string; label?: string }): Promise<boolean | undefined>
+    }
     panel: { open(name: string): void }
     // Read only: a plugin cannot set the session's model (the TUI sends its own pick with every prompt), /model does.
     model: { current(): { providerID: string; modelID: string } | undefined }
@@ -79,6 +85,7 @@ function palette(context: Context) {
     failed: t.diff?.text?.removed ?? t.text.base,
     running: t.text.action?.primary?.base ?? t.text.base,
     waiting: t.hue?.orange?.["500"] ?? t.text.base,
+    stopped: t.hue?.orange?.["500"] ?? t.text.base,
     dropped: t.text.muted,
     open: t.text.muted,
   }
@@ -87,6 +94,12 @@ function palette(context: Context) {
 }
 
 const cut = (text: string, width: number) => (text.length > width ? `${text.slice(0, width - 1)}…` : text)
+
+// The project of a session: its directory, or the project a worker's worktree lies in.
+function projectFor(context: Context, sessionID: string): string | undefined {
+  const directory = context.data.session.get(sessionID)?.location?.directory
+  return directory ? projectOf(directory) : undefined
+}
 
 function jobsOf(context: Context, sessionID: string): Job[] {
   const directory = context.data.session.get(sessionID)?.location?.directory
@@ -135,11 +148,55 @@ function Progress(props: { context: Context; sessionID: string }) {
   )
 }
 
+// The job's switches as the user flips them. STOP interrupts at once from here (the TUI reaches every session), and
+// the control file keeps anything from starting or waking until the user lifts it.
+async function stopJob(context: Context, project: string, job: JobView): Promise<void> {
+  const sure = await context.ui.dialog.confirm({ title: "Stop the job?", message: `Interrupts the micromanager and every worker of ${job.id}. Their work stays and can be continued.`, label: "Stop" })
+  if (!sure) return
+  updateControl(project, job.id, { stopped: true, auto: false, pause: undefined })
+  const sessions = [job.facilitator, ...job.rows.filter((r) => ["running", "gating", "fixing", "reviewing"].includes(r.status) && !r.stopped).map((r) => r.session)]
+  await Promise.all(sessions.filter((x): x is string => Boolean(x)).map((sessionID) => context.client.session.interrupt({ sessionID }).catch(() => undefined)))
+  context.ui.toast.show({ message: `Stopped ${job.id}`, variant: "success" })
+}
+
+const flipped = (project: string, job: JobView, key: "auto" | "parallel" | "review"): Control => {
+  const control = loadControl(project, job.id)
+  const now = key === "auto" ? control.auto === true : optionsOf(control, lastOptions(project))[key]
+  return updateControl(project, job.id, { [key]: !now, ...(key === "auto" ? { pause: undefined, wakes: 0 } : {}) })
+}
+
+function JobControls(props: { context: Context; project: string; job: JobView }) {
+  const colors = palette(props.context)
+  const [control, setControl] = createSignal<Control>(loadControl(props.project, props.job.id))
+  const timer = setInterval(() => setControl(loadControl(props.project, props.job.id)), POLL_MS)
+  onCleanup(() => clearInterval(timer))
+  const opts = () => optionsOf(control(), lastOptions(props.project))
+  const box = (on: boolean) => (on ? "☑" : "☐")
+  const toggle = (key: "auto" | "parallel" | "review") => setControl(flipped(props.project, props.job, key))
+  return (
+    <box flexDirection="row">
+      <Show when={control().stopped} fallback={
+        <>
+          <text fg={control().auto ? colors.mark.running : colors.muted} onMouseUp={() => toggle("auto")}>{control().auto && control().pause ? `auto ⏸ ${control().pause}` : `${box(control().auto === true)} auto`} </text>
+          <text fg={opts().parallel ? colors.base : colors.muted} onMouseUp={() => toggle("parallel")}>{box(opts().parallel)} parallel </text>
+          <text fg={opts().review ? colors.base : colors.muted} onMouseUp={() => toggle("review")}>{box(opts().review)} review</text>
+          <box flexGrow={1} />
+          <text fg={colors.mark.failed} onMouseUp={() => void stopJob(props.context, props.project, props.job).then(() => setControl(loadControl(props.project, props.job.id)))}>■ STOP</text>
+        </>
+      }>
+        <text fg={colors.mark.failed}>■ stopped</text>
+        <box flexGrow={1} />
+        <text fg={colors.base} onMouseUp={() => setControl(updateControl(props.project, props.job.id, { stopped: false }))}>resume ▸</text>
+      </Show>
+    </box>
+  )
+}
+
 // Groups folded at first: DONE and DROPPED always, FAILED only once it is empty (then it is not shown anyway).
 const FOLDED_AT_FIRST: readonly SidebarGroup["key"][] = ["done", "dropped"]
 
 // One job as a checklist: its header, the counts, and the groups; DONE, FAILED and DROPPED fold on a click.
-function JobChecklist(props: { context: Context; job: JobView; waiting: Map<string, string> }) {
+function JobChecklist(props: { context: Context; job: JobView; waiting: Map<string, string>; project?: string; own?: boolean }) {
   const colors = palette(props.context)
   const [folded, setFolded] = createSignal(new Set<string>(FOLDED_AT_FIRST))
   const toggle = (key: string) => setFolded((was) => { const next = new Set(was); next.has(key) ? next.delete(key) : next.add(key); return next })
@@ -152,6 +209,7 @@ function JobChecklist(props: { context: Context; job: JobView; waiting: Map<stri
         <box flexGrow={1} />
         <text fg={colors.muted}>{props.job.phase}</text>
       </box>
+      <Show when={props.own && props.project}>{(project) => <JobControls context={props.context} project={project()} job={props.job} />}</Show>
       <box flexDirection="row">
         <For each={sidebarCounts(groups())}>{(c) => <text fg={colors.mark[c.mark]}>{c.text} </text>}</For>
         <box flexGrow={1} />
@@ -219,7 +277,7 @@ function Checklist(props: { context: Context; sessionID: string }) {
           </box>
         )}
       </For>
-      <Show when={split().main}>{(main) => <JobChecklist context={props.context} job={main()} waiting={waiting()} />}</Show>
+      <Show when={split().main}>{(main) => <JobChecklist context={props.context} job={main()} waiting={waiting()} project={projectFor(props.context, props.sessionID)} own={main().facilitator === props.sessionID} />}</Show>
       <For each={split().others}>
         {(job) => (
           <box paddingTop={1}>
@@ -383,6 +441,15 @@ function Agents(props: { context: Context; panel: { sessionID: string; focused?:
   )
 }
 
+// A command on the job of the session on screen: its newest job with tasks.
+function onJob(context: Context, run: (project: string, job: JobView) => unknown): void {
+  const sessionID = context.ui.router.current()?.sessionID
+  const project = sessionID && projectFor(context, sessionID)
+  const job = sessionID ? sessionJobs(read(context, sessionID)).main : undefined
+  if (!project || !job) return context.ui.toast.show({ message: "No micromanager job in this session." })
+  void run(project, job)
+}
+
 async function openTask(context: Context): Promise<void> {
   const sessionID = context.ui.router.current()?.sessionID
   const options = sessionID ? taskChoices(read(context, sessionID), sessionID) : []
@@ -417,6 +484,9 @@ export default Plugin.define({
             { id: "micromanager.tasks", title: "Micromanager: open a task's session", group: "Micromanager", palette: true, slash: { name: "tasks" }, run: () => openTask(context) },
             { id: "micromanager.agents", title: "Micromanager: agents", group: "Micromanager", palette: true, slash: { name: "workers" }, run: () => context.ui.panel.open(PANEL) },
             { id: "micromanager.pools", title: "Micromanager: models per agent", group: "Micromanager", palette: true, slash: { name: "pools" }, run: () => pickModels(context) },
+            { id: "micromanager.auto", title: "Micromanager: auto-continue on/off", group: "Micromanager", palette: true, slash: { name: "auto" }, run: () => onJob(context, (project, job) => { const c = flipped(project, job, "auto"); context.ui.toast.show({ message: `auto-continue ${c.auto ? "on" : "off"} for ${job.id}` }) }) },
+            { id: "micromanager.parallel", title: "Micromanager: parallel on/off", group: "Micromanager", palette: true, slash: { name: "parallel" }, run: () => onJob(context, (project, job) => { const c = flipped(project, job, "parallel"); context.ui.toast.show({ message: `parallel ${c.parallel ? "on" : "off"} for ${job.id}` }) }) },
+            { id: "micromanager.stop", title: "Micromanager: stop the job", group: "Micromanager", palette: true, slash: { name: "stop" }, run: () => onJob(context, (project, job) => stopJob(context, project, job)) },
           ],
         }))
         return null

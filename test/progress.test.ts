@@ -128,3 +128,12 @@ test("one checklist per session: the newest job with tasks in full, the others f
   assert.equal(main?.id, own.id)
   assert.deepEqual(others.map(foldedLine), ["older 8d1c · 1/2 · waits for you"])
 })
+
+test("a task whose worker ended unfinished shows as STOPPED, not as running", () => {
+  const stopped = task("T5", "running", { session: "ses_5", stages: [{ stage: "delegate", result: "pass", at: "2026-10-20T10:00:00Z" }, { stage: "end", result: "fail", at: "2026-10-20T10:05:00Z" }] })
+  const v = view(job("job-1", { tasks: [stopped, task("T6", "running")] }))
+  assert.deepEqual(sidebarGroups(v).map((g) => [g.name, g.lines.map((l) => l.id)]), [["RUNNING", ["T6"]], ["STOPPED", ["T5"]]])
+  assert.equal(v.running, 1)
+  const resumed = { ...stopped, stages: [...stopped.stages, { stage: "resume", result: "pass" as const, at: "2026-10-20T10:06:00Z" }] }
+  assert.deepEqual(sidebarGroups(view(job("job-1", { tasks: [resumed] }))).map((g) => g.name), ["RUNNING"], "continued, it runs again")
+})
