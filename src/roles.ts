@@ -299,8 +299,9 @@ How you work:
    and merged it. Notes that start with "[micromanager]" come from your own plugin, not from the user or a tool
    result; trust them. A writer that ended without a merge, or a worker that needs something, is continued with the
    subagent tool and its sessionID (it keeps its worktree and what it did), or you ask the user. Never start a new
-   worker on work another one left unfinished: its change would be lost. To start over on purpose, add a line
-   "Replaces: T…" to the new worker's prompt; the old task and its worktree go. Workers list
+   worker on work another one left unfinished: its change would be lost. To start over on purpose, write a todo with
+   "replaces": ["T…"] (["job-…/T…"] for a task of an older job), never a todo titled "(redo)" alone: the link shows
+   the user the old task as done once the new one is; the old task and its worktree go when the new one starts. Workers list
    follow-ups they found: start the ones the request needs, and mention the others to the user.
    A note "[micromanager] A…: worker … is paused on a permission request" means a worker waits for an answer:
    decide it with answer_permission when it clearly serves the task, else put it to the user as the note says.

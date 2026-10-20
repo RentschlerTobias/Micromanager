@@ -1,7 +1,8 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { elapsed, jobsFor, projectOf, shortModel, sidebarCounts, sidebarGroups, summaryLine, taskChoices, view } from "../src/progress.ts"
+import { startable } from "../src/continuation.ts"
+import { elapsed, foldedLine, jobsFor, projectOf, resolver, sessionJobs, shortModel, sidebarCounts, sidebarGroups, summaryLine, taskChoices, view } from "../src/progress.ts"
 import { newJob, type Job, type Task } from "../src/state.ts"
 
 const task = (id: string, status: Task["status"], extra: Partial<Task> = {}): Task => ({
@@ -88,4 +89,42 @@ test("a running task shows its model's family and how long it runs", () => {
   assert.equal(elapsed("2026-10-19T11:56:00Z", now), "4m")
   assert.equal(elapsed("2026-10-19T10:48:00Z", now), "1.2h")
   assert.equal(elapsed(undefined, now), "")
+})
+
+test("a task done over moves to DONE once its replacement is in, and stands aside while it runs", () => {
+  const names = (j: Job, resolve?: Parameters<typeof view>[2]) =>
+    sidebarGroups(view(j, Date.now(), resolve)).map((g) => [g.name, g.lines.map((l) => `${l.id}${l.detail ? ` ${l.detail}` : ""}`)])
+  const redone = job("job-1", { tasks: [
+    task("T19", "cancelled", { replacedBy: "T26" }),
+    task("T26", "merged", { replaces: ["T19"] }),
+    task("T27", "cancelled"),
+    task("T28", "escalated"),
+  ] })
+  assert.deepEqual(names(redone), [["FAILED", ["T28"]], ["DROPPED", ["T27"]], ["DONE", ["T19 ↻ T26", "T26"]]])
+  assert.equal(summaryLine(view(redone)), "job-1 · 1/2 ✔ · 1 ✖ · execute", "the replacement counts, the replaced and dropped do not")
+  assert.deepEqual(sidebarCounts(sidebarGroups(view(redone))).map((c) => c.text), ["[✓]1", "[✗]1"], "the counts agree")
+  const running = job("job-1", { tasks: [task("T19", "escalated", { replacedBy: "T26" }), task("T26", "running")] })
+  assert.deepEqual(names(running), [["RUNNING", ["T26"]]], "while the replacement runs, it stands for the failed one")
+  // Across jobs: the old planned job's T18, done over by the session's own T17.
+  const old = job("job-8d1c", { tasks: [task("T18", "cancelled", { replacedBy: "job-0e69/T17" })] })
+  const own = job("job-0e69", { tasks: [task("T17", "merged", { replaces: ["job-8d1c/T18"] })] })
+  assert.deepEqual(names(old, resolver([old, own])), [["DONE", ["T18 ↻ T17"]]])
+  assert.deepEqual(names(old), [["DROPPED", ["T18"]]], "without the other job in view, a cancelled task is dropped")
+  const waiting = job("job-8d1c", { tasks: [task("T18", "cancelled", { replacedBy: "job-0e69/T17" }), task("T20", "pending", { dependsOn: ["T18"] })] })
+  assert.deepEqual(view(waiting, Date.now(), resolver([waiting, own])).rows[1]!.waitsFor, [], "a task done over in another job no longer blocks")
+})
+
+test("a task waiting for one that was done over can start once the replacement is merged", () => {
+  const j = job("job-1", { tasks: [task("T1", "cancelled", { replacedBy: "T3" }), task("T2", "pending", { dependsOn: ["T1"] }), task("T3", "merged")] })
+  assert.deepEqual(startable(j).map((t) => t.id), ["T2"])
+  assert.deepEqual(view(j).rows.find((r) => r.id === "T2")!.waitsFor, [])
+})
+
+test("one checklist per session: the newest job with tasks in full, the others folded", () => {
+  const empty = view(job("job-20261019-200109-eae5", { phase: "planning_session" }))
+  const own = view(job("job-20261019-214132-0e69", { rolling: true, tasks: [task("T1", "merged"), task("T2", "running")] }))
+  const old = view(job("job-20261018-194216-8d1c", { phase: "ask_user", tasks: [task("T1", "merged"), task("T2", "pending")] }))
+  const { main, others } = sessionJobs([empty, own, old])
+  assert.equal(main?.id, own.id)
+  assert.deepEqual(others.map(foldedLine), ["older 8d1c · 1/2 · waits for you"])
 })

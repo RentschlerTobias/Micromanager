@@ -6,7 +6,7 @@
 // list, with every task's status and worker sessions; this reads it.
 
 import { detail, ICON } from "./board.ts"
-import { startable } from "./continuation.ts"
+import { settled, startable } from "./continuation.ts"
 import { family } from "./roles.ts"
 import type { Job, Task, TaskStatus } from "./state.ts"
 import { DIR, LEGACY_DIR } from "./store.ts"
@@ -14,7 +14,9 @@ import { DIR, LEGACY_DIR } from "./store.ts"
 const ENDED: readonly Job["phase"][] = ["done", "stopped", "failed"]
 const RUNNING: readonly TaskStatus[] = ["running", "gating", "reviewing", "fixing"]
 const DONE: readonly TaskStatus[] = ["merged", "passed"]
-const FAILED: readonly TaskStatus[] = ["escalated", "cancelled", "blocked"]
+const FAILED: readonly TaskStatus[] = ["escalated", "blocked"]
+// Given up on purpose (stop_task, "Replaces:", a dropped todo): not a failure, and folded away in the sidebar.
+const DROPPED: readonly TaskStatus[] = ["cancelled"]
 
 export interface TaskRow {
   readonly id: string
@@ -27,6 +29,8 @@ export interface TaskRow {
   readonly since?: string // when its current run started (ISO), for a running task
   readonly startable: boolean // open, and every task it depends on is merged
   readonly waitsFor: readonly string[] // the tasks it depends on that are not merged yet
+  readonly replacedBy?: string // the task that does it over ("T26", or "job-…/T17" in another job)
+  readonly replacement?: TaskStatus // that task's status, when it is known
 }
 
 export interface JobView {
@@ -66,19 +70,32 @@ function startedAt(task: Task): string | undefined {
   return (starts.at(-1) ?? task.stages.at(-1))?.at
 }
 
-export function view(job: Job, now = Date.now()): JobView {
+// A task's status by its id: "T3" in the job itself, "job-…/T3" in another job the caller knows.
+export type Resolve = (id: string) => TaskStatus | undefined
+
+// The status of every task of the given jobs, by "job-…/T3", for replacements across jobs.
+export function resolver(jobs: readonly Job[]): Resolve {
+  const all = new Map<string, TaskStatus>(jobs.flatMap((j) => j.tasks.map((t): [string, TaskStatus] => [`${j.id}/${t.id}`, t.status])))
+  return (id) => all.get(id)
+}
+
+export function view(job: Job, now = Date.now(), resolve: Resolve = () => undefined): JobView {
   const live = job.tasks.filter((t) => !t.undone)
-  const ready = new Set(startable(job).map((t) => t.id))
+  const ready = new Set(startable(job, resolve).map((t) => t.id))
   const byId = new Map(job.tasks.map((t) => [t.id, t]))
+  const statusOf = (id: string) => (id.includes("/") ? resolve(id) : byId.get(id)?.status)
+  // A task done over is counted through its replacement, and dropped work not at all.
+  const replaced = (t: Task) => (t.replacedBy ? statusOf(t.replacedBy) : undefined)
+  const counted = live.filter((t) => !(t.replacedBy && replaced(t) !== undefined) && !DROPPED.includes(t.status))
   return {
     id: job.id,
     title: job.rolling ? "Delegated tasks" : job.goal.split("\n")[0]!, // a rolling job's goal names the session id
     phase: job.phase,
     facilitator: job.facilitator,
-    done: live.filter((t) => DONE.includes(t.status)).length,
-    running: live.filter((t) => RUNNING.includes(t.status)).length,
-    failed: live.filter((t) => FAILED.includes(t.status)).length,
-    total: live.length,
+    done: counted.filter((t) => DONE.includes(t.status)).length,
+    running: counted.filter((t) => RUNNING.includes(t.status)).length,
+    failed: counted.filter((t) => FAILED.includes(t.status)).length,
+    total: counted.length,
     rows: live.map((t) => ({
       id: t.id,
       icon: ICON[t.status],
@@ -89,7 +106,9 @@ export function view(job: Job, now = Date.now()): JobView {
       ...(t.model ? { model: t.model } : {}),
       ...(RUNNING.includes(t.status) && startedAt(t) ? { since: startedAt(t) } : {}),
       startable: ready.has(t.id),
-      waitsFor: t.dependsOn.filter((id) => { const dep = byId.get(id); return !dep || !DONE.includes(dep.status) }),
+      waitsFor: t.dependsOn.filter((id) => { const dep = byId.get(id); return !dep || !settled(job, dep, resolve) }),
+      ...(t.replacedBy ? { replacedBy: t.replacedBy } : {}),
+      ...(t.replacedBy && replaced(t) ? { replacement: replaced(t) } : {}),
     })),
   }
 }
@@ -116,9 +135,9 @@ export function taskChoices(views: readonly JobView[], sessionID: string): { tit
 // and what is open has to be clear at a glance). Groups in a fixed order, each in plan order; an empty group is left
 // out. "Waiting" is a task whose worker waits for the user (a permission or a question), read by the TUI. Open tasks
 // are TODO when they can start and BLOCKED while a task they need is not merged.
-export type Mark = "waiting" | "running" | "failed" | "open" | "done"
+export type Mark = "waiting" | "running" | "failed" | "dropped" | "open" | "done"
 
-export const BOX: Record<Mark, string> = { waiting: "[!]", running: "[▸]", failed: "[✗]", open: "[ ]", done: "[✓]" }
+export const BOX: Record<Mark, string> = { waiting: "[!]", running: "[▸]", failed: "[✗]", dropped: "[-]", open: "[ ]", done: "[✓]" }
 
 export interface SidebarLine {
   readonly mark: Mark
@@ -129,11 +148,12 @@ export interface SidebarLine {
 }
 
 export interface SidebarGroup {
-  readonly key: "waiting" | "running" | "todo" | "blocked" | "failed" | "done"
+  readonly key: "waiting" | "running" | "todo" | "blocked" | "failed" | "dropped" | "done"
   readonly mark: Mark
   readonly name: string
   readonly count: number // tasks in this state
-  readonly lines: readonly SidebarLine[] // the ones shown: all, except TODO and BLOCKED (the first few) and DONE (folded)
+  readonly redone?: number // DONE: how many of them are tasks done over by another (not counted in the totals)
+  readonly lines: readonly SidebarLine[] // the ones shown: all, except TODO and BLOCKED (the first few)
 }
 
 const SHOWN_TODO = 5
@@ -151,9 +171,12 @@ export function shortModel(model: string | undefined): string {
   return model ? family(model).slice(0, 5) : ""
 }
 
-export function markOf(row: TaskRow, waiting: ReadonlySet<string>): Mark {
+// undefined: a task done over by one that has not finished yet; the replacement stands for it.
+export function markOf(row: TaskRow, waiting: ReadonlySet<string>): Mark | undefined {
   if (DONE.includes(row.status)) return "done"
+  if (row.replacedBy && row.replacement !== undefined) return DONE.includes(row.replacement) ? "done" : undefined
   if (FAILED.includes(row.status)) return "failed"
+  if (DROPPED.includes(row.status)) return "dropped"
   if (RUNNING.includes(row.status)) return row.session && waiting.has(row.session) ? "waiting" : "running"
   return "open"
 }
@@ -165,6 +188,7 @@ export function sidebarGroups(v: JobView, waiting: ReadonlyMap<string, string> =
     const detail = mark === "running" ? `${shortModel(r.model)} ${elapsed(r.since, now)}`.trim()
       : mark === "waiting" ? waiting.get(r.session!)
       : mark === "open" && !r.startable && r.waitsFor.length ? `⧗ ${r.waitsFor.join(" ")}`
+      : mark === "done" && r.replacedBy && !DONE.includes(r.status) ? `↻ ${r.replacedBy.split("/").pop()}`
       : undefined
     return { mark, id: r.id, title: r.title, ...(detail ? { detail } : {}), ...(r.session ? { session: r.session } : {}) }
   }
@@ -177,16 +201,30 @@ export function sidebarGroups(v: JobView, waiting: ReadonlyMap<string, string> =
     { key: "todo", mark: "open", name: "TODO", count: todo.length, lines: todo.slice(0, SHOWN_TODO).map((r) => line(r, "open")) },
     { key: "blocked", mark: "open", name: "BLOCKED", count: blocked.length, lines: blocked.slice(0, SHOWN_BLOCKED).map((r) => line(r, "open")) },
     { key: "failed", mark: "failed", name: "FAILED", count: of("failed").length, lines: of("failed").map((r) => line(r, "failed")) },
-    { key: "done", mark: "done", name: "DONE", count: of("done").length, lines: of("done").map((r) => line(r, "done")) },
+    { key: "dropped", mark: "dropped", name: "DROPPED", count: of("dropped").length, lines: of("dropped").map((r) => line(r, "dropped")) },
+    { key: "done", mark: "done", name: "DONE", count: of("done").length, redone: of("done").filter((r) => !DONE.includes(r.status)).length, lines: of("done").map((r) => line(r, "done")) },
   ]
   return groups.filter((g) => g.count > 0)
 }
 
 // The counts under the job's name: "[✓]8 [▸]3 [!]1 [✗]2 [ ]28".
 export function sidebarCounts(groups: readonly SidebarGroup[]): { mark: Mark; text: string }[] {
-  const order: Mark[] = ["done", "running", "waiting", "failed", "open"]
+  const order: Mark[] = ["done", "running", "waiting", "failed", "open"] // dropped work is not counted
   return order.flatMap((mark) => {
-    const count = groups.filter((x) => x.mark === mark).reduce((n, g) => n + g.count, 0)
+    const count = groups.filter((x) => x.mark === mark).reduce((n, g) => n + g.count - (g.redone ?? 0), 0)
     return count ? [{ mark, text: `${BOX[mark]}${count}` }] : []
   })
+}
+
+// The sidebar's jobs of one session: the newest job with tasks in full, every other one as a folded line (the user,
+// 2026-10-20: a session with an old planned job and its own delegated tasks showed two FAILED groups).
+export function sessionJobs(views: readonly JobView[]): { main?: JobView; others: JobView[] } {
+  const shown = views.filter((v) => v.total > 0)
+  return { main: shown[0], others: shown.slice(1) }
+}
+
+// A folded job's line: "older 8d1c · 9/41 · waits for you".
+export function foldedLine(v: JobView): string {
+  const state = v.phase === "ask_user" ? "waits for you" : v.running ? `${v.running} running` : v.phase
+  return `older ${v.id.split("-").pop()} · ${v.done}/${v.total} · ${state}`
 }

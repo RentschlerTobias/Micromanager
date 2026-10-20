@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import { segments } from "../src/decide.ts"
-import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo, similarity } from "../src/native.ts"
+import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo, replaceIds, similarity } from "../src/native.ts"
 import { nextStep } from "../src/continuation.ts"
 import { roleByAgent } from "../src/roles.ts"
 import { moveJob, newJob, type Task } from "../src/state.ts"
@@ -155,6 +155,33 @@ test("the todo tool keeps the micromanager's list in its job; a todo is started 
   assert.match(dropped.errors[0]!, /T1 is merged, not an open todo/)
   assert.equal(nextStep(dropped.job, 3)?.kind, "start", "T2 still waits to be started")
   assert.equal(nextStep({ ...dropped.job, tasks: dropped.job.tasks.filter((t) => t.id !== "T2") }, 3), undefined, "a session's own job is never \"done\" by itself")
+})
+
+test("a todo that does a task over links both, across jobs too, and the old one goes when the new one starts", async () => {
+  assert.deepEqual(replaceIds("T19, job-20261018-194216-8d1c/t18 and t5"), ["T19", "job-20261018-194216-8d1c/T18", "T5"])
+  const project = repo()
+  const native = new Native()
+  // An old planned job of the session with a task given up on.
+  const old = { ...newJob("job-20261018-194216-8d1c", "old plan"), facilitator: "ses_mm" }
+  old.tasks.push({ id: "T18", title: "GRPO ch02", description: "", role: "code", acceptance: [], dependsOn: [], files: ["a.js"], wave: 0, status: "escalated", attempts: 1, stages: [], signatures: [] })
+  saveJob(project, old)
+  const first = native.todo(project, "ses_mm", [{ title: "ch04", agent: "coder", files: "b.js" }], [])
+  const t1 = first.added[0]!
+  t1.status = "escalated"
+  const r = native.todo(project, "ses_mm", [
+    { title: "ch04 (redo)", agent: "coder", files: "b.js", replaces: ["T1"] },
+    { title: "ch02 (restore)", agent: "coder", files: "a.js", replaces: ["job-20261018-194216-8d1c/T18"] },
+    { title: "nothing to redo", agent: "coder", files: "c.js", replaces: ["T9"] },
+  ], [])
+  assert.deepEqual(r.added.map((t) => [t.id, t.replaces]), [["T2", ["T1"]], ["T3", ["job-20261018-194216-8d1c/T18"]]])
+  assert.match(r.errors[0]!, /no task T9 to replace/)
+  assert.equal(r.job.tasks.find((t) => t.id === "T1")!.replacedBy, "T2")
+  assert.equal(loadJob(project, old.id)!.tasks[0]!.replacedBy, `${r.job.id}/T3`, "the other job's file says who does it over")
+  await native.delegate(project, "ses_mm", { agent: "coder", description: "T2", prompt: `Task: T2 · ${r.job.id}` }, MODEL)
+  assert.equal(r.job.tasks.find((t) => t.id === "T1")!.status, "cancelled", "started: the replaced task is given up for good")
+  // A merged task has nothing to do over.
+  r.job.tasks.find((t) => t.id === "T1")!.status = "merged"
+  assert.match(native.todo(project, "ses_mm", [{ title: "again", agent: "coder", files: "b.js", replaces: ["T1"] }], []).errors[0]!, /T1 is merged/)
 })
 
 test("the todo tool reads what models write: ids in prose, a numbered title, drops in the same list", () => {

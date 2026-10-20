@@ -145,6 +145,10 @@ export interface Task {
   learned?: string[] // the worker's LEARNED lines, for the project memory
   sessions?: string[] // every session that worked on it (worker, reviewers, fresh tries), to look into them
   undone?: string // the checkpoint rewind_job went back to, which left this task's merged change out of the branch
+  // A task that does another's work over, and the one it does over: "T19" in the same job, "job-…/T18" in another job of
+  // the session. The sidebar shows a failed task as done once its replacement is (src/progress.ts).
+  replaces?: string[]
+  replacedBy?: string
 }
 
 export interface Job {

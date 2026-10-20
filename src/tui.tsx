@@ -17,7 +17,7 @@ import { createSignal, For, onCleanup, Show } from "solid-js"
 
 import { loadPicks, loadSettings, savePicks } from "./config.ts"
 import { agentOptions, modelOptions, poolRows, RESET, shortNames, toggle, updatePicks, VISION, type CatalogModel, type PoolRow } from "./pools.ts"
-import { BOX, jobsFor, projectOf, sidebarCounts, sidebarGroups, summaryLine, taskChoices, view, type JobView, type Mark } from "./progress.ts"
+import { BOX, foldedLine, jobsFor, projectOf, resolver, sessionJobs, sidebarCounts, sidebarGroups, summaryLine, taskChoices, view, type JobView, type Mark, type SidebarGroup } from "./progress.ts"
 import { listJobs } from "./store.ts"
 import { agentRows, agentSummary, type AgentRow, type SessionFacts, type Tag } from "./switcher.ts"
 import type { Job } from "./state.ts"
@@ -79,6 +79,7 @@ function palette(context: Context) {
     failed: t.diff?.text?.removed ?? t.text.base,
     running: t.text.action?.primary?.base ?? t.text.base,
     waiting: t.hue?.orange?.["500"] ?? t.text.base,
+    dropped: t.text.muted,
     open: t.text.muted,
   }
   const tag: Record<Tag, Color> = { RUN: mark.running, ASK: mark.waiting, IDLE: t.text.muted, DONE: mark.done, FAIL: mark.failed }
@@ -98,7 +99,9 @@ function jobsOf(context: Context, sessionID: string): Job[] {
 }
 
 function read(context: Context, sessionID: string): JobView[] {
-  return jobsFor(jobsOf(context, sessionID), sessionID).map((job) => view(job))
+  const jobs = jobsOf(context, sessionID)
+  const resolve = resolver(jobs) // a task done over in another job of the session
+  return jobsFor(jobs, sessionID).map((job) => view(job, Date.now(), resolve))
 }
 
 // The session's jobs, kept fresh while the component that asked for them is on screen.
@@ -132,10 +135,66 @@ function Progress(props: { context: Context; sessionID: string }) {
   )
 }
 
+// Groups folded at first: DONE and DROPPED always, FAILED only once it is empty (then it is not shown anyway).
+const FOLDED_AT_FIRST: readonly SidebarGroup["key"][] = ["done", "dropped"]
+
+// One job as a checklist: its header, the counts, and the groups; DONE, FAILED and DROPPED fold on a click.
+function JobChecklist(props: { context: Context; job: JobView; waiting: Map<string, string> }) {
+  const colors = palette(props.context)
+  const [folded, setFolded] = createSignal(new Set<string>(FOLDED_AT_FIRST))
+  const toggle = (key: string) => setFolded((was) => { const next = new Set(was); next.has(key) ? next.delete(key) : next.add(key); return next })
+  const groups = () => sidebarGroups(props.job, props.waiting)
+  const foldable = (key: string) => key === "done" || key === "failed" || key === "dropped"
+  return (
+    <box>
+      <box flexDirection="row">
+        <text fg={colors.base}>{cut(props.job.title, 26)}</text>
+        <box flexGrow={1} />
+        <text fg={colors.muted}>{props.job.phase}</text>
+      </box>
+      <box flexDirection="row">
+        <For each={sidebarCounts(groups())}>{(c) => <text fg={colors.mark[c.mark]}>{c.text} </text>}</For>
+        <box flexGrow={1} />
+        <text fg={colors.muted}>/{props.job.total}</text>
+      </box>
+      <For each={groups()}>
+        {(group) => {
+          const shut = () => foldable(group.key) && folded().has(group.key)
+          const count = () => foldable(group.key) ? `${group.count} ${shut() ? "▸" : "▾"}`
+            : group.lines.length < group.count ? `${group.lines.length} of ${group.count}` : String(group.count)
+          return (
+            <box paddingTop={1}>
+              <box flexDirection="row" onMouseUp={() => foldable(group.key) && toggle(group.key)}>
+                <text fg={colors.base}>{group.name}</text>
+                <box flexGrow={1} />
+                <text fg={colors.muted}>{count()}</text>
+              </box>
+              <For each={shut() ? [] : group.lines}>
+                {(line) => (
+                  <box flexDirection="row">
+                    <text fg={colors.mark[line.mark]}>{BOX[line.mark]} </text>
+                    <text fg={line.mark === "open" || line.mark === "done" || line.mark === "dropped" ? colors.muted : colors.base}>{cut(`${line.id} ${line.title}`, line.detail ? 24 : 32)}</text>
+                    <box flexGrow={1} />
+                    <Show when={line.detail}>
+                      <text fg={colors.muted}>{line.detail}</text>
+                    </Show>
+                  </box>
+                )}
+              </For>
+            </box>
+          )
+        }}
+      </For>
+    </box>
+  )
+}
+
+// The session's checklist: its newest job in full, older open jobs as one folded line each (the user, 2026-10-20: two
+// jobs of one session showed two FAILED groups).
 function Checklist(props: { context: Context; sessionID: string }) {
   const jobs = useJobs(props.context, () => props.sessionID)
   const [waiting, setWaiting] = createSignal(new Map<string, string>())
-  const [showDone, setShowDone] = createSignal(false)
+  const [opened, setOpened] = createSignal(new Set<string>())
   const colors = palette(props.context)
   const poll = async () => {
     const running = jobs().flatMap((j) => j.rows.filter((r) => ["running", "gating", "fixing", "reviewing"].includes(r.status) && r.session).map((r) => r.session!))
@@ -145,54 +204,26 @@ function Checklist(props: { context: Context; sessionID: string }) {
   void poll()
   const timer = setInterval(() => void poll(), POLL_MS * 2)
   onCleanup(() => clearInterval(timer))
+  const split = () => sessionJobs(jobs())
+  const flip = (id: string) => setOpened((was) => { const next = new Set(was); next.has(id) ? next.delete(id) : next.add(id); return next })
   return (
-    <For each={jobs().filter((j) => j.total > 0)}>
-      {(job) => {
-        const groups = () => sidebarGroups(job, waiting())
-        return (
-          <box>
-            <box flexDirection="row">
-              <text fg={colors.base}>{cut(job.title, 26)}</text>
+    <box>
+      <Show when={split().main}>{(main) => <JobChecklist context={props.context} job={main()} waiting={waiting()} />}</Show>
+      <For each={split().others}>
+        {(job) => (
+          <box paddingTop={1}>
+            <box flexDirection="row" onMouseUp={() => flip(job.id)}>
+              <text fg={job.phase === "ask_user" ? colors.mark.waiting : colors.muted}>{foldedLine(job)}</text>
               <box flexGrow={1} />
-              <text fg={colors.muted}>{job.phase}</text>
+              <text fg={colors.muted}>{opened().has(job.id) ? "▾" : "▸"}</text>
             </box>
-            <box flexDirection="row">
-              <For each={sidebarCounts(groups())}>{(c) => <text fg={colors.mark[c.mark]}>{c.text} </text>}</For>
-              <box flexGrow={1} />
-              <text fg={colors.muted}>/{job.total}</text>
-            </box>
-            <For each={groups()}>
-              {(group) => {
-                const folded = () => group.key === "done" && !showDone()
-                const count = group.key === "done" ? `${group.count} ${showDone() ? "▾" : "▸"}`
-                  : group.lines.length < group.count ? `${group.lines.length} of ${group.count}` : String(group.count)
-                return (
-                  <box paddingTop={1}>
-                    <box flexDirection="row" onMouseUp={() => group.key === "done" && setShowDone(!showDone())}>
-                      <text fg={colors.base}>{group.name}</text>
-                      <box flexGrow={1} />
-                      <text fg={colors.muted}>{count}</text>
-                    </box>
-                    <For each={folded() ? [] : group.lines}>
-                      {(line) => (
-                        <box flexDirection="row">
-                          <text fg={colors.mark[line.mark]}>{BOX[line.mark]} </text>
-                          <text fg={line.mark === "open" || line.mark === "done" ? colors.muted : colors.base}>{cut(`${line.id} ${line.title}`, line.detail ? 24 : 32)}</text>
-                          <box flexGrow={1} />
-                          <Show when={line.detail}>
-                            <text fg={colors.muted}>{line.detail}</text>
-                          </Show>
-                        </box>
-                      )}
-                    </For>
-                  </box>
-                )
-              }}
-            </For>
+            <Show when={opened().has(job.id)}>
+              <JobChecklist context={props.context} job={job} waiting={waiting()} />
+            </Show>
           </box>
-        )
-      }}
-    </For>
+        )}
+      </For>
+    </box>
   )
 }
 

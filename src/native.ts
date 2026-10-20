@@ -26,6 +26,7 @@ import { ROLES, roleByAgent, roleById, type Role } from "./roles.ts"
 import { isDone, moveTask, newJob, moveJob, stage, type Job, type Task } from "./state.ts"
 import { excludeFromGit, jobId, listJobs, saveJob } from "./store.ts"
 import { sharedNote, skillLine, taskAcceptance } from "./brief.ts"
+import { settled } from "./continuation.ts"
 
 // The first line OpenCode puts before a new subagent's prompt; how the prompt hook tells a child's first turn.
 export const CHILD_PREFIX = "You are a subagent spawned by another session."
@@ -61,7 +62,7 @@ export function parseDelegation(prompt: string): Delegation {
     const c = line.match(/^\s*checks:\s*(.*)$/i)
     const r = line.match(/^\s*replaces:\s*(.*)$/i)
     if (r) {
-      replaces.push(...r[1]!.split(/[\s,]+/).map((id) => id.trim().toUpperCase()).filter(Boolean))
+      replaces.push(...replaceIds(r[1]))
       inChecks = false
     } else if (f) {
       files = f[1]!.trim()
@@ -129,12 +130,19 @@ export interface TodoItem {
   readonly checks?: string // shell commands, one per line
   readonly after?: readonly string[] // task ids it waits for
   readonly brief?: string // what the worker needs to know beyond the title
+  readonly replaces?: readonly string[] // tasks it does over: "T19", or "job-…/T18" in another job of the session
 }
 
 // Task ids in whatever a model wrote: ["T1", "T2"], "T1, T2", or "after T1 and T2 merged" (live run: the last one made
 // a task wait for a task "MERGED").
 export function taskIds(value: unknown): string[] {
   return (Array.isArray(value) ? value.join(" ") : String(value ?? "")).toUpperCase().match(/\bT\d+(?:\.\w+)*/g) ?? []
+}
+
+// The tasks a todo or a delegation does over: "T19", or "job-…/T18" for a task of another job of the session.
+export function replaceIds(value: unknown): string[] {
+  const text = Array.isArray(value) ? value.join(" ") : String(value ?? "")
+  return [...text.matchAll(/\b(job-[\w-]+\/)?(T\d+(?:\.\w+)*)\b/gi)].map((m) => `${m[1]?.toLowerCase() ?? ""}${m[2]!.toUpperCase()}`)
 }
 
 // The todo tool's one argument: a JSON list of todos, with {"drop": [...]} entries for the ones to remove. A string
@@ -163,6 +171,7 @@ export function parseTodo(items: string): { list: TodoItem[]; ids: string[] } | 
       checks: text(o.checks, "\n"),
       after: taskIds(o.after),
       brief: text(o.brief, "\n"),
+      replaces: replaceIds(o.replaces),
     })
   }
   return { list, ids }
@@ -318,6 +327,7 @@ export class Native {
     const added = addDelegated(job, { title: input.description.trim() || d.body.split("\n")[0]!, prompt: d.body, files: parsed.files, dependsOn: [], checks: d.checks })
     if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
     const task = added.task
+    this.#link(project, job, task, d.replaces)
     task.role = role.id
     task.model = model
     for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
@@ -407,7 +417,8 @@ export class Native {
     if (LIVE.has(task.status) && old && !old.ended) throw new DelegationError(`Not started: ${task.id} runs already${old.session ? ` (session ${old.session})` : ""}; its report comes to you when it ends.`)
     if (task.status === "merged" || task.status === "passed") throw new DelegationError(`Not started: ${task.id} is done already (${task.status}).`)
     const byId = new Map(job.tasks.map((t) => [t.id, t]))
-    const waits = task.dependsOn.filter((id) => { const dep = byId.get(id); return !dep || !isDone(dep) })
+    const elsewhere = (id: string) => { const [owner, taskId] = this.#owner(project, job, id); return owner?.tasks.find((t) => t.id === taskId)?.status }
+    const waits = task.dependsOn.filter((id) => { const dep = byId.get(id); return !dep || !settled(job, dep, elsewhere) })
     if (waits.length) throw new DelegationError(`Not started: ${task.id} waits for ${waits.join(", ")}; start it when ${waits.length > 1 ? "they are" : "it is"} merged.`)
     const checks = d.checks.length ? d.checks : [...new Set(taskAcceptance(job, task).map((a) => a.verify).filter((v): v is string => Boolean(v)))]
     if (d.checks.length) {
@@ -423,6 +434,8 @@ export class Native {
       task.worktree = undefined
       task.branch = undefined
     }
+    // A todo that does other tasks over: their worktrees go now, as for a delegation's "Replaces:" line.
+    await this.#replace(project, job, task.replaces ?? [])
     restart(task)
     task.model = model
     task.attempts = 0
@@ -446,13 +459,43 @@ export class Native {
   // "Replaces: T5": the micromanager starts T5's work over on purpose. T5 is cancelled and its worktree, with whatever
   // change it held, goes; a task that still runs has to be stopped first, and a merged one has nothing to replace.
   async #replace(project: string, job: Job, ids: readonly string[]): Promise<void> {
+    const cannot = this.#replaceable(project, job, ids)
+    if (cannot.length) throw new DelegationError(`Not started: ${cannot.join("; ")}`)
     for (const id of ids) {
-      const task = job.tasks.find((t) => t.id === id)
-      if (!task) throw new DelegationError(`Not started: there is no task ${id} to replace.`)
-      const live = LIVE.has(task.status) && !this.#entries.get(`${job.id}/${id}`)?.ended
-      if (live) throw new DelegationError(`Not started: ${id} still runs; stop it with stop_task first, then delegate again with "Replaces: ${id}".`)
-      if (task.status === "merged") throw new DelegationError(`Not started: ${id} is merged, so there is nothing to replace; leave out "Replaces: ${id}" and say in the brief what to change on top of it.`)
-      await this.discard(project, job, id, "replace", "started over by a new task")
+      const [owner, taskId] = this.#owner(project, job, id)
+      if (owner && owner.tasks.find((t) => t.id === taskId)?.status !== "cancelled") await this.discard(project, owner, taskId, "replace", "started over by a new task")
+    }
+  }
+
+  // The job a replaced id lives in and the task id inside it: "T19" in this job, "job-…/T18" in another of the project.
+  #owner(project: string, job: Job, id: string): [Job | undefined, string] {
+    const [jobId, taskId] = id.includes("/") ? id.split("/") as [string, string] : [job.id, id]
+    if (jobId === job.id) return [job, taskId]
+    return [this.current(project, jobId) ?? listJobs(project).find((j) => j.id === jobId), taskId]
+  }
+
+  // Why the given tasks cannot be done over: missing, still running, or merged already. Empty when they can.
+  #replaceable(project: string, job: Job, ids: readonly string[]): string[] {
+    return ids.flatMap((id) => {
+      const [owner, taskId] = this.#owner(project, job, id)
+      const task = owner?.tasks.find((t) => t.id === taskId)
+      if (!owner || !task) return [`there is no task ${id} to replace`]
+      if (LIVE.has(task.status) && !this.#entries.get(`${owner.id}/${taskId}`)?.ended) return [`${id} still runs; stop it with stop_task first, then replace it`]
+      if (task.status === "merged" || task.status === "passed") return [`${id} is ${task.status}, so there is nothing to replace; say in the new task what to change on top of it`]
+      return []
+    })
+  }
+
+  // The link both ways: the new task names what it does over, each old task the one doing it (job-qualified across jobs).
+  #link(project: string, job: Job, task: Task, ids: readonly string[]): void {
+    if (!ids.length) return
+    task.replaces = [...ids]
+    for (const id of ids) {
+      const [owner, taskId] = this.#owner(project, job, id)
+      const old = owner?.tasks.find((t) => t.id === taskId)
+      if (!owner || !old) continue
+      old.replacedBy = owner === job ? task.id : `${job.id}/${task.id}`
+      if (owner !== job) saveJob(project, owner)
     }
   }
 
@@ -801,8 +844,12 @@ export class Native {
       const after = (item.after ?? []).map((id) => id.trim().toUpperCase()).filter(Boolean)
       const unknown = after.filter((id) => !job.tasks.some((t) => t.id === id))
       if (unknown.length) { errors.push(`${title}: no task ${unknown.join(", ")} to wait for`); continue }
+      const replaces = item.replaces ?? []
+      const cannot = this.#replaceable(project, job, replaces)
+      if (cannot.length) { errors.push(`${title}: ${cannot.join("; ")}`); continue }
       const result = addDelegated(job, { title, prompt: item.brief?.trim() || title, files: parsed.files, dependsOn: after, checks })
       if (!result.task) { errors.push(`${title}: ${result.errors!.join("; ")}`); continue }
+      this.#link(project, job, result.task, replaces)
       result.task.role = role.id
       stage(result.task, "todo", "pass", "written down by the micromanager")
       added.push(result.task)
