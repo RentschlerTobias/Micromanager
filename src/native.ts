@@ -22,7 +22,7 @@ import {
 import { addDelegated, checkSetProblems, parseFiles } from "./plan.ts"
 import { WRITERS } from "./profile.ts"
 import { FIX_ROUNDS } from "./watchdog.ts"
-import { ROLES, roleByAgent, roleById, type Role } from "./roles.ts"
+import { ROLES, roleByAgent, roleById, type Role, type RoleId } from "./roles.ts"
 import { isDone, moveTask, newJob, moveJob, stage, type Job, type Task } from "./state.ts"
 import { excludeFromGit, jobId, listJobs, saveJob } from "./store.ts"
 import { sharedNote, skillLine, taskAcceptance } from "./brief.ts"
@@ -940,6 +940,17 @@ export class Native {
     const entry = this.#entry(session)
     const job = entry && this.#job(entry)
     return entry && job ? { project: entry.project, job } : undefined
+  }
+
+  // The live worker that works in a directory (a shell command's cwd: its own directory or below), for the sandbox
+  // (src/sandbox.ts). The deepest match wins, so a writer's worktree beats the job's integration worktree it lies in.
+  workerAt(cwd: string): { project: string; jobId: string; role: RoleId; writer: boolean; dir: string; worktree: string } | undefined {
+    const inside = (dir: string) => cwd === dir || cwd.startsWith(`${dir}/`)
+    const found = [...this.#entries.values()]
+      .filter((e) => !e.ended && (inside(e.dir) || inside(e.worktree)))
+      .sort((a, b) => b.dir.length - a.dir.length)[0]
+    const task = found && this.#job(found)?.tasks.find((t) => t.id === found.taskId)
+    return found && task ? { project: found.project, jobId: found.jobId, role: task.role as RoleId, writer: found.writer, dir: found.dir, worktree: found.worktree } : undefined
   }
 
   // The workers of a micromanager session that still run.

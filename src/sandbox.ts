@@ -115,8 +115,10 @@ export interface Wrapper {
 
 const BASE: Rules = { network: { allowedDomains: [...REGISTRIES], deniedDomains: [] }, filesystem: { denyRead: [...DENY_READ], allowRead: [], allowWrite: [], denyWrite: [] } }
 
-// Starts sandbox-runtime once per server. A sandbox that cannot start leaves the plugin working without one: the
-// commands are not wrapped, the environment is still cleaned, and src/decide.ts sends writers' commands to Jev again.
+// Checks once per server whether the sandbox can run; its proxy starts with the first command it wraps, so a server
+// (or a test) that never runs a worker command keeps no proxy alive. A sandbox that cannot run leaves the plugin
+// working without one: commands are not wrapped, the environment is still cleaned, and src/decide.ts sends writers'
+// commands to Jev again.
 export async function startSandbox(enabled = true): Promise<Wrapper> {
   const off = (reason: string): Wrapper => ({ available: false, reason, wrap: async (command) => command, stop: async () => undefined })
   if (!enabled) return off("switched off in micromanager.jsonc")
@@ -125,11 +127,17 @@ export async function startSandbox(enabled = true): Promise<Wrapper> {
     if (!SandboxManager.isSupportedPlatform()) return off(`no sandbox on ${process.platform}`)
     const deps = await SandboxManager.checkDependenciesAsync()
     if (deps.errors.length) return off(deps.errors.join("; "))
-    await SandboxManager.initialize(BASE as never)
+    let started: Promise<void> | undefined
     return {
       available: true,
-      wrap: (command, rules) => SandboxManager.wrapWithSandbox(command, undefined, rules as never),
-      stop: () => SandboxManager.reset(),
+      wrap: async (command, rules) => {
+        await (started ??= SandboxManager.initialize(BASE as never))
+        return SandboxManager.wrapWithSandbox(command, undefined, rules as never)
+      },
+      stop: async () => {
+        if (started) await SandboxManager.reset()
+        started = undefined
+      },
     }
   } catch (err) {
     return off(`sandbox-runtime did not start: ${String(err)}`)

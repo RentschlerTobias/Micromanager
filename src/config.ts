@@ -222,6 +222,26 @@ export function parseAllowOutside(text: string): readonly string[] {
   return out
 }
 
+// "sandbox": run worker commands in the sandbox (src/sandbox.ts; default true). "env": names of variables worker
+// commands keep beyond the allowlist ("DATABASE_URL", or "MYAPP_*"). "network": domains worker commands may reach
+// beyond the package registries ("api.example.com", "*.example.com", "host:8443"). Both lists are the user's standing
+// grants for every job; a single job's grants come from request_env / request_network.
+export function parseSandbox(text: string): { sandbox: boolean; env: readonly string[]; network: readonly string[] } {
+  const raw = JSON.parse(stripComments(text)) as { sandbox?: unknown; env?: unknown; network?: unknown }
+  const sandbox = raw.sandbox ?? true
+  if (typeof sandbox !== "boolean") throw new Error("sandbox must be true or false")
+  const list = (value: unknown, name: string, ok: RegExp, example: string): string[] => {
+    if (value === undefined) return []
+    if (!Array.isArray(value) || !value.every((v) => typeof v === "string" && ok.test(v))) throw new Error(`${name} must be a list like ${example}`)
+    return [...new Set(value as string[])]
+  }
+  return {
+    sandbox,
+    env: list(raw.env, "env", /^[A-Za-z_][A-Za-z0-9_]*\*?$/, '["DATABASE_URL", "MYAPP_*"]'),
+    network: list(raw.network, "network", /^(\*\.)?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*(:\d{1,5})?$/, '["api.example.com", "*.example.com"]'),
+  }
+}
+
 // With cloudOnly, local models stay in the registry (they show up in the journal's ranking) but are never routed to.
 export function cloudRegistry(registry: readonly ModelEntry[]): ModelEntry[] {
   return registry.map((m) => (m.location === "local" ? { ...m, disabled: true } : m))
@@ -238,6 +258,9 @@ export interface Settings {
   readonly decisions: PolicySet
   readonly registry: readonly ModelEntry[]
   readonly allowOutside: readonly string[]
+  readonly sandbox: boolean
+  readonly env: readonly string[]
+  readonly network: readonly string[]
 }
 
 // The settings a config file that is missing or broken falls back to. One place, so the two returns below cannot drift
@@ -252,6 +275,9 @@ const DEFAULTS: Omit<Settings, "registry"> = {
   floors: DEFAULT_FLOORS,
   decisions: {},
   allowOutside: [],
+  sandbox: true,
+  env: [],
+  network: [],
 }
 
 export function loadSettings(path = configPath()): Settings & { error?: string } {
@@ -262,7 +288,7 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text) }
   } catch (err) {
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }

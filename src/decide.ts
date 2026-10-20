@@ -620,6 +620,9 @@ export async function decide(
   preset?: "allow" | "deny" | "user",
   root: string | undefined = request.directory,
   allowed: readonly string[] = [],
+  // Whether the worker's commands run in the sandbox (src/sandbox.ts). Without it a writer's command in its worktree
+  // is no longer allowed on its text alone: what the program does is unchecked, so Jev is asked as before.
+  sandboxed = true,
 ): Promise<Outcome> {
   const rule = hardRule(request, allowed)
   if (rule) return { verdict: "user", reason: `always the user: ${rule}` }
@@ -637,7 +640,7 @@ export async function decide(
   const role = roleByAgent(request.agent)?.id
   if (!presetRules && request.action === "shell" && role !== undefined) {
     const worktree = WRITERS.has(role) ? taskWorktree(root) : undefined
-    if (worktree && staysInWorktree(request, worktree, root)) {
+    if (sandboxed && worktree && staysInWorktree(request, worktree, root)) {
       return { verdict: "allow", reason: "a command inside the task's own worktree" }
     }
     // A reader's shell asks about every command its rules do not list, so that a chain of reading programs reaches the

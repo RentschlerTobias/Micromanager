@@ -583,6 +583,11 @@ test("a writer's command inside its own task worktree is allowed without Jev; el
   const own = await decide(jev, req("shell", ["npm run build", "rm -rf dist"]), undefined, () => [], undefined, WT)
   assert.deepEqual([own.verdict, own.reason], ["allow", "a command inside the task's own worktree"])
   assert.equal(jev.calls.length, 0)
+  // Without the sandbox the program is unchecked, so its text alone allows nothing: Jev decides (and denies here).
+  const bare = await decide(jev, req("shell", ["npm run build"]), undefined, () => [], undefined, WT, [], false)
+  assert.equal(bare.verdict, "deny")
+  assert.equal(jev.calls.length, 1)
+  jev.calls.length = 0
   // the hard rules come first, also in the worktree
   assert.equal((await decide(jev, req("shell", ["git push origin HEAD"]), undefined, () => [], undefined, WT)).verdict, "user")
   assert.equal((await decide(jev, req("shell", ["sudo make install"]), undefined, () => [], undefined, WT)).verdict, "user")

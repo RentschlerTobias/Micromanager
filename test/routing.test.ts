@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { loadPicks, NO_PICKS, parsePicks, parseRouting, savePicks, stripComments } from "../src/config.ts"
+import { loadPicks, NO_PICKS, parsePicks, parseRouting, parseSandbox, savePicks, stripComments } from "../src/config.ts"
 import { backstop, DELEGATION_TOOLS, delegationRole, HEADER, notRouted, routeDelegation, routeSubagentCall, unownedDelegation, type ChildSession } from "../src/hooks.ts"
 import { modelAvailability } from "../src/plugin.ts"
 import { family, MODELS, ROLES, roleById } from "../src/roles.ts"
@@ -276,4 +276,13 @@ test("the delegation rewrites the call to the available model and reports what i
   assert.equal(call.input.model, MODELS.mimo, "the call carries a model that exists, not the one that does not")
   assert.deepEqual(routed?.skipped, [MODELS.glm])
   assert.match(String(call.input.prompt), /role: code · model: opencode-go\/mimo-v2\.6-pro/, "the brief names what it will run on")
+})
+
+test("the sandbox settings: on by default, extra variables and domains are names, nothing else", () => {
+  assert.deepEqual(parseSandbox("{}"), { sandbox: true, env: [], network: [] })
+  assert.deepEqual(parseSandbox('{"sandbox": false, "env": ["DATABASE_URL", "MYAPP_*"], "network": ["api.example.com", "*.example.com", "h:8443"]}'),
+    { sandbox: false, env: ["DATABASE_URL", "MYAPP_*"], network: ["api.example.com", "*.example.com", "h:8443"] })
+  assert.throws(() => parseSandbox('{"env": ["A=b"]}'), /env must be a list/)
+  assert.throws(() => parseSandbox('{"network": ["https://x.com"]}'), /network must be a list/)
+  assert.throws(() => parseSandbox('{"sandbox": "yes"}'), /true or false/)
 })

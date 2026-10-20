@@ -19,6 +19,7 @@ export interface Control extends Partial<JobOptions> {
   readonly pause?: string // why auto-continue does not wake the micromanager now: "waits for you", "no progress"
   readonly wakes?: number // auto-continue wakes in a row without progress
   readonly seen?: string // the job's progress at the last wake ("done:started"), to tell a wake without progress
+  readonly grants?: { readonly env?: readonly string[]; readonly network?: readonly string[] } // names and domains only, never values
 }
 
 export function controlPath(project: string, jobId: string): string {

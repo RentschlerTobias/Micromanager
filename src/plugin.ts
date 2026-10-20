@@ -25,6 +25,7 @@ import { Compactor } from "./compact.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
+import { cleanEnv, rulesFor, startSandbox, type Wrapper } from "./sandbox.ts"
 import { isStarted, lastOptions, loadControl, optionsOf, saveLastOptions, updateControl } from "./control.ts"
 import { accessForm, answersOf, formInput, gitForm, readForm, type Question } from "./forms.ts"
 import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
@@ -83,6 +84,9 @@ interface Context {
     // context's session domain is the client session API with get/switchAgent/switchModel/prompt on it.
     get(args: { sessionID: string }): Promise<unknown>
   }
+  // opencode 2.0.18: "create.before" gets the shell to start, { command, cwd, timeout, shell, env }, and what the hook
+  // leaves in it is what runs (spike, 2026-10-20). No session id: the worker is found by its directory.
+  shell?: { hook(name: string, callback: (input: { command: string; cwd?: string; env?: Record<string, string | undefined> }) => Promise<void> | void): Promise<unknown> }
   permission: {
     hook(name: string, callback: (evaluation: Evaluation) => Promise<void> | void): Promise<unknown>
     // A session's paused requests, and the reply that lets one go or fails it (opencode 2.0.18, src/ask.ts).
@@ -145,6 +149,11 @@ interface Shared {
   grants: Map<string, Grants> // job -> what the user decided about the refused paths of this job
   asked: Map<string, Asked> // job -> the question waiting for an answer, so it is never asked twice at once
   native?: Native // the micromanager's workers on OpenCode's subagent tool, made by the first instance
+  sandbox?: Promise<Wrapper> // worker commands' sandbox (src/sandbox.ts), started once per server
+  // A wrapped command -> the command the worker wrote. OpenCode evaluates a shell's permission after the shell hook
+  // wrapped it (live run, 2026-10-20: the rules and Jev saw a page of bwrap instead of `./probe.sh`), so the
+  // permission hook puts the worker's own command back before anything judges it.
+  unwrapped?: Map<string, string>
   code?: { commit: string; dirty: boolean | "unknown" } // the plugin code this server loaded
   asks: Asks // workers' paused permission requests, answered by the micromanager or the user (src/ask.ts)
   helperOf: Map<string, string> // helper session -> the writer it answers (src/helpers.ts)
@@ -721,6 +730,16 @@ export default {
     const log = logger(ctx)
     const settings = loadSettings()
     const { cloudOnly, parallel, perModel, budget, notify, routing, floors, decisions, allowOutside, error } = settings
+    // What the user granted a job's workers beyond the allowlist (request_env / request_network), kept in its control file.
+    const jobGrants = (project: string, jobId: string): { env: readonly string[]; network: readonly string[] } => {
+      const g = loadControl(project, jobId).grants
+      return { env: g?.env ?? [], network: g?.network ?? [] }
+    }
+    // Worker commands run in the sandbox (src/sandbox.ts); one per server, shared by every instance.
+    const sandbox = (SHARED.sandbox ??= startSandbox(settings.sandbox).then((box) => {
+      if (!box.available) log("warn", `worker commands run without a sandbox: ${box.reason}`)
+      return box
+    }))
     // Which models the host can run, read from ctx.model and kept for a minute (see modelAvailability).
     const hostModels = modelAvailability(ctx.model)
     // A role's pool goes to its least-used model, by tasks per $ of its monthly budget (src/routing.ts). One count for
@@ -799,6 +818,27 @@ export default {
     const native = (SHARED.native ??= new Native({ installedSkills: installedSkills(), planFirst: true, noGit: (dir) => noGitNote(dir) }))
     const workerJobs = SHARED.workerJobs
     const workerDirs = SHARED.workerDirs
+    // Every shell a worker starts: its environment cleaned to the allowlist, its command wrapped in the sandbox with the
+    // rules of its role. A shell that is no worker's (the user's own, in the TUI) is left as it is.
+    await ctx.shell?.hook("create.before", async (input) => {
+      const cwd = String(input.cwd ?? "")
+      const found = native.workerAt(cwd)
+      // A worker of the older runner path: known only by its directory, and it writes there.
+      const dir = found ? undefined : [...workerDirs.values()].filter((d) => cwd === d || cwd.startsWith(`${d}/`)).sort((a, b) => b.length - a.length)[0]
+      if (!found && !dir) return
+      const grants = found ? jobGrants(found.project, found.jobId) : { env: [], network: [] }
+      input.env = cleanEnv(input.env ?? process.env, [...settings.env, ...grants.env])
+      const box = await sandbox
+      if (!box.available) return
+      const rules = found
+        ? rulesFor({ role: found.role, writer: found.writer, dir: found.dir, worktree: found.worktree, domains: [...settings.network, ...grants.network] })
+        : rulesFor({ role: "code", writer: true, dir: dir!, worktree: dir!, domains: [...settings.network] })
+      const wrapped = await box.wrap(input.command, rules)
+      const seen = (SHARED.unwrapped ??= new Map())
+      seen.set(wrapped, input.command)
+      if (seen.size > 500) seen.delete(seen.keys().next().value!)
+      input.command = wrapped
+    })
     // The job a worker session works for: what the runner recorded when it dispatched the worker, so a vouch of
     // request_access and a reconciliation both know which job they are about. undefined for a session that is none of
     // the plugin's (the micromanager itself, the user, a build agent).
@@ -1022,6 +1062,8 @@ export default {
     // else the user is asked as usual.
     const micromanagerReads = new Map<string, number>()
     await ctx.permission.hook("evaluate", async (evaluation) => {
+      // A sandboxed shell is judged by what the worker wrote, not by its wrapper (see SHARED.unwrapped).
+      if (evaluation.action === "shell" && SHARED.unwrapped?.size) evaluation.resources = evaluation.resources.map((r) => SHARED.unwrapped!.get(r) ?? r)
       // The backstop, before every other rule, because it is the one that must hold when the delegation hook above did
       // not engage. A session that is a child of a micromanager session but is not a worker the plugin claimed and
       // moved into its worktree has no task, no checks and no merge train — so it is not allowed to change the tree,
@@ -1143,7 +1185,7 @@ export default {
       // A worker session reads inside its own worktree (its directory), so the read-only-inside fast path applies to a
       // worker's inspection instead of asking Jev, whose confidence on those sits below the read floor.
       const root = runnerSessions.has(evaluation.sessionID) ? workerDirs.get(evaluation.sessionID) ?? ctx.location?.directory : undefined
-      const outcome = await decide(jev, request, floors, undefined, preset, root, [...allowOutside, ...grantedPaths(job)])
+      const outcome = await decide(jev, request, floors, undefined, preset, root, [...allowOutside, ...grantedPaths(job)], (await sandbox).available)
       if (outcome.verdict !== "user") {
         evaluation.effect = outcome.verdict
         // A refusal says why, so the worker can choose another way instead of guessing from a bare "denied".
@@ -1168,8 +1210,11 @@ export default {
       const rel = project ? await repoRel(project, exec).catch(() => "") : ""
       const code = await pluginCode()
       SHARED.code ??= code
+      const box = await sandbox
       record({
         kind: "plugin",
+        // Whether worker commands run in the sandbox (src/sandbox.ts), and why not.
+        sandbox: box.available ? "on" : `off: ${box.reason}`,
         version: version(),
         // Which code this server runs: the plugin loads once per server, so after an update a server that was not
         // restarted runs the old one (2026-10-13: the user's hub ran the morning's code all day).
