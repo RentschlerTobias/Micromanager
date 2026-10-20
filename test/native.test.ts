@@ -11,6 +11,7 @@ import { nextStep } from "../src/continuation.ts"
 import { roleByAgent } from "../src/roles.ts"
 import { moveJob, newJob, type Task } from "../src/state.ts"
 import { loadJob, saveJob } from "../src/store.ts"
+import { updateControl } from "../src/control.ts"
 import { FIX_ROUNDS } from "../src/watchdog.ts"
 
 function repo(): string {
@@ -182,6 +183,33 @@ test("a todo that does a task over links both, across jobs too, and the old one 
   // A merged task has nothing to do over.
   r.job.tasks.find((t) => t.id === "T1")!.status = "merged"
   assert.match(native.todo(project, "ses_mm", [{ title: "again", agent: "coder", files: "b.js", replaces: ["T1"] }], []).errors[0]!, /T1 is merged/)
+})
+
+test("plan first: a writer starts only from a todo of a started job; Parallel off and STOP hold writers back", async () => {
+  const project = repo()
+  const native = new Native({ planFirst: true })
+  await assert.rejects(
+    native.delegate(project, "ses_mm", { agent: "coder", description: "add", prompt: "Add add.js\nFiles: add.js\nChecks: test -f add.js" }, MODEL),
+    /starts from a todo/,
+  )
+  const r = native.todo(project, "ses_mm", [
+    { title: "write a.js", agent: "coder", files: "a.js", checks: "test -f a.js" },
+    { title: "write b.js", agent: "coder", files: "b.js", checks: "test -f b.js" },
+  ], [])
+  const note = native.startNote(project, r.job)!
+  assert.match(note, /call the question tool with exactly this input/)
+  assert.match(note, /"header":"Start job"/)
+  await assert.rejects(native.delegate(project, "ses_mm", { agent: "coder", description: "T1", prompt: `Task: T1 · ${r.job.id}` }, MODEL), /not started yet/)
+  // A reader still starts on the fly, before the plan is started.
+  await native.delegate(project, "ses_mm", { agent: "explorer", description: "map", prompt: "Where is the entry point?" }, MODEL)
+
+  updateControl(project, r.job.id, { started: true, parallel: false })
+  assert.equal(native.startNote(project, r.job), undefined)
+  const t1 = await native.delegate(project, "ses_mm", { agent: "coder", description: "T1", prompt: `Task: T1 · ${r.job.id}` }, MODEL)
+  native.claim("ses_w1", child(t1.prompt))
+  await assert.rejects(native.delegate(project, "ses_mm", { agent: "coder", description: "T2", prompt: `Task: T2 · ${r.job.id}` }, MODEL), /Parallel is off.*T1 still runs/)
+  updateControl(project, r.job.id, { stopped: true })
+  await assert.rejects(native.delegate(project, "ses_mm", { agent: "coder", description: "T2", prompt: `Task: T2 · ${r.job.id}` }, MODEL), /the user stopped job/)
 })
 
 test("the todo tool reads what models write: ids in prose, a numbered title, drops in the same list", () => {

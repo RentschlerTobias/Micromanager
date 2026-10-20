@@ -195,8 +195,11 @@ function Checklist(props: { context: Context; sessionID: string }) {
   const jobs = useJobs(props.context, () => props.sessionID)
   const [waiting, setWaiting] = createSignal(new Map<string, string>())
   const [opened, setOpened] = createSignal(new Set<string>())
+  const [asks, setAsks] = createSignal<string[]>([]) // the micromanager's own open forms: what they ask
   const colors = palette(props.context)
   const poll = async () => {
+    const forms = items(await props.context.client.form?.list({}).catch(() => undefined)) as { sessionID?: string; title?: string; fields?: { title?: string; description?: string }[] }[]
+    setAsks(forms.filter((f) => f.sessionID === props.sessionID).map((f) => f.fields?.map((x) => x.title).filter(Boolean).join(" · ") || f.title || "a question"))
     const running = jobs().flatMap((j) => j.rows.filter((r) => ["running", "gating", "fixing", "reviewing"].includes(r.status) && r.session).map((r) => r.session!))
     const found = running.length ? await pending(props.context, running) : new Map()
     setWaiting(new Map([...found].map(([id, p]) => [id, p.what])))
@@ -208,6 +211,14 @@ function Checklist(props: { context: Context; sessionID: string }) {
   const flip = (id: string) => setOpened((was) => { const next = new Set(was); next.has(id) ? next.delete(id) : next.add(id); return next })
   return (
     <box>
+      <For each={asks()}>
+        {(what) => (
+          <box flexDirection="row" paddingBottom={1}>
+            <text fg={colors.mark.waiting}>[?] </text>
+            <text fg={colors.base}>{cut(`asks you: ${what}`, 34)}</text>
+          </box>
+        )}
+      </For>
       <Show when={split().main}>{(main) => <JobChecklist context={props.context} job={main()} waiting={waiting()} />}</Show>
       <For each={split().others}>
         {(job) => (

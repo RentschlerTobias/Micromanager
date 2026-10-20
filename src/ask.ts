@@ -13,6 +13,8 @@
 // "once" lets this call run; "job" also lets the exact same request run for the rest of the job; "refuse" fails it with
 // the reason. OpenCode's own "always" is never used: it writes a rule into the project for good.
 
+import { askForm, formInput } from "./forms.ts"
+
 export type AskDecision = "once" | "job" | "refuse"
 export type AskedBy = "micromanager" | "user" | "timeout"
 
@@ -155,8 +157,9 @@ export function askNote(ask: PendingAsk, timeoutMs = ASK_TIMEOUT_MS): string {
   const minutes = Math.round(timeoutMs / 60_000)
   const head = `[micromanager] ${ask.id}: worker ${ask.task} (${ask.agent}, session ${ask.sessionID}) is paused on a permission request until it is answered.\nRequest: ${what}\nWhy it was not decided automatically: ${ask.reason}`
   const end = `Without an answer it is refused in ${minutes} minutes and the worker carries on without it.`
+  const form = formInput(askForm(ask.id, ask.task, what, ask.reason))
   if (ask.hard) {
-    return `${head}\nThis is a hard rule: only the user can allow it. Show them the request and why the worker wants it, in one or two sentences, ask "yes, yes always (for this job) or no?", call no tool and end your turn. Their answer reaches the plugin by itself. ${end}`
+    return `${head}\nThis is a hard rule: only the user can allow it. Ask them with the question tool, with exactly this input (a form that waits for their answer; it reaches the plugin by itself):\n${form} ${end}`
   }
-  return `${head}\nDecide it: if it clearly serves the worker's task and reaches nothing outside the project, call answer_permission with id ${ask.id} and decision once (this call) or job (this exact request for the rest of the job), inside the execute tool: await tools.answer_permission({ id: "${ask.id}", decision: "once", note: "" }). If it is risky, outside the task, or you are not sure, ask the user instead: show the request and why, ask "yes, yes always or no?", call no tool and end your turn; their answer reaches the plugin by itself. To refuse it yourself, call answer_permission with decision refuse and a note why. ${end}`
+  return `${head}\nDecide it: if it clearly serves the worker's task and reaches nothing outside the project, call answer_permission with id ${ask.id} and decision once (this call) or job (this exact request for the rest of the job), inside the execute tool: await tools.answer_permission({ id: "${ask.id}", decision: "once", note: "" }). If it is risky, outside the task, or you are not sure, ask the user instead with the question tool, with exactly this input (their answer reaches the plugin by itself):\n${form}\nTo refuse it yourself, call answer_permission with decision refuse and a note why. ${end}`
 }

@@ -26,7 +26,9 @@ import { ROLES, roleByAgent, roleById, type Role } from "./roles.ts"
 import { isDone, moveTask, newJob, moveJob, stage, type Job, type Task } from "./state.ts"
 import { excludeFromGit, jobId, listJobs, saveJob } from "./store.ts"
 import { sharedNote, skillLine, taskAcceptance } from "./brief.ts"
-import { settled } from "./continuation.ts"
+import { settled, startable } from "./continuation.ts"
+import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
+import { formInput, startForm } from "./forms.ts"
 
 // The first line OpenCode puts before a new subagent's prompt; how the prompt hook tells a child's first turn.
 export const CHILD_PREFIX = "You are a subagent spawned by another session."
@@ -120,6 +122,10 @@ export interface NativeDeps {
   readonly exec?: Exec
   readonly installedSkills?: ReadonlySet<string>
   readonly graphs?: Pick<Graphs, "get"> // the code graph an explorer starts from
+  // Plan first (the user, 2026-10-20): a writer starts only from a todo of a job the user started with the start form,
+  // so the work is planned with its order before anything changes files. Readers still start on the fly. Off in the
+  // tests that delegate writers directly.
+  readonly planFirst?: boolean
 }
 
 // One entry of the todo tool: what the micromanager means to start later.
@@ -199,6 +205,19 @@ export class Native {
     this.#exec = deps.exec ?? defaultExec
     this.#skills = deps.installedSkills ?? new Set()
     this.#graphs = deps.graphs ?? new Graphs(this.#exec)
+    this.#planFirst = deps.planFirst ?? false
+  }
+
+  readonly #planFirst: boolean
+
+  // The note that asks the user to start the job, with the start form to pass to the question tool; undefined once
+  // the job is started.
+  startNote(project: string, job: Job): string | undefined {
+    if (isStarted(job, loadControl(project, job.id))) return undefined
+    const open = job.tasks.filter((t) => ["pending", "ready", "planned"].includes(t.status))
+    if (!open.length) return undefined
+    const form = startForm(job.id, open.length, startable(job).length, lastOptions(project))
+    return `The plan is not started yet. When the todo list is complete, ask the user to start it: call the question tool with exactly this input (it is a form; the user ticks the options and says Start), then end your turn:\n${formInput(form)}`
   }
 
   // The micromanager session's job: made at its first delegation, kept until the session ends.
@@ -307,6 +326,9 @@ export class Native {
     if (!role) throw new DelegationError(`Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}), not ${input.agent || "none"}.`)
     const d = parseDelegation(input.prompt)
     if (d.planned) return this.#planned(project, parent, role, d, d.planned, model)
+    if (this.#planFirst && WRITERS.has(role.id)) {
+      throw new DelegationError(`Not started: a ${role.agent} starts from a todo. Write it down with the todo tool first (with "after" for what it waits for, "replaces" for a task it does over), then start it with the prompt line "Task: T… · job-…".`)
+    }
     const parsed = parseFiles(d.files, project)
     if (parsed.problem) throw new DelegationError(`Not started: ${parsed.problem}`)
     const writer = WRITERS.has(role.id)
@@ -408,6 +430,10 @@ export class Native {
     if (!job.native && !job.rolling) throw new DelegationError(`Not started: job ${job.id} is not running on your workers; start it with run_job first.`)
     if (job.facilitator && job.facilitator !== parent) throw new DelegationError(`Not started: job ${job.id} belongs to another micromanager session; run_job ${job.id} here takes it over.`)
     if (job.phase !== "execute") throw new DelegationError(`Not started: job ${job.id} is ${job.phase}; run_job resumes it.`)
+    const control = loadControl(project, job.id)
+    if (control.stopped) throw new DelegationError(`Not started: the user stopped job ${job.id}. Ask them whether to go on; nothing starts until they start it again.`)
+    const unstarted = this.#planFirst && job.rolling && WRITERS.has(role.id) ? this.startNote(project, job) : undefined
+    if (unstarted) throw new DelegationError(`Not started: ${unstarted}`)
     const task = job.tasks.find((t) => t.id === planned.task)
     if (!task) throw new DelegationError(`Not started: job ${job.id} has no task ${planned.task}.`)
     const agent = roleById(task.role)?.agent ?? task.role
@@ -416,6 +442,10 @@ export class Native {
     const old = this.#entries.get(k)
     if (LIVE.has(task.status) && old && !old.ended) throw new DelegationError(`Not started: ${task.id} runs already${old.session ? ` (session ${old.session})` : ""}; its report comes to you when it ends.`)
     if (task.status === "merged" || task.status === "passed") throw new DelegationError(`Not started: ${task.id} is done already (${task.status}).`)
+    if (WRITERS.has(role.id) && !optionsOf(control, lastOptions(project)).parallel) {
+      const busy = [...this.#entries.values()].find((e) => e.jobId === job.id && e.project === project && e.writer && !e.ended && e.taskId !== task.id)
+      if (busy) throw new DelegationError(`Not started: Parallel is off for job ${job.id}, and ${busy.taskId} still runs; start ${task.id} after its report.`)
+    }
     const byId = new Map(job.tasks.map((t) => [t.id, t]))
     const elsewhere = (id: string) => { const [owner, taskId] = this.#owner(project, job, id); return owner?.tasks.find((t) => t.id === taskId)?.status }
     const waits = task.dependsOn.filter((id) => { const dep = byId.get(id); return !dep || !settled(job, dep, elsewhere) })

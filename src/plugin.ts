@@ -25,6 +25,8 @@ import { Compactor } from "./compact.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { nextStep, plannedLine, startable } from "./continuation.ts"
+import { saveLastOptions, updateControl } from "./control.ts"
+import { accessForm, answersOf, formInput, readForm, type Question } from "./forms.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
@@ -772,7 +774,7 @@ export default {
     const runnerSessions = SHARED.runnerSessions
 
     // The micromanager's workers run on OpenCode's subagent tool, in the background; writers in worktrees of their own.
-    const native = (SHARED.native ??= new Native({ installedSkills: installedSkills() }))
+    const native = (SHARED.native ??= new Native({ installedSkills: installedSkills(), planFirst: true }))
     const workerJobs = SHARED.workerJobs
     const workerDirs = SHARED.workerDirs
     // The job a worker session works for: what the runner recorded when it dispatched the worker, so a vouch of
@@ -1282,8 +1284,53 @@ export default {
     })
     // Web content that runner sessions fetch, a common way in for indirect injection.
     const WEB = /web|fetch/i
+    // When each micromanager session last put a form to the user.
+    const lastForm = new Map<string, number>()
+    // What a submitted form says, applied, and told to the micromanager under the tool's result.
+    const answered = async (sessionID: string, call: ToolCall): Promise<void> => {
+      const answers = answersOf(call.result)
+      const form = answers && readForm((call.input.questions ?? []) as Partial<Question>[], answers)
+      if (!form || !project) return
+      record({ kind: "form", sessionID, form })
+      const tell = (text: string) => rewriteResult(call.result, (was) => `${was}\n[micromanager] ${text}`)
+      if (form.kind === "start") {
+        const job = native.job(project, sessionID)
+        if (form.decision === "start") {
+          updateControl(project, job.id, { started: true, stopped: false, pause: undefined, wakes: 0, ...form.options })
+          saveLastOptions(project, form.options)
+          const ready = startable(job)
+          const now = form.options.parallel ? ready : ready.slice(0, 1)
+          const on = Object.entries(form.options).filter(([, v]) => v).map(([k]) => k).join(", ") || "no options"
+          tell(`The user started job ${job.id} (${on}). ${now.length ? `Start ${now.length > 1 ? "these todos now, in one message" : "this todo now"}:\n${now.map((t) => `- agent ${roleById(t.role)?.agent ?? t.role}, description "${t.id} ${t.title}", prompt "${plannedLine(t.id, job.id)}"`).join("\n")}` : "No todo can start yet."}`)
+        } else if (form.decision === "cancel") {
+          const open = job.tasks.filter((t) => ["pending", "ready", "planned"].includes(t.status)).map((t) => t.id)
+          native.todo(project, sessionID, [], open)
+          updateControl(project, job.id, { started: false })
+          tell(`The user cancelled the plan; its open todos (${open.join(", ") || "none"}) are dropped. Ask what they want instead.`)
+        } else {
+          tell(`The user wants the plan changed${form.said ? `: "${form.said}"` : ""}. Change the todos with the todo tool, then ask with the start form again.`)
+        }
+      } else if (form.kind === "access") {
+        const job = listSwept().find((j) => j.facilitator === sessionID && j.rolling) ?? sessionJob(sessionID)
+        const pending = askedFor(job)
+        // Only an answer to the question the plugin asked counts: the form names the path, and the label is the plugin's.
+        if (!pending || form.open === undefined || !form.question.includes(pending.path)) return
+        const said = grant(job, pending, form.open, sessionID)
+        log("info", `the user ${said.granted ? "opened" : "refused"} ${pending.path} for job ${job!.id}`)
+        tell(`${said.text} Tell the worker that in its next report.`)
+      } else if (form.kind === "ask" && form.decision) {
+        const r = await SHARED.asks.answer(form.id, form.decision, "user")
+        tell(`${form.id}: ${r.text}`)
+      }
+    }
+
     await ctx.tool.hook("execute.after", async (call) => {
       if (!call.sessionID) return
+      // The user's answer to one of the plugin's forms (src/forms.ts): workers may not ask, so this is the micromanager.
+      if (call.tool === "question") {
+        lastForm.set(call.sessionID, Date.now())
+        return void (await answered(call.sessionID, call).catch((err: unknown) => log("warn", `form answer failed: ${String(err)}`)))
+      }
       if (delegationRole(call) && !call.input.sessionID) {
         // A call that failed before its worker took the task drops the task; a started one names it for the micromanager.
         // Keyed on the same set as the hook above, not on the caller: it is the hook above that made the task, so a
@@ -1526,6 +1573,7 @@ export default {
               open.length
                 ? `Open todos of job ${r.job.id}:\n${open.map((t) => `- ${t.id} ${t.title} (${roleById(t.role)?.agent ?? t.role})${ready.has(t.id) ? " · can start" : ` · after ${t.dependsOn.join(", ")}`}`).join("\n")}\nStart one with the subagent tool and the prompt line "${plannedLine("T…", r.job.id)}".`
                 : `No open todos in job ${r.job.id}.`,
+              native.startNote(project, r.job) ?? "",
             ].filter(Boolean).join("\n")
           },
           rewind: async (id, to, ack, tctx) => {
@@ -1590,7 +1638,7 @@ export default {
               }
               SHARED.asked.set(job.id, question)
               record({ kind: "access", sessionID: tctx.sessionID, job: job.id, path: question.path, why: question.why, rule, asked: "the user has not answered yet" })
-              return `${grantQuestion(job, path.trim(), question.why, rule, question.task)}\n\nAsk the user this now: show it as it is, call no tool, and end your turn. Their reply reaches the plugin by itself.`
+              return `${grantQuestion(job, path.trim(), question.why, rule, question.task)}\n\nAsk the user this now with the question tool, with exactly this input (a form that waits for their answer; it reaches the plugin by itself):\n${formInput(accessForm(path.trim(), question.why, rule))}`
             }
             return out.text
           },
@@ -1779,6 +1827,13 @@ export default {
       }
       const note = input.sessionID ? steering.get(input.sessionID) : undefined
       if (note && Array.isArray(input.system)) input.system.push({ type: "text", text: note })
+      // A job that waits for the user while no form asks them (the user, 2026-10-20: a waiting job went unnoticed for a
+      // day): the micromanager is told to ask with the question tool.
+      if (input.sessionID && Array.isArray(input.system)) {
+        const since = lastForm.get(input.sessionID) ?? 0
+        const waits = listSwept().filter((j) => j.facilitator === input.sessionID && j.phase === "ask_user" && Date.parse(j.updated) > since)
+        if (waits.length) input.system.push({ type: "text", text: `[micromanager] ${waits.map((j) => `Job ${j.id} (${j.goal.split("\n")[0]!.slice(0, 80)})`).join("; ")} waits for the user's answer, and no form asks them. Ask what it needs to know with the question tool now (a question in your text gets lost), then hand their answer on: run_job with the job and their answer as note, or plan_job as the job's last note says.` })
+      }
       const planned = input.sessionID ? continuing.get(input.sessionID) : undefined
       if (planned && input.sessionID && Array.isArray(input.system)) {
         continuing.delete(input.sessionID)
