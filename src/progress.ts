@@ -39,6 +39,7 @@ export interface JobView {
   readonly title: string // the job's goal, as the sidebar heads it
   readonly phase: Job["phase"]
   readonly facilitator?: string
+  readonly isolation?: "none" // no git: writers change the folder directly, one at a time
   readonly done: number
   readonly running: number
   readonly failed: number
@@ -94,6 +95,7 @@ export function view(job: Job, now = Date.now(), resolve: Resolve = () => undefi
     title: job.rolling ? "Delegated tasks" : job.goal.split("\n")[0]!, // a rolling job's goal names the session id
     phase: job.phase,
     facilitator: job.facilitator,
+    ...(job.isolation ? { isolation: job.isolation } : {}),
     done: counted.filter((t) => DONE.includes(t.status)).length,
     running: counted.filter((t) => RUNNING.includes(t.status) && !stopped(t)).length,
     failed: counted.filter((t) => FAILED.includes(t.status)).length,

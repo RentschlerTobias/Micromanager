@@ -29,6 +29,7 @@ import { sharedNote, skillLine, taskAcceptance } from "./brief.ts"
 import { settled, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
 import { formInput, startForm } from "./forms.ts"
+import { gitState } from "./nogit.ts"
 
 // The first line OpenCode puts before a new subagent's prompt; how the prompt hook tells a child's first turn.
 export const CHILD_PREFIX = "You are a subagent spawned by another session."
@@ -126,7 +127,13 @@ export interface NativeDeps {
   // so the work is planned with its order before anything changes files. Readers still start on the fly. Off in the
   // tests that delegate writers directly.
   readonly planFirst?: boolean
+  // The note when the project is no git repository: the form that asks the user how to go on (src/plugin.ts, with
+  // Jev's recommendation). Without it a plain note says the same.
+  readonly noGit?: (project: string) => Promise<string>
 }
+
+// The project is no git repository, or one without a commit: nothing starts until the user said how to go on.
+export class NoGitError extends DelegationError {}
 
 // One entry of the todo tool: what the micromanager means to start later.
 export interface TodoItem {
@@ -206,6 +213,17 @@ export class Native {
     this.#skills = deps.installedSkills ?? new Set()
     this.#graphs = deps.graphs ?? new Graphs(this.#exec)
     this.#planFirst = deps.planFirst ?? false
+    this.#noGit = deps.noGit
+  }
+
+  readonly #noGit?: (project: string) => Promise<string>
+
+  // The user's choice for a project without git: its workers change the folder directly, one at a time.
+  withoutGit(project: string, parent: string): Job {
+    const job = this.job(project, parent)
+    job.isolation = "none"
+    saveJob(project, job)
+    return job
   }
 
   readonly #planFirst: boolean
@@ -345,7 +363,7 @@ export class Native {
     await this.#replace(project, job, d.replaces)
     const duplicate = this.#duplicate(job, role, input.description.trim(), d.body, parsed.files, d.replaces)
     if (duplicate) throw new DelegationError(duplicate)
-    const rel = await this.#integrate(project, job)
+    const rel = await this.#integrate(project, job, WRITERS.has(role.id))
     const added = addDelegated(job, { title: input.description.trim() || d.body.split("\n")[0]!, prompt: d.body, files: parsed.files, dependsOn: [], checks: d.checks })
     if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
     const task = added.task
@@ -358,8 +376,18 @@ export class Native {
   }
 
   // The job's branch and its worktree, made at its first task. Returns the project's offset inside the repository.
-  async #integrate(project: string, job: Job): Promise<string> {
+  async #integrate(project: string, job: Job, writer = true): Promise<string> {
+    if (job.isolation === "none") {
+      job.integrationWorktree = project
+      job.integrationRel = ""
+      return ""
+    }
     if (!job.integrationWorktree) {
+      if ((await gitState(project, this.#exec)) !== "repo") {
+        if (!writer) return "" // a reader changes nothing: it reads the project folder itself, no question needed
+        const note = this.#noGit ? await this.#noGit(project) : `${project} is no git repository with a commit, so workers cannot get a worktree each. Ask the user whether to create one or to work without isolation.`
+        throw new NoGitError(`Not started: ${note}`)
+      }
       excludeFromGit(project)
       const integration = await prepareIntegration(project, job.id, this.#exec)
       job.integrationBranch = integration.branch
@@ -378,8 +406,13 @@ export class Native {
   // A running task's entry, its worktree (writer) and the worker's brief.
   async #start(project: string, parent: string, job: Job, task: Task, role: Role, model: string, d: Delegation, checks: string[], rel: string): Promise<Delegated> {
     const writer = WRITERS.has(role.id)
-    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: taskDir(job.integrationWorktree!, rel), worktree: job.integrationWorktree!, rel, checks }
-    if (writer) {
+    const base = job.integrationWorktree ?? project // a reader in a folder without git reads the folder itself
+    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: taskDir(base, rel), worktree: base, rel, checks }
+    if (writer && job.isolation === "none") {
+      // No git: the project itself, and no branch; the worktree is the project, so adopt and resume keep it.
+      task.worktree = project
+      task.worktreeRel = ""
+    } else if (writer) {
       const w = await prepareTaskWorktree(project, job.id, task.id, job.integrationBranch!, this.#exec, undefined, rel)
       entry.dir = w.dir
       entry.worktree = w.worktree
@@ -442,9 +475,9 @@ export class Native {
     const old = this.#entries.get(k)
     if (LIVE.has(task.status) && old && !old.ended) throw new DelegationError(`Not started: ${task.id} runs already${old.session ? ` (session ${old.session})` : ""}; its report comes to you when it ends.`)
     if (task.status === "merged" || task.status === "passed") throw new DelegationError(`Not started: ${task.id} is done already (${task.status}).`)
-    if (WRITERS.has(role.id) && !optionsOf(control, lastOptions(project)).parallel) {
+    if (WRITERS.has(role.id) && (job.isolation === "none" || !optionsOf(control, lastOptions(project)).parallel)) {
       const busy = [...this.#entries.values()].find((e) => e.jobId === job.id && e.project === project && e.writer && !e.ended && e.taskId !== task.id)
-      if (busy) throw new DelegationError(`Not started: Parallel is off for job ${job.id}, and ${busy.taskId} still runs; start ${task.id} after its report.`)
+      if (busy) throw new DelegationError(`Not started: ${job.isolation === "none" ? `job ${job.id} works without git, so one writer at a time` : `Parallel is off for job ${job.id}`}, and ${busy.taskId} still runs; start ${task.id} after its report.`)
     }
     const byId = new Map(job.tasks.map((t) => [t.id, t]))
     const elsewhere = (id: string) => { const [owner, taskId] = this.#owner(project, job, id); return owner?.tasks.find((t) => t.id === taskId)?.status }
@@ -470,7 +503,7 @@ export class Native {
     task.model = model
     task.attempts = 0
     stage(task, "delegate", "pass", `${role.agent} on ${model}, planned task`)
-    const rel = await this.#integrate(project, job)
+    const rel = await this.#integrate(project, job, WRITERS.has(role.id))
     const acceptance = taskAcceptance(job, task).map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}${sharedNote(job, task, a.id)}`)
     const body = [
       `The job: ${job.goal}`,
@@ -744,6 +777,18 @@ export class Native {
       saveJob(entry.project, job)
       return { text: failText(`The checks fail in your directory (fix round ${task.attempts} of ${FIX_ROUNDS})`, failed, entry.dir) }
     }
+    if (job.isolation === "none") {
+      // No git: nothing to commit or merge, and no way to see what changed; the checks are the evidence.
+      stage(task, "gate", "pass", entry.checks.length ? entry.checks.join(", ") : "no checks given")
+      moveTask(task, "passed")
+      saveJob(entry.project, job)
+      const checks = entry.checks.length ? `checks passed: ${entry.checks.join("; ")}` : "no checks were given"
+      return {
+        text: `Done; your change is in the project folder (no git, so nothing is committed); ${checks}. Now end with your short report.`,
+        note: `[micromanager] ${task.id} ${task.title}: done in the project folder (no git); ${checks}.`,
+        parent: entry.parent,
+      }
+    }
     // A passing gate over an untouched tree proves nothing: read-only checks exit 0 on a worktree nobody wrote to, and
     // a worker whose session died mid-task never gets this far but a silent no-op worker does.
     const touched = await changedFiles(entry.worktree, this.#exec, task.worktreeRel ?? job.integrationRel ?? "")
@@ -934,7 +979,7 @@ export class Native {
       "",
       graph ? graphBrief(graph) : "",
       "",
-      entry.writer ? `Files you may change: ${task.files.join(", ")}. Work only in your current directory, a git worktree of its own.` : "Change no files.",
+      entry.writer ? `Files you may change: ${task.files.join(", ")}. Work only in your current directory, ${job.isolation === "none" ? "the project folder itself (it has no git, so change nothing beyond your files)" : "a git worktree of its own"}.` : "Change no files.",
       // A worktree is a checkout of the repository root, so a project that is a subdirectory sits below it. Saying so
       // keeps a worker from concluding its premise is false when a path of its own does not resolve at the top.
       entry.rel ? `Your directory ${entry.dir} is the project directory inside the worktree ${entry.worktree}; the worktree holds the whole repository (${entry.rel} below its root). Every path you read or write is relative to your own directory, never to the worktree root.` : "",

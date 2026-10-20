@@ -210,6 +210,9 @@ function JobChecklist(props: { context: Context; job: JobView; waiting: Map<stri
         <text fg={colors.muted}>{props.job.phase}</text>
       </box>
       <Show when={props.own && props.project}>{(project) => <JobControls context={props.context} project={project()} job={props.job} />}</Show>
+      <Show when={props.job.isolation === "none"}>
+        <text fg={colors.muted}>no git · one writer at a time</text>
+      </Show>
       <box flexDirection="row">
         <For each={sidebarCounts(groups())}>{(c) => <text fg={colors.mark[c.mark]}>{c.text} </text>}</For>
         <box flexGrow={1} />
@@ -486,7 +489,11 @@ export default Plugin.define({
             { id: "micromanager.pools", title: "Micromanager: models per agent", group: "Micromanager", palette: true, slash: { name: "pools" }, run: () => pickModels(context) },
             { id: "micromanager.auto", title: "Micromanager: auto-continue on/off", group: "Micromanager", palette: true, slash: { name: "auto" }, run: () => onJob(context, (project, job) => { const c = flipped(project, job, "auto"); context.ui.toast.show({ message: `auto-continue ${c.auto ? "on" : "off"} for ${job.id}` }) }) },
             { id: "micromanager.parallel", title: "Micromanager: parallel on/off", group: "Micromanager", palette: true, slash: { name: "parallel" }, run: () => onJob(context, (project, job) => { const c = flipped(project, job, "parallel"); context.ui.toast.show({ message: `parallel ${c.parallel ? "on" : "off"} for ${job.id}` }) }) },
-            { id: "micromanager.stop", title: "Micromanager: stop the job", group: "Micromanager", palette: true, slash: { name: "stop" }, run: () => onJob(context, (project, job) => stopJob(context, project, job)) },
+            { id: "micromanager.stop", title: "Micromanager: stop or resume the job", group: "Micromanager", palette: true, slash: { name: "stop" }, run: () => onJob(context, (project, job) => {
+              if (!loadControl(project, job.id).stopped) return stopJob(context, project, job)
+              updateControl(project, job.id, { stopped: false })
+              context.ui.toast.show({ message: `Resumed ${job.id}`, variant: "success" })
+            }) },
           ],
         }))
         return null

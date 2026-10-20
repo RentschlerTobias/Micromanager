@@ -165,6 +165,9 @@ export interface Job {
   triage?: { complexity?: number; clarification?: number; session: boolean; reason: string }
   designTree?: DesignTree // the planning session
   facilitator?: string // the micromanager session that runs this job's planning session
+  // "none": the project is no git repository and the user chose to work without one: writers change the project
+  // directly, one at a time, checked but not committed or merged (src/nogit.ts).
+  isolation?: "none"
   pins?: PolicySet // job-level policies from the user's shortcuts ("always local", "pipeline P1", …)
   taskPins?: Record<string, PolicySet> // task-level ones ("T3 use llamaswap/oss-u")
   budget: {

@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import { segments } from "../src/decide.ts"
-import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo, replaceIds, similarity } from "../src/native.ts"
+import { CHILD_PREFIX, DelegationError, Native, NoGitError, parseDelegation, parseTodo, replaceIds, similarity } from "../src/native.ts"
 import { nextStep } from "../src/continuation.ts"
 import { roleByAgent } from "../src/roles.ts"
 import { moveJob, newJob, type Task } from "../src/state.ts"
@@ -210,6 +210,33 @@ test("plan first: a writer starts only from a todo of a started job; Parallel of
   await assert.rejects(native.delegate(project, "ses_mm", { agent: "coder", description: "T2", prompt: `Task: T2 · ${r.job.id}` }, MODEL), /Parallel is off.*T1 still runs/)
   updateControl(project, r.job.id, { stopped: true })
   await assert.rejects(native.delegate(project, "ses_mm", { agent: "coder", description: "T2", prompt: `Task: T2 · ${r.job.id}` }, MODEL), /the user stopped job/)
+})
+
+test("a folder without git: readers read it, a writer waits for the user's choice, then works in the folder one at a time", async () => {
+  const project = mkdtempSync(join(tmpdir(), "jd-nogit-"))
+  writeFileSync(join(project, "notes.md"), "# notes\n")
+  const native = new Native({ planFirst: true, noGit: async (dir) => `${dir} has no git; ask with the form` })
+  const reader = await native.delegate(project, "ses_mm", { agent: "explorer", description: "look", prompt: "What is in notes.md?" }, MODEL)
+  assert.equal(native.claim("ses_r", child(reader.prompt))!.dir, project, "a reader reads the folder itself")
+  const r = native.todo(project, "ses_mm", [
+    { title: "add a line", agent: "writer", files: "notes.md", checks: "grep -q line notes.md" },
+    { title: "add todo.md", agent: "writer", files: "todo.md", checks: "test -f todo.md" },
+  ], [])
+  const [a, b] = r.added.map((t) => t.id)
+  updateControl(project, r.job.id, { started: true })
+  await assert.rejects(native.delegate(project, "ses_mm", { agent: "writer", description: a!, prompt: `Task: ${a} · ${r.job.id}` }, MODEL), (err: unknown) => err instanceof NoGitError && /has no git; ask with the form/.test(String(err)))
+
+  native.withoutGit(project, "ses_mm")
+  const t1 = await native.delegate(project, "ses_mm", { agent: "writer", description: a!, prompt: `Task: ${a} · ${r.job.id}` }, MODEL)
+  assert.match(t1.prompt, /the project folder itself/)
+  const claimed = native.claim("ses_w1", child(t1.prompt))!
+  assert.equal(claimed.dir, project)
+  await assert.rejects(native.delegate(project, "ses_mm", { agent: "writer", description: b!, prompt: `Task: ${b} · ${r.job.id}` }, MODEL), /works without git, so one writer at a time/)
+  writeFileSync(join(project, "notes.md"), "# notes\na line\n")
+  const done = await native.finish("ses_w1", "added the line")
+  assert.match(done.text, /^Done; your change is in the project folder \(no git/)
+  assert.equal(r.job.tasks.find((t) => t.id === a)!.status, "passed")
+  assert.equal(existsSync(join(project, ".git")), false, "no repository was made behind the user's back")
 })
 
 test("the todo tool reads what models write: ids in prose, a numbered title, drops in the same list", () => {

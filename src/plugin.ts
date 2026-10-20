@@ -26,7 +26,9 @@ import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf, saveLastOptions, updateControl } from "./control.ts"
-import { accessForm, answersOf, formInput, readForm, type Question } from "./forms.ts"
+import { accessForm, answersOf, formInput, gitForm, readForm, type Question } from "./forms.ts"
+import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
+import { NOUL_FLOOR } from "./catalog.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
@@ -774,7 +776,27 @@ export default {
     const runnerSessions = SHARED.runnerSessions
 
     // The micromanager's workers run on OpenCode's subagent tool, in the background; writers in worktrees of their own.
-    const native = (SHARED.native ??= new Native({ installedSkills: installedSkills(), planFirst: true }))
+    // A project without git (src/nogit.ts): the form that asks the user how to go on, with Jev's recommendation. Jev
+    // judges whether the folder is a code project; the rest is facts the code reads.
+    const noGitNote = async (dir: string): Promise<string> => {
+      const survey = surveyFolder(dir)
+      const state = await gitState(dir)
+      let recommend: "init" | "none" = "init"
+      try {
+        const asked = await decider.ask("git", { folder: dir.split("/").pop(), top: survey.top, extensions: survey.extensions, files: survey.files }, {
+          code: { type: "noul", instructions: "This folder is a software project (source code, tests, build files) that belongs in version control, rather than configuration files, notes or documents." },
+        })
+        const code = asked.decision.answers.code
+        if (code?.type === "noul" && (code as { noul: number }).noul < NOUL_FLOOR) recommend = "none"
+      } catch (err) {
+        log("warn", `no-git recommendation failed: ${String(err)}`)
+      }
+      record({ kind: "nogit", directory: dir, state, files: survey.files, bytes: survey.bytes, excluded: survey.excluded, recommend })
+      const shown = survey.excluded.length > 8 ? [...survey.excluded.slice(0, 8), `${survey.excluded.length - 8} more`] : survey.excluded
+      const form = gitForm(dir, survey.files, humanSize(survey.bytes), recommend, shown)
+      return `${dir} is ${state === "no-commit" ? "a git repository without a commit" : "no git repository"}, so the workers cannot get a worktree each. Ask the user how to go on: call the question tool with exactly this input (a form; their answer reaches the plugin by itself), then end your turn:\n${formInput(form)}`
+    }
+    const native = (SHARED.native ??= new Native({ installedSkills: installedSkills(), planFirst: true, noGit: (dir) => noGitNote(dir) }))
     const workerJobs = SHARED.workerJobs
     const workerDirs = SHARED.workerDirs
     // The job a worker session works for: what the runner recorded when it dispatched the worker, so a vouch of
@@ -834,6 +856,12 @@ export default {
         log("warn", `${routed.model} instead of ${routed.skipped.join(", ")}: those are not available here`)
       }
       if (resumed) {
+        // STOP holds every worker of the job, the one continued by its session too (live run, 2026-10-20: OpenCode's
+        // note that the stopped worker was cancelled woke the micromanager, and it continued the worker at once).
+        const owned = native.jobOf(resumed)
+        if (owned && loadControl(owned.project, owned.job.id).stopped) {
+          throw new DelegationError(`Not continued: the user stopped job ${owned.job.id}. Nothing runs until they resume it (the sidebar's resume, or /stop again). Tell them in one sentence and end your turn.`)
+        }
         // A worker continued by its session: it stays in its worktree (spike), a merged writer gets a new task.
         const task = await native.resume(resumed)
         if (task) log("info", `${task.id} continues in ${resumed}`)
@@ -1358,6 +1386,18 @@ export default {
         const said = grant(job, pending, form.open, sessionID)
         log("info", `the user ${said.granted ? "opened" : "refused"} ${pending.path} for job ${job!.id}`)
         tell(`${said.text} Tell the worker that in its next report.`)
+      } else if (form.kind === "git") {
+        if (form.decision === "init") {
+          const r = await initRepo(project, surveyFolder(project).excluded)
+          record({ kind: "nogit", directory: project, chosen: "init", ok: r.ok })
+          tell(r.ok ? `${r.text} Start the todos again.` : `${r.text}. Tell the user; nothing was started.`)
+        } else if (form.decision === "none") {
+          native.withoutGit(project, sessionID)
+          record({ kind: "nogit", directory: project, chosen: "none" })
+          tell("The user chose to work without git: writers change the project folder directly, one at a time, checked but not committed. Start the todos again, one writer at a time.")
+        } else {
+          tell(`The user ${form.decision === "cancel" ? "cancelled" : `answered "${form.said ?? ""}"`}: nothing starts in this folder. Ask what they want instead.`)
+        }
       } else if (form.kind === "ask" && form.decision) {
         const r = await SHARED.asks.answer(form.id, form.decision, "user")
         tell(`${form.id}: ${r.text}`)
@@ -1869,6 +1909,11 @@ export default {
       const note = input.sessionID ? steering.get(input.sessionID) : undefined
       if (note && Array.isArray(input.system)) input.system.push({ type: "text", text: note })
       if (input.sessionID) awaitTurn(input.sessionID)
+      // A stopped job: the micromanager may still be woken (OpenCode reports the cancelled workers), but starts nothing.
+      const held = input.sessionID ? autoJob(input.sessionID) : undefined
+      if (held && project && loadControl(project, held.id).stopped && Array.isArray(input.system)) {
+        input.system.push({ type: "text", text: `[micromanager] The user stopped job ${held.id}. Start and continue no worker; say in one sentence that the job is stopped and its work is kept, and that resume in the sidebar (or /stop again) goes on. Then end your turn.` })
+      }
       // A job that waits for the user while no form asks them (the user, 2026-10-20: a waiting job went unnoticed for a
       // day): the micromanager is told to ask with the question tool.
       if (input.sessionID && Array.isArray(input.system)) {
