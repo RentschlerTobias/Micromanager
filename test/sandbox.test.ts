@@ -5,7 +5,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 
-import { cleanEnv, looksSecret, neverHanded, REGISTRIES, rulesFor, startSandbox } from "../src/sandbox.ts"
+import { cleanEnv, looksSecret, neverHanded, REGISTRIES, rulesFor, startSandbox, WorkerShells } from "../src/sandbox.ts"
 
 test("a worker's environment is an allowlist; the never list beats any grant", () => {
   const env = {
@@ -66,4 +66,14 @@ test("the sandbox keeps a writer in its worktree, away from the user's keys and 
     execFileSync("rm", ["-rf", root])
     await sandbox.stop()
   }
+})
+
+test("only a shell a worker asked for is wrapped, once per call", () => {
+  const shells = new WorkerShells()
+  assert.equal(shells.take("npm test"), false, "a shell no worker asked for is left alone")
+  shells.expect("npm test")
+  shells.expect("npm test")
+  assert.equal(shells.take("npm test"), true)
+  assert.equal(shells.take("npm test"), true)
+  assert.equal(shells.take("npm test"), false, "each call is taken once")
 })

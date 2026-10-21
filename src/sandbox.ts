@@ -146,3 +146,24 @@ export async function startSandbox(enabled = true): Promise<Wrapper> {
 
 // The home directory as sandbox-runtime expands "~", for tests and messages.
 export const HOME = homedir()
+
+// The shells a worker asked for, by their command text. OpenCode's shell hook gets no session id (opencode 2.0.18:
+// { command, cwd, timeout, shell, env } only), and a directory is no proof: a reader works in the project itself, so
+// every shell there, the user's own agent's and the micromanager's included, got wrapped. The shell tool's
+// execute.before does know the session; it notes a worker's command here, and the shell hook wraps only what it takes.
+export class WorkerShells {
+  readonly #pending = new Map<string, number>()
+
+  expect(command: string): void {
+    this.#pending.set(command, (this.#pending.get(command) ?? 0) + 1)
+    if (this.#pending.size > 500) this.#pending.delete(this.#pending.keys().next().value!)
+  }
+
+  take(command: string): boolean {
+    const n = this.#pending.get(command)
+    if (!n) return false
+    if (n === 1) this.#pending.delete(command)
+    else this.#pending.set(command, n - 1)
+    return true
+  }
+}

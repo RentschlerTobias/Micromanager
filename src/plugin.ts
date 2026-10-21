@@ -25,7 +25,7 @@ import { Compactor } from "./compact.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
-import { cleanEnv, looksSecret, rulesFor, startSandbox, type Wrapper } from "./sandbox.ts"
+import { cleanEnv, looksSecret, rulesFor, startSandbox, WorkerShells, type Wrapper } from "./sandbox.ts"
 import { addGrant, isStarted, lastOptions, loadControl, optionsOf, saveLastOptions, updateControl } from "./control.ts"
 import { badName, GRANT_FLOOR, grantNote, harmlessQuestion, grantResult, GrantRequests, grantState, triage, type GrantKind } from "./grants.ts"
 import { accessForm, answersOf, formInput, gitForm, readForm, type Question } from "./forms.ts"
@@ -155,6 +155,8 @@ interface Shared {
   // wrapped it (live run, 2026-10-20: the rules and Jev saw a page of bwrap instead of `./probe.sh`), so the
   // permission hook puts the worker's own command back before anything judges it.
   unwrapped?: Map<string, string>
+  // The shells worker sessions asked for: only these are cleaned and wrapped (src/sandbox.ts WorkerShells).
+  workerShells: WorkerShells
   code?: { commit: string; dirty: boolean | "unknown" } // the plugin code this server loaded
   asks: Asks // workers' paused permission requests, answered by the micromanager or the user (src/ask.ts)
   grantRequests: GrantRequests // workers' requests for a variable or a host, waiting for the user (src/grants.ts)
@@ -171,6 +173,7 @@ const SHARED: Shared = ((globalThis as { __micromanager?: Shared }).__micromanag
   runnerSessions: new Set(),
   workerJobs: new Map(),
   workerDirs: new Map(),
+  workerShells: new WorkerShells(),
   asks: new Asks(record),
   grantRequests: new GrantRequests(record),
   helperOf: new Map(),
@@ -882,8 +885,10 @@ export default {
       if (loadControl(project, jobId).sandbox !== state) updateControl(project, jobId, { sandbox: state })
     }
     // Every shell a worker starts: its environment cleaned to the allowlist, its command wrapped in the sandbox with the
-    // rules of its role. A shell that is no worker's (the user's own, in the TUI) is left as it is.
+    // rules of its role. A shell that is no worker's (the user's own, another agent's, the micromanager's) is left as
+    // it is: its directory alone cannot tell, so the shell tool's execute.before notes a worker's command first.
     await ctx.shell?.hook("create.before", async (input) => {
+      if (!SHARED.workerShells.take(input.command)) return
       const cwd = String(input.cwd ?? "")
       const found = native.workerAt(cwd)
       // A worker of the older runner path: known only by its directory, and it writes there.
@@ -911,6 +916,11 @@ export default {
       return id && project ? loadJob(project, id) : undefined
     }
     await ctx.tool.hook("execute.before", async (call) => {
+      // A worker's shell: noted so the shell hook, which gets no session id, wraps this one and no other agent's.
+      if (call.tool === "shell" && call.sessionID && (runnerSessions.has(call.sessionID) || native.isWorker(call.sessionID))) {
+        SHARED.workerShells.expect(String(call.input.command ?? ""))
+        return
+      }
       // A delegation the plugin cannot isolate. From the micromanager this is still a refusal that names the name it
       // could not find (a live run asked for OpenCode's own `explore` and then looked for an `explore` role agent
       // that does not exist); from any other agent the call is deliberately left exactly as its caller wrote it,
