@@ -25,8 +25,9 @@ import { Compactor } from "./compact.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
-import { cleanEnv, rulesFor, startSandbox, type Wrapper } from "./sandbox.ts"
-import { isStarted, lastOptions, loadControl, optionsOf, saveLastOptions, updateControl } from "./control.ts"
+import { cleanEnv, looksSecret, rulesFor, startSandbox, type Wrapper } from "./sandbox.ts"
+import { addGrant, isStarted, lastOptions, loadControl, optionsOf, saveLastOptions, updateControl } from "./control.ts"
+import { badName, GRANT_FLOOR, grantNote, harmlessQuestion, grantResult, GrantRequests, grantState, triage, type GrantKind } from "./grants.ts"
 import { accessForm, answersOf, formInput, gitForm, readForm, type Question } from "./forms.ts"
 import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
 import { NOUL_FLOOR } from "./catalog.ts"
@@ -37,7 +38,7 @@ import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "
 import { exec, repoRel, type Exec } from "./integration.ts"
 import { readFileSync } from "node:fs"
 import { join, resolve } from "node:path"
-import { FINISH_ID, GRAPH_ID, HELPER_IDS, installFinishTool, installGraphTool, installHelperTools, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
+import { FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
 import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo } from "./native.ts"
@@ -156,6 +157,7 @@ interface Shared {
   unwrapped?: Map<string, string>
   code?: { commit: string; dirty: boolean | "unknown" } // the plugin code this server loaded
   asks: Asks // workers' paused permission requests, answered by the micromanager or the user (src/ask.ts)
+  grantRequests: GrantRequests // workers' requests for a variable or a host, waiting for the user (src/grants.ts)
   helperOf: Map<string, string> // helper session -> the writer it answers (src/helpers.ts)
   // Micromanager sessions whose planned job moved on (a worker ended): at their next turn the plugin says what to start
   // next, worked out then, so a task delegated in the meantime is not named again (src/continuation.ts). Shared: the
@@ -170,6 +172,7 @@ const SHARED: Shared = ((globalThis as { __micromanager?: Shared }).__micromanag
   workerJobs: new Map(),
   workerDirs: new Map(),
   asks: new Asks(record),
+  grantRequests: new GrantRequests(record),
   helperOf: new Map(),
   continuing: new Map(),
   watchdog: new Watchdog(),
@@ -818,6 +821,57 @@ export default {
     const native = (SHARED.native ??= new Native({ installedSkills: installedSkills(), planFirst: true, noGit: (dir) => noGitNote(dir) }))
     const workerJobs = SHARED.workerJobs
     const workerDirs = SHARED.workerDirs
+    // A worker's request for a variable or a host (src/grants.ts): every worker may ask for a variable, writers and
+    // researchers for a host.
+    const grantAllowed = (kind: GrantKind, sessionID: string): boolean =>
+      native.isWorker(sessionID) && (kind === "env" || native.isWriter(sessionID) || native.roleOf(sessionID) === "research")
+    const requestGrant = async (kind: GrantKind, asked: string, why: string, sessionID: string): Promise<string> => {
+      const where = native.jobOf(sessionID)
+      const owner = native.ownerOf(sessionID)
+      if (!where || !owner) return "Only a worker of the micromanager may ask for this."
+      const name = kind === "network" ? asked.toLowerCase() : asked
+      const bad = badName(kind, name)
+      if (bad) return bad
+      if (!why) return `${GRANT_IDS[kind]} needs why: what needs ${name}, in one sentence for the user.`
+      const jobId = where.job.id
+      const control = loadControl(where.project, jobId)
+      const held = [...settings.env, ...(control.grants?.env ?? [])]
+      const value = kind === "env" ? process.env[name] : undefined
+      const facts = {
+        kind, name, value,
+        open: kind === "env" ? held : [...settings.network, ...(control.grants?.network ?? [])],
+        refused: control.refused?.[kind] ?? [],
+        sandboxed: (await sandbox).available,
+        secrets: held.filter((n) => process.env[n] !== undefined && looksSecret(n, process.env[n])),
+      }
+      const t = triage(facts)
+      const decided = (verdict: string, by: string, reason: string) => record({ kind: "grant", event: "decided", grant: kind, name, verdict, by, reason, sessionID, job: jobId })
+      if (t.verdict === "open" || t.verdict === "refused") {
+        decided(t.verdict, "plugin", t.text.slice(0, 200))
+        return t.text
+      }
+      if (t.verdict === "jev" && jev) {
+        try {
+          const answer = (await jev.ask(grantState(kind, name, why, owner.task, value), { harmless: harmlessQuestion(kind) })).answers.harmless
+          const p = answer?.type === "noul" ? answer.noul : 0
+          if (p >= GRANT_FLOOR) {
+            addGrant(where.project, jobId, kind, name, true)
+            decided("granted", "jev", `harmless ${p.toFixed(2)}`)
+            return grantResult(kind, name, true, "jev")
+          }
+          decided("user", "jev", `harmless ${p.toFixed(2)} < ${GRANT_FLOOR}`)
+        } catch (err) {
+          log("warn", `Jev on ${GRANT_IDS[kind]} ${name} failed: ${String(err)}`)
+        }
+      }
+      const { pending, answer, fresh } = SHARED.grantRequests.open({ kind, name, why, sessionID, parent: owner.parent, task: owner.task, project: where.project, jobId, secrets: kind === "network" ? facts.secrets : [] })
+      if (fresh) {
+        await ctx.session.synthetic({ sessionID: owner.parent, text: grantNote(pending), resume: true }).catch((err: unknown) => log("warn", `grant note failed: ${String(err)}`))
+        if (notify !== "off") execFile("notify-send", ["-a", "micromanager", `${pending.id}: a worker waits for you`, `${kind === "env" ? "variable" : "host"} ${name}`], () => {})
+      }
+      const r = await answer
+      return grantResult(kind, name, r.granted, r.by)
+    }
     // Every shell a worker starts: its environment cleaned to the allowlist, its command wrapped in the sandbox with the
     // rules of its role. A shell that is no worker's (the user's own, in the TUI) is left as it is.
     await ctx.shell?.hook("create.before", async (input) => {
@@ -1044,6 +1098,7 @@ export default {
     // later about a session that no longer existed.
     const release = async (session: string, why: string): Promise<void> => {
       const helpers = [...SHARED.helperOf].filter(([, writer]) => writer === session).map(([helper]) => helper)
+      SHARED.grantRequests.drop([session])
       for (const helper of helpers) {
         if (ended.has(helper)) continue
         ended.add(helper)
@@ -1443,6 +1498,18 @@ export default {
         } else {
           tell(`The user ${form.decision === "cancel" ? "cancelled" : `answered "${form.said ?? ""}"`}: nothing starts in this folder. Ask what they want instead.`)
         }
+      } else if (form.kind === "grant") {
+        const pending = SHARED.grantRequests.get(form.id)
+        // Only the micromanager the plugin asked, and only with one of the plugin's labels: typed text is no yes.
+        if (!pending || pending.parent !== sessionID) return
+        if (form.granted === undefined) {
+          tell(`${form.id}: "${form.said ?? ""}" is no answer to the form; the worker still waits. Ask with the same form again if the user wants to decide.`)
+          return
+        }
+        addGrant(pending.project, pending.jobId, pending.kind, pending.name, form.granted)
+        SHARED.grantRequests.answer(form.id, form.granted)
+        log("info", `the user ${form.granted ? "granted" : "refused"} ${pending.name} for job ${pending.jobId}`)
+        tell(`${form.id}: ${pending.name} ${form.granted ? "is granted for this job" : "is refused for this job"}; the worker goes on.`)
       } else if (form.kind === "ask" && form.decision) {
         const r = await SHARED.asks.answer(form.id, form.decision, "user")
         tell(`${form.id}: ${r.text}`)
@@ -1788,6 +1855,11 @@ export default {
         log("error", `explore and research not installed: ${String(err)}`)
       }
       try {
+        installGrantTools(draft, (kind, name, why, tctx) => requestGrant(kind, name, why, tctx.sessionID!), grantAllowed)
+      } catch (err) {
+        log("error", `request_env and request_network not installed: ${String(err)}`)
+      }
+      try {
         installGraphTool(draft, async (a, tctx) => {
           const text = await native.askGraph(tctx.sessionID!, a.action, a.symbol, a.to)
           record({ kind: "graph", sessionID: tctx.sessionID, action: a.action, symbol: a.symbol.slice(0, 100), chars: text.length })
@@ -1910,6 +1982,7 @@ export default {
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[FINISH_ID]
         if (input.tools && !(input.sessionID && native.hasGraph(input.sessionID))) delete input.tools[GRAPH_ID]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
+        if (input.tools) for (const kind of ["env", "network"] as const) if (!(input.sessionID && grantAllowed(kind, input.sessionID))) delete input.tools[GRANT_IDS[kind]]
         // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
         if (input.sessionID && native.isWorker(input.sessionID)) {
           const worker = input.sessionID

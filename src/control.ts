@@ -19,7 +19,15 @@ export interface Control extends Partial<JobOptions> {
   readonly pause?: string // why auto-continue does not wake the micromanager now: "waits for you", "no progress"
   readonly wakes?: number // auto-continue wakes in a row without progress
   readonly seen?: string // the job's progress at the last wake ("done:started"), to tell a wake without progress
-  readonly grants?: { readonly env?: readonly string[]; readonly network?: readonly string[] } // names and domains only, never values
+  // What the user or Jev granted the job's workers beyond the allowlist (src/grants.ts), and what the user refused:
+  // variable names and hosts only, never values.
+  readonly grants?: Names
+  readonly refused?: Names
+}
+
+export interface Names {
+  readonly env?: readonly string[]
+  readonly network?: readonly string[]
 }
 
 export function controlPath(project: string, jobId: string): string {
@@ -69,6 +77,14 @@ export function updateControl(project: string, jobId: string, change: Partial<Co
   const next = { ...loadControl(project, jobId), ...change }
   writeJson(controlPath(project, jobId), next)
   return next
+}
+
+// A variable or host granted or refused for a job, added to what was there.
+export function addGrant(project: string, jobId: string, kind: keyof Names, name: string, granted: boolean): Control {
+  const control = loadControl(project, jobId)
+  const field = granted ? "grants" : "refused"
+  const was = control[field] ?? {}
+  return updateControl(project, jobId, { [field]: { ...was, [kind]: [...new Set([...(was[kind] ?? []), name])] } })
 }
 
 export function lastOptions(project: string): JobOptions {

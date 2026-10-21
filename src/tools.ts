@@ -262,6 +262,39 @@ export function installHelperTools(draft: ToolDraft, ask: (role: "explore" | "re
   }
 }
 
+// A worker's request for a variable or a host its sandbox keeps from it (src/grants.ts). The call waits until it is
+// decided: at once for what the plugin or Jev decides, up to ten minutes for the user's form. Every worker of the
+// micromanager may ask for a variable; only writers and researchers for a host. The context hook hides each tool from
+// every other session.
+export const GRANT_IDS = { env: "request_env", network: "request_network" } as const
+
+export function installGrantTools(draft: ToolDraft, request: (kind: "env" | "network", name: string, why: string, ctx: ToolContext) => Promise<string>, allowed: (kind: "env" | "network", sessionID: string) => boolean): void {
+  const read = draft.get("read")
+  const str = read?.input?.fields?.path
+  if (!read?.input?.mapFields || !str) throw new Error("the built-in read tool has no input schema to build from")
+  const tools = {
+    env: { field: "name", description: "Ask for an environment variable your shell commands do not get: they start with a cleaned environment (PATH, HOME, locale and the usual toolchain variables only). Use it when a command fails because a variable is not set, e.g. DATABASE_URL for the integration tests. name: the variable's name only; you never see its value. why: what needs it, in one sentence for the user. The call waits until it is decided, up to ten minutes when the user has to answer; once granted, every command you start has it." },
+    network: { field: "domain", description: "Ask for a host your shell commands cannot reach: they reach the package registries only. Use it when a command fails to connect, e.g. a build that downloads from github.com. domain: the host, like api.example.com (or *.example.com), without scheme or path. why: what needs it, in one sentence for the user. The call waits until it is decided, up to ten minutes when the user has to answer." },
+  }
+  for (const kind of ["env", "network"] as const) {
+    const { field, description } = tools[kind]
+    draft.add({
+      id: GRANT_IDS[kind],
+      name: GRANT_IDS[kind],
+      description,
+      input: read.input.mapFields(() => ({ [field]: str, why: str })),
+      execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+        if (!ctx?.sessionID || !allowed(kind, ctx.sessionID)) return { content: "Only a worker of the micromanager may use this tool." }
+        try {
+          return { content: await request(kind, String(args?.[field] ?? "").trim(), String(args?.why ?? "").trim(), ctx) }
+        } catch (err) {
+          return { content: `failed: ${err instanceof Error ? err.message : String(err)}` }
+        }
+      },
+    })
+  }
+}
+
 // The plan as the micromanager shows it to the user.
 export function planText(job: Job): string {
   const acceptance = job.acceptance.map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (check: ${a.verify})` : ""}`)

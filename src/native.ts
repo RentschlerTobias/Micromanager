@@ -704,6 +704,12 @@ export class Native {
     return this.#bySession.has(session)
   }
 
+  // A worker's role, for the tools it may use (request_network: writers and researchers).
+  roleOf(session: string): RoleId | undefined {
+    const entry = this.#entry(session)
+    return (entry && this.#job(entry)?.tasks.find((t) => t.id === entry.taskId)?.role) as RoleId | undefined
+  }
+
   isWriter(session: string): boolean {
     return this.#entry(session)?.writer ?? false
   }
@@ -1002,6 +1008,10 @@ export class Native {
         : "",
       others.length ? `Other workers change other files at the same time (not yours): ${others.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
       "Keys and tokens show as <secret> in what you read; never write <secret> into a file, leave such lines as they are.",
+      // The sandbox's limits, and how to ask past them (src/grants.ts).
+      entry.writer || role.id === "research"
+        ? "Your shell commands run in a sandbox with a cleaned environment that reaches the package registries only. If a command fails because a variable is not set, ask for it with request_env; if it cannot reach a host, with request_network. Never set a missing variable yourself with a value you made up: the real value is the user's, and an invented one only makes a check pass that proves nothing. Both are called inside the execute tool, e.g. `await tools.request_env({ name: \"DATABASE_URL\", why: \"…\" })`, and wait until they are decided."
+        : "Your shell commands run in a sandbox with a cleaned environment. If a command fails because a variable is not set, ask for it with request_env (never set it yourself with a value you made up), inside the execute tool: `await tools.request_env({ name: \"…\", why: \"…\" })`; it waits until it is decided.",
       skillLine(skills),
       "",
       entry.writer
