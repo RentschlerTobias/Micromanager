@@ -21,6 +21,7 @@ export interface Control extends Partial<JobOptions> {
   readonly seen?: string // the job's progress at the last wake ("done:started"), to tell a wake without progress
   // What the user or Jev granted the job's workers beyond the allowlist (src/grants.ts), and what the user refused:
   // variable names and hosts only, never values.
+  readonly sandbox?: string // "on", or "off: <why>": whether the job's worker commands run in the sandbox (src/sandbox.ts)
   readonly grants?: Names
   readonly refused?: Names
 }

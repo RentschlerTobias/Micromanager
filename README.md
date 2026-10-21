@@ -60,12 +60,36 @@ Jev and the plugin securing every task:
      inside the job's own worktrees is allowed, a path the task itself names is allowed, and anything else is
      paused for you the same way.
      `~/.ssh`, `~/.config`, `/etc`, your home directory and another job's worktree are never allowed at any layer.
-   - **A writer's worktree is its sandbox.** A shell command a writer runs in its own task worktree is allowed without
-     Jev when it stays there: no path outside the worktree or `/tmp`, no home directory, no program that reaches past
-     the tree (`kill`, `systemctl`, `curl`, `ssh`, publishing, …) and no git command that moves shared refs (`commit`,
-     `checkout`, `stash`, `reset`, …). The hard rules still come first. Asking Jev there turned a worker's own
-     verification — tests, a render, a screenshot — into refusals; replayed against the journal, 85% of the refusals
-     in task worktrees no longer happen.
+   - **Shell commands run in a sandbox.** Every shell command a worker starts is wrapped with Anthropic's
+     [sandbox-runtime](https://github.com/anthropics/sandbox-runtime) (pinned to 0.0.81; bubblewrap on
+     Linux, Seatbelt on macOS, a proxy for the network). The permission layer reads a command's text; the sandbox
+     holds for what the command actually does, so a writer's `npm test` no longer runs the project's code with your
+     full rights:
+     - a writer writes only into its own worktree, a reader nowhere; each has its own temp directory, never `/tmp` as
+       a whole;
+     - nobody reads `~/.ssh`, `~/.gnupg`, keyrings, `~/.config/opencode`, `~/.config/gh`, cloud credentials, browser
+       profiles, the plugin's journal or the project's `.env` files (`.env.example` stays readable);
+     - the network reaches the package registries (npm, PyPI, crates.io, Go) and nothing else;
+     - the environment is an allowlist: `PATH`, `HOME`, the locale and the usual toolchain variables, plus `CI=1`.
+       The desktop's sockets (D-Bus, Hyprland, Wayland, the SSH and GPG agents) and the credentials of the hub, Jev
+       and Claude Code are never handed on, whatever is granted.
+
+     Inside the sandbox a writer's command that stays in its worktree is allowed without Jev: no path outside the
+     worktree, no home directory, no program that reaches past the tree (`kill`, `systemctl`, `curl`, `ssh`,
+     publishing, …) and no git command that moves shared refs (`commit`, `checkout`, `stash`, `reset`, …). The hard
+     rules still come first. The sidebar shows `sandbox ✓` under the job's switches. Without the sandbox (the setting
+     `"sandbox": false`, an unsupported platform, or bubblewrap, socat or ripgrep missing) the commands run unwrapped
+     with the cleaned environment, a writer's commands go to Jev again, and the sidebar says `no sandbox` and why.
+   - **Workers ask for a variable or a host.** A command that fails because a variable is not set, or a host is
+     unreachable, is no dead end: the worker calls `request_env` (every worker) or `request_network` (writers and
+     researchers) with the name and why, and its call waits for the decision. The never list, a variable that is not
+     set where the server runs, and anything you refused earlier in the job are refused at once. A setting
+     (`NODE_ENV`, `RUST_LOG`) or a public host is granted by Jev when it is sure. A secret-looking variable (`*_TOKEN`,
+     `*_KEY`, a URL with credentials, …), and a host asked for while the job's commands hold such a secret, come to you
+     as a form through the micromanager (`Grant G1`: allow for this job, or refuse); the host form names the secret,
+     because the two together are what it takes to send it away. A grant holds for the job and lands in its control
+     file, names only: no model ever sees a value (Jev gets its length and kinds of characters). Workers are told
+     never to fill in a missing variable with a value they made up.
    - **Writers can ask.** A writer has two tools of its own: `explore` starts an explorer that reads the writer's
      directory, its uncommitted change included, and `research` starts a researcher with the web. The writer waits for
      the answer, which comes back as the tool's result. A helper is no task of the job: no worktree, no merge, no place
@@ -218,7 +242,10 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "parallel": 3,          // tasks of one job at the same time (1: one after another)
   "perModel": 2,          // sessions of one cloud model at the same time; a local model serves one
   "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // optional limits per job; none by default
-  "notify": "jobs"        // desktop notifications: "jobs", "tasks" (also per task) or "off"
+  "notify": "jobs",       // desktop notifications: "jobs", "tasks" (also per task) or "off"
+  "sandbox": true,        // worker commands in the sandbox (default); false runs them unwrapped
+  "env": ["DATABASE_URL", "MYAPP_*"], // variables every job's commands keep beyond the allowlist
+  "network": ["api.example.com", "*.example.com"] // hosts every job's commands may reach beyond the registries
 }
 ```
 

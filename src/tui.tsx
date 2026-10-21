@@ -173,20 +173,29 @@ function JobControls(props: { context: Context; project: string; job: JobView })
   const opts = () => optionsOf(control(), lastOptions(props.project))
   const box = (on: boolean) => (on ? "☑" : "☐")
   const toggle = (key: "auto" | "parallel" | "review") => setControl(flipped(props.project, props.job, key))
+  // Whether the job's worker commands run in the sandbox, as the server last wrote it (src/sandbox.ts).
+  const sandbox = () => control().sandbox
   return (
-    <box flexDirection="row">
-      <Show when={control().stopped} fallback={
-        <>
-          <text fg={control().auto ? colors.mark.running : colors.muted} onMouseUp={() => toggle("auto")}>{control().auto && control().pause ? `auto ⏸ ${control().pause}` : `${box(control().auto === true)} auto`} </text>
-          <text fg={opts().parallel ? colors.base : colors.muted} onMouseUp={() => toggle("parallel")}>{box(opts().parallel)} parallel </text>
-          <text fg={opts().review ? colors.base : colors.muted} onMouseUp={() => toggle("review")}>{box(opts().review)} review</text>
+    <box>
+      <box flexDirection="row">
+        <Show when={control().stopped} fallback={
+          <>
+            <text fg={control().auto ? colors.mark.running : colors.muted} onMouseUp={() => toggle("auto")}>{control().auto && control().pause ? `auto ⏸ ${control().pause}` : `${box(control().auto === true)} auto`} </text>
+            <text fg={opts().parallel ? colors.base : colors.muted} onMouseUp={() => toggle("parallel")}>{box(opts().parallel)} parallel </text>
+            <text fg={opts().review ? colors.base : colors.muted} onMouseUp={() => toggle("review")}>{box(opts().review)} review</text>
+            <box flexGrow={1} />
+            <text fg={colors.mark.failed} onMouseUp={() => void stopJob(props.context, props.project, props.job).then(() => setControl(loadControl(props.project, props.job.id)))}>■ STOP</text>
+          </>
+        }>
+          <text fg={colors.mark.failed}>■ stopped</text>
           <box flexGrow={1} />
-          <text fg={colors.mark.failed} onMouseUp={() => void stopJob(props.context, props.project, props.job).then(() => setControl(loadControl(props.project, props.job.id)))}>■ STOP</text>
-        </>
-      }>
-        <text fg={colors.mark.failed}>■ stopped</text>
-        <box flexGrow={1} />
-        <text fg={colors.base} onMouseUp={() => setControl(updateControl(props.project, props.job.id, { stopped: false }))}>resume ▸</text>
+          <text fg={colors.base} onMouseUp={() => setControl(updateControl(props.project, props.job.id, { stopped: false }))}>resume ▸</text>
+        </Show>
+      </box>
+      <Show when={sandbox()}>
+        {(state) => state() === "on"
+          ? <text fg={colors.muted}>sandbox ✓</text>
+          : <text fg={colors.mark.waiting}>{cut(`no sandbox · ${state().replace(/^off: /, "")}`, 36)}</text>}
       </Show>
     </box>
   )

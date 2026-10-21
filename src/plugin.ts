@@ -872,6 +872,15 @@ export default {
       const r = await answer
       return grantResult(kind, name, r.granted, r.by)
     }
+    // Whether a job's worker commands run in the sandbox, written once per job into its control file for the sidebar.
+    const marked = new Set<string>()
+    const markSandbox = async (project: string, jobId: string): Promise<void> => {
+      if (marked.has(`${project}\0${jobId}`)) return
+      marked.add(`${project}\0${jobId}`)
+      const box = await sandbox
+      const state = box.available ? "on" : `off: ${box.reason}`
+      if (loadControl(project, jobId).sandbox !== state) updateControl(project, jobId, { sandbox: state })
+    }
     // Every shell a worker starts: its environment cleaned to the allowlist, its command wrapped in the sandbox with the
     // rules of its role. A shell that is no worker's (the user's own, in the TUI) is left as it is.
     await ctx.shell?.hook("create.before", async (input) => {
@@ -881,6 +890,7 @@ export default {
       const dir = found ? undefined : [...workerDirs.values()].filter((d) => cwd === d || cwd.startsWith(`${d}/`)).sort((a, b) => b.length - a.length)[0]
       if (!found && !dir) return
       const grants = found ? jobGrants(found.project, found.jobId) : { env: [], network: [] }
+      if (found) await markSandbox(found.project, found.jobId)
       input.env = cleanEnv(input.env ?? process.env, [...settings.env, ...grants.env])
       const box = await sandbox
       if (!box.available) return
@@ -1465,6 +1475,7 @@ export default {
         const job = native.job(project, sessionID)
         if (form.decision === "start") {
           updateControl(project, job.id, { started: true, stopped: false, pause: undefined, wakes: 0, ...form.options })
+          await markSandbox(project, job.id)
           saveLastOptions(project, form.options)
           const ready = startable(job)
           const now = form.options.parallel ? ready : ready.slice(0, 1)
