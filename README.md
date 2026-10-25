@@ -297,6 +297,13 @@ session's system prompt, within a budget, and change there only at the session's
 - The old per-project block `.opencode/memory/jev-project.md` moves into the memory once. The journal records
   `memory.write` and `recall` (what was found, what was picked).
 
+**In the sidebar.** The CONTEXT section, folded to one line (`ctx 84k/120k ███░░│ · mem 142 · ↺2`), unfolds on a click
+into the session's context as a bar (`│` marks where a summary starts), what its epochs removed, a line per running
+worker with its own bar (`⚠` past the summary mark), the memory (entries, core size, whether vectors are on, today's
+writes, duplicates and conflicts) and the notes the last request got from it. The server writes the numbers to
+`~/.local/state/micromanager/context/`; the context is estimated from characters and leaves out the tool
+descriptions, so it reads about 2k tokens low.
+
 ## Flow chart
 
 `docs/flow.html` is a self-contained page (no server) that shows how the plugin decides: the model routing lane

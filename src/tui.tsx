@@ -9,6 +9,8 @@
 //   micromanager and every worker of the job at once; /auto, /parallel and /stop do the same (src/control.ts).
 // - In the sidebar, below the checklist, and /pools: the models each worker role may run on, picked in a popup like
 //   /model (src/pools.ts). The picks go to a file the server reads at each delegation (src/config.ts loadPicks).
+// - In the sidebar, CONTEXT: the session's context against its ceiling, its workers' contexts, the memory and the notes
+//   the last request got from it, from the status files the server writes (src/context/status.ts).
 //
 // The job file is the source of the checklist: it holds every task and its sessions, also those of a planned job,
 // whose workers are not children of the micromanager in OpenCode's eyes. Keymap layers only work inside a rendered
@@ -25,6 +27,7 @@ import { listJobs } from "./store.ts"
 import { agentRows, agentSummary, type AgentRow, type SessionFacts, type Tag } from "./switcher.ts"
 import type { Job } from "./state.ts"
 import { seedFromJournal } from "./usage.ts"
+import { bar, foldedContext, kTokens, readMemoryStats, readStatus, type ContextStatus, type MemoryStats } from "./context/status.ts"
 
 const POLL_MS = 2_000
 const PANEL = "micromanager.agents"
@@ -308,6 +311,75 @@ function Checklist(props: { context: Context; sessionID: string }) {
   )
 }
 
+// The CONTEXT section: folded to one line; unfolded the session's context as a bar (│ marks where a summary starts),
+// what its epochs removed, a line per running worker, the memory and the notes the last request got.
+function ContextSection(props: { context: Context; sessionID: string }) {
+  const colors = palette(props.context)
+  const jobs = useJobs(props.context, () => props.sessionID)
+  const [open, setOpen] = createSignal(false)
+  const [status, setStatus] = createSignal<ContextStatus | undefined>(readStatus(props.sessionID))
+  const [mem, setMem] = createSignal<MemoryStats | undefined>(readMemoryStats())
+  const [workers, setWorkers] = createSignal<{ id: string; title: string; s: ContextStatus }[]>([])
+  const poll = () => {
+    setStatus(readStatus(props.sessionID))
+    setMem(readMemoryStats())
+    const running = jobs().flatMap((j) => j.rows.filter((r) => ["running", "gating", "fixing", "reviewing"].includes(r.status) && r.session && r.session !== props.sessionID))
+    setWorkers(running.flatMap((r) => { const s = readStatus(r.session!); return s ? [{ id: r.id, title: r.title, s }] : [] }))
+  }
+  const timer = setInterval(poll, POLL_MS)
+  onCleanup(() => clearInterval(timer))
+  const full = (s: ContextStatus) => s.tokens >= s.summaryAt
+  return (
+    <Show when={status() || mem()}>
+      <box paddingTop={1}>
+        <box flexDirection="row" onMouseUp={() => setOpen(!open())}>
+          <text fg={colors.base}>CONTEXT</text>
+          <box flexGrow={1} />
+          <text fg={colors.muted}>{open() ? "▾" : "▸"}</text>
+        </box>
+        <Show when={open()} fallback={<text fg={colors.muted}>{cut(foldedContext(status(), mem()), 36)}</text>}>
+          <Show when={status()}>
+            {(s) => (
+              <box>
+                <box flexDirection="row">
+                  <text fg={full(s()) ? colors.mark.waiting : colors.mark.running}>{bar(s().tokens, s().ceiling, s().summaryAt, 22)}</text>
+                  <box flexGrow={1} />
+                  <text fg={colors.muted}>{kTokens(s().tokens)}/{kTokens(s().ceiling)}</text>
+                </box>
+                <text fg={colors.muted}>{cut(`epochs ${s().epochs} · pruned ${kTokens(s().savedChars)} chars · ${s().pending} waiting`, 36)}</text>
+              </box>
+            )}
+          </Show>
+          <For each={workers()}>
+            {(w) => (
+              <box flexDirection="row">
+                <text fg={colors.base}>{cut(`${w.id} ${w.title}`, 16).padEnd(17)}</text>
+                <text fg={full(w.s) ? colors.mark.waiting : colors.muted}>{bar(w.s.tokens, w.s.ceiling, w.s.summaryAt, 8)}</text>
+                <box flexGrow={1} />
+                <text fg={colors.muted}>{kTokens(w.s.tokens)}{full(w.s) ? " ⚠" : ""}</text>
+              </box>
+            )}
+          </For>
+          <Show when={mem()}>
+            {(m) => (
+              <box>
+                <text fg={colors.muted}>{cut(`memory ${m().entries} · core ${kTokens(m().coreChars)} · ${m().vectors ? "● vectors" : "○ keywords"}`, 36)}</text>
+                <Show when={m().writes.added || m().writes.duplicate || m().writes.contradicts}>
+                  <text fg={m().writes.contradicts ? colors.mark.waiting : colors.muted}>{cut(`today +${m().writes.added} · ${m().writes.duplicate} dupes${m().writes.contradicts ? ` · ${m().writes.contradicts} ⚡ conflict` : ""}`, 36)}</text>
+                </Show>
+              </box>
+            )}
+          </Show>
+          <Show when={status()?.recalled?.length}>
+            <text fg={colors.base}>recalled</text>
+            <For each={(status()?.recalled ?? []).slice(0, 3)}>{(note) => <text fg={colors.muted}>{cut(`· ${note}`, 36)}</text>}</For>
+          </Show>
+        </Show>
+      </box>
+    </Show>
+  )
+}
+
 // The session's model, which is the micromanager's when it runs in this session.
 function sessionModel(context: Context): string | undefined {
   const m = context.ui.model.current()
@@ -493,6 +565,7 @@ export default Plugin.define({
       render: (input) => (
         <box>
           <Checklist context={context} sessionID={input.sessionID} />
+          <ContextSection context={context} sessionID={input.sessionID} />
           <Pools context={context} />
         </box>
       ),

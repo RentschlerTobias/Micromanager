@@ -29,6 +29,7 @@ import { describe as describeEntry, Memory } from "./context/memory.ts"
 import { CoreSnapshots, RecentRecalls } from "./context/recall.ts"
 import { ledger as contextLedger } from "./context/ledger.ts"
 import { Summarizer } from "./context/summary.ts"
+import { writeMemoryStats, writeStatus } from "./context/status.ts"
 import { installMemoryTools, MEMORY_IDS } from "./context/tools.ts"
 import { lastAssistantText } from "./brief.ts"
 import { review, signalFor } from "./checkpoint.ts"
@@ -1336,7 +1337,7 @@ export default {
     // the micromanager's user turns, LEARNED lines and the memory tools through search and Jev. Off by itself when its
     // store cannot open; keyword search while the embedding service is down.
     const memorySettings = loadSettings().memory
-    const memory = new Memory(decider, record, { embed: memorySettings.embedding, ...(memorySettings.enabled ? {} : { off: "turned off in micromanager.jsonc" }) })
+    const memory = new Memory(decider, (e) => journalMemory(e), { embed: memorySettings.embedding, ...(memorySettings.enabled ? {} : { off: "turned off in micromanager.jsonc" }) })
     try {
       const moved = memory.migrate(project)
       if (moved) log("info", `memory: ${moved} entries moved from .opencode/memory/jev-project.md`)
@@ -1344,6 +1345,31 @@ export default {
       log("warn", `memory migration failed: ${String(err)}`)
     }
     const cores = new CoreSnapshots()
+    // The notes a session got from the memory most recently, for the sidebar (src/context/status.ts).
+    const recalledFor = new Map<string, string[]>()
+    // The memory's numbers for the sidebar, written after each write and at most every 30 seconds otherwise.
+    const memoryWrites = { added: 0, duplicate: 0, contradicts: 0, day: new Date().toDateString() }
+    let memoryStatsAt = 0
+    const updateMemoryStats = (force = false) => {
+      if (!force && Date.now() - memoryStatsAt < 30_000) return
+      memoryStatsAt = Date.now()
+      try {
+        const all = memory.list(project)
+        if (memoryWrites.day !== new Date().toDateString()) Object.assign(memoryWrites, { added: 0, duplicate: 0, contradicts: 0, day: new Date().toDateString() })
+        writeMemoryStats({ entries: all.length, coreChars: all.filter((e) => e.pinned).reduce((n, e) => n + e.text.length, 0), vectors: Boolean(memory.embedder?.available), writes: { added: memoryWrites.added, duplicate: memoryWrites.duplicate, contradicts: memoryWrites.contradicts } })
+      } catch {
+        // the sidebar keeps the last numbers
+      }
+    }
+    const journalMemory = (e: Record<string, unknown>) => {
+      record(e)
+      if (e.kind === "memory.write") {
+        if (e.verdict === "added" || e.verdict === "refined") memoryWrites.added++
+        if (e.verdict === "duplicate") memoryWrites.duplicate++
+        if (e.verdict === "contradicts") memoryWrites.contradicts++
+        updateMemoryStats(true)
+      }
+    }
     const recents = new RecentRecalls()
     const readerAgent = (agent?: string) => { const r = agent ? roleByAgent(agent) : undefined; return Boolean(r && !WRITERS.has(r.id)) }
     if (cloudOnly) log("info", "cloud only: no local models, guards on cloud Jev")
@@ -2077,17 +2103,28 @@ export default {
         const applied = new Set(contextManager.applied(input.sessionID).map((r) => r.id))
         const l = contextLedger(input.messages as never)
         const savedChars = contextManager.applied(input.sessionID).reduce((n, r) => n + r.saved, 0)
-        summarizer.maybeStart(input.sessionID, input.messages as never, l, applied, (l.chars - savedChars) / 3.5, ceilingTokens)
+        summarizer.maybeStart(input.sessionID, input.messages as never, l, applied, (l.chars + (input.system ?? []).reduce((n, p) => n + (p.text?.length ?? 0), 0) - savedChars) / 3.5, ceilingTokens)
         const judged = [
           ...[...pruned.values()].map((c) => ({ id: c.id, reason: "judged" as const, result: compactStub(c), saved: c.size - compactStub(c).length })),
           ...summarizer.ready(input.sessionID, applied),
         ]
-        const r = contextManager.apply(input.sessionID, input.messages, { prices: await priceBook.get(input.model), ceilingTokens, judged })
+        const baseChars = (input.system ?? []).reduce((n, p) => n + (p.text?.length ?? 0), 0)
+        const r = contextManager.apply(input.sessionID, input.messages, { prices: await priceBook.get(input.model), ceilingTokens, judged, baseChars })
         if (r.epoch) log("info", `context epoch (${r.epoch.reason}) in ${input.sessionID}: ${r.epoch.applied} results, ${r.epoch.savedChars} characters`)
         epoch = Boolean(r.epoch)
+        // A worker's notes came with its brief, the first user message: read them from there for the sidebar.
+        if (!orchestrator && !recalledFor.has(input.sessionID)) {
+          const brief = (input.messages as { role?: string; content?: unknown }[]).find((m) => m.role === "user")
+          const text = typeof brief?.content === "string" ? brief.content : Array.isArray(brief?.content) ? (brief.content as { text?: string }[]).map((p) => p.text ?? "").join("\n") : ""
+          const block = text.split("[memory] Notes from earlier work")[1]
+          recalledFor.set(input.sessionID, block ? block.split("\n").filter((l) => l.startsWith("- ")).map((l) => l.slice(2)) : [])
+        }
+        const st = contextManager.stats(input.sessionID)
+        writeStatus(input.sessionID, { tokens: r.contextTokens, ceiling: ceilingTokens, summaryAt: Math.round(0.8 * ceilingTokens), epochs: st.epochs, savedChars: st.savedChars, pending: st.pending, ...(recalledFor.has(input.sessionID) ? { recalled: recalledFor.get(input.sessionID) } : {}), at: Date.now() })
       } catch (err) {
         log("warn", `context management failed: ${String(err)}`)
       }
+      updateMemoryStats()
       // Core memory in the system prompt, the same bytes until the session's next epoch.
       try {
         if (epoch) cores.refresh(input.sessionID)
@@ -2174,6 +2211,7 @@ export default {
         if (said.trim()) {
           const notes = await memory.recallText(said, { projectDir: project, role: "micromanager", exclude: recents.next(input.sessionID), session: input.sessionID }).catch(() => ({ text: "", ids: [] }))
           if (notes.text) { tail(input, notes.text); recents.given(input.sessionID, notes.ids) }
+          recalledFor.set(input.sessionID, notes.text.split("\n").filter((l) => l.startsWith("- ")).map((l) => l.slice(2)))
         }
       }
       const note = input.sessionID ? steering.get(input.sessionID) : undefined

@@ -19,6 +19,7 @@ export interface ApplyInput {
   readonly ceilingTokens?: number // the role's ceiling (src/context/plugin.ts)
   readonly judged?: readonly Replacement[] // replacements Jev decided on (stage 2)
   readonly extraCost?: number
+  readonly baseChars?: number // the system prompt's characters: part of the context, never replaced
 }
 
 export interface ApplyResult {
@@ -109,6 +110,12 @@ export class ContextManager {
     }
   }
 
+  // How far the session got: epochs, what its applied replacements removed, what waits.
+  stats(sessionID: string): { epochs: number; savedChars: number; pending: number } {
+    const s = this.#state(sessionID)
+    return { epochs: s.epochs, savedChars: [...s.applied.values()].reduce((n, r) => n + r.saved, 0), pending: s.pending.size }
+  }
+
   // The session's applied replacements, for the TUI and the journal.
   applied(sessionID: string): readonly Replacement[] {
     return [...this.#state(sessionID).applied.values()]
@@ -130,7 +137,7 @@ export class ContextManager {
       const appliedChars = [...s.applied.values()].reduce((n, r) => n + r.saved, 0)
       const invalidatedChars = l.chars - (l.offsets[first] ?? l.chars) - [...s.applied.values()].filter((r) => (at.get(r.id) ?? 0) >= first).reduce((n, r) => n + r.saved, 0)
       const verdict = epochDue({
-        contextTokens: (l.chars - appliedChars) / cpt,
+        contextTokens: (l.chars + (input.baseChars ?? 0) - appliedChars) / cpt,
         savedTokens: saved / cpt,
         invalidatedTokens: Math.max(0, invalidatedChars - saved) / cpt,
         turns: l.turns,
@@ -145,11 +152,11 @@ export class ContextManager {
         s.pending.clear()
         s.epochs++
         this.#save(sessionID, s)
-        this.#journal({ kind: "context.epoch", sessionID, epoch: s.epochs, reason: verdict.reason, applied: epoch.applied, savedChars: saved, invalidatedTokens: epoch.invalidatedTokens, contextTokens: Math.round((l.chars - appliedChars) / cpt), gain: +verdict.gain.toFixed(5), cost: +verdict.cost.toFixed(5), byReason })
+        this.#journal({ kind: "context.epoch", sessionID, epoch: s.epochs, reason: verdict.reason, applied: epoch.applied, savedChars: saved, invalidatedTokens: epoch.invalidatedTokens, contextTokens: Math.round((l.chars + (input.baseChars ?? 0) - appliedChars) / cpt), gain: +verdict.gain.toFixed(5), cost: +verdict.cost.toFixed(5), byReason })
       }
     }
     const renderedChars = render(msgs, s.applied)
-    return { ...(epoch ? { epoch } : {}), renderedChars, pending: s.pending.size, contextTokens: Math.round((l.chars - renderedChars) / cpt) }
+    return { ...(epoch ? { epoch } : {}), renderedChars, pending: s.pending.size, contextTokens: Math.round((l.chars + (input.baseChars ?? 0) - renderedChars) / cpt) }
   }
 
   #collect(l: Ledger, msgs: readonly Message[], s: SessionState, judged: readonly Replacement[]): void {

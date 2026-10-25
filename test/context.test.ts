@@ -153,3 +153,17 @@ test("summary: the older turns form a segment; the answer is parsed; the summary
   assert.equal(moved[0]!.id, "c2")
   assert.match(moved[0]!.result!, /replaced by this summary/, "the summary moves on when its result was stubbed first")
 })
+
+test("status: the server's file per session, the bar and the folded line the sidebar shows", async () => {
+  const { bar, foldedContext, freshStatuses, readStatus, writeStatus } = await import("../src/context/status.ts")
+  const dir = mkdtempSync(join(tmpdir(), "status-"))
+  const s = { tokens: 60_000, ceiling: 120_000, summaryAt: 96_000, epochs: 2, savedChars: 284_000, pending: 3, recalled: ["tests need uv run"], at: Date.now() }
+  writeStatus("ses_1", s, dir)
+  assert.deepEqual(readStatus("ses_1", dir), s)
+  assert.deepEqual([...freshStatuses(dir).keys()], ["ses_1"])
+  assert.equal(freshStatuses(dir, 1000, Date.now() + 5000).size, 0, "a stale file is not listed")
+  assert.equal(bar(60_000, 120_000, 96_000, 10), "█████░░░│░")
+  assert.equal(bar(120_000, 120_000, 96_000, 10), "██████████")
+  assert.equal(foldedContext(s, { entries: 142, coreChars: 3900, vectors: true, writes: { added: 1, duplicate: 0, contradicts: 0 } }), "ctx 60k/120k ███░░│ · mem 142 · ↺2")
+  assert.equal(foldedContext(undefined, undefined), "no context data yet")
+})
