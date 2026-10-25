@@ -963,7 +963,7 @@ k/n is how many attempts pass, and the group is the task class (role, difficulty
 **Question.** Can a lane be one native subagent session, which stays a child in the TUI tree and is reported by
 OpenCode, and start over with a fresh head at a loop boundary, because the plugin resets the context the session's
 model sees? The alternative, plugin-made sessions, was ruled out by the user. The code is on branch
-`spike/ralph-reset` (commit 0901f5b) and is not merged.
+`archive/spike-ralph-reset` on GitHub (commit 0901f5b) and is not merged.
 
 **How it was tested.**
 - **Loop boundary:** a writer's failed `finish_task` once its fix rounds were used (`fixRounds` 0 in the later runs).
