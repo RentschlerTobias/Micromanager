@@ -6,7 +6,7 @@
 
 import { execFile } from "node:child_process"
 
-import { installAgents, type AgentDraft } from "./agents.ts"
+import { installAgents, SUMMARIZER_AGENT, type AgentDraft } from "./agents.ts"
 import { cloudRegistry, configPath, loadPicks, loadSettings } from "./config.ts"
 import { allowedOutside, decide, forbiddenOutside, forbiddenOutsideWhat, inJobArea, normalizeOutside, taskNamesPath, ALLOW_OUTSIDE_REASON, GRANT_OUTSIDE_REASON, REFUSED_OUTSIDE_REASON, type PermissionRequest } from "./decide.ts"
 import { injected, injectionScore } from "./gate.ts"
@@ -19,7 +19,7 @@ import { probe, type Availability } from "./registry.ts"
 import { chooseModel, unknown as allAvailable, withPicks, type Available } from "./routing.ts"
 import { family, MICROMANAGER, ROLES, roleByAgent, roleById, type Rule } from "./roles.ts"
 import { WRITERS } from "./profile.ts"
-import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
+import { recentFailure, Runner, summary, taskReport, toModel, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
 import { Compactor, stub as compactStub } from "./compact.ts"
 import { ContextManager } from "./context/manager.ts"
@@ -27,6 +27,8 @@ import { PriceBook } from "./context/prices.ts"
 import { learnedLines } from "./context/capture.ts"
 import { describe as describeEntry, Memory } from "./context/memory.ts"
 import { CoreSnapshots, RecentRecalls } from "./context/recall.ts"
+import { ledger as contextLedger } from "./context/ledger.ts"
+import { Summarizer } from "./context/summary.ts"
 import { installMemoryTools, MEMORY_IDS } from "./context/tools.ts"
 import { lastAssistantText } from "./brief.ts"
 import { review, signalFor } from "./checkpoint.ts"
@@ -2052,13 +2054,34 @@ export default {
     const workerJudge = new Compactor(decider, record, { keepTurns: 8, ruleAge: 20, tools: new Set(["read", "grep", "glob", "list", "webfetch", "websearch"]), subject: "worker" })
     const contextManager = new ContextManager({ journal: record })
     const priceBook = new PriceBook(() => ctx.model?.list())
+    // Stage 3: a session near its ceiling gets its older turns summarized by DeepSeek V4.1 Flash (the user's pick,
+    // 2026-10-20) in a hidden, tool-less session; the facts it lists go to the memory first (src/context/summary.ts).
+    const SUMMARY_MODEL = "opencode-go/deepseek-v4.1-flash"
+    const summarizer = new Summarizer({
+      generate: async (_system, prompt, label) => {
+        const s = await ctx.session.create({ title: `[context] summary · ${label}`, agent: SUMMARIZER_AGENT, model: toModel(SUMMARY_MODEL), location: { directory: project } })
+        await ctx.session.prompt({ sessionID: s.id, text: prompt })
+        await ctx.session.wait({ sessionID: s.id })
+        return lastAssistantText(await ctx.session.context({ sessionID: s.id }).catch(() => undefined))
+      },
+      facts: async (facts, sessionID) => { for (const text of facts) await memory.capture({ text, source: `summary ${sessionID}` }, project) },
+      journal: record,
+    })
     const manageContext = async (input: SessionHookInput, orchestrator: boolean) => {
       if (!input.sessionID || !Array.isArray(input.messages)) return
       let epoch = false
       try {
+        const ceilingTokens = orchestrator ? 100_000 : 120_000
         const { pruned } = await (orchestrator ? compactor : workerJudge).judge(input.sessionID, input.messages)
-        const judged = [...pruned.values()].map((c) => ({ id: c.id, reason: "judged" as const, result: compactStub(c), saved: c.size - compactStub(c).length }))
-        const r = contextManager.apply(input.sessionID, input.messages, { prices: await priceBook.get(input.model), ceilingTokens: orchestrator ? 100_000 : 120_000, judged })
+        const applied = new Set(contextManager.applied(input.sessionID).map((r) => r.id))
+        const l = contextLedger(input.messages as never)
+        const savedChars = contextManager.applied(input.sessionID).reduce((n, r) => n + r.saved, 0)
+        summarizer.maybeStart(input.sessionID, input.messages as never, l, applied, (l.chars - savedChars) / 3.5, ceilingTokens)
+        const judged = [
+          ...[...pruned.values()].map((c) => ({ id: c.id, reason: "judged" as const, result: compactStub(c), saved: c.size - compactStub(c).length })),
+          ...summarizer.ready(input.sessionID, applied),
+        ]
+        const r = contextManager.apply(input.sessionID, input.messages, { prices: await priceBook.get(input.model), ceilingTokens, judged })
         if (r.epoch) log("info", `context epoch (${r.epoch.reason}) in ${input.sessionID}: ${r.epoch.applied} results, ${r.epoch.savedChars} characters`)
         epoch = Boolean(r.epoch)
       } catch (err) {
@@ -2081,6 +2104,11 @@ export default {
     }
     await ctx.session.hook("context", async (input) => {
       // The tools exist for every agent; only the micromanager sees them.
+      // The summarizer reads only the transcript it is given: no tools, no memory, no context management.
+      if (input.agent === SUMMARIZER_AGENT) {
+        if (input.tools) for (const id of Object.keys(input.tools)) delete input.tools[id]
+        return
+      }
       if (input.agent !== MICROMANAGER.agent) {
         await manageContext(input, false)
         // A note the micromanager steered into a running worker (steer_task): it arrives at this turn boundary, which is

@@ -131,3 +131,25 @@ test("price book: prices by provider and model from the host's catalog, read onc
   await book.get({ providerID: "opencode-go", id: "deepseek-v4.1-flash" })
   assert.equal(reads, 1)
 })
+
+test("summary: the older turns form a segment; the answer is parsed; the summary survives a rule's stub", async () => {
+  const { segmentOf, parseSummary, Summarizer } = await import("../src/context/summary.ts")
+  const msgs = history(Array.from({ length: 12 }, (_, i): Call => ({ tool: "read", input: { path: `f${i}.ts` }, out: big(`F${i}`, 5000) })))
+  const l = ledger(msgs)
+  const seg = segmentOf(msgs, l, new Set(["c0"]), { startAt: 0.8, keepTurns: 6, minChars: 10_000, maxChars: 120_000, perResult: 4000, timeoutMs: 1000 })!
+  assert.deepEqual(seg.ids, ["c1", "c2", "c3", "c4", "c5"], "the last turns and applied results stay out")
+  assert.equal(seg.brief, "fix the parser")
+  assert.deepEqual(parseSummary("SUMMARY:\nRead f1 to f5; the parser lives in f3.ts at line 40, nothing changed yet.\n\nFACTS:\n- the parser is in f3.ts\n- none"), { summary: "Read f1 to f5; the parser lives in f3.ts at line 40, nothing changed yet.", facts: ["the parser is in f3.ts"] })
+  assert.equal(parseSummary("no sections"), undefined)
+  const facts: string[] = []
+  const s = new Summarizer({ generate: async () => "SUMMARY:\nThe agent read the files f1 to f5 and found the parser in f3.ts.\nFACTS:\n- the parser is in f3.ts", facts: async (f) => { facts.push(...f) } }, { minChars: 10_000 })
+  assert.equal(s.maybeStart("ses", msgs, l, new Set(["c0"]), 1000, 100_000), false, "far from the ceiling")
+  assert.equal(s.maybeStart("ses", msgs, l, new Set(["c0"]), 90_000, 100_000), true)
+  await new Promise((r) => setTimeout(r, 20))
+  assert.deepEqual(facts, ["the parser is in f3.ts"])
+  const ready = s.ready("ses", new Set(["c0"]))
+  assert.match(ready[0]!.result!, /^\[context: the results of turns 1-5 were replaced by this summary/)
+  const moved = s.ready("ses", new Set(["c0", "c1"]))
+  assert.equal(moved[0]!.id, "c2")
+  assert.match(moved[0]!.result!, /replaced by this summary/, "the summary moves on when its result was stubbed first")
+})
