@@ -1012,7 +1012,10 @@ export default {
         if (owned && loadControl(owned.project, owned.job.id).stopped) {
           throw new DelegationError(`Not continued: the user stopped job ${owned.job.id}. Nothing runs until they resume it (the sidebar's resume, or /stop again). Tell them in one sentence and end your turn.`)
         }
-        // A worker continued by its session: it stays in its worktree (spike), a merged writer gets a new task.
+        // A worker continued by its session: it stays in its worktree (spike), a merged writer gets a new task. It is
+        // alive again, so the sweep must not take it for one that ended without handing off (live run, 2026-10-25: a
+        // continued worker's task was cancelled on disk while the worker went on).
+        ended.delete(resumed)
         const task = await native.resume(resumed)
         if (task) log("info", `${task.id} continues in ${resumed}`)
         return
@@ -1130,7 +1133,11 @@ export default {
         for (let i = 0; i < 50 && !requestID; i++) {
           await new Promise((r) => setTimeout(r, 200))
           const pending = await ctx.permission.list({ sessionID }).catch(() => [])
-          requestID = pending.find((p) => p.action === action && p.resources.join("\0") === resources.join("\0") && !claimedRequests.has(p.id))?.id
+          // A sandboxed shell's pending request still carries the wrapped command; the evaluation was judged by the worker's
+          // own command (SHARED.unwrapped), so both sides are compared unwrapped (live run, 2026-10-25: every paused shell
+          // of a sandboxed worker was lost this way, and the worker waited until its session ended).
+          const own = (r: string) => SHARED.unwrapped?.get(r) ?? r
+          requestID = pending.find((p) => p.action === action && p.resources.map(own).join("\0") === resources.join("\0") && !claimedRequests.has(p.id))?.id
         }
         if (!requestID) {
           log("error", `paused ${action} of ${sessionID} but found no pending request to answer; it waits until the session ends`)

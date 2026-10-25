@@ -958,6 +958,64 @@ k/n is how many attempts pass, and the group is the task class (role, difficulty
 3. **A stronger verifier.** Attempts also write tests; each attempt's tests run against its siblings' code
    (agreement as in CodeT), to pick a winner where the user's checks are weak.
 
+## 24. Spike: Ralph loops inside one native worker session (2026-10-25)
+
+**Question.** Can a lane be one native subagent session, which stays a child in the TUI tree and is reported by
+OpenCode, and start over with a fresh head at a loop boundary, because the plugin resets the context the session's
+model sees? The alternative, plugin-made sessions, was ruled out by the user. The code is on branch
+`spike/ralph-reset` (commit 0901f5b) and is not merged.
+
+**How it was tested.**
+- **Loop boundary:** a writer's failed `finish_task` once its fix rounds were used (`fixRounds` 0 in the later runs).
+  `finish_task` answers with a handoff (the worker's summary, changed files, the failing checks with output, and "say
+  what you will do differently"), and the context manager resets the session at its next request.
+- **Two reset shapes:** "stubs" replaces every earlier tool result with a stub. "cut" drops every message between the
+  brief and the turn that crossed the boundary, and does so again on every later request.
+- **Runs:** headless on a private `opencode serve` with GLM 5.3 Flash and DeepSeek V4.1 Flash. The task was a German
+  slugify whose gate also ran held-out cases the worker could not read.
+
+**Results.**
+
+| Run | Resets | Worker went on | Context at the reset (provider tokens) |
+|---|---|---|---|
+| GLM, stubs | 2 | yes, no provider error | 19.7k → 16.8k (−15%) |
+| DeepSeek, stubs | 2 | yes, through all 3 loops | 35.1k → 32.0k (−9%), 62.0k → 60.4k (−3%) |
+| DeepSeek, cut | 2 | yes; **merged in loop 3** | 36k → 9k, 38k → 8k (back to system prompt + brief + handoff) |
+
+- **Answer: C can be done, with "cut".** The provider accepts the shortened history, the worker keeps working in the
+  same turn loop after the handoff, and the context drops to its starting size at every boundary.
+- **"stubs" works mechanically but misses the point.** The assistant's own text and the tool inputs stay; DeepSeek's
+  long messages refilled the context within one step.
+- **Nothing is lost.** OpenCode keeps the full history: the TUI and the session API show every loop. Only what the
+  model gets is cut; the plugin keeps the cut point (`cutAt`) per session.
+- **The plugin's estimate is off.** Its `contextTokens` estimate undercounts after a cut, because it counts the dropped
+  messages as JSON. Use the provider's numbers.
+
+**What it means for a real feature.** The loop need not be built now; these are the conditions if it is.
+- **A failed `finish_task` alone is too rare a trigger.** Good workers run their checks themselves and fix in place.
+  Three GLM runs never reached a boundary until fix rounds were set to 0. Better triggers:
+  - the N16 checkpoint verdict "fresh" (`making_progress` no, `wrong_approach` yes);
+  - watchdog signs: the same check failing again and again, or a circle of tool calls;
+  - the context ceiling: start over instead of summarizing.
+- **Adaptive checkpoint interval** (decided by the user). The first interval comes from the N5 difficulty, later from
+  the outcome log (about the 75th percentile of the steps that merged tasks of the class needed). Watchdog signs pull
+  it earlier, and Jev's confidence lengthens or shortens the next one. The outcome log needs the steps per attempt for
+  this.
+- **Workers try to reach hidden test data.** One worker went looking for the held-out cases although the prompt
+  forbade it; the permission layer refused it (shell `cat …/holdout.json`, then a search of `~/.local/share` and
+  `~/.config`). Held-out checks need the sandbox and the permission rules, not the prompt.
+
+**Side findings (bugs in the plugin).**
+1. **Lost paused shells, fixed on omo-hybrid.** A sandboxed worker's paused shell was never found among OpenCode's
+   pending requests: the evaluation had been unwrapped to the worker's own command, the pending request still held
+   the bwrap command. The worker (or helper) then waited until its session ended. Both sides are now compared
+   unwrapped.
+2. **Resume against the sweep, fixed on omo-hybrid.** A worker continued with its sessionID stayed in the plugin's
+   `ended` set, so the sweep cancelled its task on disk while it went on. `resume` now takes it out of the set.
+3. **Watchdog `same_call`, open.** It stopped a worker for running the task's own check three times between edits.
+   Rerunning a check after a change is wanted; the rule should not count the task's checks when files changed in
+   between.
+
 ## Sources
 - **Orchestration:**
   - Magentic-One ledgers (github.com/microsoft/autogen, `_magentic_one`)
