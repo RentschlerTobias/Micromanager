@@ -1335,7 +1335,8 @@ export default {
     // Memory beyond the session (src/context/): core entries in every prompt, recalled notes in a worker's brief and at
     // the micromanager's user turns, LEARNED lines and the memory tools through search and Jev. Off by itself when its
     // store cannot open; keyword search while the embedding service is down.
-    const memory = new Memory(decider, record)
+    const memorySettings = loadSettings().memory
+    const memory = new Memory(decider, record, { embed: memorySettings.embedding, ...(memorySettings.enabled ? {} : { off: "turned off in micromanager.jsonc" }) })
     try {
       const moved = memory.migrate(project)
       if (moved) log("info", `memory: ${moved} entries moved from .opencode/memory/jev-project.md`)

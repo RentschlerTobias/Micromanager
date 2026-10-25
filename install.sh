@@ -5,6 +5,9 @@
 #                           the "plugins" of ~/.config/opencode/cli.json
 #   ./install.sh --remove   remove both
 #   ./install.sh --skills   link skills/<name> into ~/.config/opencode/skills/
+#   ./install.sh --embedding [0.6b|4b|8b]   download Qwen3-Embedding (Q8, default 4b) and run it as the user service
+#                           micromanager-embedding.service (llama.cpp on the CPU, port 8093) for the memory's search
+#   ./install.sh --embedding-remove         stop and remove that service (the model file stays)
 # OpenCode loads plugins when it starts: restart the hub/server afterwards.
 set -euo pipefail
 
@@ -59,6 +62,55 @@ if [[ "${1:-}" == "--skills" ]]; then
     ln -sfn "${dir%/}" "$target"
     echo "linked $target -> ${dir%/}"
   done
+  exit 0
+fi
+
+# --embedding: the memory's embedding service (src/context/embed.ts). Its own llama.cpp process on the CPU, not in
+# llama-swap, where every embedding call would push the loaded chat model off the GPU. Down or missing, the memory
+# searches by keywords.
+UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/micromanager-embedding.service"
+if [[ "${1:-}" == "--embedding-remove" ]]; then
+  systemctl --user disable --now micromanager-embedding.service 2>/dev/null || true
+  rm -f "$UNIT" && systemctl --user daemon-reload && echo "removed micromanager-embedding.service"
+  exit 0
+fi
+if [[ "${1:-}" == "--embedding" ]]; then
+  size="${2:-4b}"
+  case "$size" in 0.6b|0.6B) size="0.6B" ;; 4b|4B) size="4B" ;; 8b|8B) size="8B" ;; *) echo "size must be 0.6b, 4b or 8b" >&2; exit 1 ;; esac
+  models="${MICROMANAGER_MODELS:-$HOME/Models/gguf}/qwen3-embedding-${size,,}"
+  file="$models/Qwen3-Embedding-${size}-Q8_0.gguf"
+  if [[ ! -f "$file" ]]; then
+    mkdir -p "$models"
+    echo "downloading Qwen3-Embedding-${size} (Q8) to $file"
+    curl -fL -C - -o "$file.part" "https://huggingface.co/Qwen/Qwen3-Embedding-${size}-GGUF/resolve/main/Qwen3-Embedding-${size}-Q8_0.gguf"
+    mv "$file.part" "$file"
+  fi
+  # llama.cpp's server: LLAMA_SERVER, else llama-server on PATH, else the llama-vulkan build with its serve command.
+  if [[ -n "${LLAMA_SERVER:-}" ]]; then server="$LLAMA_SERVER"
+  elif command -v llama-server >/dev/null; then server="$(command -v llama-server)"
+  elif [[ -x "$HOME/.local/bin/llama-vulkan" ]]; then server="$HOME/.local/bin/llama-vulkan serve"
+  else echo "no llama.cpp server found; set LLAMA_SERVER to its command" >&2; exit 1
+  fi
+  mkdir -p "$(dirname "$UNIT")"
+  cat >"$UNIT" <<UNIT_EOF
+[Unit]
+Description=micromanager memory embeddings: Qwen3-Embedding-${size} on the CPU (port 8093)
+After=default.target
+
+[Service]
+ExecStart=$server --embedding --pooling last -m $file --alias qwen3-embedding-${size,,} -dev none -ngl 0 -c 8192 -b 2048 -ub 2048 --host 127.0.0.1 --port 8093
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT_EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now micromanager-embedding.service
+  echo "micromanager-embedding.service runs Qwen3-Embedding-${size} on :8093"
+  if [[ "$size" != "4B" ]]; then
+    echo "set \"memory\": { \"embedding\": { \"url\": \"http://127.0.0.1:8093\", \"model\": \"qwen3-embedding-${size,,}\" } } in micromanager.jsonc, so the vectors are made again with this model"
+  fi
   exit 0
 fi
 

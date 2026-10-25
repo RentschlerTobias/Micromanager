@@ -242,6 +242,32 @@ export function parseSandbox(text: string): { sandbox: boolean; env: readonly st
   }
 }
 
+// The memory (src/context/): on by default; "embedding" names the local service install.sh --embedding sets up, false
+// for keyword search only. The model id is recorded with every vector, so a new size re-embeds rather than mixes.
+export interface MemorySettings {
+  readonly enabled: boolean
+  readonly embedding: { readonly url: string; readonly model: string } | false
+}
+
+export const DEFAULT_MEMORY: MemorySettings = { enabled: true, embedding: { url: "http://127.0.0.1:8093", model: "qwen3-embedding-4b" } }
+
+export function parseMemory(text: string): MemorySettings {
+  const raw = (JSON.parse(stripComments(text)) as { memory?: unknown }).memory
+  if (raw === undefined) return DEFAULT_MEMORY
+  if (typeof raw === "boolean") return { ...DEFAULT_MEMORY, enabled: raw }
+  if (typeof raw !== "object" || raw === null) throw new Error('memory must be true, false or { "embedding": { "url": …, "model": … } | false }')
+  const m = raw as { enabled?: unknown; embedding?: unknown }
+  if (m.enabled !== undefined && typeof m.enabled !== "boolean") throw new Error("memory.enabled must be true or false")
+  let embedding: MemorySettings["embedding"] = DEFAULT_MEMORY.embedding
+  if (m.embedding === false) embedding = false
+  else if (m.embedding !== undefined) {
+    const e = m.embedding as { url?: unknown; model?: unknown }
+    if (typeof e !== "object" || e === null || (e.url !== undefined && typeof e.url !== "string") || (e.model !== undefined && typeof e.model !== "string")) throw new Error('memory.embedding must be { "url": "http://…", "model": "qwen3-embedding-4b" } or false')
+    embedding = { url: String(e.url ?? (DEFAULT_MEMORY.embedding as { url: string }).url), model: String(e.model ?? (DEFAULT_MEMORY.embedding as { model: string }).model) }
+  }
+  return { enabled: m.enabled ?? true, embedding }
+}
+
 // With cloudOnly, local models stay in the registry (they show up in the journal's ranking) but are never routed to.
 export function cloudRegistry(registry: readonly ModelEntry[]): ModelEntry[] {
   return registry.map((m) => (m.location === "local" ? { ...m, disabled: true } : m))
@@ -261,6 +287,7 @@ export interface Settings {
   readonly sandbox: boolean
   readonly env: readonly string[]
   readonly network: readonly string[]
+  readonly memory: MemorySettings
 }
 
 // The settings a config file that is missing or broken falls back to. One place, so the two returns below cannot drift
@@ -278,6 +305,7 @@ const DEFAULTS: Omit<Settings, "registry"> = {
   sandbox: true,
   env: [],
   network: [],
+  memory: DEFAULT_MEMORY,
 }
 
 export function loadSettings(path = configPath()): Settings & { error?: string } {
@@ -288,7 +316,7 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text), memory: parseMemory(text) }
   } catch (err) {
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }

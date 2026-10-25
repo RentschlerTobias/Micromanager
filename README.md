@@ -16,6 +16,7 @@ the fully code-driven design. The design is [docs/design.md](docs/design.md), it
 ```bash
 ./install.sh            # links src/plugin.ts into ~/.config/opencode/plugins/micromanager.ts
 ./install.sh --remove
+./install.sh --embedding 4b   # the memory's embedding service (0.6b, 4b or 8b), see "Context and memory"
 ```
 
 Restart the OpenCode server afterwards (plugins load at start): the one your TUI attaches to, which here is the voice
@@ -257,6 +258,43 @@ skill in a worker's brief only when that link is in place. The local GLiNER
 decision server (`decider/`, see its README) answers guard questions on the CPU, and `npm run bench-guards`
 measures them; the journal
 `~/.local/state/micromanager/decisions.jsonl` feeds `npm run eval` and `npm run export-dataset`.
+
+## Context and memory
+
+Every session's context, the micromanager's and each worker's, is managed by `src/context/`, and what lasts beyond a
+session goes into one memory for all projects.
+
+**Context in epochs.** A provider caches the prompt's prefix, so dropping something from the middle of a context makes
+the rest uncached once. The context manager therefore collects what can go and applies it all at once, in an epoch,
+and between epochs the prompt stays the same bytes:
+1. Rules, no model: a read that a later read covers, or that the file's later edit made stale, a repeated call, old
+   shell output (cut to its last 10 lines), the content of old `write`/`edit` calls (the file has it), old web pages.
+2. Jev's "still needed?" on the older large results (the micromanager's of any tool, a worker's reads and web results).
+3. Near the ceiling (80% of 120k tokens, the micromanager's 100k), the turns before the last six are summarized by
+   DeepSeek V4.1 Flash in a hidden, tool-less session (the `summarizer` agent); the facts it lists go to the memory first.
+
+An epoch comes when the saving over the expected remaining steps beats the cache it breaks, priced per model from the
+host's catalog, or when the context passes the ceiling. Notes the plugin adds for one request go at its end, never into
+the system prompt. `node bench/context-replay.ts` replays the recorded sessions in OpenCode's database through the rules
+and reports the context and cost they would have had (on the sessions up to 2026-10-23: coders 24% less context with
+the rules alone). The journal records `context.epoch` and `context.summary`.
+
+**Memory.** One Markdown file per entry in a git repository, `~/.local/share/micromanager/memory/`, readable and editable
+by hand; the SQLite index next to it is rebuilt from the files whenever it falls behind. Entries belong to the user
+(preferences), to every project (tool pitfalls) or to one project. Pinned entries are core memory: they stand in every
+session's system prompt, within a budget, and change there only at the session's next epoch.
+- A worker's brief gets the entries that help its task: keyword and vector search fused by rank, Jev per entry, no two
+  saying the same, within a budget per role. The micromanager gets the same at each user turn, for that request only,
+  without what it got in its last three turns.
+- Workers end their report with `LEARNED:` lines. The micromanager has `memory_set`, `memory_replace`, `memory_list` and
+  `memory_get`; readers have `memory_search`. Every write is searched against the memory first, and Jev says whether it
+  is new, a duplicate, a refinement of an entry (which it replaces) or a contradiction (reported back to ask the user).
+- Vectors come from Qwen3-Embedding on the CPU (`./install.sh --embedding 4b`: downloads the model and runs
+  `micromanager-embedding.service` on port 8093). Without the service the memory searches by keywords and fills in
+  the vectors later. `"memory": false` in `micromanager.jsonc` turns it off, `"memory": { "embedding": false }` keeps
+  keywords only, and a different size needs `"memory": { "embedding": { "model": "qwen3-embedding-8b" } }`.
+- The old per-project block `.opencode/memory/jev-project.md` moves into the memory once. The journal records
+  `memory.write` and `recall` (what was found, what was picked).
 
 ## Flow chart
 

@@ -16,6 +16,7 @@ export interface MemoryOptions {
   readonly root?: string
   readonly embed?: Partial<EmbedOptions> | false // false: keywords only
   readonly git?: boolean
+  readonly off?: string // the memory is turned off, and why
 }
 
 export class Memory {
@@ -30,6 +31,7 @@ export class Memory {
     this.#decider = decider
     this.#journal = journal
     this.#o = o
+    this.#off = o.off
   }
 
   get off(): string | undefined {

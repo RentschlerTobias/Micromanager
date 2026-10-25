@@ -116,3 +116,12 @@ test("recall: Jev's picks within the role's budget, the rest as pointers; held-b
   cores.refresh("s")
   assert.equal(cores.get("s", () => `core ${++n}`), "core 2")
 })
+
+test("settings: memory on by default, the embedding service configurable or off", async () => {
+  const { parseMemory, DEFAULT_MEMORY } = await import("../src/config.ts")
+  assert.deepEqual(parseMemory("{}"), DEFAULT_MEMORY)
+  assert.equal(parseMemory('{ "memory": false }').enabled, false)
+  assert.equal(parseMemory('{ "memory": { "embedding": false } }').embedding, false)
+  assert.deepEqual(parseMemory('{ "memory": { "embedding": { "model": "qwen3-embedding-8b" } } }').embedding, { url: "http://127.0.0.1:8093", model: "qwen3-embedding-8b" })
+  assert.throws(() => parseMemory('{ "memory": { "embedding": 3 } }'), /memory.embedding/)
+})
