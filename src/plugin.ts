@@ -31,7 +31,7 @@ import { ledger as contextLedger } from "./context/ledger.ts"
 import { Summarizer } from "./context/summary.ts"
 import { writeMemoryStats, writeStatus } from "./context/status.ts"
 import { installMemoryTools, MEMORY_IDS } from "./context/tools.ts"
-import { lastAssistantText, usage as sessionUsage } from "./brief.ts"
+import { lastAssistantText } from "./brief.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
@@ -54,6 +54,7 @@ import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
 import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo } from "./native.ts"
 import { classOf, needsTrials, outcomeOf, readOutcomes, recordOutcome } from "./outcomes.ts"
 import { DEEP, trialSize, type Assessment } from "./trials.ts"
+import { Accountant, limitsOf, overBudget, overNote, sessionUsage, wrapUpNote } from "./budget.ts"
 import { seedFromJournal, Usage } from "./usage.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
@@ -174,6 +175,10 @@ interface Shared {
   asks: Asks // workers' paused permission requests, answered by the micromanager or the user (src/ask.ts)
   grantRequests: GrantRequests // workers' requests for a variable or a host, waiting for the user (src/grants.ts)
   helperOf: Map<string, string> // helper session -> the writer it answers (src/helpers.ts)
+  // What every session of a native job used, so the job is charged only what is new (src/budget.ts), and the jobs
+  // whose used-up budget the micromanager was told about already.
+  accountant?: Accountant
+  overBudget?: Set<string>
   // Micromanager sessions whose planned job moved on (a worker ended): at their next turn the plugin says what to start
   // next, worked out then, so a task delegated in the meantime is not named again (src/continuation.ts). Shared: the
   // worker's end is seen by the instance of its worktree, the micromanager's turn by the instance of its directory.
@@ -1005,6 +1010,14 @@ export default {
         })
         log("warn", `${routed.model} instead of ${routed.skipped.join(", ")}: those are not available here`)
       }
+      // A used-up budget starts nothing and continues nothing (src/budget.ts); the micromanager asks the user.
+      if (project) {
+        const d = parseDelegation(asked)
+        const ref = d.attempt ?? d.planned
+        const target = resumed ? native.jobOf(resumed)?.job : ref ? native.current(project, ref.job) ?? loadJob(project, ref.job) : budgetJob(call.sessionID)?.job
+        const why = target && overNow(target)
+        if (why) throw new DelegationError(`Not ${resumed ? "continued" : "started"}: job ${target.id} used its budget (${why}). Ask the user whether to raise it ("budget" in ~/.config/opencode/micromanager.jsonc); nothing starts until then.`)
+      }
       if (resumed) {
         // STOP holds every worker of the job, the one continued by its session too (live run, 2026-10-20: OpenCode's
         // note that the stopped worker was cancelled woke the micromanager, and it continued the worker at once).
@@ -1446,6 +1459,41 @@ export default {
     // What the micromanager must do in its next turn, per session; set from the user's turn or a job update, used by
     // every provider turn of that answer (steering through a system block, Phase A1), replaced at the user's next turn.
     const steering = new Map<string, string>()
+    // The budget of native jobs (src/budget.ts): every request of a worker, helper or micromanager charges its job
+    // with what its session used since the last one.
+    const accountant = (SHARED.accountant ??= new Accountant())
+    const toldOver = (SHARED.overBudget ??= new Set())
+    // The job a session's usage goes to: a worker's or helper's job, or the micromanager's own (rolling first).
+    const budgetJob = (sessionID: string): { project: string; job: Job } | undefined => {
+      const owned = native.jobOf(sessionID) ?? native.jobOf(SHARED.helperOf.get(sessionID) ?? "")
+      if (owned) return owned
+      if (!project) return undefined
+      const mine = listJobs(project).filter((j) => j.facilitator === sessionID && (j.rolling || j.native) && !["done", "stopped", "failed"].includes(j.phase))
+      const job = mine.find((j) => j.rolling) ?? mine[0]
+      return job ? { project, job: native.current(project, job.id) ?? job } : undefined
+    }
+    const overNow = (job: Job): string | undefined => overBudget(job, limitsOf(job, loadSettings().budget))
+    const charge = async (sessionID: string): Promise<void> => {
+      const owned = budgetJob(sessionID)
+      if (!owned) return
+      const messages = await ctx.session.context({ sessionID }).catch(() => undefined)
+      if (!messages) return
+      const d = accountant.charge(owned.job, sessionID, sessionUsage(messages))
+      if (!d.tokens && !d.cost && !d.requests) return
+      saveJob(owned.project, owned.job)
+      const why = overNow(owned.job)
+      if (!why) {
+        toldOver.delete(owned.job.id) // raised meanwhile: a later overrun is told again
+        return
+      }
+      if (toldOver.has(owned.job.id)) return
+      toldOver.add(owned.job.id)
+      const running = native.running(owned.job.facilitator ?? "").filter((w) => native.jobOf(w.session)?.job.id === owned.job.id)
+      for (const w of running) steering.set(w.session, wrapUpNote(why))
+      record({ kind: "budget", job: owned.job.id, why, running: running.map((w) => w.task) })
+      log("warn", `job ${owned.job.id}: ${why}`)
+      if (owned.job.facilitator) await ctx.session.synthetic({ sessionID: owned.job.facilitator, text: overNote(owned.job, why, running.map((w) => w.task)), resume: true }).catch((err: unknown) => log("warn", `budget note failed: ${String(err)}`))
+    }
     const continuing = (SHARED.continuing ??= new Map()) // a server that loaded an older version of this module has none
     const notifier = new Notifier({
       mode: notify,
@@ -2205,6 +2253,7 @@ export default {
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
         if (input.tools) for (const kind of ["env", "network"] as const) if (!(input.sessionID && grantAllowed(kind, input.sessionID))) delete input.tools[GRANT_IDS[kind]]
         // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
+        if (input.sessionID && (native.isWorker(input.sessionID) || SHARED.helperOf.has(input.sessionID))) void charge(input.sessionID).catch((err: unknown) => log("warn", `budget count failed: ${String(err)}`))
         if (input.sessionID && native.isWorker(input.sessionID)) {
           const worker = input.sessionID
           native.watchEnd(worker, () => ctx.session.wait({ sessionID: worker }), () => stops.get(worker)?.detail, (note, parent, r) => {
@@ -2247,6 +2296,7 @@ export default {
         for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
       }
       await manageContext(input, true)
+      if (input.sessionID) void charge(input.sessionID).catch((err: unknown) => log("warn", `budget count failed: ${String(err)}`))
       // A new message of the user (or a worker's report): what the memory knows about it, for this request only.
       const last = Array.isArray(input.messages) ? (input.messages as { role?: string; content?: unknown }[]).at(-1) : undefined
       if (input.sessionID && last?.role === "user") {

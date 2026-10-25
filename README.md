@@ -268,6 +268,11 @@ micromanager is told what each hit and splits the task. Every writer's end, with
 tokens and cost, goes to `~/.local/state/micromanager/outcomes.jsonl`; `npm run export-dataset -- --target router`
 turns it into one row per task, the training data for a router (docs/design.md §23).
 
+A job's `budget` (tokens, requests, cost; none by default) holds for the micromanager's own workers too: every
+request of a worker, its helpers and the micromanager is counted against its job. A used-up budget cuts nothing: no
+new worker starts and none is continued, the running ones are asked to wrap up (their work stays in their worktrees),
+and the micromanager asks you whether to raise it. A raised `budget` holds from the next request on.
+
 ## Context and memory
 
 Every session's context, the micromanager's and each worker's, is managed by `src/context/`, and what lasts beyond a

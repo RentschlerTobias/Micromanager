@@ -44,6 +44,7 @@ import { discoveredCap, isDone, parallelSafe, moveJob, moveTask, newJob, promote
 import { skillsFor, type Stage } from "./skills.ts"
 import { excludeFromGit, jobId, loadJob, saveJob, saveNote } from "./store.ts"
 import { FIX_ROUNDS, handoffNote, MAX_STEPS, TIER_STEPS, type Signal } from "./watchdog.ts"
+import { overBudget } from "./budget.ts"
 
 // The part of ctx.session the runner needs (argument shapes as seen in Phase A).
 export interface SessionApi {
@@ -259,11 +260,7 @@ export class Runner {
 
   // The first budget the job has used up, as a reason; checked before every start (design.md §10.2).
   #overBudget(job: Job): string | undefined {
-    const { budget: b, counters: c } = job
-    if (b.tokensMax && (c.tokens ?? 0) >= b.tokensMax) return `token budget of ${b.tokensMax} used up (${c.tokens})`
-    if (b.requestsMax && (c.requests ?? 0) >= b.requestsMax) return `request budget of ${b.requestsMax} used up (${c.requests})`
-    if (b.costMax && (c.cost ?? 0) >= b.costMax) return `cost budget of ${b.costMax} used up (${(c.cost ?? 0).toFixed(2)})`
-    return undefined
+    return overBudget(job)
   }
 
   // Goal -> validated plan, waiting at the plan gate for the user's go.
