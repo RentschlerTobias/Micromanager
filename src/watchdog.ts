@@ -167,8 +167,12 @@ export class Watchdog {
       s.writes++
       s.lastWrite = s.calls.length - 1
     }
+    // The same call again is a loop only when nothing was written in between: running the task's check after each
+    // edit is the work, not a circle (live run, 2026-10-25: a worker was stopped for its third `node check.js` with an
+    // edit before each). A write repeated with the same input still counts over the whole window.
     const recent = s.calls.slice(-s.limits.window)
-    const same = recent.filter((c) => c === key).length
+    const since = wrote ? recent : s.calls.slice(Math.max(s.lastWrite + 1, s.calls.length - s.limits.window))
+    const same = since.filter((c) => c === key).length
     if (same >= s.limits.sameCall) return { kind: "same_call", severity: "stop", detail: `${tool} with the same input ${same}x in the last ${recent.length} calls` }
     const path = pathOf(input)
     const i = input as { offset?: unknown; limit?: unknown } | undefined

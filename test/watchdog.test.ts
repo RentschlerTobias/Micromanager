@@ -122,6 +122,19 @@ test("a command that works is progress: verifying repeatedly is not a stall", ()
   assert.equal(loop.onTool("l", "shell", { command: "npm test" }), undefined)
   assert.equal(loop.onTool("l", "shell", { command: "npm test" })?.kind, "same_call")
 
+  // The check after each edit is the work: an edit in between resets the count (live run, 2026-10-25).
+  const verifying = new Watchdog()
+  verifying.watch("v")
+  for (let n = 0; n < 5; n++) {
+    assert.equal(verifying.onTool("v", "edit", { path: "slug.js", oldString: `a${n}`, newString: `a${n + 1}` }), undefined)
+    assert.equal(verifying.onTool("v", "shell", { command: "node check.js" }), undefined, `check ${n + 1}`)
+  }
+  // the same edit over and over is still a loop
+  const editing = new Watchdog()
+  editing.watch("e")
+  for (let n = 0; n < 2; n++) editing.onTool("e", "edit", { path: "a.js", oldString: "x", newString: "y" })
+  assert.equal(editing.onTool("e", "edit", { path: "a.js", oldString: "x", newString: "y" })?.kind, "same_call")
+
   // A command that keeps failing is the case sameCall cannot see: the text differs, nothing works.
   const failing = new Watchdog()
   failing.watch("f", { noNewFiles: 6 })

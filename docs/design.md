@@ -1012,9 +1012,9 @@ model sees? The alternative, plugin-made sessions, was ruled out by the user. Th
    unwrapped.
 2. **Resume against the sweep, fixed on omo-hybrid.** A worker continued with its sessionID stayed in the plugin's
    `ended` set, so the sweep cancelled its task on disk while it went on. `resume` now takes it out of the set.
-3. **Watchdog `same_call`, open.** It stopped a worker for running the task's own check three times between edits.
-   Rerunning a check after a change is wanted; the rule should not count the task's checks when files changed in
-   between.
+3. **Watchdog `same_call`, fixed on omo-hybrid.** It stopped a worker for running the task's own check three times
+   with an edit before each. A repeated call now counts only since the last write; a write repeated with the same
+   input still counts over the whole window.
 
 ## Sources
 - **Orchestration:**
