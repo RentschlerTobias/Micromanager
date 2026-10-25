@@ -56,8 +56,8 @@ export function family(model: string): string {
 
 const rule = (action: string, effect: Effect, resource = "*"): Rule => ({ action, resource, effect })
 const WRITE_TOOLS = ["edit", "write", "patch"] as const
-// Workers never write the project memory themselves (opencode-agent-memory's tools); they report LEARNED lines and
-// Jev decides what is kept (src/memory.ts).
+// Workers never write the memory themselves; they report LEARNED lines and search and Jev decide what is kept
+// (src/context/capture.ts).
 const noMemory = ["memory_set", "memory_replace", "memory_oversized", "journal_write"].map((t) => rule(t, "deny"))
 const WEB_TOOLS = ["webfetch", "websearch"] as const
 
@@ -130,7 +130,8 @@ const SHARED = `You are a sub-agent of the micromanager. You get one sub-task wi
 Do only that sub-task. When you finish, answer with: what you did, which files you changed (if any), and for
 each acceptance point whether it is met. A refused permission is not a blocker: nobody is asked while you run, so carry
 on without it and say in your report what you wanted it for and what you did instead. If something blocks you, say what
-and stop; do not guess.`
+and stop; do not guess. If you learned a lasting fact that later tasks will need and cannot see quickly in the code
+(how to run the tests, where something lives, a pitfall), end your report with one line per fact: LEARNED: <the fact>.`
 
 // Agent ids: the orchestrator is the micromanager, the workers are named after their role (the user's choice,
 // 2026-10-05). Nouns, since OpenCode's built-in agents are already called plan and explore.

@@ -24,6 +24,11 @@ import { checkGuards } from "./gate.ts"
 import { Compactor, stub as compactStub } from "./compact.ts"
 import { ContextManager } from "./context/manager.ts"
 import { PriceBook } from "./context/prices.ts"
+import { learnedLines } from "./context/capture.ts"
+import { describe as describeEntry, Memory } from "./context/memory.ts"
+import { CoreSnapshots, RecentRecalls } from "./context/recall.ts"
+import { installMemoryTools, MEMORY_IDS } from "./context/tools.ts"
+import { lastAssistantText } from "./brief.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
@@ -1006,6 +1011,10 @@ export default {
       }
       const d = await native.delegate(project, call.sessionID, { agent: String(call.input.agent ?? ""), description: String(call.input.description ?? ""), prompt: asked }, routed.model)
       call.input.prompt = d.prompt
+      // What the memory knows that helps this task (src/context/recall.ts), after the Files/Checks lines and a blank line,
+      // so they stay the task's (native.ts parseDelegation stops checks at a blank line).
+      const notes = await memory.recallText(asked, { projectDir: project, role: routed.role, session: call.sessionID }).catch(() => ({ text: "", ids: [] }))
+      if (notes.text) call.input.prompt = `${String(call.input.prompt)}\n\n${notes.text}`
       tasks.set(String(call.input.agent), asked)
       // What the router decided, next to the permission decisions, so /flow can show the whole path. `agent` is the
       // caller, which is not always the micromanager: that is how an operator sees, from the journal alone, which
@@ -1321,6 +1330,19 @@ export default {
     }
     const backends = { ...DEFAULT_BACKENDS, cloudOnly }
     const decider = new Decider(backends, makeAskers(backends, key))
+    // Memory beyond the session (src/context/): core entries in every prompt, recalled notes in a worker's brief and at
+    // the micromanager's user turns, LEARNED lines and the memory tools through search and Jev. Off by itself when its
+    // store cannot open; keyword search while the embedding service is down.
+    const memory = new Memory(decider, record)
+    try {
+      const moved = memory.migrate(project)
+      if (moved) log("info", `memory: ${moved} entries moved from .opencode/memory/jev-project.md`)
+    } catch (err) {
+      log("warn", `memory migration failed: ${String(err)}`)
+    }
+    const cores = new CoreSnapshots()
+    const recents = new RecentRecalls()
+    const readerAgent = (agent?: string) => { const r = agent ? roleByAgent(agent) : undefined; return Boolean(r && !WRITERS.has(r.id)) }
     if (cloudOnly) log("info", "cloud only: no local models, guards on cloud Jev")
     // The loop watchdog judges the planner and worker sessions the runner starts; a signal interrupts the session
     // and the runner reads why (design.md §10.1).
@@ -1892,6 +1914,41 @@ export default {
       } catch (err) {
         log("error", `code_graph not installed: ${String(err)}`)
       }
+      try {
+        const store = () => { const st = memory.store(); if (!st) throw new Error(`the memory is off: ${memory.off}`); return st }
+        installMemoryTools(draft, {
+          search: async (query) => {
+            if (!query) return "memory_search needs query: what you want to know, in a sentence."
+            const r = await memory.search(query, project)
+            if (!r) return `The memory is off: ${memory.off}`
+            if (!r.hits.length) return "Nothing in the memory matches."
+            return `${r.hits.map((h) => describeEntry(h.entry)).join("\n")}${r.vectors ? "" : "\n(keyword search only: the embedding service is down)"}`
+          },
+          list: async () => memory.list(project).sort((a, b) => Number(b.pinned) - Number(a.pinned)).map(describeEntry).join("\n") || "The memory is empty.",
+          get: async (id) => { const e = store().get(id); return e ? `${describeEntry(e)}\nsource: ${e.source ?? "-"} · created ${e.created} · updated ${e.updated}${e.replaces ? ` · replaces ${e.replaces}` : ""}` : `No memory entry ${id}.` },
+          set: async (text, scope, core, tctx) => {
+            const sc = (["user", "global", "project"] as const).find((x) => x === scope.toLowerCase())
+            if (!text) return "memory_set needs text: the fact, in one sentence."
+            if (!sc) return "memory_set needs scope: user, global or project."
+            const v = await memory.capture({ text, source: `memory_set ${tctx.sessionID ?? ""}`.trim(), scope: sc, pinned: /^(yes|true|ja)$/i.test(core) }, project)
+            if (!v) return `The memory is off: ${memory.off}`
+            if (v.kind === "duplicate") return `Not stored: ${describeEntry(v.of)} already says it.`
+            if (v.kind === "dropped") return `Not stored: ${v.why}.`
+            if (v.kind === "contradicts") return `Stored as ${v.entry.id}, but it contradicts ${describeEntry(v.other)}. Ask the user which one holds, then memory_replace the wrong one.`
+            if (v.kind === "refined") return `Refined ${v.old.id}: ${v.entry.text}`
+            return `Stored: ${describeEntry(v.entry)}`
+          },
+          replace: async (id, text) => {
+            if (!id || !text) return "memory_replace needs id and text."
+            const e = store().update(id, { text }, "replace")
+            if (!e) return `No memory entry ${id}.`
+            record({ kind: "memory.write", verdict: "replaced", id, text: text.slice(0, 200) })
+            return `Replaced: ${describeEntry(e)}`
+          },
+        }, (tool, tctx) => tctx.agent === MICROMANAGER.agent || (tool === "search" && readerAgent(tctx.agent)))
+      } catch (err) {
+        log("error", `memory tools not installed: ${String(err)}`)
+      }
     })
 
     await ctx.session.hook("prompt", async (input) => {
@@ -1997,13 +2054,23 @@ export default {
     const priceBook = new PriceBook(() => ctx.model?.list())
     const manageContext = async (input: SessionHookInput, orchestrator: boolean) => {
       if (!input.sessionID || !Array.isArray(input.messages)) return
+      let epoch = false
       try {
         const { pruned } = await (orchestrator ? compactor : workerJudge).judge(input.sessionID, input.messages)
         const judged = [...pruned.values()].map((c) => ({ id: c.id, reason: "judged" as const, result: compactStub(c), saved: c.size - compactStub(c).length }))
         const r = contextManager.apply(input.sessionID, input.messages, { prices: await priceBook.get(input.model), ceilingTokens: orchestrator ? 100_000 : 120_000, judged })
         if (r.epoch) log("info", `context epoch (${r.epoch.reason}) in ${input.sessionID}: ${r.epoch.applied} results, ${r.epoch.savedChars} characters`)
+        epoch = Boolean(r.epoch)
       } catch (err) {
         log("warn", `context management failed: ${String(err)}`)
+      }
+      // Core memory in the system prompt, the same bytes until the session's next epoch.
+      try {
+        if (epoch) cores.refresh(input.sessionID)
+        const core = cores.get(input.sessionID, () => memory.core(project))
+        if (core && Array.isArray(input.system)) input.system.push({ type: "text", text: core })
+      } catch (err) {
+        log("warn", `core memory failed: ${String(err)}`)
       }
     }
     // A note for this one request goes at its end, not into the system prompt: the hook's messages are what the provider
@@ -2026,6 +2093,7 @@ export default {
           }
         }
         if (input.tools) for (const id of TOOL_IDS) delete input.tools[id]
+        if (input.tools) for (const [tool, id] of Object.entries(MEMORY_IDS)) if (!(tool === "search" && readerAgent(input.agent))) delete input.tools[id]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[FINISH_ID]
         if (input.tools && !(input.sessionID && native.hasGraph(input.sessionID))) delete input.tools[GRAPH_ID]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
@@ -2037,6 +2105,11 @@ export default {
             // Its end is the one thing reconcileJob needs to stop calling this worker alive (src/state.ts).
             ended.add(worker)
             void release(worker, "the worker that asked it has ended")
+            // Its LEARNED lines go to the memory, each through search and Jev (src/context/capture.ts).
+            void (async () => {
+              const report = lastAssistantText(await ctx.session.context({ sessionID: worker }).catch(() => undefined))
+              for (const line of learnedLines(report).slice(0, 5)) await memory.capture({ text: line, source: `LEARNED ${worker}` }, project)
+            })().catch((err: unknown) => log("warn", `memory capture failed: ${String(err)}`))
             if (note) void ctx.session.synthetic({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
             // A planned job goes on by itself: the next ready tasks, or that it is done or stuck, at the micromanager's
             // next turn, which the worker's report starts (src/continuation.ts).
@@ -2065,6 +2138,15 @@ export default {
         for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
       }
       await manageContext(input, true)
+      // A new message of the user (or a worker's report): what the memory knows about it, for this request only.
+      const last = Array.isArray(input.messages) ? (input.messages as { role?: string; content?: unknown }[]).at(-1) : undefined
+      if (input.sessionID && last?.role === "user") {
+        const said = typeof last.content === "string" ? last.content : Array.isArray(last.content) ? (last.content as { text?: string }[]).map((p) => p.text ?? "").join(" ") : ""
+        if (said.trim()) {
+          const notes = await memory.recallText(said, { projectDir: project, role: "micromanager", exclude: recents.next(input.sessionID), session: input.sessionID }).catch(() => ({ text: "", ids: [] }))
+          if (notes.text) { tail(input, notes.text); recents.given(input.sessionID, notes.ids) }
+        }
+      }
       const note = input.sessionID ? steering.get(input.sessionID) : undefined
       if (note) tail(input, note)
       if (input.sessionID) awaitTurn(input.sessionID)
