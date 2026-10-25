@@ -221,8 +221,9 @@ below.
 
 **Picking the pools in the TUI.** The sidebar's MODELS section (click it to unfold) shows each worker role's pool and
 the vision model; a click on a role, or `/pools`, opens a popup like `/model` with every model the host runs, the
-pool's members checked. ↵ checks or unchecks a model, "back to the default" drops the pick, a pool never becomes
-empty. The picks go to `~/.config/opencode/micromanager-models.json`, which the server reads at each delegation, so
+pool's members checked. ↵ checks or unchecks a model, "clear all" unchecks the whole pool to pick a new one from
+nothing, "back to the default" drops the pick, a pool never becomes empty (esc right after "clear all" keeps the old
+one). The picks go to `~/.config/opencode/micromanager-models.json`, which the server reads at each delegation, so
 they hold from the next task on without a restart; they win over `models` in `micromanager.jsonc`, and the journal's
 `routing` record says `picked: true`. The micromanager itself runs on the session's model: change that with `/model`.
 

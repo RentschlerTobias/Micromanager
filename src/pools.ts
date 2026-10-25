@@ -13,6 +13,9 @@ import { chain, withPicks, type Routing } from "./routing.ts"
 export const VISION = "vision"
 // The popup entry that drops the user's pick and goes back to the default pool.
 export const RESET = "\u0000default"
+// The popup entry that unchecks every model of a role's pool, so the user picks a new pool from nothing. The empty
+// pool lives only in the popup: nothing is saved until a model is checked again.
+export const CLEAR = "\u0000clear"
 
 export interface PoolRow {
   readonly key: RoleId | typeof VISION
@@ -89,6 +92,7 @@ export function modelOptions(
   })
   return [
     { title: row.own ? "↺ back to the default" : "  (default)", value: RESET, category: row.agent },
+    ...(row.key !== VISION && row.models.length > 0 ? [{ title: "✕ clear all", value: CLEAR, category: row.agent }] : []),
     ...providers.flatMap((provider) => usable.filter((m) => m.providerID === provider)
       .sort((a, b) => (a.name ?? a.id!).localeCompare(b.name ?? b.id!))
       .map((m) => option(idOf(m), m.name ?? m.id!, provider))),

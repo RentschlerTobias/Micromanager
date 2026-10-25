@@ -19,7 +19,7 @@ import { createSignal, For, onCleanup, Show } from "solid-js"
 
 import { loadPicks, loadSettings, savePicks } from "./config.ts"
 import { lastOptions, loadControl, optionsOf, updateControl, type Control } from "./control.ts"
-import { agentOptions, modelOptions, poolRows, RESET, shortNames, toggle, updatePicks, VISION, type CatalogModel, type PoolRow } from "./pools.ts"
+import { agentOptions, CLEAR, modelOptions, poolRows, RESET, shortNames, toggle, updatePicks, VISION, type CatalogModel, type PoolRow } from "./pools.ts"
 import { BOX, foldedLine, jobsFor, projectOf, resolver, sessionJobs, sidebarCounts, sidebarGroups, summaryLine, taskChoices, view, type JobView, type Mark, type SidebarGroup } from "./progress.ts"
 import { listJobs } from "./store.ts"
 import { agentRows, agentSummary, type AgentRow, type SessionFacts, type Tag } from "./switcher.ts"
@@ -351,7 +351,8 @@ function Pools(props: { context: Context }) {
 }
 
 // The popup: step 1 picks the agent, step 2 its models. A plugin's select has no keys of its own, so ↵ checks or
-// unchecks a model and the popup opens again on it; esc ends. Every change is saved at once.
+// unchecks a model and the popup opens again on it; esc ends. Every change is saved at once, except "clear all": its
+// empty pool stays in the popup until a model is checked, and esc before that keeps the saved pool.
 async function pickModels(context: Context, key?: PoolRow["key"]): Promise<void> {
   if (!key) {
     const chosen = await context.ui.dialog.select({ title: "Micromanager: models per agent", placeholder: "agent", options: agentOptions(rows(), sessionModel(context)) })
@@ -365,13 +366,23 @@ async function pickModels(context: Context, key?: PoolRow["key"]): Promise<void>
   for (const pick of seedFromJournal()) weekly.set(pick.model, (weekly.get(pick.model) ?? 0) + 1)
   const budget = (model: string) => settings.registry.find((m) => m.id === model)?.budget
   let current: string | undefined
+  let cleared = false
   for (;;) {
-    const row = poolRows(settings.routing, loadPicks()).find((r) => r.key === key)
-    if (!row) return
+    const saved = poolRows(settings.routing, loadPicks()).find((r) => r.key === key)
+    if (!saved) return
+    const row = cleared ? { ...saved, models: [] } : saved
     const title = key === VISION ? "vision · ↵ picks the image model" : `${row.agent} · ↵ check · esc done`
     const chosen = await context.ui.dialog.select({ title, placeholder: "model", current, options: modelOptions(catalog, row, (m) => weekly.get(m) ?? 0, budget) })
-    if (!chosen) return
+    if (!chosen) {
+      if (cleared) context.ui.toast.show({ message: `${row.agent}: nothing checked, the pool stays ${shortNames(saved.models).join(" ")}.` })
+      return
+    }
     current = chosen
+    if (chosen === CLEAR) {
+      cleared = true
+      continue
+    }
+    cleared = false
     const models = chosen === RESET ? RESET : toggle(row, chosen)
     if (!models) {
       context.ui.toast.show({ message: `${row.agent} needs at least one model.` })

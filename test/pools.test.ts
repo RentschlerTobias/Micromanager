@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { NO_PICKS } from "../src/config.ts"
-import { agentOptions, modelOptions, poolRows, RESET, shortNames, toggle, updatePicks, VISION, type CatalogModel } from "../src/pools.ts"
+import { agentOptions, CLEAR, modelOptions, poolRows, RESET, shortNames, toggle, updatePicks, VISION, type CatalogModel } from "../src/pools.ts"
 import { MODELS, roleById } from "../src/roles.ts"
 import { DEFAULT_ROUTING } from "../src/routing.ts"
 
@@ -33,6 +33,7 @@ test("the popup lists what the host runs, by provider with the pool's first, the
   const options = modelOptions(catalog, coder, (m) => (m === MODELS.glm ? 9 : 0), (m) => (m === MODELS.glm ? 60 : undefined))
   assert.deepEqual(options.map((o) => `${o.category}: ${o.title}`), [
     "coder: ↺ back to the default",
+    "coder: ✕ clear all",
     "opencode-go: [ ] deepseek-v4.1-flash",
     "opencode-go: [x] glm-5.3-flash",
     "opencode-go: [x] mimo-v2.6-pro",
@@ -44,6 +45,15 @@ test("the popup lists what the host runs, by provider with the pool's first, the
   // The vision row offers only models with image input.
   const vision = poolRows(DEFAULT_ROUTING, NO_PICKS).at(-1)!
   assert.deepEqual(modelOptions(catalog, vision).map((o) => o.value), [RESET, MODELS.qwen])
+})
+
+test("clear all unchecks the pool, and the next check starts a new one", () => {
+  const coder = { key: "code" as const, agent: "coder", models: [MODELS.glm, MODELS.mimo], own: true }
+  const cleared = { ...coder, models: [] }
+  const options = modelOptions(catalog, cleared)
+  assert.ok(options.every((o) => !o.title.startsWith("[x]")))
+  assert.ok(!options.some((o) => o.value === CLEAR))
+  assert.deepEqual(toggle(cleared, MODELS.deepseek), [MODELS.deepseek])
 })
 
 test("a toggle adds at the end, takes out, never empties a pool; vision holds one", () => {
