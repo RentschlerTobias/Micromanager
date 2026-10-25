@@ -43,6 +43,8 @@ export interface CompactOptions {
   readonly startChars: number // compaction starts when candidates hold this much
   readonly reaskAge: number // a kept result is asked about again after this many more turns
   readonly ruleAge: number // without an answer, results older than this go
+  readonly tools?: ReadonlySet<string> // only these tools' results are candidates (absent: all)
+  readonly subject?: string // who the context belongs to, for Jev's question (default: the orchestrator)
 }
 
 export const DEFAULT_COMPACT: CompactOptions = { keepTurns: 2, minChars: 800, startChars: 20_000, reaskAge: 6, ruleAge: 8 }
@@ -70,7 +72,8 @@ export function candidates(messages: readonly Message[], o: CompactOptions = DEF
   for (const { part, at } of seen) {
     const text = valueOf(part)
     const age = assistantTurns - at
-    if (age < o.keepTurns || text.length < o.minChars || text.startsWith("[micromanager: this earlier")) continue
+    if (age < o.keepTurns || text.length < o.minChars || text.startsWith("[micromanager: this earlier") || text.startsWith("[context: ")) continue
+    if (o.tools && !o.tools.has(part.name ?? "")) continue
     out.push({ id: part.id!, tool: part.name ?? "tool", input: inputs.get(part.id!) ?? "", size: text.length, age, head: text.slice(0, 400) })
   }
   return out
@@ -92,10 +95,10 @@ export function prune(messages: Message[], drop: ReadonlyMap<string, Candidate>)
   return removed
 }
 
-export function compactQuestions(cands: readonly Candidate[]): Record<string, Question> {
+export function compactQuestions(cands: readonly Candidate[], subject = "orchestrator"): Record<string, Question> {
   return Object.fromEntries(cands.map((c, i) => [`needed.${i}`, {
     type: "noul",
-    instructions: `The orchestrator still needs the result of call ${i} (${c.tool}, ${c.input.slice(0, 160)}) to finish the user's request: it is not yet acted on, and no later result replaces it.`,
+    instructions: `The ${subject} still needs the result of call ${i} (${c.tool}, ${c.input.slice(0, 160)}) to finish ${subject === "orchestrator" ? "the user's request" : "its task"}: it is not yet acted on, and no later result replaces it.`,
   } satisfies Question]))
 }
 
@@ -123,6 +126,16 @@ export class Compactor {
   // One turn of the micromanager: decides on new candidates when it is worth it, then prunes everything decided so far.
   async apply(sessionID: string, messages: unknown): Promise<{ removed: number; asked: number }> {
     if (!Array.isArray(messages)) return { removed: 0, asked: 0 }
+    const { asked, pruned } = await this.judge(sessionID, messages)
+    const removed = prune(messages as Message[], pruned)
+    if (asked) this.#journal({ kind: "compaction", sessionID, asked, pruned: pruned.size, removedChars: removed })
+    return { removed, asked }
+  }
+
+  // Decides on new candidates when it is worth it and returns everything dropped so far, without touching the
+  // messages: the context manager applies it at its next epoch (src/context/manager.ts).
+  async judge(sessionID: string, messages: unknown): Promise<{ asked: number; pruned: ReadonlyMap<string, Candidate> }> {
+    if (!Array.isArray(messages)) return { asked: 0, pruned: new Map() }
     const msgs = messages as Message[]
     const pruned = this.#pruned.get(sessionID) ?? new Map<string, Candidate>()
     const kept = this.#kept.get(sessionID) ?? new Map<string, number>()
@@ -134,7 +147,7 @@ export class Compactor {
     let asked = 0
     if (open.length && load >= this.#o.startChars) {
       const answers = this.#decider
-        ? (await this.#decider.ask("N14", { ...focus(msgs), results: open.map((c, i) => ({ call: i, tool: c.tool, input: c.input.slice(0, 300), age: c.age, start: c.head })) }, compactQuestions(open), { job: sessionID }).catch(() => undefined))?.decision.answers ?? {}
+        ? (await this.#decider.ask("N14", { ...focus(msgs), results: open.map((c, i) => ({ call: i, tool: c.tool, input: c.input.slice(0, 300), age: c.age, start: c.head })) }, compactQuestions(open, this.#o.subject), { job: sessionID }).catch(() => undefined))?.decision.answers ?? {}
         : {}
       asked = open.length
       open.forEach((c, i) => {
@@ -144,8 +157,6 @@ export class Compactor {
         else pruned.set(c.id, c)
       })
     }
-    const removed = prune(msgs, pruned)
-    if (asked) this.#journal({ kind: "compaction", sessionID, asked, pruned: pruned.size, removedChars: removed, candidates: cands.length })
-    return { removed, asked }
+    return { asked, pruned }
   }
 }

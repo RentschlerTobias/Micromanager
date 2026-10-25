@@ -21,7 +21,9 @@ import { family, MICROMANAGER, ROLES, roleByAgent, roleById, type Rule } from ".
 import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
-import { Compactor } from "./compact.ts"
+import { Compactor, stub as compactStub } from "./compact.ts"
+import { ContextManager } from "./context/manager.ts"
+import { PriceBook } from "./context/prices.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
@@ -68,6 +70,7 @@ interface SessionHookInput {
   prompt?: { text?: string }
   system?: { type: string; text: string }[]
   tools?: Record<string, unknown>
+  model?: { providerID?: string; id?: string }
 }
 
 interface Context {
@@ -1985,17 +1988,40 @@ export default {
 
     // Micromanager sessions whose first turn was looked at for an earlier session's open work.
     const greeted = new Set<string>()
-    // Jev drops the micromanager's old tool results it no longer needs before each of its turns (src/compact.ts).
+    // Jev drops old tool results a session no longer needs (src/compact.ts): any result of the micromanager's, the
+    // reads and web results of every other session. It only decides; the context manager applies the decisions together
+    // with its own rules in epochs, so the prompt's prefix stays byte-identical between them (src/context/manager.ts).
     const compactor = new Compactor(decider, record)
+    const workerJudge = new Compactor(decider, record, { keepTurns: 8, ruleAge: 20, tools: new Set(["read", "grep", "glob", "list", "webfetch", "websearch"]), subject: "worker" })
+    const contextManager = new ContextManager({ journal: record })
+    const priceBook = new PriceBook(() => ctx.model?.list())
+    const manageContext = async (input: SessionHookInput, orchestrator: boolean) => {
+      if (!input.sessionID || !Array.isArray(input.messages)) return
+      try {
+        const { pruned } = await (orchestrator ? compactor : workerJudge).judge(input.sessionID, input.messages)
+        const judged = [...pruned.values()].map((c) => ({ id: c.id, reason: "judged" as const, result: compactStub(c), saved: c.size - compactStub(c).length }))
+        const r = contextManager.apply(input.sessionID, input.messages, { prices: await priceBook.get(input.model), ceilingTokens: orchestrator ? 100_000 : 120_000, judged })
+        if (r.epoch) log("info", `context epoch (${r.epoch.reason}) in ${input.sessionID}: ${r.epoch.applied} results, ${r.epoch.savedChars} characters`)
+      } catch (err) {
+        log("warn", `context management failed: ${String(err)}`)
+      }
+    }
+    // A note for this one request goes at its end, not into the system prompt: the hook's messages are what the provider
+    // gets and are not stored (spike 2026-10-25), and a note in the system prompt changed the prefix every time it came,
+    // so the provider's cache broke (20.8% of the micromanager's input went uncached on glm-5.3-flash).
+    const tail = (input: SessionHookInput, text: string) => {
+      if (Array.isArray(input.messages)) (input.messages as unknown[]).push({ role: "user", content: [{ type: "text", text }] })
+    }
     await ctx.session.hook("context", async (input) => {
       // The tools exist for every agent; only the micromanager sees them.
       if (input.agent !== MICROMANAGER.agent) {
-        // A note the micromanager steered into a running worker (steer_task): it arrives as a system block at this
-        // turn boundary, which is the only place a note can arrive without cutting into a live provider stream.
+        await manageContext(input, false)
+        // A note the micromanager steered into a running worker (steer_task): it arrives at this turn boundary, which is
+        // the only place a note can arrive without cutting into a live provider stream.
         if (input.sessionID) {
           const note = steering.get(input.sessionID)
-          if (note && Array.isArray(input.system)) {
-            input.system.push({ type: "text", text: note })
+          if (note) {
+            tail(input, note)
             steering.delete(input.sessionID)
           }
         }
@@ -2038,35 +2064,29 @@ export default {
         delete input.tools[GRAPH_ID]
         for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
       }
-      if (input.sessionID) {
-        const c = await compactor.apply(input.sessionID, input.messages).catch((err: unknown) => {
-          log("warn", `compaction failed: ${String(err)}`)
-          return undefined
-        })
-        if (c?.asked) log("info", `compaction: ${c.removed} characters dropped from the micromanager's context`)
-      }
+      await manageContext(input, true)
       const note = input.sessionID ? steering.get(input.sessionID) : undefined
-      if (note && Array.isArray(input.system)) input.system.push({ type: "text", text: note })
+      if (note) tail(input, note)
       if (input.sessionID) awaitTurn(input.sessionID)
       // A stopped job: the micromanager may still be woken (OpenCode reports the cancelled workers), but starts nothing.
       const held = input.sessionID ? autoJob(input.sessionID) : undefined
-      if (held && project && loadControl(project, held.id).stopped && Array.isArray(input.system)) {
-        input.system.push({ type: "text", text: `[micromanager] The user stopped job ${held.id}. Start and continue no worker; say in one sentence that the job is stopped and its work is kept, and that resume in the sidebar (or /stop again) goes on. Then end your turn.` })
+      if (held && project && loadControl(project, held.id).stopped) {
+        tail(input, `[micromanager] The user stopped job ${held.id}. Start and continue no worker; say in one sentence that the job is stopped and its work is kept, and that resume in the sidebar (or /stop again) goes on. Then end your turn.`)
       }
       // A job that waits for the user while no form asks them (the user, 2026-10-20: a waiting job went unnoticed for a
       // day): the micromanager is told to ask with the question tool.
-      if (input.sessionID && Array.isArray(input.system)) {
+      if (input.sessionID) {
         const since = lastForm.get(input.sessionID) ?? 0
         const waits = listSwept().filter((j) => j.facilitator === input.sessionID && j.phase === "ask_user" && Date.parse(j.updated) > since)
-        if (waits.length) input.system.push({ type: "text", text: `[micromanager] ${waits.map((j) => `Job ${j.id} (${j.goal.split("\n")[0]!.slice(0, 80)})`).join("; ")} waits for the user's answer, and no form asks them. Ask what it needs to know with the question tool now (a question in your text gets lost), then hand their answer on: run_job with the job and their answer as note, or plan_job as the job's last note says.` })
+        if (waits.length) tail(input, `[micromanager] ${waits.map((j) => `Job ${j.id} (${j.goal.split("\n")[0]!.slice(0, 80)})`).join("; ")} waits for the user's answer, and no form asks them. Ask what it needs to know with the question tool now (a question in your text gets lost), then hand their answer on: run_job with the job and their answer as note, or plan_job as the job's last note says.`)
       }
       const planned = input.sessionID ? continuing.get(input.sessionID) : undefined
-      if (planned && input.sessionID && Array.isArray(input.system)) {
+      if (planned && input.sessionID) {
         continuing.delete(input.sessionID)
         const job = native.current(project, planned) ?? loadJob(project, planned)
         const step = job && nextStep(job, optionsFor(job).parallel ? parallel : 1)
         if (step) {
-          input.system.push({ type: "text", text: step.text })
+          tail(input, step.text)
           record({ kind: "continuation", sessionID: input.sessionID, job: planned, step: step.kind, tasks: step.kind === "start" ? step.tasks.map((t) => t.id) : [] })
         }
       }
