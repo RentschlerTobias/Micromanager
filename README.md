@@ -1,28 +1,50 @@
 # micromanager
 
-An OpenCode (v2) plugin that orchestrates sub-agents, with [TypeSafe Jev](https://typesafe.ai) making the
-decisions:
-- which role a sub-task gets, with which rights and tools,
-- which model and skills it uses,
-- how hard and how risky it is,
-- whether a sub-agent's question or permission request is answered by Jev or goes to the user.
+An [OpenCode](https://opencode.ai) v2 plugin that turns one agent into an orchestrator of sub-agents: the
+**micromanager** splits your request into small tasks and starts a worker per task, and the plugin plus
+[TypeSafe Jev](https://typesafe.ai), a decision model, secure every one of them.
 
-Status: the `omo-hybrid` branch: an oh-my-openagent-style orchestrator with Jev as the decision model; `main` keeps
-the fully code-driven design. The design is [docs/design.md](docs/design.md), its flow chart
-[docs/design.html](docs/design.html), the phases and research [docs/plan.md](docs/plan.md).
+- **Isolation:** every worker that writes gets its own git worktree and branch; your checkout is never touched. Its
+  shell commands run in a sandbox (bubblewrap on Linux, Seatbelt on macOS).
+- **Checks before merge:** a writer's change is merged only when its checks pass (`Checks: npm test`), through a merge
+  train onto the session's branch `jev/<job>`; you merge that into your checkout when you say so.
+- **Decisions by Jev:** which role, model and skills a task gets, how hard it is, and which permission requests are
+  answered on your behalf; the rest is paused and put to you.
+- **Hard tasks run as trials:** several attempts at once on different model families; the first whose checks pass
+  wins. Every attempt's outcome and cost is logged, the data for a router that learns.
+- **Budget, watchdog, memory:** per-job limits on tokens, requests and cost; a watchdog against loops and stalls; a
+  memory across sessions and projects, and context management for long sessions.
+
+The design is [docs/design.md](docs/design.md), its flow chart [docs/design.html](docs/design.html), the phases
+and research [docs/plan.md](docs/plan.md). Development happens on the branch `omo-hybrid` and is merged into `main`.
+
+## Requirements
+
+- OpenCode v2 (tested with 2.0.18) and Node.js with TypeScript type stripping (22.18 or newer; tested with 26).
+- git: workers need a repository with at least one commit (without one the micromanager asks how to go on).
+- A Jev API key, as `JEV_API_KEY` or in the keyring (`secret-tool`, service `typesafe`, key `jev`). Without one, every
+  decision goes to you.
+- For the sandbox on Linux: `bubblewrap`, `socat` and `ripgrep`. Without them commands run unwrapped, and the plugin
+  says so.
+- Optional: the local embedding service for the memory (`./install.sh --embedding`), and `uv` for the GLiNER
+  decision server in `decider/`.
 
 ## Install
 
 ```bash
-./install.sh            # links src/plugin.ts into ~/.config/opencode/plugins/micromanager.ts
+git clone git@github.com:RentschlerTobias/Micromanager.git micromanager
+cd micromanager
+npm install                    # the sandbox runtime
+./install.sh                   # links src/plugin.ts into ~/.config/opencode/plugins/micromanager.ts
+./install.sh --skills          # optional: the worker skills
+./install.sh --embedding 4b    # optional: the memory's embedding service (0.6b, 4b or 8b), see "Context and memory"
 ./install.sh --remove
-./install.sh --embedding 4b   # the memory's embedding service (0.6b, 4b or 8b), see "Context and memory"
 ```
 
-Restart the OpenCode server afterwards (plugins load at start): the one your TUI attaches to, which here is the voice
-agent's hub (`systemctl --user restart voice-agent-hub`), not only the background service `opencode run` uses. The
-`plugin` record in the journal and the header of `job_status` name the plugin commit a server runs. Requires opencode
-v2 (tested with 2.0.18).
+Restart the OpenCode server afterwards: plugins load when it starts, so restart the server your TUI attaches to,
+not only the background service `opencode run` uses. The `plugin` record in the journal and the header of
+`job_status` name the plugin commit a server runs. Settings go into `~/.config/opencode/micromanager.jsonc`; none are
+needed to start (see the optional settings under "Use").
 
 ## Use
 
@@ -358,3 +380,8 @@ call aimed at one of this plugin's role agents — not by which agent made it, b
 session and switching it silently skipped every later delegation (live test, 2026-10-06: ten workers wrote into the
 user's checkout with no task, no worktree and no error). And plugins load when the OpenCode server starts, so a change
 to `src/plugin.ts` needs a restart before anything observes it.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).
+
