@@ -14,6 +14,8 @@ import type { NotifyMode } from "./scheduler.ts"
 
 // The name before 2026-10-19 (jev-micromanager.jsonc) is still read while the new one does not exist.
 export function configPath(): string {
+  // Spike: a run's own config (the live runs of spike/ralph-reset), so the user's file stays as it is.
+  if (process.env.MICROMANAGER_CONFIG) return process.env.MICROMANAGER_CONFIG
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config")
   const path = join(base, "opencode", "micromanager.jsonc")
   const old = join(base, "opencode", "jev-micromanager.jsonc")
@@ -199,6 +201,27 @@ export function parseTrials(text: string): number {
   return Math.min(raw, MAX_TRIALS)
 }
 
+// "spike": debug settings of the Ralph-loop spike (spike/ralph-reset): { "ralphLoops": 3, "resetMode": "stubs" | "cut" }.
+// ralphLoops 1 (the default) is off: a writer at its fix-round cap blocks as before.
+export interface SpikeSettings {
+  readonly ralphLoops: number
+  readonly resetMode: "stubs" | "cut"
+  readonly planFirst: boolean // false: writers start without a todo and the start form (headless runs)
+  readonly fixRounds?: number // fix rounds per loop; absent: FIX_ROUNDS
+  readonly helpers: boolean // false: writers get no explore/research helpers (headless runs)
+}
+
+export function parseSpike(text: string): SpikeSettings {
+  const raw = (JSON.parse(stripComments(text)) as { spike?: { ralphLoops?: unknown; resetMode?: unknown; planFirst?: unknown; fixRounds?: unknown; helpers?: unknown } }).spike ?? {}
+  const loops = raw.ralphLoops ?? 1
+  if (typeof loops !== "number" || !Number.isInteger(loops) || loops < 1) throw new Error("spike.ralphLoops must be a whole number from 1")
+  const mode = raw.resetMode ?? "stubs"
+  if (mode !== "stubs" && mode !== "cut") throw new Error('spike.resetMode must be "stubs" or "cut"')
+  const fix = raw.fixRounds
+  if (fix !== undefined && (typeof fix !== "number" || !Number.isInteger(fix) || fix < 0)) throw new Error("spike.fixRounds must be a whole number from 0")
+  return { ralphLoops: Math.min(loops, 5), resetMode: mode, planFirst: raw.planFirst !== false, ...(fix !== undefined ? { fixRounds: fix as number } : {}), helpers: raw.helpers !== false }
+}
+
 // "cloudOnly": true (the default for now, the user's choice of 2026-10-05) routes no task to a local model and asks
 // cloud Jev for the guards instead of the local GLiNER server. false brings the local fleet and GLiNER back.
 export function parseCloudOnly(text: string): boolean {
@@ -288,6 +311,7 @@ export interface Settings {
   readonly parallel: number
   readonly perModel: number
   readonly trials: number
+  readonly spike: SpikeSettings
   readonly budget: Budget
   readonly notify: NotifyMode
   readonly routing: Routing
@@ -308,6 +332,7 @@ const DEFAULTS: Omit<Settings, "registry"> = {
   parallel: 3,
   perModel: 2,
   trials: DEFAULT_TRIALS,
+  spike: { ralphLoops: 1, resetMode: "stubs", planFirst: true, helpers: true },
   budget: DEFAULT_BUDGET,
   notify: "jobs",
   routing: DEFAULT_ROUTING,
@@ -328,7 +353,7 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text), memory: parseMemory(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), spike: parseSpike(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text), memory: parseMemory(text) }
   } catch (err) {
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }

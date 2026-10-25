@@ -22,7 +22,7 @@ import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, toModel, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
 import { Compactor, stub as compactStub } from "./compact.ts"
-import { ContextManager } from "./context/manager.ts"
+import { ContextManager, type ResetMode } from "./context/manager.ts"
 import { PriceBook } from "./context/prices.ts"
 import { learnedLines } from "./context/capture.ts"
 import { describe as describeEntry, Memory } from "./context/memory.ts"
@@ -174,6 +174,9 @@ interface Shared {
   asks: Asks // workers' paused permission requests, answered by the micromanager or the user (src/ask.ts)
   grantRequests: GrantRequests // workers' requests for a variable or a host, waiting for the user (src/grants.ts)
   helperOf: Map<string, string> // helper session -> the writer it answers (src/helpers.ts)
+  // Spike (Ralph loops in one session): worker sessions whose context resets at their next request. Shared, because
+  // the instance that serves a worker's context hook is not always the one whose finish_task crossed the boundary.
+  resets?: Map<string, ResetMode>
   // Micromanager sessions whose planned job moved on (a worker ended): at their next turn the plugin says what to start
   // next, worked out then, so a task delegated in the meantime is not named again (src/continuation.ts). Shared: the
   // worker's end is seen by the instance of its worktree, the micromanager's turn by the instance of its directory.
@@ -854,7 +857,9 @@ export default {
       const form = gitForm(dir, survey.files, humanSize(survey.bytes), recommend, shown)
       return `${dir} is ${state === "no-commit" ? "a git repository without a commit" : "no git repository"}, so the workers cannot get a worktree each. Ask the user how to go on: call the question tool with exactly this input (a form; their answer reaches the plugin by itself), then end your turn:\n${formInput(form)}`
     }
-    const native = (SHARED.native ??= new Native({ installedSkills: installedSkills(), planFirst: true, noGit: (dir) => noGitNote(dir) }))
+    const resets = (SHARED.resets ??= new Map())
+    const ralph = settings.spike.ralphLoops > 1 ? { loops: settings.spike.ralphLoops, reset: (session: string) => void resets.set(session, settings.spike.resetMode), ...(settings.spike.fixRounds !== undefined ? { fixRounds: settings.spike.fixRounds } : {}) } : undefined
+    const native = (SHARED.native ??= new Native({ installedSkills: installedSkills(), planFirst: settings.spike.planFirst, noGit: (dir) => noGitNote(dir), ...(ralph ? { ralph } : {}) }))
     const workerJobs = SHARED.workerJobs
     const workerDirs = SHARED.workerDirs
     // A worker's request for a variable or a host (src/grants.ts): every worker may ask for a variable, writers and
@@ -1130,7 +1135,11 @@ export default {
         for (let i = 0; i < 50 && !requestID; i++) {
           await new Promise((r) => setTimeout(r, 200))
           const pending = await ctx.permission.list({ sessionID }).catch(() => [])
-          requestID = pending.find((p) => p.action === action && p.resources.join("\0") === resources.join("\0") && !claimedRequests.has(p.id))?.id
+          // A sandboxed shell's pending request still carries the wrapped command; the evaluation was judged by the worker's
+          // own command (SHARED.unwrapped), so both sides are compared unwrapped (live run, 2026-10-25: every paused shell
+          // of a sandboxed worker was lost this way, and the worker waited until its session ended).
+          const own = (r: string) => SHARED.unwrapped?.get(r) ?? r
+          requestID = pending.find((p) => p.action === action && p.resources.map(own).join("\0") === resources.join("\0") && !claimedRequests.has(p.id))?.id
         }
         if (!requestID) {
           log("error", `paused ${action} of ${sessionID} but found no pending request to answer; it waits until the session ends`)
@@ -2133,6 +2142,11 @@ export default {
       try {
         const ceilingTokens = orchestrator ? 100_000 : 120_000
         const { pruned } = await (orchestrator ? compactor : workerJudge).judge(input.sessionID, input.messages)
+        const reset = resets.get(input.sessionID)
+        if (reset) {
+          contextManager.requestReset(input.sessionID, reset)
+          resets.delete(input.sessionID)
+        }
         const applied = new Set(contextManager.applied(input.sessionID).map((r) => r.id))
         const l = contextLedger(input.messages as never)
         const savedChars = contextManager.applied(input.sessionID).reduce((n, r) => n + r.saved, 0)
@@ -2144,6 +2158,8 @@ export default {
         const baseChars = (input.system ?? []).reduce((n, p) => n + (p.text?.length ?? 0), 0)
         const r = contextManager.apply(input.sessionID, input.messages, { prices: await priceBook.get(input.model), ceilingTokens, judged, baseChars })
         if (r.epoch) log("info", `context epoch (${r.epoch.reason}) in ${input.sessionID}: ${r.epoch.applied} results, ${r.epoch.savedChars} characters`)
+        // Spike: every worker request's size after rendering, so the effect of a loop reset can be read off the journal.
+        if (!orchestrator && settings.spike.ralphLoops > 1) record({ kind: "spike.request", sessionID: input.sessionID, contextTokens: r.contextTokens, messages: (input.messages as unknown[]).length, resets: contextManager.stats(input.sessionID).epochs })
         epoch = Boolean(r.epoch)
         // A worker's notes came with its brief, the first user message: read them from there for the sidebar.
         if (!orchestrator && !recalledFor.has(input.sessionID)) {
@@ -2195,7 +2211,7 @@ export default {
         if (input.tools) for (const [tool, id] of Object.entries(MEMORY_IDS)) if (!(tool === "search" && readerAgent(input.agent))) delete input.tools[id]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[FINISH_ID]
         if (input.tools && !(input.sessionID && native.hasGraph(input.sessionID))) delete input.tools[GRAPH_ID]
-        if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
+        if (input.tools && (!settings.spike.helpers || !(input.sessionID && native.isWriter(input.sessionID)))) for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
         if (input.tools) for (const kind of ["env", "network"] as const) if (!(input.sessionID && grantAllowed(kind, input.sessionID))) delete input.tools[GRANT_IDS[kind]]
         // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
         if (input.sessionID && native.isWorker(input.sessionID)) {

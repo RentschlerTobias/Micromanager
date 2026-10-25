@@ -763,3 +763,26 @@ test("a trial needs Parallel and a worktree per attempt; without them the task r
   assert.equal(d.task.difficulty, 0.9, "the estimate is kept for the outcome log")
   assert.equal(native.trialNote(project, d.job.id, d.task.id), undefined)
 })
+
+test("spike: with Ralph loops, a writer at its fix-round cap starts the next loop in the same session instead of blocking", async () => {
+  const project = repo()
+  const resets: string[] = []
+  const native = new Native({ ralph: { loops: 2, reset: (s) => resets.push(s) } })
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "make it pass", prompt: "Make the check pass.\nFiles: a.js\nChecks: test -f never.txt" }, MODEL)
+  const w = native.claim("ses_w", child(d.prompt))!
+  writeFileSync(join(w.dir, "a.js"), "x\n")
+  let r = await native.finish("ses_w", "wrote a.js")
+  for (let i = 0; i < FIX_ROUNDS; i++) r = await native.finish("ses_w", "wrote a.js again")
+  assert.match(r.text, /^Loop 1 of 2 is over/)
+  assert.match(r.text, /Files changed so far: a\.js/)
+  assert.match(r.text, /\$ test -f never\.txt \(exit 1\)/)
+  assert.equal(r.note, undefined, "the micromanager hears nothing: the loop is the plugin's")
+  assert.deepEqual(resets, ["ses_w"])
+  const task = native.jobOf("ses_w")!.job.tasks[0]!
+  assert.deepEqual([task.status, task.loops, task.attempts], ["running", 1, 0])
+  assert.ok(task.stages.some((s) => s.stage === "loop"))
+  // the last loop ends as before: blocked after its fix rounds
+  for (let i = 0; i <= FIX_ROUNDS; i++) r = await native.finish("ses_w", "still failing")
+  assert.match(r.text, /still fail after/)
+  assert.equal(native.jobOf("ses_w")!.job.tasks[0]!.status, "blocked")
+})

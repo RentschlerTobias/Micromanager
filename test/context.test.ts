@@ -167,3 +167,52 @@ test("status: the server's file per session, the bar and the folded line the sid
   assert.equal(foldedContext(s, { entries: 142, coreChars: 3900, vectors: true, writes: { added: 1, duplicate: 0, contradicts: 0 } }), "ctx 60k/120k ███░░│ · mem 142 · ↺2")
   assert.equal(foldedContext(undefined, undefined), "no context data yet")
 })
+
+// Spike (Ralph loops in one session): the history at a loop boundary, the last turn being finish_task with the handoff.
+function looped(): Message[] {
+  const msgs = history([
+    { tool: "read", input: { path: "a.ts" }, out: big("A") },
+    { tool: "edit", input: { path: "a.ts", oldString: "x".repeat(400), newString: "y" }, out: "Edited a.ts" },
+    { tool: "shell", input: { command: "npm test" }, out: big("FAIL") },
+  ])
+  msgs.push({ role: "assistant", content: [{ type: "text", text: "done" }, { type: "tool-call", id: "fin", name: "finish_task", input: { summary: "s" } }] })
+  msgs.push({ role: "tool", content: [{ type: "tool-result", id: "fin", name: "finish_task", result: { type: "text", value: "Loop 1 of 3 is over … handoff" } }] })
+  return msgs
+}
+
+test("a loop reset (stubs): every result before the boundary turn becomes a stub at once, and stays one", () => {
+  const dir = mkdtempSync(join(tmpdir(), "mm-ctx-"))
+  const journal: Record<string, unknown>[] = []
+  const m = new ContextManager({ dir, journal: (e) => journal.push(e) })
+  m.apply("s", looped())
+  m.requestReset("s", "stubs")
+  const msgs = looped()
+  const r = m.apply("s", msgs)
+  for (const id of ["c0", "c1", "c2"]) assert.match(valueOf(msgs, id), /^\[loop reset/)
+  assert.equal(valueOf(msgs, "fin"), "Loop 1 of 3 is over … handoff", "the handoff stays")
+  const edit = msgs[3]!.content as { type?: string; input?: unknown }[]
+  assert.deepEqual(edit.find((p) => p.type === "tool-call")!.input, { dropped: "[loop reset]" }, "a long input goes too")
+  assert.equal(msgs.length, 9, "stubs keep every message")
+  assert.ok(r.renderedChars > 3000)
+  assert.equal(journal.find((e) => e.kind === "context.reset")?.results, 3)
+  // a later request of the same session, with a new turn, and a manager started over from disk
+  const later = looped()
+  later.push({ role: "assistant", content: [{ type: "tool-call", id: "c9", name: "read", input: { path: "a.ts" } }] }, { role: "tool", content: [{ type: "tool-result", id: "c9", name: "read", result: { type: "text", value: "A2" } }] })
+  new ContextManager({ dir }).apply("s", later)
+  assert.match(valueOf(later, "c0"), /^\[loop reset/)
+  assert.equal(valueOf(later, "c9"), "A2", "loop 2's own work is untouched")
+})
+
+test("a loop reset (cut): the request holds the brief and the turn that crossed the boundary, from then on", () => {
+  const dir = mkdtempSync(join(tmpdir(), "mm-ctx-"))
+  const m = new ContextManager({ dir })
+  m.requestReset("s", "cut")
+  const msgs = looped()
+  m.apply("s", msgs)
+  assert.deepEqual(msgs.map((x) => x.role), ["user", "assistant", "tool"])
+  assert.equal(valueOf(msgs, "fin"), "Loop 1 of 3 is over … handoff")
+  const later = looped()
+  later.push({ role: "assistant", content: [{ type: "tool-call", id: "c9", name: "read", input: { path: "a.ts" } }] }, { role: "tool", content: [{ type: "tool-result", id: "c9", name: "read", result: { type: "text", value: "A2" } }] })
+  new ContextManager({ dir }).apply("s", later)
+  assert.deepEqual(later.map((x) => x.role), ["user", "assistant", "tool", "assistant", "tool"], "the cut holds across a restart")
+})

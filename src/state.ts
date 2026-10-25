@@ -152,6 +152,7 @@ export interface Task {
   difficulty?: number // the N5 estimate at a native delegation, 0..1 (src/trials.ts)
   // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has (src/trials.ts).
   trial?: { of: string; n: number }
+  loops?: number // spike: loop boundaries this task's session crossed (Ralph loops in one session)
 }
 
 export interface Job {

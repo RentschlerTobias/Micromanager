@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
-import { ledger, resultText, type Ledger, type Message } from "./ledger.ts"
+import { ledger, resultText, type Ledger, type Message, type Part } from "./ledger.ts"
 import { DEFAULT_POLICY, epochDue, type EpochVerdict, type PolicyOptions, type Prices } from "./policy.ts"
 import { DEFAULT_RULES, findReplacements, type Replacement, type RuleOptions } from "./rules.ts"
 
@@ -33,7 +33,16 @@ interface SessionState {
   applied: Map<string, Replacement>
   pending: Map<string, Replacement>
   epochs: number
+  // A loop boundary (spike: Ralph loops in one session): at the next request every turn before the last one is reset.
+  resetDue?: ResetMode
+  // Variant "cut": the earlier turns are dropped from every request, up to the assistant message with this call.
+  cutAt?: string
+  resets?: number
 }
+
+// "stubs": the earlier tool results become stubs and long inputs go; the assistant's words stay. "cut": the earlier
+// turns are dropped, so the request holds the brief and the turn that crossed the boundary (with the handoff) only.
+export type ResetMode = "stubs" | "cut"
 
 export interface ManagerOptions {
   readonly rules?: Partial<RuleOptions>
@@ -68,6 +77,16 @@ export function render(messages: Message[], applied: ReadonlyMap<string, Replace
   return removed
 }
 
+// Variant "cut" of a loop reset, in place: every message between the brief (the first user message) and the assistant
+// message that made call `at` goes. What is left is valid: user, then assistant with its calls, then their results.
+export function cut(messages: Message[], at: string): number {
+  const first = messages.findIndex((m) => m.role === "user")
+  const until = messages.findIndex((m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((p) => p.type === "tool-call" && p.id === at))
+  if (first < 0 || until <= first + 1) return 0
+  const gone = messages.splice(first + 1, until - first - 1)
+  return gone.reduce((n, m) => n + JSON.stringify(m.content ?? "").length, 0)
+}
+
 export class ContextManager {
   readonly #rules: RuleOptions
   readonly #policy: PolicyOptions
@@ -89,9 +108,11 @@ export class ContextManager {
     const file = this.#dir ? join(this.#dir, `${sessionID}.json`) : undefined
     if (file && existsSync(file)) {
       try {
-        const saved = JSON.parse(readFileSync(file, "utf8")) as { applied?: Replacement[]; epochs?: number }
+        const saved = JSON.parse(readFileSync(file, "utf8")) as { applied?: Replacement[]; epochs?: number; cutAt?: string; resets?: number }
         for (const r of saved.applied ?? []) s.applied.set(r.id, r)
         s.epochs = saved.epochs ?? 0
+        if (saved.cutAt) s.cutAt = saved.cutAt
+        if (saved.resets) s.resets = saved.resets
       } catch {
         // a broken file starts the session over: the next epoch rewrites it
       }
@@ -104,7 +125,7 @@ export class ContextManager {
     if (!this.#dir) return
     try {
       mkdirSync(this.#dir, { recursive: true })
-      writeFileSync(join(this.#dir, `${sessionID}.json`), JSON.stringify({ epochs: s.epochs, applied: [...s.applied.values()] }))
+      writeFileSync(join(this.#dir, `${sessionID}.json`), JSON.stringify({ epochs: s.epochs, applied: [...s.applied.values()], ...(s.cutAt ? { cutAt: s.cutAt } : {}), ...(s.resets ? { resets: s.resets } : {}) }))
     } catch {
       // losing the file only costs one more cache break after a restart
     }
@@ -121,12 +142,47 @@ export class ContextManager {
     return [...this.#state(sessionID).applied.values()]
   }
 
+  // A loop boundary: the next request resets every turn before the one that crossed it (the turn whose tool call answered
+  // with the handoff). Applied at once, outside the epoch policy: a reset is the one cache break the loop wants.
+  requestReset(sessionID: string, mode: ResetMode): void {
+    this.#state(sessionID).resetDue = mode
+  }
+
+  #reset(sessionID: string, s: SessionState, msgs: Message[], l: Ledger, mode: ResetMode): void {
+    // The boundary: the last assistant message that made a tool call (finish_task, whose result is the handoff).
+    const last = [...msgs.keys()].reverse().find((i) => msgs[i]!.role === "assistant" && Array.isArray(msgs[i]!.content) && (msgs[i]!.content as Part[]).some((p) => p.type === "tool-call" && p.id))
+    if (last === undefined) return
+    const boundary = (msgs[last]!.content as Part[]).find((p) => p.type === "tool-call" && p.id)!.id!
+    const turn = l.items.find((i) => i.id === boundary)?.turn ?? l.turns - 1
+    let saved = 0
+    let count = 0
+    for (const item of l.items) {
+      if (item.turn >= turn || s.applied.has(item.id)) continue
+      const result = `[loop reset: dropped; the handoff after the reset says what matters]`
+      const input = item.inputSize > 300 ? { dropped: "[loop reset]" } : undefined
+      const r: Replacement = { id: item.id, reason: "reset", result, ...(input ? { input } : {}), saved: Math.max(0, item.size - result.length) + (input ? item.inputSize : 0) }
+      s.applied.set(item.id, r)
+      s.pending.delete(item.id)
+      saved += r.saved
+      count++
+    }
+    if (mode === "cut") s.cutAt = boundary
+    s.resets = (s.resets ?? 0) + 1
+    s.epochs++
+    this.#save(sessionID, s)
+    this.#journal({ kind: "context.reset", sessionID, mode, reset: s.resets, boundary, turn, results: count, savedChars: saved, chars: l.chars })
+  }
+
   // One request of a session: collect, maybe start an epoch, render.
   apply(sessionID: string, messages: unknown, input: ApplyInput = {}): ApplyResult {
     if (!Array.isArray(messages)) return { renderedChars: 0, pending: 0, contextTokens: 0 }
     const msgs = messages as Message[]
     const s = this.#state(sessionID)
     const l = ledger(msgs)
+    if (s.resetDue) {
+      this.#reset(sessionID, s, msgs, l, s.resetDue)
+      s.resetDue = undefined
+    }
     this.#collect(l, msgs, s, input.judged ?? [])
     const cpt = this.#policy.charsPerToken
     const at = new Map(l.items.map((i) => [i.id, i.message]))
@@ -155,7 +211,8 @@ export class ContextManager {
         this.#journal({ kind: "context.epoch", sessionID, epoch: s.epochs, reason: verdict.reason, applied: epoch.applied, savedChars: saved, invalidatedTokens: epoch.invalidatedTokens, contextTokens: Math.round((l.chars + (input.baseChars ?? 0) - appliedChars) / cpt), gain: +verdict.gain.toFixed(5), cost: +verdict.cost.toFixed(5), byReason })
       }
     }
-    const renderedChars = render(msgs, s.applied)
+    let renderedChars = render(msgs, s.applied)
+    if (s.cutAt) renderedChars += cut(msgs, s.cutAt)
     return { ...(epoch ? { epoch } : {}), renderedChars, pending: s.pending.size, contextTokens: Math.round((l.chars + (input.baseChars ?? 0) - renderedChars) / cpt) }
   }
 

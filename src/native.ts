@@ -137,6 +137,9 @@ export interface NativeDeps {
   // so the work is planned with its order before anything changes files. Readers still start on the fly. Off in the
   // tests that delegate writers directly.
   readonly planFirst?: boolean
+  // Spike (Ralph loops in one session): a writer at its fix-round cap starts loop k+1 in the same session instead of
+  // blocking, up to `loops` loops; reset asks the context manager to reset the session at its next request.
+  readonly ralph?: { readonly loops: number; readonly reset: (session: string) => void; readonly fixRounds?: number }
   // The note when the project is no git repository: the form that asks the user how to go on (src/plugin.ts, with
   // Jev's recommendation). Without it a plain note says the same.
   readonly noGit?: (project: string) => Promise<string>
@@ -231,6 +234,7 @@ export class Native {
     this.#skills = deps.installedSkills ?? new Set()
     this.#graphs = deps.graphs ?? new Graphs(this.#exec)
     this.#planFirst = deps.planFirst ?? false
+    this.#ralph = deps.ralph
     this.#noGit = deps.noGit
   }
 
@@ -245,6 +249,7 @@ export class Native {
   }
 
   readonly #planFirst: boolean
+  readonly #ralph?: NativeDeps["ralph"]
 
   // The note that asks the user to start the job, with the start form to pass to the question tool; undefined once
   // the job is started.
@@ -851,6 +856,19 @@ export class Native {
       // 2026-10-06: four identical gate failures, then the worker gave up). The last failure goes back with the
       // reason, because at the cap the useful message is that the CHECK is the problem, not the work.
       task.attempts++
+      const loop = (task.loops ?? 0) + 1
+      if (this.#ralph && task.attempts > (this.#ralph.fixRounds ?? FIX_ROUNDS) && loop < this.#ralph.loops) {
+        // A loop boundary: the session goes on with a fresh context (brief + this handoff), in the same worktree.
+        const touched = await changedFiles(entry.worktree, this.#exec, task.worktreeRel ?? job.integrationRel ?? "").catch(() => [] as string[])
+        task.loops = loop
+        task.attempts = 0
+        stage(task, "loop", "fail", `loop ${loop} of ${this.#ralph.loops} ended: ${failed.map((f) => f.command).join(", ")}`)
+        moveTask(task, "fixing")
+        moveTask(task, "running")
+        saveJob(entry.project, job)
+        this.#ralph.reset(session)
+        return { text: loopText(loop, this.#ralph.loops, this.#ralph.fixRounds ?? FIX_ROUNDS, summary, failed, touched, entry.dir) }
+      }
       if (task.attempts > FIX_ROUNDS) {
         stage(task, "gate", "fail", failed.map((f) => f.command).join(", "))
         moveTask(task, "blocked")
@@ -1181,6 +1199,20 @@ function dirtyNote(job: Job, writer: boolean): string {
   return writer
     ? `The working tree of the project has uncommitted changes that this worktree does not have (${job.integrationDirty}); the worktree is a checkout of the last commit. Do not try to read them: say so in your report if your task depends on them.`
     : `The working tree of the project has uncommitted changes that this worktree does not have (${job.integrationDirty}); what you read here is the last commit. Say so if your question depends on them.`
+}
+
+// The answer at a loop boundary: everything the next loop needs, since the session's earlier turns are gone after it.
+function loopText(loop: number, loops: number, fixRounds: number, summary: string, failed: readonly GateResult[], touched: readonly string[], dir: string): string {
+  return [
+    `Loop ${loop} of ${loops} is over: the checks still fail${fixRounds ? ` after ${fixRounds} fix rounds` : ""}. Loop ${loop + 1} starts now. Your earlier turns are reset: from your next step on you see only your task (the first message) and this handoff. Your files in ${dir} are as you left them.`,
+    "",
+    `What you said you did: ${summary.trim().slice(0, 1500) || "(nothing)"}`,
+    touched.length ? `Files changed so far: ${touched.join(", ")}` : "No file is changed so far.",
+    "The checks that fail, with their output:",
+    ...failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output.slice(0, 3000)}`),
+    "",
+    `Before you change anything, say in one sentence what you will do differently from loop ${loop}, and why the last approach failed. Then go on, and call finish_task when the change is done.`,
+  ].join("\n")
 }
 
 // What an attempt hears when another attempt of its trial won first.

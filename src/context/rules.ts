@@ -10,7 +10,7 @@
 import type { Item, Ledger } from "./ledger.ts"
 import { covers } from "./ledger.ts"
 
-export type Reason = "duplicate" | "superseded" | "stale" | "errored" | "written" | "shell" | "web" | "aged" | "judged" | "summarized"
+export type Reason = "duplicate" | "superseded" | "stale" | "errored" | "written" | "shell" | "web" | "aged" | "judged" | "summarized" | "reset"
 
 export interface Replacement {
   readonly id: string // the tool call id
