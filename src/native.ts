@@ -30,6 +30,7 @@ import { settled, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
 import { formInput, startForm } from "./forms.ts"
 import { gitState } from "./nogit.ts"
+import { allFailedText, attemptBrief, attemptFailedText, attempts, fanOutText, standing, wonText, type Assessment } from "./trials.ts"
 
 // The first line OpenCode puts before a new subagent's prompt; how the prompt hook tells a child's first turn.
 export const CHILD_PREFIX = "You are a subagent spawned by another session."
@@ -42,6 +43,7 @@ export interface Delegation {
   readonly checks: string[]
   readonly replaces: string[] // tasks this one deliberately starts over ("Replaces: T5")
   readonly planned?: { readonly task: string; readonly job: string } // a planned task to start ("Task: T5 · job-…")
+  readonly attempt?: { readonly task: string; readonly job: string } // another attempt of a trial ("Attempt: T5 · job-…")
 }
 
 // The "Files:" and "Checks:" lines of a delegation, wherever they stand; the checks go on over the following lines
@@ -52,8 +54,16 @@ export function parseDelegation(prompt: string): Delegation {
   const replaces: string[] = []
   let files = ""
   let planned: Delegation["planned"]
+  let attempt: Delegation["attempt"]
   let inChecks = false
   for (const line of prompt.split("\n")) {
+    // The line the plugin hands out for a trial's other attempts (src/trials.ts attemptLine).
+    const a = line.match(/^\s*attempt:\s*(T\d+(?:\.\w+)*)\s*·\s*(job-[\w-]+)\s*$/i)
+    if (a) {
+      attempt = { task: a[1]!.toUpperCase(), job: a[2]! }
+      inChecks = false
+      continue
+    }
     // Only the exact form run_job hands out (src/continuation.ts plannedLine): a prompt's own "Task: …" stays prose.
     const t = line.match(/^\s*task:\s*(T\d+(?:\.\w+)*)\s*·\s*(job-[\w-]+)\s*$/i)
     if (t) {
@@ -79,7 +89,7 @@ export function parseDelegation(prompt: string): Delegation {
       body.push(line)
     }
   }
-  return { body: body.join("\n").trim(), files, checks, replaces, ...(planned ? { planned } : {}) }
+  return { body: body.join("\n").trim(), files, checks, replaces, ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}) }
 }
 
 // How much two task texts are about the same thing: the share of their words they have in common (Jaccard over the
@@ -188,6 +198,14 @@ export function parseTodo(items: string): { list: TodoItem[]; ids: string[] } | 
     })
   }
   return { list, ids }
+}
+
+// A worker's task as its session ended.
+export interface Worker {
+  readonly project: string
+  readonly job: Job
+  readonly task: Task
+  readonly writer: boolean
 }
 
 export interface Delegated {
@@ -333,17 +351,19 @@ export class Native {
   // A new subagent call of the micromanager: the task, its worktree and the worker's brief. Throws a
   // DelegationError the micromanager can act on when the call is not a valid delegation. Calls of one message come
   // at the same time; they go one after another (live test: two made the session branch at once, and one failed).
-  delegate(project: string, parent: string, input: { agent: string; description: string; prompt: string }, model: string): Promise<Delegated> {
-    const next = (this.#delegating.get(parent) ?? Promise.resolve()).then(() => this.#delegate(project, parent, input, model))
+  // assess: what the plugin found out about a writer before (src/trials.ts): its difficulty and how many attempts.
+  delegate(project: string, parent: string, input: { agent: string; description: string; prompt: string }, model: string, assess?: Assessment): Promise<Delegated> {
+    const next = (this.#delegating.get(parent) ?? Promise.resolve()).then(() => this.#delegate(project, parent, input, model, assess))
     this.#delegating.set(parent, next.catch(() => undefined))
     return next
   }
 
-  async #delegate(project: string, parent: string, input: { agent: string; description: string; prompt: string }, model: string): Promise<Delegated> {
+  async #delegate(project: string, parent: string, input: { agent: string; description: string; prompt: string }, model: string, assess?: Assessment): Promise<Delegated> {
     const role = roleByAgent(input.agent)
     if (!role) throw new DelegationError(`Not started: use one of the role agents (${ROLES.map((r) => r.agent).join(", ")}), not ${input.agent || "none"}.`)
     const d = parseDelegation(input.prompt)
-    if (d.planned) return this.#planned(project, parent, role, d, d.planned, model)
+    if (d.attempt) return this.#attempt(project, parent, role, d, d.attempt, model)
+    if (d.planned) return this.#planned(project, parent, role, d, d.planned, model, assess)
     if (this.#planFirst && WRITERS.has(role.id)) {
       throw new DelegationError(`Not started: a ${role.agent} starts from a todo. Write it down with the todo tool first (with "after" for what it waits for, "replaces" for a task it does over), then start it with the prompt line "Task: T… · job-…".`)
     }
@@ -370,9 +390,64 @@ export class Native {
     this.#link(project, job, task, d.replaces)
     task.role = role.id
     task.model = model
+    this.#assess(project, job, task, assess)
     for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
     stage(task, "delegate", "pass", `${role.agent} on ${model}`)
     return this.#start(project, parent, job, task, role, model, d, d.checks, rel)
+  }
+
+  // The difficulty on the task, and a trial when the plugin asked for one and the job can run one: in worktrees of its
+  // own (no trial without git) and with Parallel on.
+  #assess(project: string, job: Job, task: Task, assess?: Assessment): void {
+    if (assess?.difficulty !== undefined) task.difficulty = assess.difficulty
+    if (!assess || assess.trials < 2 || !WRITERS.has(task.role) || job.isolation === "none") return
+    if (!optionsOf(loadControl(project, job.id), lastOptions(project)).parallel) return
+    task.trial = { of: task.id, n: assess.trials }
+    task.title = `${task.title.replace(/ \(attempt \d+\/\d+\)$/, "")} (attempt 1/${assess.trials})`.slice(0, 140)
+  }
+
+  // "Attempt: T5 · job-…": another attempt of T5's trial. It gets T5's task, files and checks, a worktree of its own,
+  // and is not refused as the same work: that is what it is meant to be.
+  async #attempt(project: string, parent: string, role: Role, d: Delegation, attempt: NonNullable<Delegation["attempt"]>, model: string): Promise<Delegated> {
+    const job = this.#jobs.get(key(project, attempt.job)) ?? listJobs(project).find((j) => j.id === attempt.job)
+    if (!job) throw new DelegationError(`Not started: there is no job ${attempt.job} in this project.`)
+    if (job.facilitator && job.facilitator !== parent) throw new DelegationError(`Not started: job ${job.id} belongs to another micromanager session.`)
+    if (loadControl(project, job.id).stopped) throw new DelegationError(`Not started: the user stopped job ${job.id}. Ask them whether to go on; nothing starts until they start it again.`)
+    const head = job.tasks.find((t) => t.id === attempt.task)
+    if (!head?.trial || head.trial.of !== head.id) throw new DelegationError(`Not started: ${attempt.task} runs no trial; start a task with its own prompt instead.`)
+    if (head.role !== role.id) throw new DelegationError(`Not started: ${head.id} is a task for ${roleById(head.role)?.agent ?? head.role}; start its attempts with that agent.`)
+    const now = standing(job, head)
+    if (now.winner) throw new DelegationError(`Not started: ${now.winner.id} already won the trial of ${head.id}; its work is merged.`)
+    if (now.all.length >= head.trial.n) throw new DelegationError(`Not started: the trial of ${head.id} has all its ${head.trial.n} attempts already (${now.all.map((t) => t.id).join(", ")}).`)
+    const checks = this.#entries.get(`${job.id}/${head.id}`)?.checks ?? []
+    const title = `${head.title.replace(/ \(attempt \d+\/\d+\)$/, "")} (attempt ${now.all.length + 1}/${head.trial.n})`
+    const added = addDelegated(job, { title, prompt: head.description, files: head.files, dependsOn: [], checks })
+    if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
+    const task = added.task
+    task.role = role.id
+    task.model = model
+    task.trial = { ...head.trial }
+    if (head.difficulty !== undefined) task.difficulty = head.difficulty
+    this.#jobs.set(key(project, job.id), job)
+    for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
+    stage(task, "delegate", "pass", `${role.agent} on ${model}, attempt of ${head.id}`)
+    const rel = await this.#integrate(project, job, true)
+    const body = job.rolling ? head.description : this.#plannedBody(job, head, d.body)
+    return this.#start(project, parent, job, task, role, model, { ...d, body }, checks, rel)
+  }
+
+  // The fan-out note for a trial's first attempt, once its subagent call went through; undefined for any other task.
+  trialNote(project: string, jobId: string, taskId: string): string | undefined {
+    const job = this.#jobs.get(key(project, jobId))
+    const task = job?.tasks.find((t) => t.id === taskId)
+    return job && task ? fanOutText(job, task) : undefined
+  }
+
+  // The models a trial's attempts run on so far, so the next attempt goes to another family.
+  trialModels(project: string, jobId: string, taskId: string): string[] {
+    const job = this.#jobs.get(key(project, jobId)) ?? listJobs(project).find((j) => j.id === jobId)
+    const task = job?.tasks.find((t) => t.id === taskId)
+    return job && task ? attempts(job, task).map((t) => t.model).filter((m): m is string => Boolean(m)) : []
   }
 
   // The job's branch and its worktree, made at its first task. Returns the project's offset inside the repository.
@@ -457,7 +532,7 @@ export class Native {
   // "Task: T5 · job-…": the micromanager starts a task of a planned job (run_job). The plan already says what it is:
   // its role, files, acceptance points and checks; the prompt can add to it. A task that ran before (on the runner, or
   // a worker that stopped) starts over in a fresh worktree; continuing its old worker is the way to keep its change.
-  async #planned(project: string, parent: string, role: Role, d: Delegation, planned: NonNullable<Delegation["planned"]>, model: string): Promise<Delegated> {
+  async #planned(project: string, parent: string, role: Role, d: Delegation, planned: NonNullable<Delegation["planned"]>, model: string, assess?: Assessment): Promise<Delegated> {
     const job = this.#jobs.get(key(project, planned.job)) ?? listJobs(project).find((j) => j.id === planned.job)
     if (!job) throw new DelegationError(`Not started: there is no job ${planned.job} in this project.`)
     if (!job.native && !job.rolling) throw new DelegationError(`Not started: job ${job.id} is not running on your workers; start it with run_job first.`)
@@ -502,21 +577,28 @@ export class Native {
     restart(task)
     task.model = model
     task.attempts = 0
+    // A task started again starts a new trial, if it gets one: the old attempts' trial is over.
+    task.trial = undefined
+    this.#assess(project, job, task, assess)
     stage(task, "delegate", "pass", `${role.agent} on ${model}, planned task`)
     const rel = await this.#integrate(project, job, WRITERS.has(role.id))
+    return this.#start(project, parent, job, task, role, model, { ...d, body: this.#plannedBody(job, task, d.body) }, checks, rel)
+  }
+
+  // A planned task's brief: the job, the task, its acceptance points and decisions, and what the micromanager added.
+  #plannedBody(job: Job, task: Task, extra: string): string {
     const acceptance = taskAcceptance(job, task).map((a) => `- ${a.id}: ${a.text}${a.verify ? ` (checked with: ${a.verify})` : ""}${sharedNote(job, task, a.id)}`)
-    const body = [
+    return [
       `The job: ${job.goal}`,
       "",
-      `Your task (${task.id}): ${task.title}`,
+      `Your task (${task.id}): ${task.title.replace(/ \(attempt \d+\/\d+\)$/, "")}`,
       task.description,
       "",
       "Acceptance points:",
       ...(acceptance.length ? acceptance : ["- none given"]),
       job.decisions.length ? `\nDecisions that apply: ${job.decisions.map((x) => x.text).join("; ")}` : "",
-      d.body ? `\nFrom the micromanager: ${d.body}` : "",
+      extra ? `\nFrom the micromanager: ${extra}` : "",
     ].filter((line) => line !== "").join("\n")
-    return this.#start(project, parent, job, task, role, model, { ...d, body }, checks, rel)
   }
 
   // "Replaces: T5": the micromanager starts T5's work over on purpose. T5 is cancelled and its worktree, with whatever
@@ -745,19 +827,23 @@ export class Native {
 
   // finish_task: the checks in the worker's worktree, then the commit and the merge train. The text goes back to the
   // worker; note is what the micromanager should hear (undefined: nothing new).
-  async finish(session: string, summary: string): Promise<{ text: string; note?: string; parent?: string }> {
+  // stop: the sessions of a trial's other attempts, which the plugin interrupts once one attempt won.
+  async finish(session: string, summary: string): Promise<{ text: string; note?: string; parent?: string; stop?: string[] }> {
     const entry = this.#entry(session)
     const job = entry && this.#job(entry)
     const task = job?.tasks.find((t) => t.id === entry!.taskId)
     if (!entry || !job || !task) return { text: "This session has no task of the micromanager; there is nothing to finish." }
     if (!entry.writer) return { text: "You only read: there is nothing to check or merge. End with your findings; they are your result." }
     if (task.status === "merged") return { text: `${task.id} is already merged into ${job.integrationBranch}. End with your short report.` }
+    if (task.trial && task.status === "cancelled") return { text: lostText(job, task) }
     if (task.status === "escalated") moveTask(task, "running")
     moveTask(task, "gating")
     task.summary = summary.trim().slice(0, 2000) || task.summary
     // The checks run where the worker's files are, not in the worktree root: a project below the repository root lives
     // that far down, and a check naming one of its files finds nothing above it.
     const failed = (await runGate(entry.worktree, entry.checks, this.#exec, undefined, entry.dir)).filter((r) => !r.passed)
+    // Another attempt of its trial won while these checks ran (and took the worktree away).
+    if (task.status === "cancelled") return { text: lostText(job, task) }
     if (failed.length) {
       // The same cap the runner applies to its fix rounds (runner.ts: #work, `fixRounds ?? 2`). Without it a check that
       // cannot be satisfied in this environment -- a path that does not exist, a command the gate refuses -- was handed
@@ -769,7 +855,7 @@ export class Native {
         stage(task, "gate", "fail", failed.map((f) => f.command).join(", "))
         moveTask(task, "blocked")
         task.summary = `its checks still fail after ${FIX_ROUNDS} fix round(s): ${failed.map((f) => f.command).join(", ")}`
-        const note = `[micromanager] ${task.id} ${task.title}: its worker hit the limit of ${FIX_ROUNDS} fix rounds with the checks still failing (${failed.map((f) => f.command).join(", ")}). If the check is what is wrong -- a path that does not exist in the worktree, a command the gate refuses -- correct the task with steer_task and its sessionID ${session} rather than starting a new worker.`
+        const note = this.#trialFailed(job, task) ?? `[micromanager] ${task.id} ${task.title}: its worker hit the limit of ${FIX_ROUNDS} fix rounds with the checks still failing (${failed.map((f) => f.command).join(", ")}). If the check is what is wrong -- a path that does not exist in the worktree, a command the gate refuses -- correct the task with steer_task and its sessionID ${session} rather than starting a new worker.`
         saveJob(entry.project, job)
         return {
           text: `Your checks still fail after ${FIX_ROUNDS} rounds, so I am stopping here rather than spending the rest of your budget on them:\n\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}\n\nIf the work is done and the CHECK is what cannot be satisfied here, say so plainly in your report. If the work is not done, name what is missing.`,
@@ -805,7 +891,7 @@ export class Native {
       saveJob(entry.project, job)
       return {
         text: `Your checks pass, but you changed no file, so there is nothing to commit and nothing was verified. If the task was already done by someone else, say so in your report. Otherwise make the change the task asked for and call finish_task again.`,
-        note: `[micromanager] ${task.id} ${task.title}: its checks passed but it changed no file, so nothing was committed. Continue it with the subagent tool and sessionID ${session}, or tell the user.`,
+        note: this.#trialFailed(job, task) ?? `[micromanager] ${task.id} ${task.title}: its checks passed but it changed no file, so nothing was committed. Continue it with the subagent tool and sessionID ${session}, or tell the user.`,
         parent: entry.parent,
       }
     }
@@ -813,19 +899,51 @@ export class Native {
     const commit = await commitTask(entry.worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${task.model ?? "?"} (${task.role}), session ${session}${task.summary ? `\n\n${task.summary}` : ""}`, this.#exec)
     moveTask(task, "passed")
     const train = this.#trains.get(job.id) ?? Promise.resolve()
-    const step = train.then(() => this.#merge(entry, job, task))
+    const step = train.then(() => (task.status === "cancelled" ? { ok: false as const, text: lostText(job, task) } : this.#merge(entry, job, task)))
     this.#trains.set(job.id, step.catch(() => undefined))
     const merged = await step
     saveJob(entry.project, job)
     if (!merged.ok) return { text: merged.text }
+    const won = task.trial ? await this.#settleTrial(entry, job, task) : undefined
     // The commit as merged: a rebase onto other tasks' commits gave it a new id (live test).
     const head = commit && (await this.#exec("git", ["rev-parse", "--short", "HEAD"], { cwd: entry.worktree })).stdout.trim()
     const checks = entry.checks.length ? `checks passed: ${entry.checks.join("; ")}` : "no checks were given"
     return {
       text: `Merged into ${job.integrationBranch}${head ? ` as ${head}` : " (nothing to commit)"}; ${checks}. Now end with your short report.`,
-      note: `[micromanager] ${task.id} ${task.title}: merged into ${job.integrationBranch}${head ? ` (${head})` : ", nothing changed"}; ${checks}.`,
+      note: won?.note ?? `[micromanager] ${task.id} ${task.title}: merged into ${job.integrationBranch}${head ? ` (${head})` : ", nothing changed"}; ${checks}.`,
       parent: entry.parent,
+      ...(won?.stop.length ? { stop: won.stop } : {}),
     }
+  }
+
+  // A trial's attempt merged: it won. Every other attempt is done over by it (replacedBy, so what waits for the first
+  // attempt waits for the winner), cancelled, and its worktree goes; the ones still at work are returned to be stopped.
+  async #settleTrial(winner: Entry, job: Job, task: Task): Promise<{ note: string; stop: string[] }> {
+    const now = standing(job, task)
+    const stop: string[] = []
+    for (const other of now.all) {
+      if (other === task || other.status === "merged" || other.status === "cancelled") continue
+      const e = this.#entries.get(`${job.id}/${other.id}`)
+      if (e?.session && !e.ended && now.live.includes(other)) stop.push(e.session)
+      moveTask(other, "cancelled")
+      stage(other, "trial", "pass", `won by ${task.id}`)
+      other.replacedBy = task.id
+      if (e) await this.#dropWorktree(e, other)
+    }
+    // The first attempt is what the plan and the dependants know: done over by the winner, it counts as done.
+    stage(task, "trial", "pass", `won the trial of ${task.trial!.of} (${now.failed.length} failed, ${now.live.length - 1} stopped)`)
+    saveJob(winner.project, job)
+    return { note: wonText(job, task, now.live.filter((t) => t !== task), now.failed.length), stop }
+  }
+
+  // The note when a trial's attempt failed: the trial's state (others still run, or all failed); undefined outside one.
+  #trialFailed(job: Job, task: Task): string | undefined {
+    if (!task.trial) return undefined
+    const now = standing(job, task)
+    if (now.winner) return undefined
+    if (now.live.length) return attemptFailedText(task, now.live)
+    const head = job.tasks.find((t) => t.id === task.trial!.of) ?? task
+    return allFailedText(job, head, now.failed)
   }
 
   // Rebase onto the session branch, the checks again when it moved, then the fast-forward.
@@ -858,13 +976,17 @@ export class Native {
 
   // Waits once per run for a worker's end (wait resolves when its session goes idle).
   // reason: why the watchdog stopped the worker, if it did.
-  watchEnd(session: string, wait: () => Promise<unknown>, reason: () => string | undefined, ended: (note: string | undefined, parent: string) => void): void {
+  // ended gets the worker's task as it ended too, for the outcome log (src/outcomes.ts).
+  watchEnd(session: string, wait: () => Promise<unknown>, reason: () => string | undefined, ended: (note: string | undefined, parent: string, w: Worker) => void): void {
     if (this.#waiting.has(session) || !this.#bySession.has(session)) return
     this.#waiting.add(session)
     void wait().catch(() => undefined).then(async () => {
       this.#waiting.delete(session)
       const r = await this.ended(session, reason())
-      if (r) ended(r.note, r.parent)
+      const entry = this.#entry(session)
+      const job = entry && this.#job(entry)
+      const task = job?.tasks.find((t) => t.id === entry!.taskId)
+      if (r && entry && job && task) ended(r.note, r.parent, { project: entry.project, job, task, writer: entry.writer })
     })
   }
 
@@ -885,9 +1007,15 @@ export class Native {
       }
     } else if (task.status === "merged") {
       await this.#dropWorktree(entry, task)
+    } else if (task.trial && task.status === "cancelled") {
+      // Stopped because another attempt won: its work is not needed, and the winner's note said so.
+      await this.#dropWorktree(entry, task)
     } else {
+      const blocked = task.status === "blocked"
       stage(task, "end", "fail", reason ?? "ended without finish_task")
-      note = `[micromanager] ${task.id} ${task.title}: its worker ended${reason ? ` (${reason})` : ""} without passing finish_task, so nothing was checked or merged; its change is still in ${entry.dir}. Continue it with the subagent tool and sessionID ${session} to finish, or tell the user.`
+      // In a trial, finish_task reported a blocked attempt already; one that ended unfinished is a failed attempt.
+      if (task.trial) note = blocked ? undefined : this.#trialFailed(job, task)
+      else note = `[micromanager] ${task.id} ${task.title}: its worker ended${reason ? ` (${reason})` : ""} without passing finish_task, so nothing was checked or merged; its change is still in ${entry.dir}. Continue it with the subagent tool and sessionID ${session} to finish, or tell the user.`
     }
     saveJob(entry.project, job)
     return { note, parent: entry.parent }
@@ -994,6 +1122,8 @@ export class Native {
       "",
       d.body,
       "",
+      attemptBrief(task),
+      "",
       graph ? graphBrief(graph) : "",
       "",
       entry.writer ? `Files you may change: ${task.files.join(", ")}. Work only in your current directory, ${job.isolation === "none" ? "the project folder itself (it has no git, so change nothing beyond your files)" : "a git worktree of its own"}.` : "Change no files.",
@@ -1051,6 +1181,11 @@ function dirtyNote(job: Job, writer: boolean): string {
   return writer
     ? `The working tree of the project has uncommitted changes that this worktree does not have (${job.integrationDirty}); the worktree is a checkout of the last commit. Do not try to read them: say so in your report if your task depends on them.`
     : `The working tree of the project has uncommitted changes that this worktree does not have (${job.integrationDirty}); what you read here is the last commit. Say so if your question depends on them.`
+}
+
+// What an attempt hears when another attempt of its trial won first.
+function lostText(job: Job, task: Task): string {
+  return `${task.replacedBy ?? "Another attempt"} of this trial merged into ${job.integrationBranch} first, so your work is not needed and nothing of it is merged. Stop now and end with a one-line report; add a LEARNED line if your attempt found something worth knowing.`
 }
 
 // "<job>/<task>" from a brief's header line.

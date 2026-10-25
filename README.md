@@ -243,6 +243,7 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "registry": [{ "id": "llamaswap/mimo", "disabled": true }],
   "parallel": 3,          // tasks of one job at the same time (1: one after another)
   "perModel": 2,          // sessions of one cloud model at the same time; a local model serves one
+  "trials": 3,            // attempts a hard writer task runs as, each on another model (1: no trials; at most 4)
   "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // optional limits per job; none by default
   "notify": "jobs",       // desktop notifications: "jobs", "tasks" (also per task) or "off"
   "sandbox": true,        // worker commands in the sandbox (default); false runs them unwrapped
@@ -259,6 +260,13 @@ skill in a worker's brief only when that link is in place. The local GLiNER
 decision server (`decider/`, see its README) answers guard questions on the CPU, and `npm run bench-guards`
 measures them; the journal
 `~/.local/state/micromanager/decisions.jsonl` feeds `npm run eval` and `npm run export-dataset`.
+
+A hard writer task (N5 difficulty "hard" or "very hard"), a task that does failed work over, and a task of a class
+that mostly fails on one worker run as a **trial**: `trials` attempts at once, each in its own worktree on another
+model family, and the first whose checks pass is merged while the others stop. When all of them fail, the
+micromanager is told what each hit and splits the task. Every writer's end, with its model, difficulty, gate result,
+tokens and cost, goes to `~/.local/state/micromanager/outcomes.jsonl`; `npm run export-dataset -- --target router`
+turns it into one row per task, the training data for a router (docs/design.md §23).
 
 ## Context and memory
 

@@ -149,6 +149,9 @@ export interface Task {
   // the session. The sidebar shows a failed task as done once its replacement is (src/progress.ts).
   replaces?: string[]
   replacedBy?: string
+  difficulty?: number // the N5 estimate at a native delegation, 0..1 (src/trials.ts)
+  // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has (src/trials.ts).
+  trial?: { of: string; n: number }
 }
 
 export interface Job {

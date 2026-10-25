@@ -308,6 +308,10 @@ How you work:
    follow-ups they found: start the ones the request needs, and mention the others to the user.
    A note "[micromanager] A…: worker … is paused on a permission request" means a worker waits for an answer:
    decide it with answer_permission when it clearly serves the task, else put it to the user as the note says.
+   A hard task runs as a trial: the plugin's note after its first worker asks you to start further attempts with the
+   prompt line "Attempt: T… · job-…"; start them at once, in one message. The first attempt whose checks pass is
+   merged and the others stop by themselves; do not continue or restart a stopped attempt. When every attempt failed,
+   the note says what each hit: split the task into smaller todos as it says.
 5. When everything is done, tell the user briefly what changed and how to merge the session branch (git merge
    jev/<job>, the notes name it) or discard it.
 

@@ -7,7 +7,7 @@ import { test } from "node:test"
 
 import { segments } from "../src/decide.ts"
 import { CHILD_PREFIX, DelegationError, Native, NoGitError, parseDelegation, parseTodo, replaceIds, similarity } from "../src/native.ts"
-import { nextStep } from "../src/continuation.ts"
+import { nextStep, settled } from "../src/continuation.ts"
 import { roleByAgent } from "../src/roles.ts"
 import { moveJob, newJob, type Task } from "../src/state.ts"
 import { loadJob, saveJob } from "../src/store.ts"
@@ -682,4 +682,84 @@ test("the note on an earlier session's job says what was merged, whether the che
   for (const choice of ["continue:", "merge:", "discard:", "new:"]) assert.ok(all.includes(`- ${choice}`), choice)
   assert.match(all, new RegExp(`take_over_job with job ${job.id}`))
   assert.match(all, /nothing is deleted, and the next session asks again/)
+})
+
+test("an Attempt line names the trial it joins", () => {
+  assert.deepEqual(parseDelegation("Attempt: t3 · job-20261025-1\n").attempt, { task: "T3", job: "job-20261025-1" })
+  assert.equal(parseDelegation("Attempt: something else entirely").attempt, undefined)
+})
+
+test("a hard task runs as a trial: its attempts are no duplicates, the first to pass wins and the others stop", async () => {
+  const project = repo()
+  const native = new Native()
+  const OTHER = "opencode-go/kimi-k3"
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "add add.js", prompt: "Create add.js.\nFiles: add.js\nChecks: test -f add.js" }, MODEL, { difficulty: 0.8, trials: 3 })
+  const job = d.job
+  assert.deepEqual(d.task.trial, { of: "T1", n: 3 })
+  assert.equal(d.task.difficulty, 0.8)
+  assert.match(d.task.title, /\(attempt 1\/3\)$/)
+  assert.match(d.prompt, /You are attempt 1 of 3/)
+  const fan = native.trialNote(project, job.id, "T1")!
+  assert.match(fan, /Start the other 2 attempts now/)
+  assert.match(fan, new RegExp(`Attempt: T1 · ${job.id}`))
+
+  const attempt = (model: string) => native.delegate(project, "ses_mm", { agent: "coder", description: "T1 attempt", prompt: `Attempt: T1 · ${job.id}` }, model)
+  const a2 = await attempt(OTHER)
+  assert.equal(a2.task.id, "T2")
+  assert.deepEqual(a2.task.trial, { of: "T1", n: 3 })
+  assert.match(a2.prompt, /Create add\.js\./)
+  assert.match(a2.prompt, /Checks the plugin runs when you finish: test -f add\.js/)
+  assert.match(a2.prompt, /You are attempt 2 of 3/)
+  assert.deepEqual(native.trialModels(project, job.id, "T1"), [MODEL, OTHER])
+  const a3 = await attempt(MODEL)
+  await assert.rejects(attempt(MODEL), /has all its 3 attempts already/)
+  assert.equal(native.trialNote(project, job.id, "T1"), undefined, "every attempt started")
+  await assert.rejects(native.delegate(project, "ses_mm", { agent: "coder", description: "x", prompt: `Attempt: T2 · ${job.id}` }, MODEL), /T2 runs no trial/)
+
+  const w1 = native.claim("ses_a1", child(d.prompt))!
+  const w2 = native.claim("ses_a2", child(a2.prompt))!
+  native.claim("ses_a3", child(a3.prompt))
+  assert.notEqual(w1.dir, w2.dir, "each attempt has its own worktree")
+  writeFileSync(join(w2.dir, "add.js"), "export const add = (a, b) => a + b\n")
+  const won = await native.finish("ses_a2", "wrote add.js")
+  assert.match(won.text, /^Merged into/)
+  assert.match(won.note!, /T2 won the trial of T1/)
+  assert.deepEqual(won.stop?.sort(), ["ses_a1", "ses_a3"])
+  const tasks = native.jobOf("ses_a2")!.job.tasks
+  assert.deepEqual(tasks.map((t) => [t.id, t.status, t.replacedBy]), [["T1", "cancelled", "T2"], ["T2", "merged", undefined], ["T3", "cancelled", "T2"]])
+  assert.equal(existsSync(w1.dir), false, "a stopped attempt's worktree goes")
+  assert.ok(settled(job, tasks[0]!), "what waits for T1 waits for the winner")
+
+  writeFileSync(join(w2.dir, "late.js"), "")
+  assert.match((await native.finish("ses_a1", "late")).text, /T2 of this trial merged .* first/)
+  assert.equal((await native.ended("ses_a1"))?.note, undefined, "the winner's note said it all")
+})
+
+test("a trial whose attempts all fail tells the micromanager to split the task, with what each attempt hit", async () => {
+  const project = repo()
+  const native = new Native()
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "make it pass", prompt: "Make the check pass.\nFiles: a.js\nChecks: test -f never.txt" }, MODEL, { difficulty: 0.9, trials: 2 })
+  const a2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "T1 attempt", prompt: `Attempt: T1 · ${d.job.id}` }, "opencode-go/kimi-k3")
+  const w1 = native.claim("ses_a1", child(d.prompt))!
+  native.claim("ses_a2", child(a2.prompt))
+  writeFileSync(join(w1.dir, "a.js"), "x\n")
+  let r = await native.finish("ses_a1", "tried")
+  for (let i = 0; i < FIX_ROUNDS; i++) r = await native.finish("ses_a1", "tried again")
+  assert.match(r.note!, /T1 .* failed, but T2 of its trial still runs: nothing to do/)
+  const end = await native.ended("ses_a2", "loop: the same edit 5 times")
+  assert.match(end!.note!, /All 2 attempts at T1 make it pass failed/)
+  assert.match(end!.note!, /- T1 on opencode-go\/glm-5\.3-flash: gate: test -f never\.txt/)
+  assert.match(end!.note!, /- T2 on opencode-go\/kimi-k3: end: loop: the same edit 5 times/)
+  assert.match(end!.note!, /Split it into smaller tasks/)
+})
+
+test("a trial needs Parallel and a worktree per attempt; without them the task runs once", async () => {
+  const project = repo()
+  const native = new Native()
+  const first = await native.delegate(project, "ses_mm", { agent: "explorer", description: "look", prompt: "Where is the router?" }, MODEL)
+  updateControl(project, first.job.id, { parallel: false })
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "add add.js", prompt: "Create add.js.\nFiles: add.js\nChecks: test -f add.js" }, MODEL, { difficulty: 0.9, trials: 3 })
+  assert.equal(d.task.trial, undefined)
+  assert.equal(d.task.difficulty, 0.9, "the estimate is kept for the outcome log")
+  assert.equal(native.trialNote(project, d.job.id, d.task.id), undefined)
 })

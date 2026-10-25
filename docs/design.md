@@ -922,6 +922,42 @@ eval harness, the Open-Jev dataset and GLiNER retraining.
 **Commands:** `/micromanager set <node> <value>` and `/micromanager pins` show and change the policies. The chat
 shortcuts are exact phrases, matched before any model.
 
+## 23. Trials and the router (after Dr. Zero, 2026-10-25)
+
+Dr. Zero (arXiv 2601.07055) trains a proposer and a solver against each other: the proposer is rewarded for
+questions the solver passes in some but not all of n rollouts (0 < k < n), so a curriculum appears by itself, and
+HRPO compares rollouts within groups of the same shape (hop count) instead of sampling n per question. On coding
+tasks the pieces map as follows: a rollout is a worker attempt in its own worktree, the verifier is the shell gate,
+k/n is how many attempts pass, and the group is the task class (role, difficulty tier, number of files).
+
+**Phase 1 (implemented, cloud only).**
+- **Difficulty.** Before a writer delegation is routed, the plugin asks Jev N5's one difficulty question
+  (`assessDelegation` in src/plugin.ts). A hard task prefers the pool's deep-tier models.
+- **Trials (src/trials.ts).** A task runs as `trials` attempts (default 3, capped by `parallel`) when it is hard
+  (difficulty ≥ 0.67), when it does failed work over, or when the outcome log says its class mostly fails on a single
+  worker (`needsTrials`). The first attempt starts as usual; the plugin's note on its subagent result asks the
+  micromanager to start the others with `Attempt: T… · job-…`, because only its subagent calls make children that
+  OpenCode reports back to it. Each attempt is a task of its own and avoids its siblings' model families.
+- **Settling.** The first attempt that passes its checks and merges wins. Every other attempt is cancelled with
+  `replacedBy` set to the winner, so dependants of the first attempt wait for the winner, and its session is
+  interrupted and its worktree removed. An attempt that fails while others run reports nothing to act on; when all
+  of them failed (k = 0), the note lists what each hit and asks for a split.
+- **Outcome log (src/outcomes.ts).** One row per writer end: features known before the start (role, difficulty,
+  class, files, checks, brief), the allocation (model, n), and the result (gate, fix rounds, merged, end reason,
+  seconds, tokens, cost). Attempts stopped because a sibling won are kept as censored. `export-dataset --target
+  router` joins a trial's attempts into one row.
+
+**Phase 2 (later, once local models are back).**
+1. **A trained router.** A small local model (e.g. Qwen 1.5–3B) reads the features and outputs tier, n, the families
+   and whether to split first. It is trained with GRPO on reward = merged − λ·cost, with advantages normalised inside
+   the task class, so no task needs n samples of its own (the HRPO idea).
+2. **A proposer.** Synthetic coding tasks from the user's own repositories, with free verifiers: revert a past commit
+   and ask for it back (its tests are the check), empty a function body, break a test. A task is worth keeping when
+   the current pool solves it in some but not all attempts, which yields a curriculum that follows the pool and more
+   router data than real jobs produce.
+3. **A stronger verifier.** Attempts also write tests; each attempt's tests run against its siblings' code
+   (agreement as in CodeT), to pick a winner where the user's checks are weak.
+
 ## Sources
 - **Orchestration:**
   - Magentic-One ledgers (github.com/microsoft/autogen, `_magentic_one`)

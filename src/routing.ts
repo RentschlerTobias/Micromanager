@@ -39,6 +39,7 @@ export interface Spread {
   readonly usage?: { count(model: string): number; record(model: string): void }
   readonly budget?: (model: string) => number | undefined
   readonly avoidFamilies?: readonly string[] // a task started again: not the family its failed attempt ran on
+  readonly prefer?: (model: string) => boolean // a hard task: the pool's models of the deep tier, when it has any
 }
 
 export const FREE_BUDGET = 60
@@ -106,7 +107,9 @@ export async function chooseModel(
   const avoid = spread.avoidFamilies ?? []
   const fresh = all.filter((m) => !avoid.includes(family(m)))
   const avoided = fresh.length > 0 && fresh.length < all.length
-  const models = avoided ? fresh : all
+  const left = avoided ? fresh : all
+  const preferred = spread.prefer ? left.filter(spread.prefer) : []
+  const models = preferred.length ? preferred : left
   if (needs.vision && role.id !== "review") {
     const vision = await firstAvailable([routing.vision], available)
     return { model: vision.model, reason: "needs image input", ...(vision.skipped.length ? { skipped: vision.skipped } : {}) }
@@ -132,7 +135,7 @@ export async function chooseModel(
   return {
     model: picked.model,
     reason: picked.spread
-      ? `least used of ${role.id}: ${picked.spread}${avoided ? ` (not ${avoid.join(", ")}: the failed attempt's family)` : ""}`
+      ? `least used of ${role.id}: ${picked.spread}${avoided ? ` (not ${avoid.join(", ")}: the failed attempt's family)` : ""}${preferred.length ? " (deep tier: a hard task)" : ""}`
       : picked.skipped.length ? `first available model for ${role.id}` : `first model for ${role.id}`,
     ...(picked.skipped.length ? { skipped: picked.skipped } : {}),
   }

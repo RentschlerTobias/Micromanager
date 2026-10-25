@@ -1,5 +1,5 @@
 // Command line: npm run eval -- [--floor 0.8] [--backend typesafe] [--journal path]
-//               npm run export-dataset -- [--target openjev|gliner] [--out file] [--journal path]
+//               npm run export-dataset -- [--target openjev|gliner|router] [--out file] [--journal path]
 //               npm run bench-guards -- [--cases bench/guard_cases.json] [--url http://127.0.0.1:8781/v1/systemone] [--repeat]
 //               npm run bench-n7 -- [--cases bench/followup_cases.json]
 //               node src/cli.ts status [--project dir] [--all] [--watch]   (an ASCII board of the newest job, or of all)
@@ -14,6 +14,7 @@ import { evaluate, formatReport } from "./eval.ts"
 import { journalPath, readJournal } from "./journal.ts"
 import { board } from "./board.ts"
 import { listJobs } from "./store.ts"
+import { outcomesPath, readOutcomes, routerRows } from "./outcomes.ts"
 
 function flag(args: readonly string[], name: string): string | undefined {
   const i = args.indexOf(`--${name}`)
@@ -62,11 +63,12 @@ export async function main(argv: readonly string[]): Promise<number> {
   }
   if (command === "export-dataset") {
     const targetName = flag(args, "target") ?? "openjev"
-    if (targetName !== "openjev" && targetName !== "gliner") {
-      console.error(`unknown target ${targetName}: openjev or gliner`)
+    if (targetName !== "openjev" && targetName !== "gliner" && targetName !== "router") {
+      console.error(`unknown target ${targetName}: openjev, gliner or router`)
       return 2
     }
-    const rows = targetName === "gliner" ? glinerRows(entries) : openJevRows(entries)
+    // router: the outcome log (src/outcomes.ts), one row per task with a trial's attempts joined, not the journal.
+    const rows = targetName === "router" ? routerRows(readOutcomes(flag(args, "outcomes") ?? outcomesPath())) : targetName === "gliner" ? glinerRows(entries) : openJevRows(entries)
     const text = rows.map((r) => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : "")
     const out = flag(args, "out")
     if (out) writeFileSync(out, text)

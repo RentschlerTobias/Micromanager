@@ -9,6 +9,7 @@ import { validatePolicies, type PolicySet } from "./policy.ts"
 import { DEFAULT_REGISTRY, mergeRegistry, type ModelEntry } from "./registry.ts"
 import { DEFAULT_ROUTING, type Routing } from "./routing.ts"
 import { roleById, type RoleId } from "./roles.ts"
+import { DEFAULT_TRIALS, MAX_TRIALS } from "./trials.ts"
 import type { NotifyMode } from "./scheduler.ts"
 
 // The name before 2026-10-19 (jev-micromanager.jsonc) is still read while the new one does not exist.
@@ -189,6 +190,15 @@ export function parseParallel(text: string): { parallel: number; perModel: numbe
   return { parallel: int(raw.parallel, "parallel", 3, 6), perModel: int(raw.perModel, "perModel", 2, 4) }
 }
 
+// "trials": attempts a hard writer task runs as at once, each on another model, the first to pass is merged (default 3,
+// at most 4; 1 turns trials off; src/trials.ts).
+export function parseTrials(text: string): number {
+  const raw = (JSON.parse(stripComments(text)) as { trials?: unknown }).trials
+  if (raw === undefined) return DEFAULT_TRIALS
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) throw new Error("trials must be a whole number from 1")
+  return Math.min(raw, MAX_TRIALS)
+}
+
 // "cloudOnly": true (the default for now, the user's choice of 2026-10-05) routes no task to a local model and asks
 // cloud Jev for the guards instead of the local GLiNER server. false brings the local fleet and GLiNER back.
 export function parseCloudOnly(text: string): boolean {
@@ -277,6 +287,7 @@ export interface Settings {
   readonly cloudOnly: boolean
   readonly parallel: number
   readonly perModel: number
+  readonly trials: number
   readonly budget: Budget
   readonly notify: NotifyMode
   readonly routing: Routing
@@ -296,6 +307,7 @@ const DEFAULTS: Omit<Settings, "registry"> = {
   cloudOnly: true,
   parallel: 3,
   perModel: 2,
+  trials: DEFAULT_TRIALS,
   budget: DEFAULT_BUDGET,
   notify: "jobs",
   routing: DEFAULT_ROUTING,
@@ -316,7 +328,7 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text), memory: parseMemory(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text), memory: parseMemory(text) }
   } catch (err) {
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }

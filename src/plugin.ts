@@ -17,7 +17,7 @@ import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe, type Availability } from "./registry.ts"
 import { chooseModel, unknown as allAvailable, withPicks, type Available } from "./routing.ts"
-import { family, MICROMANAGER, ROLES, roleByAgent, roleById, type Rule } from "./roles.ts"
+import { family, MICROMANAGER, ROLES, roleByAgent, roleById, type RoleId, type Rule } from "./roles.ts"
 import { WRITERS } from "./profile.ts"
 import { recentFailure, Runner, summary, taskReport, toModel, type SessionApi } from "./runner.ts"
 import { checkGuards } from "./gate.ts"
@@ -31,7 +31,7 @@ import { ledger as contextLedger } from "./context/ledger.ts"
 import { Summarizer } from "./context/summary.ts"
 import { writeMemoryStats, writeStatus } from "./context/status.ts"
 import { installMemoryTools, MEMORY_IDS } from "./context/tools.ts"
-import { lastAssistantText } from "./brief.ts"
+import { lastAssistantText, usage as sessionUsage } from "./brief.ts"
 import { review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
@@ -40,7 +40,7 @@ import { addGrant, isStarted, lastOptions, loadControl, optionsOf, saveLastOptio
 import { badName, GRANT_FLOOR, grantNote, harmlessQuestion, grantResult, GrantRequests, grantState, triage, type GrantKind } from "./grants.ts"
 import { accessForm, answersOf, formInput, gitForm, readForm, type Question } from "./forms.ts"
 import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
-import { NOUL_FLOOR } from "./catalog.ts"
+import { CLASSIFY, NOUL_FLOOR } from "./catalog.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
@@ -52,6 +52,8 @@ import { FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installFinishTool, installG
 import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
 import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo } from "./native.ts"
+import { classOf, needsTrials, outcomeOf, readOutcomes, recordOutcome } from "./outcomes.ts"
+import { DEEP, trialSize, type Assessment } from "./trials.ts"
 import { seedFromJournal, Usage } from "./usage.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
@@ -746,7 +748,7 @@ export default {
   setup: async (ctx: Context): Promise<void> => {
     const log = logger(ctx)
     const settings = loadSettings()
-    const { cloudOnly, parallel, perModel, budget, notify, routing, floors, decisions, allowOutside, error } = settings
+    const { cloudOnly, parallel, perModel, trials, budget, notify, routing, floors, decisions, allowOutside, error } = settings
     // What the user granted a job's workers beyond the allowlist (request_env / request_network), kept in its control file.
     const jobGrants = (project: string, jobId: string): { env: readonly string[]; network: readonly string[] } => {
       const g = loadControl(project, jobId).grants
@@ -781,7 +783,27 @@ export default {
         const own = job && (native.current(project, job.id) ?? job)
         for (const id of d.replaces) before.push(own?.tasks.find((t) => t.id === id)?.model)
       }
+      // Another attempt of a trial: not the families its other attempts run on (src/trials.ts).
+      if (d.attempt) before.push(...native.trialModels(project, d.attempt.job, d.attempt.task))
       return [...new Set(before.filter((m): m is string => Boolean(m)).map(family))]
+    }
+    // A writer delegation before it starts: N5's difficulty (the one question), and how many attempts it gets
+    // (src/trials.ts). retry: it does a failed attempt over. Undefined for a reader and for a trial's further attempts.
+    const assessDelegation = async (sessionID: string, prompt: string, role: RoleId, retry: boolean): Promise<Assessment | undefined> => {
+      if (!project || !WRITERS.has(role)) return undefined
+      const d = parseDelegation(prompt)
+      if (d.attempt) return undefined
+      const planned = d.planned && (native.current(project, d.planned.job) ?? loadJob(project, d.planned.job))?.tasks.find((t) => t.id === d.planned!.task)
+      const task = planned
+        ? { id: planned.id, title: planned.title, description: `${planned.description}${d.body ? `\n${d.body}` : ""}`, files: planned.files, plannerRole: planned.role }
+        : { title: d.body.split("\n")[0]!.slice(0, 120), description: d.body, files: d.files.split(",").map((f) => f.trim()).filter(Boolean), plannerRole: role }
+      const asked = await decider.ask("N5", { task, checks: d.checks }, { difficulty: CLASSIFY.difficulty! }, {}).catch(() => undefined)
+      const answer = asked?.decision.answers.difficulty
+      const difficulty = answer?.type === "score" ? Math.max(0, Math.min(4, answer.score)) / 4 : undefined
+      const learned = needsTrials(readOutcomes(), classOf(role, difficulty, task.files.length))
+      const n = trialSize({ difficulty, retry, learned, setting: trials, parallel })
+      record({ kind: "assess", sessionID, role, difficulty, retry, learned, trials: n, decision: asked?.id })
+      return { difficulty, trials: n }
     }
     const registry = cloudOnly ? cloudRegistry(settings.registry) : settings.registry
     if (error) log("warn", `config ignored, defaults used: ${error}`)
@@ -963,8 +985,11 @@ export default {
       // taken at its first entry — otherwise a renamed free model breaks every role at once (the user's question,
       // 2026-10-07).
       const avoidFamilies = resumed ? [] : failedFamilies(call.sessionID, asked)
+      const assess = resumed ? undefined : await assessDelegation(call.sessionID, asked, delegationRole(call)!.id, avoidFamilies.length > 0 && !parseDelegation(asked).attempt).catch(() => undefined)
+      // A hard task goes to the pool's deep-tier models when it has some (src/registry.ts tiers).
+      const deep = assess?.difficulty !== undefined && assess.difficulty >= DEEP ? (m: string) => registry.find((r) => r.id === m)?.tier === "deep" : undefined
       const picks = loadPicks()
-      const routed = await routeDelegation(call, withPicks(routing, picks), undefined, hostModels, { usage, budget: goBudget, avoidFamilies })
+      const routed = await routeDelegation(call, withPicks(routing, picks), undefined, hostModels, { usage, budget: goBudget, avoidFamilies, ...(deep ? { prefer: deep } : {}) })
       // Whether the pool was the user's own pick in the TUI, so the journal tells a pick from the default.
       const picked = routed && (picks.models[routed.role] || (picks.vision && routed.model === picks.vision)) ? { picked: true } : {}
       if (routed?.skipped?.length) {
@@ -1012,7 +1037,7 @@ export default {
       if (guard.flagged.some((g) => g === "injection" || g === "harmful")) {
         throw new DelegationError(`The local check flagged this task (${guard.flagged.join(", ")}). Ask the user whether it should run before you start it again.`)
       }
-      const d = await native.delegate(project, call.sessionID, { agent: String(call.input.agent ?? ""), description: String(call.input.description ?? ""), prompt: asked }, routed.model)
+      const d = await native.delegate(project, call.sessionID, { agent: String(call.input.agent ?? ""), description: String(call.input.description ?? ""), prompt: asked }, routed.model, assess)
       call.input.prompt = d.prompt
       // What the memory knows that helps this task (src/context/recall.ts), after the Files/Checks lines and a blank line,
       // so they stay the task's (native.ts parseDelegation stops checks at a blank line).
@@ -1605,7 +1630,9 @@ export default {
         if (call.error) await native.abandon(String(call.input.prompt ?? "")).catch((err: unknown) => log("warn", `abandon failed: ${String(err)}`))
         else {
           const id = String(call.input.prompt ?? "").match(/^\[micromanager\] task (T\d+) · job (\S+) ·/)
-          if (id) rewriteResult(call.result, (text) => `${text}\n[micromanager] This worker is task ${id[1]} of job ${id[2]}${/· role (code|test|visual|write|debug) ·/.test(String(call.input.prompt)) ? `; its change is merged into jev/${id[2]} when its checks pass` : ""}.`)
+          // A trial's first attempt: the micromanager starts the others now (src/trials.ts fanOutText).
+          const fan = id && project ? native.trialNote(project, id[2]!, id[1]!) : undefined
+          if (id) rewriteResult(call.result, (text) => `${text}\n[micromanager] This worker is task ${id[1]} of job ${id[2]}${/· role (code|test|visual|write|debug) ·/.test(String(call.input.prompt)) ? `; its change is merged into jev/${id[2]} when its checks pass` : ""}.${fan ? `\n${fan}` : ""}`)
         }
         return
       }
@@ -1916,6 +1943,12 @@ export default {
       try {
         installFinishTool(draft, async (text, tctx) => {
           const r = await native.finish(tctx.sessionID!, text)
+          // A trial's attempt won: the others stop (their tasks are cancelled already, their worktrees gone).
+          for (const other of r.stop ?? []) {
+            ended.add(other)
+            await ctx.session.interrupt({ sessionID: other }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
+            await release(other, "another attempt of its trial won")
+          }
           // The merge, as a quiet note in the micromanager's session; OpenCode's notification with the report follows.
           if (r.note && r.parent) await ctx.session.synthetic({ sessionID: r.parent, text: r.note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
           record({ kind: "finish", sessionID: tctx.sessionID, merged: Boolean(r.note), text: r.text.slice(0, 300) })
@@ -2167,13 +2200,16 @@ export default {
         // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
         if (input.sessionID && native.isWorker(input.sessionID)) {
           const worker = input.sessionID
-          native.watchEnd(worker, () => ctx.session.wait({ sessionID: worker }), () => stops.get(worker)?.detail, (note, parent) => {
+          native.watchEnd(worker, () => ctx.session.wait({ sessionID: worker }), () => stops.get(worker)?.detail, (note, parent, r) => {
             // Its end is the one thing reconcileJob needs to stop calling this worker alive (src/state.ts).
             ended.add(worker)
             void release(worker, "the worker that asked it has ended")
             // Its LEARNED lines go to the memory, each through search and Jev (src/context/capture.ts).
+            // A writer's attempt goes to the outcome log with what its session cost (src/outcomes.ts).
             void (async () => {
-              const report = lastAssistantText(await ctx.session.context({ sessionID: worker }).catch(() => undefined))
+              const messages = await ctx.session.context({ sessionID: worker }).catch(() => undefined)
+              if (r.writer) recordOutcome(outcomeOf(r.project, r.job, r.task, messages ? sessionUsage(messages) : undefined))
+              const report = lastAssistantText(messages)
               for (const line of learnedLines(report).slice(0, 5)) await memory.capture({ text: line, source: `LEARNED ${worker}` }, project)
             })().catch((err: unknown) => log("warn", `memory capture failed: ${String(err)}`))
             if (note) void ctx.session.synthetic({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
