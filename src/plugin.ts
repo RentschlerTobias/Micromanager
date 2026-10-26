@@ -44,7 +44,7 @@ import { CHECK_BUG, CHECK_BUG_FLOOR, CLASSIFY, NOUL_FLOOR, OPEN_ENDED, OPEN_ENDE
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { backlogIgnored, listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
-import { backlogDir, backlogTool, goalOf, localBackend, type BacklogItem } from "./backlog.ts"
+import { backlogDir, backlogTool, githubIssue, githubIssues, githubRepo, goalOf, localBackend, publishForm, publishIssue, readPublish, type BacklogItem } from "./backlog.ts"
 import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "./state.ts"
 import { exec, repoRel, type Exec } from "./integration.ts"
 import { readFileSync } from "node:fs"
@@ -883,6 +883,14 @@ export default {
       const shown = survey.excluded.length > 8 ? [...survey.excluded.slice(0, 8), `${survey.excluded.length - 8} more`] : survey.excluded
       const form = gitForm(dir, survey.files, humanSize(survey.bytes), recommend, shown)
       return `${dir} is ${state === "no-commit" ? "a git repository without a commit" : "no git repository"}, so the workers cannot get a worktree each. Ask the user how to go on: call the question tool with exactly this input (a form; their answer reaches the plugin by itself), then end your turn:\n${formInput(form)}`
+    }
+    // The project's GitHub repository when the user opted it in for the backlog ("githubBacklog"); asked of gh once.
+    let repoOf: Promise<string | undefined> | undefined
+    const optedRepo = async (): Promise<string | undefined> => {
+      if (!project || !settings.githubBacklog.length) return undefined
+      repoOf ??= githubRepo(project).catch(() => undefined)
+      const repo = await repoOf
+      return repo && settings.githubBacklog.includes(repo) ? repo : undefined
     }
     // A trial decided by score (src/contract.ts): the attempts that waited get their outcome rows once it is decided, and a
     // decision nobody's finish_task carried (its deadline, its last attempt ending) reaches the micromanager as a note.
@@ -1724,6 +1732,22 @@ export default {
         tell(`${change.id}: the user ${change.accepted ? "accepted the change; the plugin applies it" : "refused the change; it stays as it is"}, and the worker goes on.`)
         return
       }
+      // Publishing a backlog item as a GitHub issue (src/backlog.ts): only on the user's yes in the plugin's own form.
+      const publish = answers && project && asked[0]?.header ? readPublish(asked[0].header, answers[0] ?? []) : undefined
+      if (publish && project) {
+        const tell = (text: string) => rewriteResult(call.result, (was) => `${was}\n[micromanager] ${text}`)
+        const item = localBackend.get(project, publish.slug)
+        const repo = await optedRepo()
+        if (!item || !repo) return
+        if (publish.yes !== true) {
+          tell(`${publish.slug} stays local${publish.yes === false ? "" : ": the answer was none of the form's choices"}; nothing went to GitHub.`)
+          return
+        }
+        const r = await publishIssue(project, item, repo)
+        record({ kind: "backlog", sessionID, action: "publish", slug: publish.slug, url: r.url, problem: r.problem })
+        tell(r.url ? `${publish.slug} is published as ${r.url}.` : `${publish.slug} was not published: ${r.problem}.`)
+        return
+      }
       // A contract's round (src/contractround.ts): its forms are named by the contract, and its answers move it on.
       const round = answers && project ? roundFormOf(asked) : undefined
       if (round && answers) {
@@ -1912,8 +1936,21 @@ export default {
             // A backlog item (src/backlog.ts): its title, goal, acceptance points and checks are the goal the planner reads.
             const ref = text.match(/^backlog:\s*([\w-]+)$/i)
             if (ref) {
-              const item = localBackend.get(project, ref[1]!)
+              const gh = ref[1]!.match(/^gh-(\d+)$/i)
+              const repo = gh ? await optedRepo() : undefined
+              if (gh && !repo) return `GitHub issues are off for this project ("githubBacklog" in ${configPath()}), so there is no ${ref[1]}.`
+              const item = gh ? await githubIssue(project, repo!, Number(gh[1])) : localBackend.get(project, ref[1]!)
               if (!item) return `There is no backlog item ${ref[1]}; the backlog tool lists them.`
+              if (gh) {
+                // An issue is read, never written: the job's progress stays in the job, and the issue is the user's.
+                if (item.status === "done") return `Issue ${ref[1]} is closed.`
+                const out = await runner(tctx.sessionID).start(goalOf(item), tctx.sessionID)
+                if (out.job.facilitator === undefined && tctx.sessionID) {
+                  out.job.facilitator = tctx.sessionID
+                  saveJob(project, out.job)
+                }
+                return out.kind === "plan" ? planText(out.job) : out.text
+              }
               if (item.status === "done" || item.status === "dropped" || item.status === "running") return `Backlog item ${item.slug} is ${item.status}${item.job ? ` (job ${item.job})` : ""}; set its status to ready first if it should run again.`
               if (planning) return `Job ${active!.id} is still being planned in this session; finish or stop it before starting ${item.slug}.`
               const out = await runner(tctx.sessionID).start(goalOf(item), tctx.sessionID)
@@ -2074,7 +2111,22 @@ export default {
             ].filter(Boolean).join("\n")
           },
           backlog: async (action, slug, value, tctx) => {
-            const text = backlogTool(project, action, slug, value)
+            const a = action.trim().toLowerCase()
+            const repo = await optedRepo()
+            if (a === "publish") {
+              const item = localBackend.get(project, slug.trim())
+              if (!item) return `There is no backlog item ${slug.trim()}.`
+              if (!repo) return `GitHub issues are off for this project: put its repository into "githubBacklog" in ${configPath()} to opt in. The item stays a local file.`
+              if (item.issue) return `${item.slug} is published already: ${item.issue}.`
+              return `Only the user decides what goes to GitHub. Ask them with the question tool, with exactly this input (a form; its answer reaches the plugin by itself), then end your turn:\n${formInput(publishForm(item, repo))}`
+            }
+            let text = backlogTool(project, action, slug, value)
+            // Issues of an opted-in repository are part of the list (read only; nothing is written to GitHub here).
+            if ((a === "" || a === "list") && repo) {
+              const gh = await githubIssues(project, repo)
+              const open = gh.items.filter((i) => i.status !== "done" && i.status !== "dropped")
+              text += gh.problem ? `\n${gh.problem}; the local backlog above is all there is for now.` : `\nGitHub issues in ${repo} labelled micromanager${open.length ? `:\n${open.map((i) => `- ${i.slug} [${i.status}, ${i.kind}] ${i.title} (${i.issue})`).join("\n")}` : ": none open."}`
+            }
             record({ kind: "backlog", sessionID: tctx.sessionID, action: action.trim(), slug: slug.trim() || undefined, text: text.slice(0, 300) })
             return text
           },

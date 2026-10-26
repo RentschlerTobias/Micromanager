@@ -223,7 +223,9 @@ Jev and the plugin securing every task:
    them: the plugin's exclude lines leave that directory and `.micromanager/contracts/` to git and keep the rest out.
    When a job is merged or discarded, the follow-ups its workers reported that no task took up, and a trial whose
    attempts all failed, become drafts there. `plan_job` with the goal `backlog:<slug>` starts an item; the `backlog`
-   tool lists and edits them.
+   tool lists and edits them. With the project's repository in `"githubBacklog"` (e.g. `["owner/name"]`), its issues
+   labelled `micromanager` join the list as `gh-<number>` and can be planned the same way; a local item becomes an
+   issue only when you say "Publish it" in the form `backlog publish <slug>` brings up.
 
 9. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
    after a planning session with you. You approve it, and `run_job` runs it.
@@ -309,6 +311,7 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "perModel": 2,          // sessions of one cloud model at the same time; a local model serves one
   "trials": 3,            // attempts a hard writer task runs as, each on another model (1: no trials; at most 4)
   "trialDeadline": 20,    // minutes a trial decided by a fitness contract waits for its last attempts
+  "githubBacklog": [],    // repositories ("owner/name") whose issues labelled micromanager join the backlog
   "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // optional limits per job; none by default
   "notify": "jobs",       // desktop notifications: "jobs", "tasks" (also per task) or "off"
   "sandbox": true,        // worker commands in the sandbox (default); false runs them unwrapped

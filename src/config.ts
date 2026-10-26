@@ -216,6 +216,15 @@ export function parseCloudOnly(text: string): boolean {
   return raw
 }
 
+// "githubBacklog": the GitHub repositories ("owner/name") whose issues labelled micromanager are part of the backlog
+// (src/backlog.ts, design.md §25 P7). Off for every other project: an issue is published content, so each repository is
+// opted in by name. Reading them is free; an issue is only ever created after the user says so in a form.
+export function parseGithubBacklog(text: string): readonly string[] {
+  const raw = (JSON.parse(stripComments(text)) as { githubBacklog?: unknown }).githubBacklog ?? []
+  if (!Array.isArray(raw) || raw.some((r) => typeof r !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(r))) throw new Error('githubBacklog must be a list of repositories, e.g. ["owner/name"]')
+  return raw.map((r: string) => r.toLowerCase())
+}
+
 // "allowOutside": absolute paths (or path prefixes) a worker may reach even where src/decide.ts refuses, e.g.
 // ["/home/u/.config/omarchy"]. Empty by default: the user's list is the only thing that lifts those rules, and it lifts
 // nothing until they write it. A wrong entry here is a widened rule, so the value is checked, not cast: a list of
@@ -305,6 +314,7 @@ export interface Settings {
   readonly decisions: PolicySet
   readonly registry: readonly ModelEntry[]
   readonly allowOutside: readonly string[]
+  readonly githubBacklog: readonly string[]
   readonly sandbox: boolean
   readonly env: readonly string[]
   readonly network: readonly string[]
@@ -325,6 +335,7 @@ const DEFAULTS: Omit<Settings, "registry"> = {
   floors: DEFAULT_FLOORS,
   decisions: {},
   allowOutside: [],
+  githubBacklog: [],
   sandbox: true,
   env: [],
   network: [],
@@ -339,7 +350,7 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), trialDeadline: parseTrialDeadline(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text), memory: parseMemory(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), trialDeadline: parseTrialDeadline(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), githubBacklog: parseGithubBacklog(text), ...parseSandbox(text), memory: parseMemory(text) }
   } catch (err) {
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }

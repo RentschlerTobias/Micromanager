@@ -1143,6 +1143,18 @@ committed with the project (src/backlog.ts). Items are jobs, never a job's inter
   when it is discarded. The `backlog` tool lists (open first, ready before draft, then by order), shows, adds and
   changes items. There is no runner that works the backlog off by itself.
 
+**P7: GitHub issues as a backlog backend (implemented, opt-in).** The same item text works as an issue body.
+- **Opt-in per repository:** `"githubBacklog": ["owner/name"]` in micromanager.jsonc; the project's repository is
+  asked of `gh repo view` once. Every other project has a local backlog only, and missing `gh`, a missing login or no
+  remote leave it that way, with a line that says why.
+- **Reading is free:** `backlog list` adds the open issues labelled `micromanager` as `gh-<number>` (an issue without
+  front matter is a draft whose goal is its text; a closed one is done), and `plan_job backlog:gh-<n>` plans a job
+  from one. The plugin never writes an issue's state: the job's progress stays in the job, and the issue is the
+  user's.
+- **Writing only on the user's yes:** `backlog publish <slug>` answers with a form (`Publish <slug>`); only the
+  answer "Publish it" runs `gh label create micromanager --force` and `gh issue create` with the item as body, and
+  the local item keeps the issue's address (`issue:`). The plugin runs `gh` itself, outside the worker sandbox.
+
 - **Known weak spot:** a task's checks are kept as one `verify` string joined with `" && "` and split again after a
   restart, so a check that contains `&&` itself comes back as two. The evaluator is kept out of that path.
 

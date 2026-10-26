@@ -7,9 +7,12 @@
 // for every backend: a YAML front matter (a small subset: scalars, lists of scalars, lists of one-level maps, and
 // JSON values) and a Markdown body; the GitHub backend (P7) puts the same text into an issue.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 
+import type { Question } from "./forms.ts"
+import { exec, type Exec } from "./integration.ts"
 import { checkProblem } from "./plan.ts"
 import { failureDigest } from "./trials.ts"
 import { stateDir } from "./store.ts"
@@ -27,6 +30,7 @@ export interface BacklogItem {
   origin: "user" | "later" | "trial-failed"
   from?: string // the job and task it came from: "job-…/T7"
   job?: string // the job that works on it, once started
+  issue?: string // the GitHub issue it was published as (P7)
   acceptance: { text: string; verify?: string }[]
   checks: string[]
   fitness?: Record<string, unknown> // a contract as the contract tool takes it (src/contract.ts)
@@ -115,6 +119,7 @@ export function renderItem(item: BacklogItem): string {
     `origin: ${item.origin}`,
     ...(item.from ? [`from: ${plain(item.from)}`] : []),
     ...(item.job ? [`job: ${plain(item.job)}`] : []),
+    ...(item.issue ? [`issue: ${plain(item.issue)}`] : []),
     `created: ${item.created}`,
   ]
   if (item.acceptance.length) {
@@ -157,6 +162,7 @@ export function parseItem(text: string, slug: string): { item?: BacklogItem; err
       origin: f.origin === "later" || f.origin === "trial-failed" ? f.origin : "user",
       ...(typeof f.from === "string" ? { from: f.from } : {}),
       ...(typeof f.job === "string" ? { job: f.job } : {}),
+      ...(typeof f.issue === "string" ? { issue: f.issue } : {}),
       acceptance,
       checks,
       ...(fitness ? { fitness } : {}),
@@ -343,4 +349,85 @@ export function backlogTool(project: string, action: string, slug: string, value
 
 function relativeDir(project: string): string {
   return join(stateDir(project), "backlog")
+}
+
+// --- GitHub issues (P7, opt-in per repository) ------------------------------------------------------------------
+
+// Issues labelled micromanager in a repository the user opted in ("githubBacklog" in micromanager.jsonc). The body
+// holds the same front matter and Markdown as a file; an issue without one is read as a draft with its text as goal.
+// Reading is free. Writing happens only in publishIssue, after the user's yes in a form.
+export const ISSUE_LABEL = "micromanager"
+
+// The repository a project's GitHub remote names, as gh sees it; undefined without gh, a remote or a login.
+export async function githubRepo(project: string, run: Exec = exec): Promise<string | undefined> {
+  const r = await run("gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], { cwd: project, timeoutMs: 15_000 })
+  const name = r.stdout.trim().toLowerCase()
+  return r.code === 0 && /^[\w.-]+\/[\w.-]+$/.test(name) ? name : undefined
+}
+
+function issueItem(issue: { number: number; title: string; body?: string; state?: string; url?: string }): BacklogItem {
+  const slug = `gh-${issue.number}`
+  const parsed = issue.body ? parseItem(issue.body, slug).item : undefined
+  const closed = String(issue.state ?? "").toUpperCase() === "CLOSED"
+  if (parsed) return { ...parsed, title: issue.title || parsed.title, ...(closed ? { status: "done" as const } : {}), ...(issue.url ? { issue: issue.url } : {}) }
+  return { slug, title: issue.title, status: closed ? "done" : "draft", order: 100, kind: "build", origin: "user", acceptance: [], checks: [], created: "", body: `## Goal\n${issue.body?.trim() || issue.title}`, ...(issue.url ? { issue: issue.url } : {}) }
+}
+
+export async function githubIssues(project: string, repo: string, run: Exec = exec): Promise<{ items: BacklogItem[]; problem?: string }> {
+  const r = await run("gh", ["issue", "list", "--repo", repo, "--label", ISSUE_LABEL, "--state", "all", "--limit", "200", "--json", "number,title,body,state,url"], { cwd: project, timeoutMs: 30_000 })
+  if (r.code !== 0) return { items: [], problem: `gh could not list the issues of ${repo}: ${r.stderr.trim().slice(0, 200) || `exit ${r.code}`}` }
+  try {
+    return { items: (JSON.parse(r.stdout) as Parameters<typeof issueItem>[0][]).map(issueItem).sort(byTurn) }
+  } catch {
+    return { items: [], problem: `gh answered no issue list for ${repo}` }
+  }
+}
+
+export async function githubIssue(project: string, repo: string, number: number, run: Exec = exec): Promise<BacklogItem | undefined> {
+  const r = await run("gh", ["issue", "view", String(number), "--repo", repo, "--json", "number,title,body,state,url"], { cwd: project, timeoutMs: 30_000 })
+  if (r.code !== 0) return undefined
+  try {
+    return issueItem(JSON.parse(r.stdout) as Parameters<typeof issueItem>[0])
+  } catch {
+    return undefined
+  }
+}
+
+// A local item published as an issue, after the user's yes: the label made if it is missing, the issue created with
+// the item's text as its body, and the item keeps the issue's address.
+export async function publishIssue(project: string, item: BacklogItem, repo: string, run: Exec = exec, backend: BacklogBackend = localBackend): Promise<{ url?: string; problem?: string }> {
+  await run("gh", ["label", "create", ISSUE_LABEL, "--repo", repo, "--color", "5319e7", "--description", "a job for the micromanager", "--force"], { cwd: project, timeoutMs: 30_000 })
+  const scratch = mkdtempSync(join(tmpdir(), "mm-issue-"))
+  try {
+    const body = join(scratch, "body.md")
+    writeFileSync(body, renderItem({ ...item, issue: undefined }))
+    const r = await run("gh", ["issue", "create", "--repo", repo, "--title", item.title, "--label", ISSUE_LABEL, "--body-file", body], { cwd: project, timeoutMs: 60_000 })
+    const url = r.stdout.trim().split("\n").find((l) => /^https:\/\/github\.com\//.test(l))
+    if (r.code !== 0 || !url) return { problem: `gh issue create failed: ${r.stderr.trim().slice(0, 200) || `exit ${r.code}`}` }
+    backend.save(project, { ...item, issue: url })
+    return { url }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
+const PUBLISH = { yes: "Publish it", no: "Keep it local" } as const
+
+// The question before anything goes to GitHub: an issue is published content.
+export function publishForm(item: BacklogItem, repo: string): Question[] {
+  return [{
+    header: `Publish ${item.slug}`.slice(0, 30),
+    question: `Publish backlog item ${item.slug} ("${item.title.slice(0, 100)}") as a GitHub issue in ${repo}, labelled ${ISSUE_LABEL}? Its whole text becomes the issue's body, visible to whoever can see the repository.`,
+    options: [
+      { label: PUBLISH.yes, description: `gh issue create in ${repo}` },
+      { label: PUBLISH.no, description: "Nothing leaves this machine" },
+    ],
+  }]
+}
+
+export function readPublish(header: string, answers: readonly string[]): { slug: string; yes?: boolean } | undefined {
+  const m = header.match(/^Publish (\S+)$/)
+  if (!m) return undefined
+  const a = answers.map((x) => x.trim().toLowerCase())
+  return { slug: m[1]!, ...(a.includes(PUBLISH.yes.toLowerCase()) ? { yes: true } : a.includes(PUBLISH.no.toLowerCase()) ? { yes: false } : {}) }
 }

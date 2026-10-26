@@ -4,7 +4,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 
-import { backlogTool, byTurn, draftFromLater, draftFromTrial, goalOf, localBackend, parseFrontMatter, parseItem, renderItem, slugOf, type BacklogItem } from "../src/backlog.ts"
+import { backlogTool, byTurn, draftFromLater, draftFromTrial, githubIssue, githubIssues, githubRepo, goalOf, localBackend, parseFrontMatter, parseItem, publishForm, publishIssue, readPublish, renderItem, slugOf, type BacklogItem } from "../src/backlog.ts"
+import { parseGithubBacklog } from "../src/config.ts"
+import type { Exec } from "../src/integration.ts"
 import { newJob, stage, type Task } from "../src/state.ts"
 
 const item = (extra: Partial<BacklogItem> = {}): BacklogItem => ({
@@ -87,4 +89,50 @@ test("the backlog tool lists, adds, shows and changes items in the project", () 
   assert.match(backlogTool(project, "show", "docs", ""), /^---\ntitle: Docs\nstatus: done/)
   assert.equal(localBackend.list(project).length, 2)
   assert.match(backlogTool(project, "show", "nope", ""), /no backlog item nope/)
+})
+
+test("GitHub issues of an opted-in repository are read as items; one is published only through the form", async () => {
+  const project = mkdtempSync(join(tmpdir(), "jd-gh-"))
+  const calls: string[][] = []
+  let body = ""
+  const run: Exec = async (command, args) => {
+    calls.push([command, ...args])
+    const a = args.join(" ")
+    if (a.startsWith("repo view")) return { code: 0, stdout: "Owner/Repo\n", stderr: "" }
+    if (a.startsWith("issue list")) {
+      return { code: 0, stderr: "", stdout: JSON.stringify([
+        { number: 7, title: "Faster search", state: "OPEN", url: "https://github.com/owner/repo/issues/7", body: renderItem(item({ slug: "x", title: "old title" })) },
+        { number: 9, title: "Fix login", state: "CLOSED", url: "https://github.com/owner/repo/issues/9", body: "It breaks on Safari." },
+        { number: 3, title: "Docs", state: "OPEN", url: "https://github.com/owner/repo/issues/3", body: "" },
+      ]) }
+    }
+    if (a.startsWith("issue view 7")) return { code: 0, stderr: "", stdout: JSON.stringify({ number: 7, title: "Faster search", state: "OPEN", url: "u7", body: "plain" }) }
+    if (a.startsWith("issue create")) {
+      body = readFileSync(args[args.indexOf("--body-file") + 1]!, "utf8")
+      return { code: 0, stdout: "Creating issue\nhttps://github.com/owner/repo/issues/12\n", stderr: "" }
+    }
+    return { code: 0, stdout: "", stderr: "" }
+  }
+  assert.equal(await githubRepo(project, run), "owner/repo")
+  const listed = await githubIssues(project, "owner/repo", run)
+  assert.deepEqual(listed.items.map((i) => [i.slug, i.status, i.title, i.kind]), [["gh-7", "ready", "Faster search", "optimize"], ["gh-3", "draft", "Docs", "build"], ["gh-9", "done", "Fix login", "build"]])
+  assert.match(listed.items.find((i) => i.slug === "gh-9")!.body, /It breaks on Safari\./)
+  assert.equal((await githubIssue(project, "owner/repo", 7, run))!.issue, "u7")
+  assert.match((await githubIssues(project, "owner/repo", async () => ({ code: 1, stdout: "", stderr: "gh: not logged in" }))).problem!, /not logged in/)
+
+  const local = item({ slug: "faster-search", status: "draft" })
+  localBackend.save(project, local)
+  const form = publishForm(local, "owner/repo")
+  assert.equal(form[0]!.header, "Publish faster-search")
+  assert.deepEqual(readPublish("Publish faster-search", ["Publish it"]), { slug: "faster-search", yes: true })
+  assert.deepEqual(readPublish("Publish faster-search", ["Keep it local"]), { slug: "faster-search", yes: false })
+  assert.deepEqual(readPublish("Publish faster-search", ["maybe"]), { slug: "faster-search" })
+  assert.equal(readPublish("C1 baseline", ["Publish it"]), undefined)
+  calls.length = 0
+  assert.deepEqual(await publishIssue(project, local, "owner/repo", run), { url: "https://github.com/owner/repo/issues/12" })
+  assert.deepEqual(calls.map((c) => c.slice(0, 3)), [["gh", "label", "create"], ["gh", "issue", "create"]])
+  assert.equal(body, renderItem(local))
+  assert.equal(localBackend.get(project, "faster-search")!.issue, "https://github.com/owner/repo/issues/12")
+  assert.equal(parseGithubBacklog('{ "githubBacklog": ["Owner/Repo"] }')[0], "owner/repo")
+  assert.throws(() => parseGithubBacklog('{ "githubBacklog": ["no-slash"] }'), /owner\/name/)
 })
