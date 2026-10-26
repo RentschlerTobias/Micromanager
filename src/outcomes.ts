@@ -8,6 +8,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { dirname, join } from "node:path"
 
+import { contractHash, reward } from "./contract.ts"
 import { journalPath } from "./journal.ts"
 import { family } from "./roles.ts"
 import { tierFor } from "./registry.ts"
@@ -42,6 +43,13 @@ export interface Outcome {
   readonly seconds?: number // from its delegation to its end
   readonly tokens?: number
   readonly cost?: number
+  // A task measured against a fitness contract (src/contract.ts): which version, what it measured last, and the reward,
+  // the primary score's improvement over the baseline (positive is better, 0 for an invalid result). The hash tells
+  // two versions of "better" apart, which a router must not mix.
+  readonly contract?: { readonly id: string; readonly version: number; readonly hash: string }
+  readonly score?: { readonly valid: boolean; readonly values: Readonly<Record<string, number>> }
+  readonly reward?: number
+  readonly graded?: number // the share of cases its checks' own MM_SCORE lines passed, at its last gate
 }
 
 // The class a task is compared in: what a router could know before it starts.
@@ -58,6 +66,8 @@ export function outcomeOf(project: string, job: Job, task: Task, usage?: { token
   const end: Outcome["end"] = task.status === "merged" ? "merged" : task.status === "cancelled" ? (won ? "sibling_won" : "cancelled") : task.status === "blocked" ? "blocked" : "unfinished"
   const started = task.stages.find((s) => s.stage === "delegate")?.at
   const verify = job.acceptance.filter((a) => task.acceptance.includes(a.id)).map((a) => a.verify).filter((v): v is string => Boolean(v))
+  const contract = task.contract && job.contracts?.find((c) => c.id === task.contract!.id)
+  const r = contract && task.score ? reward(contract, task.score) : undefined
   return {
     time: now.toISOString(),
     project,
@@ -74,11 +84,16 @@ export function outcomeOf(project: string, job: Job, task: Task, usage?: { token
     brief: task.description.slice(0, 2000),
     briefHash: createHash("sha256").update(task.description).digest("hex").slice(0, 16),
     gate,
-    fixRounds: Math.max(0, gates.filter((s) => s.result === "fail").length),
+    // A failed fitness measurement is a fix round as much as a failing check (src/native.ts finish).
+    fixRounds: task.stages.filter((s) => (s.stage === "gate" || s.stage === "fitness") && s.result === "fail").length,
     merged: task.status === "merged",
     end,
     ...(started ? { seconds: Math.round((now.getTime() - Date.parse(started)) / 1000) } : {}),
     ...(usage ? { tokens: usage.tokens, cost: usage.cost } : {}),
+    ...(contract ? { contract: { id: contract.id, version: task.contract!.version, hash: contractHash(contract) } } : {}),
+    ...(task.score ? { score: { valid: task.score.valid, values: task.score.values } } : {}),
+    ...(r !== undefined ? { reward: r } : {}),
+    ...(task.graded ? { graded: Math.round((task.graded.passed / task.graded.total) * 1000) / 1000 } : {}),
   }
 }
 
@@ -150,6 +165,7 @@ export function routerRows(rows: readonly Outcome[]): Record<string, unknown>[] 
         tokens: t.attempts.reduce((s, a) => s + (a.tokens ?? 0), 0),
         cost: Math.round(t.attempts.reduce((s, a) => s + (a.cost ?? 0), 0) * 1e6) / 1e6,
         seconds: Math.max(0, ...t.attempts.map((a) => a.seconds ?? 0)),
+        ...(t.attempts.some((a) => a.reward !== undefined) ? { reward: Math.max(...t.attempts.map((a) => a.reward ?? 0)) } : {}),
       },
     }
   })

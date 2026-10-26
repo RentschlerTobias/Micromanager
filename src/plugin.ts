@@ -11,7 +11,7 @@ import { cloudRegistry, configPath, loadPicks, loadSettings } from "./config.ts"
 import { allowedOutside, decide, forbiddenOutside, forbiddenOutsideWhat, inJobArea, normalizeOutside, taskNamesPath, ALLOW_OUTSIDE_REASON, GRANT_OUTSIDE_REASON, REFUSED_OUTSIDE_REASON, type PermissionRequest } from "./decide.ts"
 import { injected, injectionScore } from "./gate.ts"
 import { backstop, DELEGATION_TOOLS, delegationRole, notRouted, resultText, rewriteResult, routeDelegation, unownedDelegation, type ChildSession, type ToolCall } from "./hooks.ts"
-import { Jev, apiKey, redact } from "./jev.ts"
+import { Jev, apiKey, redact, type Question as JevQuestion } from "./jev.ts"
 import { record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
@@ -40,7 +40,7 @@ import { addGrant, isStarted, lastOptions, loadControl, optionsOf, saveLastOptio
 import { badName, GRANT_FLOOR, grantNote, harmlessQuestion, grantResult, GrantRequests, grantState, triage, type GrantKind } from "./grants.ts"
 import { accessForm, answersOf, formInput, gitForm, readForm, type Question } from "./forms.ts"
 import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
-import { CLASSIFY, NOUL_FLOOR } from "./catalog.ts"
+import { CLASSIFY, NOUL_FLOOR, OPEN_ENDED, OPEN_ENDED_FLOOR } from "./catalog.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
@@ -802,13 +802,19 @@ export default {
       const task = planned
         ? { id: planned.id, title: planned.title, description: `${planned.description}${d.body ? `\n${d.body}` : ""}`, files: planned.files, plannerRole: planned.role }
         : { title: d.body.split("\n")[0]!.slice(0, 120), description: d.body, files: d.files.split(",").map((f) => f.trim()).filter(Boolean), plannerRole: role }
-      const asked = await decider.ask("N5", { task, checks: d.checks }, { difficulty: CLASSIFY.difficulty! }, {}).catch(() => undefined)
+      // One ask, two questions: whether it needs a fitness contract (src/contract.ts) costs no extra request. A
+      // delegation that names its contract already is not asked.
+      const named = d.contract ?? (planned ? planned.contract?.id : undefined)
+      const questions: Record<string, JevQuestion> = named ? { difficulty: CLASSIFY.difficulty! } : { difficulty: CLASSIFY.difficulty!, open_ended: OPEN_ENDED }
+      const asked = await decider.ask("N5", { task, checks: d.checks }, questions, {}).catch(() => undefined)
       const answer = asked?.decision.answers.difficulty
       const difficulty = answer?.type === "score" ? Math.max(0, Math.min(4, answer.score)) / 4 : undefined
+      const open = asked?.decision.answers.open_ended
+      const openEnded = open?.type === "noul" && open.noul >= OPEN_ENDED_FLOOR
       const learned = needsTrials(readOutcomes(), classOf(role, difficulty, task.files.length))
       const n = trialSize({ difficulty, retry, learned, setting: trials, parallel })
-      record({ kind: "assess", sessionID, role, difficulty, retry, learned, trials: n, decision: asked?.id })
-      return { difficulty, trials: n }
+      record({ kind: "assess", sessionID, role, difficulty, retry, learned, trials: n, openEnded, decision: asked?.id })
+      return { difficulty, trials: n, ...(openEnded ? { openEnded } : {}) }
     }
     const registry = cloudOnly ? cloudRegistry(settings.registry) : settings.registry
     if (error) log("warn", `config ignored, defaults used: ${error}`)
@@ -1924,6 +1930,12 @@ export default {
                 : `No open todos in job ${r.job.id}.`,
               native.startNote(project, r.job) ?? "",
             ].filter(Boolean).join("\n")
+          },
+          contract: async (id, json, tctx) => {
+            if (!tctx.sessionID) return "contract needs a session."
+            const text = await native.contract(project, tctx.sessionID, id.trim(), json)
+            record({ kind: "contract", sessionID: tctx.sessionID, job: id.trim() || undefined, text: text.slice(0, 300) })
+            return text
           },
           rewind: async (id, to, ack, tctx) => {
             const found = id.trim() ? loadSwept(id.trim()) : listSwept().find((j) => j.facilitator === tctx.sessionID) ?? listSwept()[0]

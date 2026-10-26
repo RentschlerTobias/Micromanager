@@ -18,6 +18,8 @@ import type { Job, Task } from "./state.ts"
 export interface Assessment {
   readonly difficulty?: number // 0..1; undefined when no estimate could be made
   readonly trials: number // 1: no trial
+  // The task asks to improve a measurable property with no fixed end state: it needs a fitness contract to start.
+  readonly openEnded?: boolean
 }
 
 // The difficulty from which a task runs as a trial: N5's "hard" and "very hard" (tierFor's deep tier).

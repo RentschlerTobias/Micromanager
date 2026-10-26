@@ -1016,6 +1016,46 @@ model sees? The alternative, plugin-made sessions, was ruled out by the user. Th
    with an edit before each. A repeated call now counts only since the last write; a write repeated with the same
    input still counts over the whole window.
 
+## 25. Fitness contracts and the backlog (2026-10-26)
+
+A build task is done when its checks pass. A task with no fixed end ("make the search faster") is never done that
+way: it needs a number with a direction, a baseline, and guards against raising the number without improving the
+goal. The contract settles that before money is spent, the same way for every domain and every search method (one
+worker, a trial, later lanes and an evolver). The plan has seven phases: P1 the contract core, P2 frozen tests on the
+native path, P6 the local backlog, P3 `request_check_change`, P4 best-score trials with a held-out corpus, P5 the
+contract round (draft, user form, red team, baseline, freeze), P7 GitHub issues as an opt-in backend.
+
+**P1: the contract core (implemented).**
+- **The contract (src/contract.ts)** lives on the job (`job.contracts`, ids `C1`, `C2`, …) and in
+  `.micromanager/contracts/<job>/<id>.json`; a task references `{id, version}`. It holds the goal, the evaluator, the
+  scores with direction and noise band, the guards with a tolerance relative to the baseline, the visible corpus,
+  `repeats`, a timeout, the stop rule (`evaluations`, `seconds`), the baseline, what it used, and its history.
+- **The evaluator protocol.** One shell command that prints `MM_SCORE {"valid":…,"scores":{…},"cases":{…},
+  "category":…}`; the last such line counts. A non-zero exit, a timeout, no line, `"valid":false` or a missing score
+  make the result invalid (the hard constraints), which loses to any valid one. A prefixed line rather than bare
+  JSON, because test runners print JSON too. The evaluator gets `MM_CORPUS` (visible or heldout) and `MM_REPEAT`; P4
+  adds `MM_CORPUS_DIR`.
+- **Comparing.** Lexicographic: the first score decides unless two values lie inside its noise band, then the next
+  one does. Repeated runs count by their median, and one invalid run makes the measurement invalid.
+- **The gate (src/native.ts finish).** The evaluator runs only after the checks pass, in the worker's directory. An
+  invalid result or a broken guard is a fix round like a failing check (stage `fitness`); a used-up stop rule blocks
+  the worker at once. After a rebase onto newer commits it is measured again. The worker's brief names the contract,
+  its scores with today's values, and its guards.
+- **Refusal.** N5's ask at a writer delegation carries a second question, `open_ended` (floor 0.8, high on purpose: a
+  build task refused costs a turn, an optimization let through only lacks the measurement). An open-ended writer
+  without `Contract:` is refused like a writer without checks; so is a contract the job does not have, or one
+  without a baseline.
+- **The contract tool** stores a contract or a new version of one, and measures the baseline on the job branch at
+  once (`costPerEval` too). An evaluator that gives no valid result there leaves the contract without a baseline.
+- **The outcome log** keeps the contract's id, version and hash, the last score, and the reward: the first score's
+  improvement over the baseline, signed so that better is positive, 0 for an invalid result. `routerRows` carries the
+  best reward of a task's attempts. An ordinary check may print `MM_SCORE {"cases":…}` as well, which grades a build
+  task (`graded`) without deciding it. Evaluator runs are counted on the job (`counters.evals`, `evalSeconds`).
+- **Not yet:** the contract round (P5) and its freeze; until then a contract is a draft the micromanager writes, and
+  it should show the baseline to the user before writers start.
+- **Known weak spot:** a task's checks are kept as one `verify` string joined with `" && "` and split again after a
+  restart, so a check that contains `&&` itself comes back as two. The evaluator is kept out of that path.
+
 ## Sources
 - **Orchestration:**
   - Magentic-One ledgers (github.com/microsoft/autogen, `_magentic_one`)

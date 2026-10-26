@@ -163,6 +163,7 @@ Jev and the plugin securing every task:
    | `rewind_job` | list the job's checkpoints, or move its branch back to one with your words; undone the same way |
    | `undo_merge` | take back the last `merge_job` in your checkout, while it is still where that merge left it |
    | `stop_job` | stop the whole job; `run_job` resumes it |
+   | `contract` | define what "better" means for a task with no fixed end; the baseline is measured at once |
 
 6. **Checkpoints and rewind.** Every merged task is a commit `Tn: title` on `jev/<job>`, and the job remembers where
    the branch started, so the branch is a row of checkpoints: `start`, then the state after each task. `rewind_job`
@@ -183,7 +184,20 @@ Jev and the plugin securing every task:
    **merge** (`merge_job`), **discard** (`discard_job`), or **new** (leave it as it is and start a fresh job; nothing is
    deleted, and the next session asks again). Nothing happens before you answer.
 
-7. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
+7. **Fitness contracts.** A task that asks to make something better with no fixed end (faster, smaller, more
+   reliable) is refused until it has a fitness contract: Jev's N5 ask, which estimates the difficulty anyway, also
+   asks whether the task is open-ended. The micromanager defines the contract with the `contract` tool: the goal, an
+   evaluator command that prints one line `MM_SCORE {"scores":{"p50_ms":12.3}}`, the scores with a direction (the
+   first decides, the next break ties inside a noise band), guards that may not get worse than today, the corpus,
+   repeats (the median counts) and a stop rule (`evaluations`, `seconds`). The plugin measures the baseline on the job
+   branch at once and keeps the contract in the job and in `.micromanager/contracts/<job>/C1.json`. A writer started
+   with a line `Contract: C1` (or `"contract"` in its todo) is measured after its checks pass: an invalid result (a
+   non-zero exit, a timeout, no `MM_SCORE` line, a missing score) or a broken guard is a fix round like a failing
+   check, and after a rebase it is measured again. Its score, the contract's version and the reward (the first
+   score's improvement over the baseline) go into the outcome log. Any ordinary check may print
+   `MM_SCORE {"cases":{"passed":7,"total":8}}` too; that grades a build task in the outcome log without deciding it.
+
+8. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
    after a planning session with you. You approve it, and `run_job` runs it.
 
 Jobs and task notes live in `.jev-micromanager/`, kept out of git through the repository's `.git/info/exclude` — found

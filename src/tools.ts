@@ -21,6 +21,8 @@ export const TOOL_IDS = [
   "take_over_job",
   // The micromanager's todo list, kept in its job (src/native.ts todo).
   "todo",
+  // What "better" means for a task with no fixed end (src/contract.ts).
+  "contract",
 ] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
@@ -51,6 +53,7 @@ export interface Handlers {
   undoMerge(job: string, ack: string, ctx: ToolContext): Promise<string>
   takeOver(job: string, ctx: ToolContext): Promise<string>
   todo(items: string, ctx: ToolContext): Promise<string>
+  contract(job: string, json: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -172,6 +175,13 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     description: "Your todo list, kept in your job so it is never lost: write down the tasks you mean to start before you start them, and start each later with the subagent tool and the prompt line \"Task: T… · job-…\" (plus anything to add below it); the plugin fills in its brief, files and checks. items: a JSON list of {\"title\", \"agent\" (a role agent, coder if left out), \"files\" (what a writer may change, comma separated), \"checks\" (shell commands, one per line), \"after\" ([task ids it waits for, e.g. [\"T1\", \"T2\"]]), \"brief\" (what the worker needs to know), \"replaces\" ([ids of failed or stopped tasks it does over, e.g. [\"T19\"], or [\"job-…/T18\"] for one of an older job])}; an entry {\"drop\": [\"T5\"]} removes open todos that are not needed any more. Empty: it only shows the list. When a worker ends, a note names the todos that can start.",
     input: input("items"),
     execute: guarded(([items], ctx) => handlers.todo(items!, ctx), "items"),
+  })
+  draft.add({
+    id: "contract",
+    name: "contract",
+    description: "Define what \"better\" means before a writer works on a task with no fixed end (make X faster, smaller, more reliable): such a writer is refused without one. json: {\"goal\": what the work is for, in words; \"evaluator\": a shell command that prints one line MM_SCORE {\"scores\": {\"<name>\": <number>, …}} (exit 0; anything else counts as an invalid result); \"scores\": [{\"name\", \"direction\": \"min\"|\"max\", \"noise\": 0.05}] (the first decides, the next break ties inside its noise band); \"guards\": [{\"name\", \"direction\", \"tolerance\": 0.2}] (measured values that may not get worse than today by more than that share: they close the ways to raise a score without improving the goal); \"corpus\": {\"visible\": [paths it measures on]}; \"repeats\": runs per measurement, the median counts (3 for timings); \"timeoutSeconds\"; \"stop\": {\"evaluations\": n, \"seconds\": s}}. With \"id\": \"C1\" it changes that contract (a new version). The plugin measures the baseline on the job's branch now and answers with it; a writer is then measured with a line \"Contract: C1\" in its prompt (or \"contract\" in its todo). job: empty for this session's job.",
+    input: input("job", "json"),
+    execute: guarded(([job, json], ctx) => handlers.contract(job!, json!, ctx), "job", "json"),
   })
   draft.add({
     id: "undo_merge",

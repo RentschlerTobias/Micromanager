@@ -112,6 +112,14 @@ export function listJobs(project: string): Job[] {
   return jobs.sort((a, b) => String(b.created ?? "").localeCompare(String(a.created ?? "")))
 }
 
+// A job's fitness contract, next to the job and readable on its own (src/contract.ts): what "better" means is a
+// decision worth reviewing, and its versions are the history of that decision.
+export function saveContract(project: string, jobId: string, contract: { id: string; version: number }): string {
+  const path = join(project, stateDir(project), "contracts", jobId, `${contract.id}.json`)
+  atomicWrite(path, JSON.stringify(contract, null, 2) + "\n")
+  return path
+}
+
 export function saveNote(project: string, jobId: string, taskId: string, text: string): string {
   const path = join(notesDir(project, jobId), `${taskId}.md`)
   atomicWrite(path, text)

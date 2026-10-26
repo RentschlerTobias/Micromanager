@@ -183,7 +183,9 @@ export interface Job {
     requestsMax?: number // provider turns over every session of the job
     costMax?: number // in the providers' currency, when they report a cost
   }
-  counters: { turns: number; stalls: number; replans: number; tokens?: number; requests?: number; cost?: number }
+  // evals: evaluator runs of the job's fitness contracts (src/contract.ts), and the seconds they took: an evaluator is
+  // a command, not a session, so its cost shows here and not in tokens.
+  counters: { turns: number; stalls: number; replans: number; tokens?: number; requests?: number; cost?: number; evals?: number; evalSeconds?: number }
   lessons: string[]
   later?: Later[] // follow-ups that did not become tasks
   rolling?: boolean // a micromanager session's job: the orchestrator delegates tasks into it while it runs (omo-hybrid)

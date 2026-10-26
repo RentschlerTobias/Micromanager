@@ -5,6 +5,7 @@
 import { execFile } from "node:child_process"
 import { join, relative, resolve, sep } from "node:path"
 
+import { measuredOf, median, parseScoreLines, type Contract, type Measured } from "./contract.ts"
 import { stateDir } from "./store.ts"
 import type { Job, Task } from "./state.ts"
 
@@ -31,13 +32,15 @@ export interface Run {
   readonly timedOut?: boolean
 }
 
-export type Exec = (command: string, args: readonly string[], options: { cwd: string; timeoutMs?: number }) => Promise<Run>
+// env: added to the plugin's own environment, for an evaluator told which corpus to measure on.
+export type Exec = (command: string, args: readonly string[], options: { cwd: string; timeoutMs?: number; env?: Readonly<Record<string, string>> }) => Promise<Run>
 
 // Never throws: a failing command is a result. Gates run with a low priority, so a test suite does not take the
 // whole machine.
 export const exec: Exec = (command, args, options) =>
   new Promise((resolve) => {
-    execFile(command, [...args], { cwd: options.cwd, timeout: options.timeoutMs ?? 120_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const env = options.env ? { ...process.env, ...options.env } : undefined
+    execFile(command, [...args], { cwd: options.cwd, timeout: options.timeoutMs ?? 120_000, maxBuffer: 8 * 1024 * 1024, ...(env ? { env } : {}) }, (err, stdout, stderr) => {
       const e = err as (NodeJS.ErrnoException & { killed?: boolean; code?: number | string }) | null
       resolve({
         code: e ? (typeof e.code === "number" ? e.code : 1) : 0,
@@ -140,6 +143,9 @@ export interface GateResult {
   readonly passed: boolean
   readonly code: number
   readonly output: string // the tail, enough for the worker to fix it
+  // The check's own MM_SCORE line (src/contract.ts), read before the output is cut: an ordinary check may say how many
+  // of its cases passed, which grades a build task without deciding it; pass or fail is still its exit code.
+  readonly score?: Measured
 }
 
 // Runs each check in the task's directory at low priority; a check passes on exit code 0.
@@ -162,9 +168,31 @@ export async function runGate(worktree: string, commands: readonly string[], run
     }
     const r = await run("nice", ["-n", "15", "sh", "-c", command], { cwd, timeoutMs })
     const text = `${r.stdout}\n${r.stderr}`.trim()
-    out.push({ command, passed: r.code === 0 && !r.timedOut, code: r.code, output: (r.timedOut ? "[timed out]\n" : "") + text.slice(-3000) })
+    const score = parseScoreLines(r.stdout)
+    out.push({ command, passed: r.code === 0 && !r.timedOut, code: r.code, output: (r.timedOut ? "[timed out]\n" : "") + text.slice(-3000), ...(score ? { score } : {}) })
   }
   return out
+}
+
+// The cases the checks' MM_SCORE lines counted together; undefined when none of them graded anything.
+export function gradedOf(results: readonly GateResult[]): { passed: number; total: number } | undefined {
+  const cases = results.map((r) => r.score?.cases).filter((c): c is NonNullable<typeof c> => Boolean(c))
+  return cases.length ? { passed: cases.reduce((s, c) => s + c.passed, 0), total: cases.reduce((s, c) => s + c.total, 0) } : undefined
+}
+
+// A contract's evaluator in the worker's directory, repeated as the contract says; the median of the runs is the
+// measurement, and seconds what all runs took (the contract's cost per evaluation, for its stop rule). The evaluator
+// is told which corpus it measures on; the held-out corpus (P4) comes with its directory.
+export async function runEvaluator(dir: string, contract: Contract, corpus: "visible" | "heldout" = "visible", run: Exec = exec, corpusDir?: string): Promise<{ measured: Measured; seconds: number }> {
+  const started = Date.now()
+  const runs: Measured[] = []
+  for (let i = 0; i < contract.repeats; i++) {
+    const env = { MM_CORPUS: corpus, MM_REPEAT: String(i + 1), ...(corpusDir ? { MM_CORPUS_DIR: corpusDir } : {}) }
+    const m = measuredOf(contract, await run("nice", ["-n", "15", "sh", "-c", contract.evaluator], { cwd: dir, timeoutMs: contract.timeoutMs, env }))
+    runs.push(m)
+    if (!m.valid) break // one invalid run makes the measurement invalid; the others would only cost time
+  }
+  return { measured: median(runs), seconds: Math.round((Date.now() - started) / 100) / 10 }
 }
 
 // The worker's change against the last commit, new files included, for a reviewer that has no git.

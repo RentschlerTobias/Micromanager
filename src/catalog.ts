@@ -67,6 +67,15 @@ export const ANSWER: Record<string, Question> = {
 export const NOUL_FLOOR = 0.5
 export const CHOICE_FLOOR = 0.6
 
+// Asked with N5's difficulty at a writer delegation (src/plugin.ts assessDelegation): a task that asks to make
+// something better with no fixed end needs a fitness contract (src/contract.ts). Its floor is high on purpose: a
+// build task refused as open-ended costs the user a turn, an optimization let through only lacks the measurement.
+export const OPEN_ENDED: Question = {
+  type: "noul",
+  instructions: "The task asks to improve a measurable property (speed, size, memory, accuracy, reliability) with no fixed end state, rather than to build, fix or change something specific.",
+}
+export const OPEN_ENDED_FLOOR = 0.8
+
 // N2b: which open question to ask next; the criteria are built per turn from the frontier.
 export function nextQuestionChoice(options: Record<string, string>): Question {
   return {

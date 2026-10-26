@@ -763,3 +763,74 @@ test("a trial needs Parallel and a worktree per attempt; without them the task r
   assert.equal(d.task.difficulty, 0.9, "the estimate is kept for the outcome log")
   assert.equal(native.trialNote(project, d.job.id, d.task.id), undefined)
 })
+
+test("a fitness contract: its baseline is measured, a writer is measured against it, and a broken guard is a fix round", async () => {
+  const project = repo()
+  // The evaluator reads two numbers the worker changes: ms is the score (lower is better), hits a guard.
+  writeFileSync(join(project, "bench.sh"), 'echo "MM_SCORE {\\"scores\\":{\\"ms\\":$(cat ms.txt),\\"hits\\":$(cat hits.txt)}}"\n')
+  writeFileSync(join(project, "ms.txt"), "100\n")
+  writeFileSync(join(project, "hits.txt"), "10\n")
+  git(project, "add", "-A")
+  git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "bench")
+  const native = new Native()
+  const json = JSON.stringify({ goal: "faster", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], guards: [{ name: "hits", direction: "max", tolerance: 0 }] })
+  const stored = await native.contract(project, "ses_mm", "", json)
+  assert.match(stored, /^Contract C1 \(version 1, draft\) is stored for job job-\S+\. Baseline on [0-9a-f]+: ms 100 \([\d.]+s per run\)\. Start the writers it measures with a line "Contract: C1"/)
+  const job = native.job(project, "ses_mm")
+  assert.ok(existsSync(join(project, ".micromanager", "contracts", job.id, "C1.json")))
+  assert.deepEqual(job.contracts![0]!.baseline!.values, { ms: 100, hits: 10 })
+  assert.equal(job.counters.evals, 1)
+
+  const ask = (prompt: string, assess?: { trials: number; openEnded?: boolean }) => native.delegate(project, "ses_mm", { agent: "coder", description: "speed", prompt }, MODEL, assess)
+  await assert.rejects(ask("Make it faster.\nFiles: ms.txt\nChecks: test -f ms.txt", { trials: 1, openEnded: true }), /needs a fitness contract/)
+  await assert.rejects(ask("Make it faster.\nContract: C9\nFiles: ms.txt\nChecks: test -f ms.txt"), /has no contract C9/)
+  await assert.rejects(native.delegate(project, "ses_mm", { agent: "explorer", description: "look", prompt: "How fast is it?\nContract: C1" }, MODEL), /leave out the Contract line for a reader/)
+
+  const d = await ask("Make it faster.\nContract: C1\nFiles: ms.txt, hits.txt\nChecks: test -s ms.txt", { trials: 1, openEnded: true })
+  assert.deepEqual(d.task.contract, { id: "C1", version: 1 })
+  assert.match(d.prompt, /measured against fitness contract C1 \(version 1\): faster/)
+  const w = native.claim("ses_w1", child(d.prompt))!
+  writeFileSync(join(w.dir, "ms.txt"), "80\n")
+  writeFileSync(join(w.dir, "hits.txt"), "8\n")
+  const red = await native.finish("ses_w1", "cached the hits away")
+  assert.match(red.text, /Your checks pass, but the fitness contract does not hold \(fix round 1 of 2\)/)
+  assert.match(red.text, /guard broken: hits is 8, worse than the baseline 10/)
+  writeFileSync(join(w.dir, "hits.txt"), "10\n")
+  const green = await native.finish("ses_w1", "faster, same hits")
+  assert.match(green.text, /^Merged into .*; checks passed: test -s ms\.txt; measured: ms 80 \(baseline 100\)\./)
+  const saved = loadJob(project, job.id)!
+  const task = saved.tasks.find((t) => t.id === d.task.id)!
+  assert.deepEqual(task.score!.values, { ms: 80, hits: 10 })
+  assert.deepEqual(task.stages.map((s) => `${s.stage}:${s.result}`), ["delegate:pass", "gate:pass", "fitness:fail", "gate:pass", "fitness:pass", "merge:pass"])
+  assert.equal(saved.counters.evals, 3)
+
+  // A new version is measured again; an evaluator that gives nothing valid leaves the contract without a baseline, and
+  // no writer is measured against it.
+  const broken = await native.contract(project, "ses_mm", "", JSON.stringify({ id: "C1", goal: "faster", evaluator: "sh missing.sh", scores: [{ name: "ms", direction: "min" }] }))
+  assert.match(broken, /Contract C1 \(version 2\) is stored .* gave no valid result on today's code \(the evaluator exited \d+/)
+  await assert.rejects(ask("Make it faster still.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt"), /contract C1 has no baseline/)
+
+  // The stop rule: an evaluation budget that is used up blocks the worker at once instead of handing back fix rounds.
+  assert.match(await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "smaller", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], stop: { evaluations: 1 } })), /^Contract C2/)
+  const e = await ask("Make it smaller.\nContract: C2\nFiles: ms.txt\nChecks: test -s ms.txt")
+  const ew = native.claim("ses_w2", child(e.prompt))!
+  writeFileSync(join(ew.dir, "ms.txt"), "70\n")
+  const spent = await native.finish("ses_w2", "smaller")
+  assert.match(spent.text, /still fail after 2 rounds/)
+  assert.match(spent.text, /contract C2 allows 1 evaluations, and they are used up/)
+  assert.equal(loadJob(project, job.id)!.tasks.find((t) => t.id === e.task.id)!.status, "blocked")
+})
+
+test("a todo names its contract; one the job does not have is not taken", async () => {
+  const project = repo()
+  writeFileSync(join(project, "bench.sh"), 'echo "MM_SCORE {\\"scores\\":{\\"ms\\":5}}"\n')
+  git(project, "add", "-A")
+  git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "bench")
+  const native = new Native()
+  await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "g", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }] }))
+  const parsed = parseTodo(JSON.stringify([{ title: "faster", files: "a.js", checks: "test -f a.js", contract: "c1" }, { title: "other", files: "b.js", checks: "test -f b.js", contract: "C7" }]))
+  assert.ok(typeof parsed !== "string")
+  const r = native.todo(project, "ses_mm", parsed.list, parsed.ids)
+  assert.deepEqual(r.added.map((t) => t.contract), [{ id: "C1", version: 1 }])
+  assert.match(r.errors.join(), /other: job \S+ has no contract C7/)
+})

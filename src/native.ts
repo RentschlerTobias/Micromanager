@@ -15,8 +15,9 @@
 
 import { Graphs, graphBrief, queryGraph, type Graph } from "./graph.ts"
 import { HEADER } from "./hooks.ts"
+import { contractBrief, describe, guardViolations, parseContract, type Contract } from "./contract.ts"
 import {
-  changedFiles, commitTask, exec as defaultExec, fastForward, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, repoRel, runGate, taskDir,
+  changedFiles, commitTask, exec as defaultExec, fastForward, gradedOf, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, repoRel, runEvaluator, runGate, taskDir,
   type Exec, type GateResult,
 } from "./integration.ts"
 import { addDelegated, checkSetProblems, parseFiles } from "./plan.ts"
@@ -24,7 +25,7 @@ import { WRITERS } from "./profile.ts"
 import { FIX_ROUNDS } from "./watchdog.ts"
 import { ROLES, roleByAgent, roleById, type Role, type RoleId } from "./roles.ts"
 import { isDone, moveTask, newJob, moveJob, stage, type Job, type Task } from "./state.ts"
-import { excludeFromGit, jobId, listJobs, saveJob } from "./store.ts"
+import { excludeFromGit, jobId, listJobs, saveContract, saveJob } from "./store.ts"
 import { sharedNote, skillLine, taskAcceptance } from "./brief.ts"
 import { settled, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
@@ -44,6 +45,7 @@ export interface Delegation {
   readonly replaces: string[] // tasks this one deliberately starts over ("Replaces: T5")
   readonly planned?: { readonly task: string; readonly job: string } // a planned task to start ("Task: T5 · job-…")
   readonly attempt?: { readonly task: string; readonly job: string } // another attempt of a trial ("Attempt: T5 · job-…")
+  readonly contract?: string // the fitness contract its work is measured against ("Contract: C1", src/contract.ts)
 }
 
 // The "Files:" and "Checks:" lines of a delegation, wherever they stand; the checks go on over the following lines
@@ -55,8 +57,15 @@ export function parseDelegation(prompt: string): Delegation {
   let files = ""
   let planned: Delegation["planned"]
   let attempt: Delegation["attempt"]
+  let contract: string | undefined
   let inChecks = false
   for (const line of prompt.split("\n")) {
+    const k = line.match(/^\s*contract:\s*(C\d+)\s*$/i)
+    if (k) {
+      contract = k[1]!.toUpperCase()
+      inChecks = false
+      continue
+    }
     // The line the plugin hands out for a trial's other attempts (src/trials.ts attemptLine).
     const a = line.match(/^\s*attempt:\s*(T\d+(?:\.\w+)*)\s*·\s*(job-[\w-]+)\s*$/i)
     if (a) {
@@ -89,7 +98,7 @@ export function parseDelegation(prompt: string): Delegation {
       body.push(line)
     }
   }
-  return { body: body.join("\n").trim(), files, checks, replaces, ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}) }
+  return { body: body.join("\n").trim(), files, checks, replaces, ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}), ...(contract ? { contract } : {}) }
 }
 
 // How much two task texts are about the same thing: the share of their words they have in common (Jaccard over the
@@ -125,6 +134,7 @@ interface Entry {
   removed?: boolean // the writer's worktree was removed after its merge
   session?: string // the child session, once claimed
   checks: string[]
+  contract?: string // the fitness contract its work is measured against, by id
   graph?: boolean // an explorer with a code graph of its directory (the code_graph tool)
   ended?: boolean // its session ended; a writer that did not merge stays "running" until it is continued or swept
 }
@@ -154,6 +164,7 @@ export interface TodoItem {
   readonly after?: readonly string[] // task ids it waits for
   readonly brief?: string // what the worker needs to know beyond the title
   readonly replaces?: readonly string[] // tasks it does over: "T19", or "job-…/T18" in another job of the session
+  readonly contract?: string // the fitness contract it is measured against: "C1"
 }
 
 // Task ids in whatever a model wrote: ["T1", "T2"], "T1, T2", or "after T1 and T2 merged" (live run: the last one made
@@ -195,6 +206,7 @@ export function parseTodo(items: string): { list: TodoItem[]; ids: string[] } | 
       after: taskIds(o.after),
       brief: text(o.brief, "\n"),
       replaces: replaceIds(o.replaces),
+      ...(typeof o.contract === "string" && /^c\d+$/i.test(o.contract.trim()) ? { contract: o.contract.trim().toUpperCase() } : {}),
     })
   }
   return { list, ids }
@@ -304,6 +316,7 @@ export class Native {
           removed: writer && !task.worktree,
           session: task.session,
           checks: verify.flatMap((v) => v.split(" && ")).map((c) => c.trim()).filter(Boolean),
+          ...(task.contract ? { contract: task.contract.id } : {}),
           ended: true,
         }
         this.#entries.set(k, entry)
@@ -380,6 +393,7 @@ export class Native {
     if (!d.body) throw new DelegationError("Not started: the prompt has no task.")
 
     const job = this.job(project, parent)
+    this.#contractFor(job, writer, d.contract, assess)
     await this.#replace(project, job, d.replaces)
     const duplicate = this.#duplicate(job, role, input.description.trim(), d.body, parsed.files, d.replaces)
     if (duplicate) throw new DelegationError(duplicate)
@@ -387,6 +401,7 @@ export class Native {
     const added = addDelegated(job, { title: input.description.trim() || d.body.split("\n")[0]!, prompt: d.body, files: parsed.files, dependsOn: [], checks: d.checks })
     if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
     const task = added.task
+    this.#bind(job, task, d.contract)
     this.#link(project, job, task, d.replaces)
     task.role = role.id
     task.model = model
@@ -394,6 +409,92 @@ export class Native {
     for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
     stage(task, "delegate", "pass", `${role.agent} on ${model}`)
     return this.#start(project, parent, job, task, role, model, d, d.checks, rel)
+  }
+
+  // The contract a writer is measured against, checked before anything of the task exists: one that the job has, with
+  // a baseline to compare with. An open-ended task (N5's open_ended, src/trials.ts Assessment) without one is refused,
+  // as a writer without checks is: nothing could tell a better result from a worse one.
+  #contractFor(job: Job, writer: boolean, id: string | undefined, assess?: Assessment): Contract | undefined {
+    if (!writer) {
+      if (id) throw new DelegationError("Not started: a fitness contract measures a writer's work; leave out the Contract line for a reader.")
+      return undefined
+    }
+    if (!id) {
+      if (assess?.openEnded) throw new DelegationError('Not started: this task asks to make something better with no fixed end, so it needs a fitness contract that says what "better" means. Define one with the contract tool (goal, an evaluator that prints MM_SCORE, scores with a direction, guards), then delegate again with a line "Contract: C…".')
+      return undefined
+    }
+    const c = job.contracts?.find((x) => x.id === id)
+    if (!c) throw new DelegationError(`Not started: job ${job.id} has no contract ${id}; define it with the contract tool first.`)
+    if (!c.baseline) throw new DelegationError(`Not started: contract ${id} has no baseline, because its evaluator did not give a valid result on today's code; fix the contract with the contract tool first.`)
+    return c
+  }
+
+  // The task is measured against this version of the contract from now on.
+  #bind(job: Job, task: Task, id: string | undefined): void {
+    const c = id ? job.contracts?.find((x) => x.id === id) : undefined
+    if (c) task.contract = { id: c.id, version: c.version }
+  }
+
+  // The contract tool: a contract for the job (the session's own when jobId is empty), new or as a new version of the
+  // one with its id, with its baseline measured on the job's branch as it is now. Returns the answer to the micromanager.
+  async contract(project: string, parent: string, jobId: string, json: string): Promise<string> {
+    const job = jobId ? this.#jobs.get(key(project, jobId)) ?? listJobs(project).find((j) => j.id === jobId) : this.job(project, parent)
+    if (!job) return `There is no job ${jobId} in this project. Nothing was stored.`
+    const parsed = parseContract(json)
+    if (!parsed.contract) return `Not stored: ${parsed.errors.join("; ")}.`
+    const wanted = String((JSON.parse(json) as { id?: unknown }).id ?? "").toUpperCase()
+    const old = wanted ? job.contracts?.find((c) => c.id === wanted) : undefined
+    if (wanted && !old) return `Not stored: job ${job.id} has no contract ${wanted} to change; leave out the id for a new one.`
+    if (old?.status === "frozen") return `Not stored: contract ${old.id} is frozen; only the user changes it.`
+    const at = new Date().toISOString()
+    const n = Math.max(0, ...(job.contracts ?? []).map((c) => Number(c.id.slice(1)))) + 1
+    const c: Contract = old
+      ? { ...old, ...parsed.contract, version: old.version + 1, baseline: undefined, history: [...old.history, { version: old.version + 1, change: "changed with the contract tool", at }] }
+      : { id: `C${n}`, version: 1, status: "draft", ...parsed.contract, history: [{ version: 1, change: "defined with the contract tool", at }] }
+    // The baseline is today's code on the job's branch, where the workers start from; a folder without git has only
+    // itself.
+    const rel = await this.#integrate(project, job, false)
+    const dir = taskDir(job.integrationWorktree ?? project, rel)
+    const { measured, seconds } = await runEvaluator(dir, c, "visible", this.#exec)
+    this.#count(job, c, seconds)
+    if (measured.valid) {
+      const commit = job.integrationWorktree ? (await this.#exec("git", ["rev-parse", "--short", "HEAD"], { cwd: job.integrationWorktree })).stdout.trim() : undefined
+      c.baseline = { values: { ...measured.values }, at, ...(commit ? { commit } : {}) }
+      c.costPerEval = Math.round((seconds / c.repeats) * 10) / 10
+    }
+    job.contracts = [...(job.contracts ?? []).filter((x) => x.id !== c.id), c]
+    this.#jobs.set(key(project, job.id), job)
+    saveJob(project, job)
+    saveContract(project, job.id, c)
+    if (!measured.valid) return `Contract ${c.id} (version ${c.version}) is stored for job ${job.id}, but its evaluator gave no valid result on today's code (${measured.error}), so it has no baseline and no writer can be measured against it yet. Fix the evaluator and send the contract again with "id": "${c.id}".`
+    return `Contract ${c.id} (version ${c.version}, ${c.status}) is stored for job ${job.id}. Baseline${c.baseline?.commit ? ` on ${c.baseline.commit}` : ""}: ${describe({ ...c, baseline: undefined }, measured)} (${c.costPerEval}s per run). Start the writers it measures with a line "Contract: ${c.id}" (or "contract" in a todo).`
+  }
+
+  // What a contract's evaluations cost: on the contract (its stop rule) and on the job (its counters).
+  #count(job: Job, c: Contract, seconds: number): void {
+    c.used = { evaluations: (c.used?.evaluations ?? 0) + 1, seconds: Math.round(((c.used?.seconds ?? 0) + seconds) * 10) / 10 }
+    job.counters.evals = (job.counters.evals ?? 0) + 1
+    job.counters.evalSeconds = Math.round(((job.counters.evalSeconds ?? 0) + seconds) * 10) / 10
+  }
+
+  // A writer's work measured against its contract, after its checks passed. Returns a failure the gate treats like a
+  // failing check (an invalid result or a broken guard), with exhausted when the contract's stop rule allows no
+  // further evaluation; or the evidence for a passing fitness stage.
+  async #measure(entry: Entry, job: Job, task: Task): Promise<{ failed?: GateResult; exhausted?: boolean; evidence?: string }> {
+    const c = job.contracts?.find((x) => x.id === entry.contract)
+    if (!c) return {}
+    const used = c.used ?? { evaluations: 0, seconds: 0 }
+    const spent = (c.stop.evaluations && used.evaluations >= c.stop.evaluations && `${c.stop.evaluations} evaluations`) || (c.stop.seconds && used.seconds >= c.stop.seconds && `${c.stop.seconds}s of evaluation`)
+    if (spent) return { failed: { command: `evaluator of ${c.id}`, passed: false, code: -1, output: `not run: contract ${c.id} allows ${spent}, and they are used up` }, exhausted: true }
+    const { measured, seconds } = await runEvaluator(entry.dir, c, "visible", this.#exec)
+    this.#count(job, c, seconds)
+    const broken = measured.valid ? guardViolations(c, measured) : []
+    if (!measured.valid || broken.length) {
+      const why = measured.valid ? `guard broken: ${broken.join("; ")}` : measured.error ?? "invalid"
+      return { failed: { command: `evaluator of ${c.id}: ${c.evaluator}`, passed: false, code: measured.valid ? 0 : 1, output: Object.keys(measured.values).length ? `${why}\nMeasured: ${describe(c, { ...measured, valid: true })}` : why } }
+    }
+    task.score = { ...measured, corpus: "visible", at: new Date().toISOString() }
+    return { evidence: describe(c, measured) }
   }
 
   // The difficulty on the task, and a trial when the plugin asked for one and the job can run one: in worktrees of its
@@ -428,6 +529,7 @@ export class Native {
     task.model = model
     task.trial = { ...head.trial }
     if (head.difficulty !== undefined) task.difficulty = head.difficulty
+    if (head.contract) task.contract = { ...head.contract }
     this.#jobs.set(key(project, job.id), job)
     for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
     stage(task, "delegate", "pass", `${role.agent} on ${model}, attempt of ${head.id}`)
@@ -482,7 +584,7 @@ export class Native {
   async #start(project: string, parent: string, job: Job, task: Task, role: Role, model: string, d: Delegation, checks: string[], rel: string): Promise<Delegated> {
     const writer = WRITERS.has(role.id)
     const base = job.integrationWorktree ?? project // a reader in a folder without git reads the folder itself
-    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: taskDir(base, rel), worktree: base, rel, checks }
+    const entry: Entry = { project, jobId: job.id, taskId: task.id, parent, writer, dir: taskDir(base, rel), worktree: base, rel, checks, ...(task.contract ? { contract: task.contract.id } : {}) }
     if (writer && job.isolation === "none") {
       // No git: the project itself, and no branch; the worktree is the project, so adopt and resume keep it.
       task.worktree = project
@@ -563,6 +665,8 @@ export class Native {
       const problem = checkSetProblems(d.checks, WRITERS.has(role.id))
       if (problem) throw new DelegationError(`Not started: ${problem}`)
     }
+    const contract = d.contract ?? task.contract?.id
+    this.#contractFor(job, WRITERS.has(role.id), contract, assess)
     this.#jobs.set(key(project, job.id), job)
     if (old) {
       await this.#dropWorktree(old, task)
@@ -580,6 +684,7 @@ export class Native {
     // A task started again starts a new trial, if it gets one: the old attempts' trial is over.
     task.trial = undefined
     this.#assess(project, job, task, assess)
+    this.#bind(job, task, contract)
     stage(task, "delegate", "pass", `${role.agent} on ${model}, planned task`)
     const rel = await this.#integrate(project, job, WRITERS.has(role.id))
     return this.#start(project, parent, job, task, role, model, { ...d, body: this.#plannedBody(job, task, d.body) }, checks, rel)
@@ -841,9 +946,23 @@ export class Native {
     task.summary = summary.trim().slice(0, 2000) || task.summary
     // The checks run where the worker's files are, not in the worktree root: a project below the repository root lives
     // that far down, and a check naming one of its files finds nothing above it.
-    const failed = (await runGate(entry.worktree, entry.checks, this.#exec, undefined, entry.dir)).filter((r) => !r.passed)
+    const results = await runGate(entry.worktree, entry.checks, this.#exec, undefined, entry.dir)
+    const graded = gradedOf(results)
+    if (graded) task.graded = graded
+    const failed = results.filter((r) => !r.passed)
     // Another attempt of its trial won while these checks ran (and took the worktree away).
     if (task.status === "cancelled") return { text: lostText(job, task) }
+    // The contract's evaluator runs only once the checks pass: it may take minutes, and a broken build measures nothing.
+    const fitness = failed.length ? {} : await this.#measure(entry, job, task)
+    // The evaluator can take minutes, and the trial may be decided meanwhile (TypeScript cannot see that across await).
+    if ((task.status as Task["status"]) === "cancelled") return { text: lostText(job, task) }
+    if (fitness.failed) {
+      failed.push(fitness.failed)
+      stage(task, "gate", "pass", entry.checks.join(", "))
+      // A used-up stop rule is final for this worker: another fix round could not be measured.
+      if (fitness.exhausted) task.attempts = FIX_ROUNDS
+    }
+    const what = fitness.failed ? "fitness" : "gate"
     if (failed.length) {
       // The same cap the runner applies to its fix rounds (runner.ts: #work, `fixRounds ?? 2`). Without it a check that
       // cannot be satisfied in this environment -- a path that does not exist, a command the gate refuses -- was handed
@@ -852,7 +971,7 @@ export class Native {
       // reason, because at the cap the useful message is that the CHECK is the problem, not the work.
       task.attempts++
       if (task.attempts > FIX_ROUNDS) {
-        stage(task, "gate", "fail", failed.map((f) => f.command).join(", "))
+        stage(task, what, "fail", failed.map((f) => f.command).join(", "))
         moveTask(task, "blocked")
         task.summary = `its checks still fail after ${FIX_ROUNDS} fix round(s): ${failed.map((f) => f.command).join(", ")}`
         const note = this.#trialFailed(job, task) ?? `[micromanager] ${task.id} ${task.title}: its worker hit the limit of ${FIX_ROUNDS} fix rounds with the checks still failing (${failed.map((f) => f.command).join(", ")}). If the check is what is wrong -- a path that does not exist in the worktree, a command the gate refuses -- correct the task with steer_task and its sessionID ${session} rather than starting a new worker.`
@@ -865,16 +984,17 @@ export class Native {
       }
       moveTask(task, "fixing")
       moveTask(task, "running")
-      stage(task, "gate", "fail", failed.map((f) => f.command).join(", "))
+      stage(task, what, "fail", fitness.failed ? fitness.failed.output.split("\n")[0]! : failed.map((f) => f.command).join(", "))
       saveJob(entry.project, job)
-      return { text: failText(`The checks fail in your directory (fix round ${task.attempts} of ${FIX_ROUNDS})`, failed, entry.dir) }
+      return { text: failText(fitness.failed ? `Your checks pass, but the fitness contract does not hold (fix round ${task.attempts} of ${FIX_ROUNDS})` : `The checks fail in your directory (fix round ${task.attempts} of ${FIX_ROUNDS})`, failed, entry.dir) }
     }
     if (job.isolation === "none") {
       // No git: nothing to commit or merge, and no way to see what changed; the checks are the evidence.
       stage(task, "gate", "pass", entry.checks.length ? entry.checks.join(", ") : "no checks given")
+      if (fitness.evidence) stage(task, "fitness", "pass", fitness.evidence)
       moveTask(task, "passed")
       saveJob(entry.project, job)
-      const checks = entry.checks.length ? `checks passed: ${entry.checks.join("; ")}` : "no checks were given"
+      const checks = `${entry.checks.length ? `checks passed: ${entry.checks.join("; ")}` : "no checks were given"}${fitness.evidence ? `; measured: ${fitness.evidence}` : ""}`
       return {
         text: `Done; your change is in the project folder (no git, so nothing is committed); ${checks}. Now end with your short report.`,
         note: `[micromanager] ${task.id} ${task.title}: done in the project folder (no git); ${checks}.`,
@@ -896,6 +1016,7 @@ export class Native {
       }
     }
     stage(task, "gate", "pass", entry.checks.length ? entry.checks.join(", ") : "no checks given")
+    if (fitness.evidence) stage(task, "fitness", "pass", fitness.evidence)
     const commit = await commitTask(entry.worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${task.model ?? "?"} (${task.role}), session ${session}${task.summary ? `\n\n${task.summary}` : ""}`, this.#exec)
     moveTask(task, "passed")
     const train = this.#trains.get(job.id) ?? Promise.resolve()
@@ -907,7 +1028,7 @@ export class Native {
     const won = task.trial ? await this.#settleTrial(entry, job, task) : undefined
     // The commit as merged: a rebase onto other tasks' commits gave it a new id (live test).
     const head = commit && (await this.#exec("git", ["rev-parse", "--short", "HEAD"], { cwd: entry.worktree })).stdout.trim()
-    const checks = entry.checks.length ? `checks passed: ${entry.checks.join("; ")}` : "no checks were given"
+    const checks = `${entry.checks.length ? `checks passed: ${entry.checks.join("; ")}` : "no checks were given"}${fitness.evidence ? `; measured: ${fitness.evidence}` : ""}`
     return {
       text: `Merged into ${job.integrationBranch}${head ? ` as ${head}` : " (nothing to commit)"}; ${checks}. Now end with your short report.`,
       note: won?.note ?? `[micromanager] ${task.id} ${task.title}: merged into ${job.integrationBranch}${head ? ` (${head})` : ", nothing changed"}; ${checks}.`,
@@ -962,6 +1083,14 @@ export class Native {
         stage(task, "merge", "fail", `checks fail on top of the newer commits: ${failed.map((f) => f.command).join(", ")}`)
         return { ok: false, text: failText(`Your change is rebased onto ${job.integrationBranch}, which other tasks moved on meanwhile, and there the checks fail`, failed, entry.dir) }
       }
+      // Other tasks' commits can change what the evaluator measures as much as what the checks see.
+      const fitness = await this.#measure(entry, job, task)
+      if (fitness.failed) {
+        moveTask(task, "escalated")
+        stage(task, "merge", "fail", `the fitness contract does not hold on top of the newer commits: ${fitness.failed.output.split("\n")[0]}`)
+        return { ok: false, text: failText(`Your change is rebased onto ${job.integrationBranch}, which other tasks moved on meanwhile, and there the fitness contract does not hold`, [fitness.failed], entry.dir) }
+      }
+      if (fitness.evidence) stage(task, "fitness", "pass", `after the rebase: ${fitness.evidence}`)
     }
     const ff = await fastForward(job.integrationWorktree!, entry.branch!, this.#exec)
     if (!ff.ok) {
@@ -1058,8 +1187,11 @@ export class Native {
       const replaces = item.replaces ?? []
       const cannot = this.#replaceable(project, job, replaces)
       if (cannot.length) { errors.push(`${title}: ${cannot.join("; ")}`); continue }
+      if (item.contract && !writer) { errors.push(`${title}: ${role.agent} only reads; a fitness contract measures a writer's work`); continue }
+      if (item.contract && !job.contracts?.some((c) => c.id === item.contract)) { errors.push(`${title}: job ${job.id} has no contract ${item.contract}; define it with the contract tool first`); continue }
       const result = addDelegated(job, { title, prompt: item.brief?.trim() || title, files: parsed.files, dependsOn: after, checks })
       if (!result.task) { errors.push(`${title}: ${result.errors!.join("; ")}`); continue }
+      this.#bind(job, result.task, item.contract)
       this.#link(project, job, result.task, replaces)
       result.task.role = role.id
       stage(result.task, "todo", "pass", "written down by the micromanager")
@@ -1136,6 +1268,7 @@ export class Native {
           ? `Checks the plugin runs when you finish: ${entry.checks.join("; ")}`
           : "No checks were given: test your change yourself as far as you can."
         : "",
+      entry.contract && job.contracts?.find((c) => c.id === entry.contract) ? contractBrief(job.contracts.find((c) => c.id === entry.contract)!) : "",
       others.length ? `Other workers change other files at the same time (not yours): ${others.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
       "Keys and tokens show as <secret> in what you read; never write <secret> into a file, leave such lines as they are.",
       // The sandbox's limits, and how to ask past them (src/grants.ts).
