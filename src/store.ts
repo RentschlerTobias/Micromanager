@@ -72,13 +72,31 @@ export function excludeFromGit(project: string): boolean {
   if (!common) return false
   // atomicWrite creates the directory: a bare or hand-made repo can lack .git/info entirely.
   const exclude = join(common, "info", "exclude")
-  let current = existsSync(exclude) ? readFileSync(exclude, "utf8") : ""
-  for (const entry of [`${stateDir(project)}/`, ".opencode/memory/"]) {
-    if (current.split("\n").some((line) => line.trim() === entry || line.trim() === entry.slice(0, -1))) continue
-    current = `${current}${current && !current.endsWith("\n") ? "\n" : ""}${entry}\n`
-    atomicWrite(exclude, current)
+  const before = existsSync(exclude) ? readFileSync(exclude, "utf8") : ""
+  // The backlog and the contracts are the user's to commit (design.md §25); everything else in the state directory
+  // stays out. A bare "<dir>/" line from before would hide them, and git cannot re-include a file below an excluded
+  // directory, so that line is replaced rather than added to. "**/": a pattern with a slash in it is anchored at the
+  // repository root, and the project is often a subdirectory of it.
+  const dir = stateDir(project)
+  const lines = before.split("\n").filter((line) => line.trim() !== `${dir}/` && line.trim() !== dir)
+  while (lines.length && lines.at(-1) === "") lines.pop()
+  for (const entry of [`**/${dir}/*`, `!**/${dir}/backlog/`, `!**/${dir}/contracts/`, ".opencode/memory/"]) {
+    if (!lines.some((line) => line.trim() === entry || line.trim() === entry.replace(/\/$/, ""))) lines.push(entry)
   }
+  const after = `${lines.join("\n")}\n`
+  if (after !== before) atomicWrite(exclude, after)
   return true
+}
+
+// Whether a file in the backlog would be ignored by git all the same: a .gitignore of the project's own that names the
+// whole state directory beats the exclude file's re-include. The caller says so once instead of letting drafts vanish.
+export function backlogIgnored(project: string): boolean {
+  try {
+    execFileSync("git", ["check-ignore", "-q", "--no-index", join(stateDir(project), "backlog", "x.md")], { cwd: project, timeout: 3000, stdio: "ignore" })
+    return true
+  } catch {
+    return false
+  }
 }
 
 export function saveJob(project: string, job: Job): string {

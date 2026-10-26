@@ -40,7 +40,8 @@ test("the survey leaves secrets, generated folders and huge files out of the fir
   assert.equal(await gitState(dir), "repo")
   assert.deepEqual(git(dir, "ls-files").split("\n").sort(), [".gitignore", "main.py", "src/util.py"])
   const ignore = readFileSync(join(dir, ".gitignore"), "utf8")
-  assert.match(ignore, /^\.micromanager\/$/m)
+  assert.match(ignore, /^\.micromanager\/\*$/m)
+  assert.match(ignore, /^!\.micromanager\/backlog\/$/m)
   assert.match(ignore, /^\/\.env$/m)
 })
 

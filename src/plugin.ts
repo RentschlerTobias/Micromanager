@@ -43,11 +43,12 @@ import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
 import { CLASSIFY, NOUL_FLOOR, OPEN_ENDED, OPEN_ENDED_FLOOR } from "./catalog.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
-import { listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
+import { backlogIgnored, listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
+import { backlogDir, backlogTool, goalOf, localBackend, type BacklogItem } from "./backlog.ts"
 import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "./state.ts"
 import { exec, repoRel, type Exec } from "./integration.ts"
 import { readFileSync } from "node:fs"
-import { join, resolve } from "node:path"
+import { join, relative, resolve } from "node:path"
 import { FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
 import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
@@ -358,6 +359,15 @@ const MERGED_STATES: readonly TaskStatus[] = ["merged", "cancelled", "passed"]
 export interface GitOutcome {
   readonly wrote: boolean
   readonly text: string
+}
+
+// What a job left for later, now backlog drafts (src/backlog.ts): named at the end of merge_job and discard_job, with
+// the one thing that would make them vanish.
+function draftsText(r: { drafts: readonly BacklogItem[]; source: readonly BacklogItem[] }, project: string): string {
+  const source = r.source.length ? `\n\nBacklog item ${r.source.map((i) => `${i.slug} is ${i.status}`).join(", ")} now.` : ""
+  if (!r.drafts.length) return source
+  const hidden = backlogIgnored(project) ? " The project's .gitignore hides that directory, so git will not see them until it is changed." : ""
+  return `${source}\n\nWhat the job found and did not do is in the backlog as drafts: ${r.drafts.map((d) => `${d.slug} (${d.title})`).join("; ")}. They are files in ${relative(project, backlogDir(project))}/; tell the user, who commits them to keep them.${hidden}`
 }
 
 const said = (text: string): GitOutcome => ({ wrote: false, text })
@@ -1794,6 +1804,23 @@ export default {
             // A job that runs or waits in the queue is not in planning: a new goal becomes the next job.
             const planning = active && !["done", "stopped", "failed", "integrate", "wrap", "execute", "replan", "verify"].includes(active.phase) &&
               !(["paused", "ask_user"].includes(active.phase) && ["execute", "replan", "verify"].includes(active.resumePhase ?? ""))
+            // A backlog item (src/backlog.ts): its title, goal, acceptance points and checks are the goal the planner reads.
+            const ref = text.match(/^backlog:\s*([\w-]+)$/i)
+            if (ref) {
+              const item = localBackend.get(project, ref[1]!)
+              if (!item) return `There is no backlog item ${ref[1]}; the backlog tool lists them.`
+              if (item.status === "done" || item.status === "dropped" || item.status === "running") return `Backlog item ${item.slug} is ${item.status}${item.job ? ` (job ${item.job})` : ""}; set its status to ready first if it should run again.`
+              if (planning) return `Job ${active!.id} is still being planned in this session; finish or stop it before starting ${item.slug}.`
+              const out = await runner(tctx.sessionID).start(goalOf(item), tctx.sessionID)
+              if (out.job.facilitator === undefined && tctx.sessionID) {
+                out.job.facilitator = tctx.sessionID
+                saveJob(project, out.job)
+              }
+              item.status = "running"
+              item.job = out.job.id
+              localBackend.save(project, item)
+              return out.kind === "plan" ? planText(out.job) : out.text
+            }
             const failed = !JOB_ID.test(text) && !planning ? recentFailure(active, text) : undefined
             if (failed) return failed
             const fresh = text.replace(/^retry:\s*/i, "")
@@ -1911,7 +1938,7 @@ export default {
               saveJob(project, job)
             }
             record({ kind: "merge", sessionID: tctx.sessionID, job: found.id, branch: found.integrationBranch, merged: out.wrote, ...(out.merge ?? {}), text: out.text.slice(-500) })
-            return out.text
+            return out.merge ? `${out.text}${draftsText(native.backlog(project, found, true), project)}` : out.text
           },
           takeOver: async (id, tctx) => {
             if (!tctx.sessionID) return "take_over_job needs a session."
@@ -1940,6 +1967,11 @@ export default {
                 : `No open todos in job ${r.job.id}.`,
               native.startNote(project, r.job) ?? "",
             ].filter(Boolean).join("\n")
+          },
+          backlog: async (action, slug, value, tctx) => {
+            const text = backlogTool(project, action, slug, value)
+            record({ kind: "backlog", sessionID: tctx.sessionID, action: action.trim(), slug: slug.trim() || undefined, text: text.slice(0, 300) })
+            return text
           },
           contract: async (id, json, tctx) => {
             if (!tctx.sessionID) return "contract needs a session."
@@ -1976,7 +2008,7 @@ export default {
             if (scheduler.snapshot().running === found.id) return `Job ${found.id} is still running; discard it when it is done, or stop_job first.`
             const out = await discardJob(project, found, ack, exec)
             record({ kind: "discard", sessionID: tctx.sessionID, job: found.id, deleted: out.wrote, text: out.text.slice(-500) })
-            return out.text
+            return out.wrote ? `${out.text}${draftsText(native.backlog(project, found, false), project)}` : out.text
           },
           permission: async (id, decision, note, tctx) => {
             const ask = SHARED.asks.get(id.trim())
@@ -2288,6 +2320,8 @@ export default {
               const messages = await ctx.session.context({ sessionID: worker }).catch(() => undefined)
               if (r.writer) recordOutcome(outcomeOf(r.project, r.job, r.task, messages ? sessionUsage(messages) : undefined))
               const report = lastAssistantText(messages)
+              // Its follow-ups stay with the job and become backlog drafts when the job ends (src/backlog.ts).
+              native.noteFollowUps(worker, report)
               for (const line of learnedLines(report).slice(0, 5)) await memory.capture({ text: line, source: `LEARNED ${worker}` }, project)
             })().catch((err: unknown) => log("warn", `memory capture failed: ${String(err)}`))
             if (note) void ctx.session.synthetic({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))

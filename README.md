@@ -168,6 +168,7 @@ Jev and the plugin securing every task:
    | `undo_merge` | take back the last `merge_job` in your checkout, while it is still where that merge left it |
    | `stop_job` | stop the whole job; `run_job` resumes it |
    | `contract` | define what "better" means for a task with no fixed end; the baseline is measured at once |
+   | `backlog` | list, show, add or change the project's waiting jobs in `.micromanager/backlog/` |
 
 6. **Checkpoints and rewind.** Every merged task is a commit `Tn: title` on `jev/<job>`, and the job remembers where
    the branch started, so the branch is a row of checkpoints: `start`, then the state after each task. `rewind_job`
@@ -201,10 +202,16 @@ Jev and the plugin securing every task:
    score's improvement over the baseline) go into the outcome log. Any ordinary check may print
    `MM_SCORE {"cases":{"passed":7,"total":8}}` too; that grades a build task in the outcome log without deciding it.
 
-8. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
+8. **The backlog.** Jobs that wait live in `.micromanager/backlog/<slug>.md` (front matter plus Markdown), and you commit
+   them: the plugin's exclude lines leave that directory and `.micromanager/contracts/` to git and keep the rest out.
+   When a job is merged or discarded, the follow-ups its workers reported that no task took up, and a trial whose
+   attempts all failed, become drafts there. `plan_job` with the goal `backlog:<slug>` starts an item; the `backlog`
+   tool lists and edits them.
+
+9. **Large or unclear jobs.** `plan_job` lets a planner write a full plan with acceptance points, optionally
    after a planning session with you. You approve it, and `run_job` runs it.
 
-Jobs and task notes live in `.jev-micromanager/`, kept out of git through the repository's `.git/info/exclude` — found
+Jobs and task notes live in `.micromanager/` (`.jev-micromanager/` in older projects), kept out of git through the repository's `.git/info/exclude` — found
 with `git rev-parse --git-common-dir`, so it works when the project is a subdirectory of a larger repository and when
 it is itself a worktree.
 

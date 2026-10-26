@@ -23,6 +23,8 @@ export const TOOL_IDS = [
   "todo",
   // What "better" means for a task with no fixed end (src/contract.ts).
   "contract",
+  // Jobs that wait, in the project (src/backlog.ts).
+  "backlog",
 ] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
@@ -54,6 +56,7 @@ export interface Handlers {
   takeOver(job: string, ctx: ToolContext): Promise<string>
   todo(items: string, ctx: ToolContext): Promise<string>
   contract(job: string, json: string, ctx: ToolContext): Promise<string>
+  backlog(action: string, slug: string, value: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -182,6 +185,13 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     description: "Define what \"better\" means before a writer works on a task with no fixed end (make X faster, smaller, more reliable): such a writer is refused without one. json: {\"goal\": what the work is for, in words; \"evaluator\": a shell command that prints one line MM_SCORE {\"scores\": {\"<name>\": <number>, …}} (exit 0; anything else counts as an invalid result); \"scores\": [{\"name\", \"direction\": \"min\"|\"max\", \"noise\": 0.05}] (the first decides, the next break ties inside its noise band); \"guards\": [{\"name\", \"direction\", \"tolerance\": 0.2}] (measured values that may not get worse than today by more than that share: they close the ways to raise a score without improving the goal); \"corpus\": {\"visible\": [paths it measures on]}; \"repeats\": runs per measurement, the median counts (3 for timings); \"timeoutSeconds\"; \"stop\": {\"evaluations\": n, \"seconds\": s}}. With \"id\": \"C1\" it changes that contract (a new version). The plugin measures the baseline on the job's branch now and answers with it; a writer is then measured with a line \"Contract: C1\" in its prompt (or \"contract\" in its todo). job: empty for this session's job.",
     input: input("job", "json"),
     execute: guarded(([job, json], ctx) => handlers.contract(job!, json!, ctx), "job", "json"),
+  })
+  draft.add({
+    id: "backlog",
+    name: "backlog",
+    description: "The project's backlog: jobs that wait, one file each in .micromanager/backlog/ (the user commits them). action \"list\" shows them in the order they run; \"show\" with slug shows one; \"add\" with value a JSON object {\"title\", \"kind\": \"build\"|\"fix\"|\"optimize\", \"goal\", \"acceptance\": [{\"text\", \"verify\"}], \"checks\": [shell commands], \"fitness\": a contract as the contract tool takes it, \"order\", \"status\": \"draft\"|\"ready\"} writes a new one (add only what the user asked to keep for later); \"set\" with slug and value \"status=ready\" or \"order=10\" changes one. A job's follow-ups that no task took up become drafts by themselves when the job is merged or discarded. Start an item with plan_job and the goal \"backlog:<slug>\", or write its tasks as todos.",
+    input: input("action", "slug", "value"),
+    execute: guarded(([action, slug, value], ctx) => handlers.backlog(action!, slug!, value!, ctx), "action", "slug", "value"),
   })
   draft.add({
     id: "undo_merge",

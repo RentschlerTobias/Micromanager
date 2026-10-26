@@ -1064,6 +1064,28 @@ told "make the test pass" could change the test.
   puts the frozen paths into `denyWrite`, so `sed -i` cannot get around it (checked with bubblewrap). The brief lists
   the frozen files. A wrong test is to be named in the report; P3 gives the worker a tool to ask for the change.
 
+**P6: the local backlog (implemented).** Jobs that wait, one Markdown file each in `.micromanager/backlog/<slug>.md`,
+committed with the project (src/backlog.ts). Items are jobs, never a job's internal tasks.
+- **Format:** a YAML front matter in a small subset the plugin reads and writes itself (scalars, lists, lists of
+  one-level maps, JSON values; no YAML dependency): `title`, `status` (draft, ready, running, done, dropped), `order`,
+  `kind` (build, fix, optimize), `origin` (user, later, trial-failed), `from`, `job`, `created`, `acceptance`
+  (`text`, `verify`), `checks`, `fitness` (a contract as the contract tool takes it). The body is free Markdown. The
+  same text is meant to be a GitHub issue body (P7).
+- **In git:** the exclude file now reads `**/.micromanager/*` with `!**/.micromanager/backlog/` and
+  `!**/.micromanager/contracts/` (a bare `.micromanager/` line from before is replaced: git cannot re-include a file
+  below an excluded directory; `**/` because a pattern with a slash is anchored at the repository root). A project the
+  plugin made a repository for gets the same lines in its `.gitignore`. A `.gitignore` of the user's own that hides
+  the directory is named when drafts are written. Agents may read the backlog and the contracts; only the plugin
+  writes them.
+- **Drafts at a job's end:** native workers now end their report with `FOLLOWUP: what | why | files` lines; the plugin
+  keeps the ones the job has no task for in `job.later`. When the job is merged (`merge_job`) or discarded
+  (`discard_job`), each such follow-up and each trial whose attempts all failed and that nothing did over becomes a
+  draft, once; the answer names them. Nothing is committed for the user.
+- **Starting an item:** `plan_job` with the goal `backlog:<slug>` plans a job from the item's title, goal, acceptance
+  points, checks and fitness, and marks the item running; the item is done when that job is merged and ready again
+  when it is discarded. The `backlog` tool lists (open first, ready before draft, then by order), shows, adds and
+  changes items. There is no runner that works the backlog off by itself.
+
 - **Not yet:** the contract round (P5) and its freeze; until then a contract is a draft the micromanager writes, and
   it should show the baseline to the user before writers start.
 - **Known weak spot:** a task's checks are kept as one `verify` string joined with `" && "` and split again after a

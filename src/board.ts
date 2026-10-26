@@ -56,7 +56,7 @@ export function board(job: Job, width = 110, now = Date.now(), plugin?: string):
     return `${left}${pad(rest, Math.max(20, width - left.length))}`
   })
   const open = `│   open a task's session: opencode -s <session>  (in another terminal; it shows what the worker does)`
-  const later = (job.later ?? []).map((l) => `│   later: ${pad(`${l.what} (${l.from}, ${l.reason.replace(/_/g, " ")})`, width - 12)}`)
+  const later = (job.later ?? []).map((l) => `│   later: ${pad(`${l.what} (${l.from}, ${l.draft ? `backlog ${l.draft}` : l.reason.replace(/_/g, " ")})`, width - 12)}`)
   const lessons = job.lessons.slice(-3).map((l) => `│   note: ${pad(l, width - 11)}`)
   return [...head, ...rows, `├${"─".repeat(Math.min(width, 100))}`, open, ...later, ...lessons, `└${"─".repeat(Math.min(width, 100))}`].join("\n")
 }

@@ -70,7 +70,12 @@ const noDelegation = [rule("subagent", "deny")]
 // The plugin's state (job files, notes) is not for agents: a local planner looped on it in a live test. Paths are
 // relative to the session's directory; a worker inside its worktree never needs to climb up into jobs or notes.
 const STATE_PATHS = [".micromanager", ".jev-micromanager"].flatMap((dir) => [`${dir}*`, `*/${dir}/jobs*`, `*/${dir}/notes*`]) // the old name too
-const noStateDir = ["read", "glob", "grep", "list", "edit", "write", "patch"].flatMap((tool) => STATE_PATHS.map((path) => rule(tool, "deny", path)))
+const noStateDir = [
+  ...["read", "glob", "grep", "list", "edit", "write", "patch"].flatMap((tool) => STATE_PATHS.map((path) => rule(tool, "deny", path))),
+  // The backlog and the contracts are meant to be read (design.md §25); the last matching rule wins, so these come after
+  // the denials. Only the plugin writes them.
+  ...["read", "glob", "grep", "list"].flatMap((tool) => [".micromanager", ".jev-micromanager"].flatMap((dir) => [`${dir}/backlog*`, `${dir}/contracts*`].map((path) => rule(tool, "allow", path)))),
+]
 
 export const TEST_RUNNERS = [
   "pytest*", "python -m pytest*", "python3 -m pytest*", "uv run pytest*", "uv run python -m pytest*",
@@ -305,7 +310,9 @@ How you work:
    worker on work another one left unfinished: its change would be lost. To start over on purpose, write a todo with
    "replaces": ["T…"] (["job-…/T…"] for a task of an older job), never a todo titled "(redo)" alone: the link shows
    the user the old task as done once the new one is; the old task and its worktree go when the new one starts. Workers list
-   follow-ups they found: start the ones the request needs, and mention the others to the user.
+   follow-ups they found: start the ones the request needs, and mention the others to the user; the plugin keeps
+   those as backlog drafts when the job is merged or discarded. Work the user wants kept for later goes into the
+   backlog tool; plan_job with the goal "backlog:<slug>" starts an item from it.
    A note "[micromanager] A…: worker … is paused on a permission request" means a worker waits for an answer:
    decide it with answer_permission when it clearly serves the task, else put it to the user as the note says.
    A hard task runs as a trial: the plugin's note after its first worker asks you to start further attempts with the

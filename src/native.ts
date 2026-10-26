@@ -28,9 +28,10 @@ import { addDelegated, checkSetProblems, parseFiles } from "./plan.ts"
 import { WRITERS } from "./profile.ts"
 import { FIX_ROUNDS } from "./watchdog.ts"
 import { ROLES, roleByAgent, roleById, type Role, type RoleId } from "./roles.ts"
-import { isDone, moveTask, newJob, moveJob, stage, type Job, type Task } from "./state.ts"
+import { isDone, moveTask, newJob, moveJob, stage, type Job, type Later, type Task } from "./state.ts"
 import { excludeFromGit, jobId, listJobs, saveContract, saveJob } from "./store.ts"
-import { sharedNote, skillLine, taskAcceptance } from "./brief.ts"
+import { draftFromLater, draftFromTrial, localBackend, type BacklogBackend, type BacklogItem } from "./backlog.ts"
+import { parseReport, sharedNote, skillLine, taskAcceptance } from "./brief.ts"
 import { settled, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
 import { formInput, startForm } from "./forms.ts"
@@ -518,6 +519,60 @@ export class Native {
     if (!entry?.writer || !entry.frozen?.size) return []
     const frozen = new Set(this.frozenOf(session))
     return resources.filter((r) => frozen.has(isAbsolute(r) ? resolve(r) : resolve(entry.dir, r)))
+  }
+
+  // A worker's report as it ended: its FOLLOWUP lines go to the job's later list, unless the job has the work already
+  // (a task with nearly that title) or the list has it. They become backlog drafts when the job ends (backlog()).
+  noteFollowUps(session: string, report: string): Later[] {
+    const entry = this.#entry(session)
+    const job = entry && this.#job(entry)
+    if (!entry || !job) return []
+    const known = [...job.tasks.map((t) => t.title), ...(job.later ?? []).map((l) => l.what)]
+    const added = parseReport(report).followUps
+      .filter((f) => !known.some((k) => similarity(k, f.what) >= SAME_WORK))
+      .slice(0, 5)
+      .map((f): Later => ({ ...f, from: entry.taskId, reason: "reported" }))
+    if (!added.length) return []
+    job.later = [...(job.later ?? []), ...added]
+    saveJob(entry.project, job)
+    return added
+  }
+
+  // The job ended (merged into the checkout or discarded): what it found and did not do goes to the backlog as drafts,
+  // so it outlives the session. A follow-up that a task of the job took up after all is left out, and so is a failed
+  // trial that a later task did over. Each item is written once. The item the job was started from (plan_job
+  // backlog:<slug>) is done once the job is merged, and ready again once it is discarded.
+  backlog(project: string, job: Job, merged: boolean, backend: BacklogBackend = localBackend, now = new Date()): { drafts: BacklogItem[]; source: BacklogItem[] } {
+    const live = this.#jobs.get(key(project, job.id)) ?? job
+    const items = backend.list(project)
+    const source = items.filter((i) => i.job === live.id && i.status === "running")
+    for (const i of source) {
+      i.status = merged ? "done" : "ready"
+      backend.save(project, i)
+    }
+    const taken = new Set(items.map((i) => i.slug))
+    const drafts: BacklogItem[] = []
+    const save = (item: BacklogItem) => {
+      backend.save(project, item)
+      taken.add(item.slug)
+      drafts.push(item)
+    }
+    for (const l of live.later ?? []) {
+      if (l.draft || live.tasks.some((t) => t.id !== l.from && similarity(t.title, l.what) >= SAME_WORK)) continue
+      const item = draftFromLater(l, live, taken, now)
+      save(item)
+      l.draft = item.slug
+    }
+    for (const head of live.tasks.filter((t) => t.trial?.of === t.id)) {
+      const trial = standing(live, head)
+      if (trial.winner || trial.live.length || !trial.failed.length || trial.all.some((t) => t.replacedBy) || head.stages.some((s) => s.stage === "backlog")) continue
+      const checks = live.acceptance.filter((a) => head.acceptance.includes(a.id)).flatMap((a) => (a.verify ? [a.verify] : []))
+      const item = draftFromTrial(live, head, trial.failed, checks, taken, now)
+      save(item)
+      stage(head, "backlog", "pass", `draft ${item.slug}`)
+    }
+    if (drafts.length) saveJob(project, live)
+    return { drafts, source }
   }
 
   // What a contract's evaluations cost: on the contract (its stop rule) and on the job (its counters).
@@ -1346,11 +1401,14 @@ export class Native {
         ? "Two helpers answer questions while you wait: explore (an explorer reads your directory, your change included) and research (a researcher looks it up on the web). Ask one when a question would take you many reads or needs documentation you cannot reach; at most 3 per task. Like finish_task, they are called inside the execute tool: `await tools.explore({ question: \"…\" })`."
         : "",
       entry.writer
-        ? "When your change is done, call finish_task with a two-line summary, inside the execute tool: `await tools.finish_task({ summary: \"…\" })`. The plugin then runs the checks, commits and merges; if it answers with failures, fix them and call finish_task again. Once it says merged, end with a short report: what you changed, what the checks showed, anything left open, and work you noticed outside your task (follow-ups)."
-        : "End with your findings: they are your result. Add work you noticed that the request needs (follow-ups).",
+        ? `When your change is done, call finish_task with a two-line summary, inside the execute tool: \`await tools.finish_task({ summary: "…" })\`. The plugin then runs the checks, commits and merges; if it answers with failures, fix them and call finish_task again. Once it says merged, end with a short report: what you changed, what the checks showed, anything left open. ${FOLLOWUP_LINE}`
+        : `End with your findings: they are your result. ${FOLLOWUP_LINE}`,
     ].filter((line, i, all) => line !== "" || all[i - 1] !== "").join("\n").trim()
   }
 }
+
+// How a worker reports work outside its task, so the plugin can keep it (src/brief.ts parseReport reads these lines).
+const FOLLOWUP_LINE = "Name work you noticed outside your task that the project needs, one line each, as FOLLOWUP: what | why | the files it would change (leave it out if none)."
 
 // A planned task on its way to a worker, from wherever it stopped: open, given up, stopped, left running by a process
 // that ended, or cancelled by a sweep. Cancelled is final for the state machine, so a task started again on purpose

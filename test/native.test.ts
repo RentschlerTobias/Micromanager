@@ -751,6 +751,16 @@ test("a trial whose attempts all fail tells the micromanager to split the task, 
   assert.match(end!.note!, /- T1 on opencode-go\/glm-5\.3-flash: gate: test -f never\.txt/)
   assert.match(end!.note!, /- T2 on opencode-go\/kimi-k3: end: loop: the same edit 5 times/)
   assert.match(end!.note!, /Split it into smaller tasks/)
+
+  // The job ends with its follow-ups and the failed trial undone: both become backlog drafts, each once; a follow-up
+  // the job took up after all does not.
+  assert.equal(native.noteFollowUps("ses_a1", "STATUS: BLOCKED\nFOLLOWUP: Fix the flaky date test | it fails at midnight | test/date.test.ts\nFOLLOWUP: Make it pass | dup\nFOLLOWUP: none").length, 1)
+  assert.equal(native.noteFollowUps("ses_a2", "FOLLOWUP: fix the flaky date test | again").length, 0, "known already")
+  const first = native.backlog(project, d.job, false)
+  assert.deepEqual(first.drafts.map((i) => [i.slug, i.origin, i.from]), [["fix-the-flaky-date-test", "later", `${d.job.id}/T1`], ["make-it-pass", "trial-failed", `${d.job.id}/T1`]])
+  assert.match(readFileSync(join(project, ".micromanager", "backlog", "make-it-pass.md"), "utf8"), /checks:\n  - test -f never\.txt\n/)
+  assert.deepEqual(native.backlog(project, d.job, false).drafts, [], "written once")
+  assert.equal(loadJob(project, d.job.id)!.later![0]!.draft, "fix-the-flaky-date-test")
 })
 
 test("a trial needs Parallel and a worktree per attempt; without them the task runs once", async () => {

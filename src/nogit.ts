@@ -99,7 +99,9 @@ export async function initRepo(project: string, excluded: readonly string[], run
   const ignore = join(project, ".gitignore")
   const had = existsSync(ignore) ? readFileSync(ignore, "utf8") : ""
   const lines = had.split("\n").map((l) => l.trim())
-  const add = [...OWN].filter((n) => n !== ".git").map((n) => `${n}/`).concat(excluded.map((p) => `/${p}`)).filter((p) => !lines.includes(p))
+  // The plugin's state stays out, except its backlog and contracts, which are the user's to commit (design.md §25).
+  const own = [...OWN].filter((n) => n !== ".git").flatMap((n) => [`${n}/*`, `!${n}/backlog/`, `!${n}/contracts/`])
+  const add = own.concat(excluded.map((p) => `/${p}`)).filter((p) => !lines.includes(p))
   if (add.length) writeFileSync(ignore, `${had}${had && !had.endsWith("\n") ? "\n" : ""}${had ? "\n" : ""}# left out of the first commit by micromanager\n${add.join("\n")}\n`)
   const staged = await run("git", ["add", "-A"], { cwd: project })
   if (staged.code !== 0) return { ok: false, text: `git add failed: ${staged.stderr.trim()}` }
