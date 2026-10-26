@@ -129,6 +129,10 @@ Jev and the plugin securing every task:
    - **Checks and merge.** A writer ends by calling `finish_task`: the plugin runs the checks in the worktree; on
      a failure the worker gets the output and fixes it, on a pass the plugin commits and a merge train brings the
      commit onto `jev/<job>` (rebased and checked again when another task got there first).
+   - **Tests are frozen.** The files a writer's checks name that are not its own (`node --test test/a.test.js`), its
+     contract's evaluator and corpus, and any it was given with `Frozen:` (or `"frozen"` in its todo) may be read and
+     run but not changed: an edit is refused at once, the sandbox denies the write, and a changed one is put back at
+     `finish_task` and counts as a failing check.
    - **A task that changed nothing does not merge.** A gate that passes over an empty diff verified nothing, so it is
      reported as unverified instead. Failing checks come back at most twice; then the worker stops and says the
      check is the likely problem, because an unsatisfiable one otherwise burns the whole session.

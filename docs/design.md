@@ -1051,6 +1051,19 @@ contract round (draft, user form, red team, baseline, freeze), P7 GitHub issues 
   improvement over the baseline, signed so that better is positive, 0 for an invalid result. `routerRows` carries the
   best reward of a task's attempts. An ordinary check may print `MM_SCORE {"cases":…}` as well, which grades a build
   task (`graded`) without deciding it. Evaluator runs are counted on the job (`counters.evals`, `evalSeconds`).
+**P2: frozen tests on the native path (implemented).** Only the runner's P3 pipeline froze tests; a native writer
+told "make the test pass" could change the test.
+- **What is frozen:** the files a writer's todo or delegation names (`Frozen:`, `"frozen"`), the existing files its
+  checks name (`node --test test/a.test.js` freezes the test), and its contract's evaluator script and visible corpus
+  (a directory through `git ls-files`). A file of its own write scope is never frozen. They are hashed when it starts
+  (`task.frozen`, so a restart keeps them).
+- **The gate holds it:** `finish_task` first compares the hashes; a changed, deleted or created frozen file is put
+  back before the checks run, so they judge the code against the tests as they were, and the round fails with
+  "frozen files unchanged". `frozenCheck` moved from runner.ts to integration.ts; both paths use it.
+- **Early feedback:** the permission hook denies an edit, write or patch on a frozen path at once, and the sandbox
+  puts the frozen paths into `denyWrite`, so `sed -i` cannot get around it (checked with bubblewrap). The brief lists
+  the frozen files. A wrong test is to be named in the report; P3 gives the worker a tool to ask for the change.
+
 - **Not yet:** the contract round (P5) and its freeze; until then a contract is a draft the micromanager writes, and
   it should show the baseline to the user before writers start.
 - **Known weak spot:** a task's checks are kept as one `verify` string joined with `" && "` and split again after a

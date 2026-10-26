@@ -13,11 +13,15 @@
 //
 // Every plugin instance of one server shares this state (a moved worker is served by the instance of its worktree).
 
+import { statSync } from "node:fs"
+import { isAbsolute, join, resolve } from "node:path"
+
 import { Graphs, graphBrief, queryGraph, type Graph } from "./graph.ts"
 import { HEADER } from "./hooks.ts"
 import { contractBrief, describe, guardViolations, parseContract, type Contract } from "./contract.ts"
 import {
-  changedFiles, commitTask, exec as defaultExec, fastForward, gradedOf, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, repoRel, runEvaluator, runGate, taskDir,
+  changedFiles, commitTask, exec as defaultExec, fastForward, frozenChanged, gradedOf, hashFiles, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree,
+  repoRel, revertFiles, runEvaluator, runGate, taskDir,
   type Exec, type GateResult,
 } from "./integration.ts"
 import { addDelegated, checkSetProblems, parseFiles } from "./plan.ts"
@@ -46,6 +50,7 @@ export interface Delegation {
   readonly planned?: { readonly task: string; readonly job: string } // a planned task to start ("Task: T5 · job-…")
   readonly attempt?: { readonly task: string; readonly job: string } // another attempt of a trial ("Attempt: T5 · job-…")
   readonly contract?: string // the fitness contract its work is measured against ("Contract: C1", src/contract.ts)
+  readonly frozen?: string // files it may read and run but not change, as written ("Frozen: test/a.test.js")
 }
 
 // The "Files:" and "Checks:" lines of a delegation, wherever they stand; the checks go on over the following lines
@@ -55,6 +60,7 @@ export function parseDelegation(prompt: string): Delegation {
   const checks: string[] = []
   const replaces: string[] = []
   let files = ""
+  let frozen = ""
   let planned: Delegation["planned"]
   let attempt: Delegation["attempt"]
   let contract: string | undefined
@@ -80,6 +86,12 @@ export function parseDelegation(prompt: string): Delegation {
       inChecks = false
       continue
     }
+    const z = line.match(/^\s*frozen:\s*(.*)$/i)
+    if (z) {
+      frozen = z[1]!.trim()
+      inChecks = false
+      continue
+    }
     const f = line.match(/^\s*files:\s*(.*)$/i)
     const c = line.match(/^\s*checks:\s*(.*)$/i)
     const r = line.match(/^\s*replaces:\s*(.*)$/i)
@@ -98,7 +110,7 @@ export function parseDelegation(prompt: string): Delegation {
       body.push(line)
     }
   }
-  return { body: body.join("\n").trim(), files, checks, replaces, ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}), ...(contract ? { contract } : {}) }
+  return { body: body.join("\n").trim(), files, checks, replaces, ...(frozen ? { frozen } : {}), ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}), ...(contract ? { contract } : {}) }
 }
 
 // How much two task texts are about the same thing: the share of their words they have in common (Jaccard over the
@@ -135,6 +147,7 @@ interface Entry {
   session?: string // the child session, once claimed
   checks: string[]
   contract?: string // the fitness contract its work is measured against, by id
+  frozen?: Map<string, string> // project-relative path -> content hash when the writer started (task.frozen)
   graph?: boolean // an explorer with a code graph of its directory (the code_graph tool)
   ended?: boolean // its session ended; a writer that did not merge stays "running" until it is continued or swept
 }
@@ -165,6 +178,7 @@ export interface TodoItem {
   readonly brief?: string // what the worker needs to know beyond the title
   readonly replaces?: readonly string[] // tasks it does over: "T19", or "job-…/T18" in another job of the session
   readonly contract?: string // the fitness contract it is measured against: "C1"
+  readonly frozen?: string // files it may read and run but not change, comma separated
 }
 
 // Task ids in whatever a model wrote: ["T1", "T2"], "T1, T2", or "after T1 and T2 merged" (live run: the last one made
@@ -207,6 +221,7 @@ export function parseTodo(items: string): { list: TodoItem[]; ids: string[] } | 
       brief: text(o.brief, "\n"),
       replaces: replaceIds(o.replaces),
       ...(typeof o.contract === "string" && /^c\d+$/i.test(o.contract.trim()) ? { contract: o.contract.trim().toUpperCase() } : {}),
+      ...(text(o.frozen, ", ") ? { frozen: text(o.frozen, ", ")! } : {}),
     })
   }
   return { list, ids }
@@ -317,6 +332,7 @@ export class Native {
           session: task.session,
           checks: verify.flatMap((v) => v.split(" && ")).map((c) => c.trim()).filter(Boolean),
           ...(task.contract ? { contract: task.contract.id } : {}),
+          ...(task.frozen ? { frozen: new Map(Object.entries(task.frozen)) } : {}),
           ended: true,
         }
         this.#entries.set(k, entry)
@@ -402,6 +418,7 @@ export class Native {
     if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
     const task = added.task
     this.#bind(job, task, d.contract)
+    if (d.frozen) task.freeze = parseFiles(d.frozen, project).files
     this.#link(project, job, task, d.replaces)
     task.role = role.id
     task.model = model
@@ -470,6 +487,39 @@ export class Native {
     return `Contract ${c.id} (version ${c.version}, ${c.status}) is stored for job ${job.id}. Baseline${c.baseline?.commit ? ` on ${c.baseline.commit}` : ""}: ${describe({ ...c, baseline: undefined }, measured)} (${c.costPerEval}s per run). Start the writers it measures with a line "Contract: ${c.id}" (or "contract" in a todo).`
   }
 
+  // The files a writer may read and run but not change, hashed as its worktree has them now: the ones its todo or
+  // delegation asked for, the existing files its checks name that are not its own, and its contract's evaluator and
+  // visible corpus. A file of its own write scope is never frozen: the two would contradict each other.
+  async #freeze(job: Job, task: Task, entry: Entry): Promise<void> {
+    const own = new Set(task.files)
+    const c = entry.contract ? job.contracts?.find((x) => x.id === entry.contract) : undefined
+    const corpus: string[] = []
+    for (const p of c?.corpus.visible ?? []) {
+      const listed = await this.#exec("git", ["ls-files", "--", p], { cwd: entry.dir })
+      corpus.push(...listed.stdout.split("\n").map((l) => l.trim()).filter(Boolean))
+    }
+    const named = [...entry.checks, ...(c ? [c.evaluator] : [])].flatMap((command) => namedFiles(command, entry.dir))
+    const paths = [...new Set([...(task.freeze ?? []), ...named, ...corpus])].filter((p) => !own.has(p)).sort()
+    if (!paths.length) return
+    entry.frozen = await hashFiles(entry.worktree, paths, this.#exec, entry.dir)
+    task.frozen = Object.fromEntries(entry.frozen)
+  }
+
+  // A writer's frozen files as absolute paths, for the sandbox (src/sandbox.ts denyWrite) and the permission hook.
+  frozenOf(session: string): string[] {
+    const entry = this.#entry(session)
+    return entry?.writer && entry.frozen ? [...entry.frozen.keys()].map((f) => resolve(entry.dir, f)) : []
+  }
+
+  // The resources of a write request that are frozen for this writer; resources are paths relative to its directory or
+  // absolute.
+  frozenHit(session: string, resources: readonly string[]): string[] {
+    const entry = this.#entry(session)
+    if (!entry?.writer || !entry.frozen?.size) return []
+    const frozen = new Set(this.frozenOf(session))
+    return resources.filter((r) => frozen.has(isAbsolute(r) ? resolve(r) : resolve(entry.dir, r)))
+  }
+
   // What a contract's evaluations cost: on the contract (its stop rule) and on the job (its counters).
   #count(job: Job, c: Contract, seconds: number): void {
     c.used = { evaluations: (c.used?.evaluations ?? 0) + 1, seconds: Math.round(((c.used?.seconds ?? 0) + seconds) * 10) / 10 }
@@ -530,6 +580,7 @@ export class Native {
     task.trial = { ...head.trial }
     if (head.difficulty !== undefined) task.difficulty = head.difficulty
     if (head.contract) task.contract = { ...head.contract }
+    if (head.freeze) task.freeze = [...head.freeze]
     this.#jobs.set(key(project, job.id), job)
     for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
     stage(task, "delegate", "pass", `${role.agent} on ${model}, attempt of ${head.id}`)
@@ -598,6 +649,7 @@ export class Native {
       task.worktreeRel = w.rel
       task.branch = w.branch
     }
+    if (writer) await this.#freeze(job, task, entry)
     const graph = role.id === "explore" ? await this.#graphs.get(entry.dir) : undefined
     entry.graph = Boolean(graph)
     this.#entries.set(`${job.id}/${task.id}`, entry)
@@ -685,6 +737,7 @@ export class Native {
     task.trial = undefined
     this.#assess(project, job, task, assess)
     this.#bind(job, task, contract)
+    if (d.frozen) task.freeze = [...new Set([...(task.freeze ?? []), ...parseFiles(d.frozen, project).files])]
     stage(task, "delegate", "pass", `${role.agent} on ${model}, planned task`)
     const rel = await this.#integrate(project, job, WRITERS.has(role.id))
     return this.#start(project, parent, job, task, role, model, { ...d, body: this.#plannedBody(job, task, d.body) }, checks, rel)
@@ -858,6 +911,7 @@ export class Native {
       added.task.model = task.model
       added.task.session = session
       added.task.sessions = [session]
+      if (task.frozen) added.task.frozen = { ...task.frozen }
       for (const s of ["ready", "planned", "running"] as const) moveTask(added.task, s)
       stage(added.task, "delegate", "pass", `continues ${task.id} in session ${session}`)
       this.#entries.delete(`${job.id}/${task.id}`)
@@ -946,7 +1000,12 @@ export class Native {
     task.summary = summary.trim().slice(0, 2000) || task.summary
     // The checks run where the worker's files are, not in the worktree root: a project below the repository root lives
     // that far down, and a check naming one of its files finds nothing above it.
+    // Frozen files first: a changed test is put back before the checks run, so they judge the code against the tests as
+    // they were, and the worker hears what it may not do.
+    const frozen = entry.frozen ? await frozenChanged(entry.worktree, entry.frozen, this.#exec, entry.dir) : []
+    if (frozen.length) await revertFiles(entry.worktree, frozen, this.#exec, entry.dir)
     const results = await runGate(entry.worktree, entry.checks, this.#exec, undefined, entry.dir)
+    if (frozen.length) results.push({ command: "frozen files unchanged", passed: false, code: 1, output: `You changed ${frozen.join(", ")}, which you may read and run but not change; they are restored to how they were. Change the code instead. If one of them is wrong, say so plainly in your report, with the line that shows it.` })
     const graded = gradedOf(results)
     if (graded) task.graded = graded
     const failed = results.filter((r) => !r.passed)
@@ -1192,6 +1251,9 @@ export class Native {
       const result = addDelegated(job, { title, prompt: item.brief?.trim() || title, files: parsed.files, dependsOn: after, checks })
       if (!result.task) { errors.push(`${title}: ${result.errors!.join("; ")}`); continue }
       this.#bind(job, result.task, item.contract)
+      const freeze = item.frozen ? parseFiles(item.frozen, project) : undefined
+      if (freeze?.problem) errors.push(`${title}: frozen ${freeze.problem}`)
+      else if (freeze?.files.length) result.task.freeze = freeze.files
       this.#link(project, job, result.task, replaces)
       result.task.role = role.id
       stage(result.task, "todo", "pass", "written down by the micromanager")
@@ -1210,13 +1272,15 @@ export class Native {
 
   // The live worker that works in a directory (a shell command's cwd: its own directory or below), for the sandbox
   // (src/sandbox.ts). The deepest match wins, so a writer's worktree beats the job's integration worktree it lies in.
-  workerAt(cwd: string): { project: string; jobId: string; role: RoleId; writer: boolean; dir: string; worktree: string } | undefined {
+  workerAt(cwd: string): { project: string; jobId: string; role: RoleId; writer: boolean; dir: string; worktree: string; frozen: string[] } | undefined {
     const inside = (dir: string) => cwd === dir || cwd.startsWith(`${dir}/`)
     const found = [...this.#entries.values()]
       .filter((e) => !e.ended && (inside(e.dir) || inside(e.worktree)))
       .sort((a, b) => b.dir.length - a.dir.length)[0]
     const task = found && this.#job(found)?.tasks.find((t) => t.id === found.taskId)
-    return found && task ? { project: found.project, jobId: found.jobId, role: task.role as RoleId, writer: found.writer, dir: found.dir, worktree: found.worktree } : undefined
+    return found && task
+      ? { project: found.project, jobId: found.jobId, role: task.role as RoleId, writer: found.writer, dir: found.dir, worktree: found.worktree, frozen: found.writer && found.frozen ? [...found.frozen.keys()].map((f) => resolve(found.dir, f)) : [] }
+      : undefined
   }
 
   // The workers of a micromanager session that still run.
@@ -1269,6 +1333,7 @@ export class Native {
           : "No checks were given: test your change yourself as far as you can."
         : "",
       entry.contract && job.contracts?.find((c) => c.id === entry.contract) ? contractBrief(job.contracts.find((c) => c.id === entry.contract)!) : "",
+      entry.frozen?.size ? `Frozen, so read and run them but do not change them (the plugin puts them back and counts it as a failing check): ${[...entry.frozen.keys()].join(", ")}.` : "",
       others.length ? `Other workers change other files at the same time (not yours): ${others.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
       "Keys and tokens show as <secret> in what you read; never write <secret> into a file, leave such lines as they are.",
       // The sandbox's limits, and how to ask past them (src/grants.ts).
@@ -1331,4 +1396,20 @@ function tokenOf(text: string): string | undefined {
 // in, and that was the one diagnostic missing when a worker hunted for a file three directories up.
 function failText(what: string, failed: readonly GateResult[], dir: string): string {
   return `${what}. Fix them, then call finish_task again:\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}\n\nThe checks ran in ${dir}; a path in them is relative to that directory.`
+}
+
+// The existing files a shell command names, project-relative: "node --test test/a.test.js" names test/a.test.js. A
+// word that is no path, or no file in dir, is left out; a check names a file it reads far more often than one it
+// writes, and one it would write does not exist yet.
+export function namedFiles(command: string, dir: string): string[] {
+  return [...new Set(command.split(/[\s;|&()<>=]+/).map((w) => w.replace(/^['"]+|['"]+$/g, "")))]
+    .filter((w) => /^[\w./@+-]+$/.test(w) && /[./]/.test(w) && !w.startsWith("-") && !w.startsWith("/") && !w.split("/").includes(".."))
+    .map((w) => w.replace(/^\.\//, ""))
+    .filter((w) => {
+      try {
+        return statSync(join(dir, w)).isFile()
+      } catch {
+        return false
+      }
+    })
 }

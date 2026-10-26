@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import { segments } from "../src/decide.ts"
-import { CHILD_PREFIX, DelegationError, Native, NoGitError, parseDelegation, parseTodo, replaceIds, similarity } from "../src/native.ts"
+import { CHILD_PREFIX, DelegationError, Native, NoGitError, namedFiles, parseDelegation, parseTodo, replaceIds, similarity } from "../src/native.ts"
 import { nextStep, settled } from "../src/continuation.ts"
 import { roleByAgent } from "../src/roles.ts"
 import { moveJob, newJob, type Task } from "../src/state.ts"
@@ -833,4 +833,41 @@ test("a todo names its contract; one the job does not have is not taken", async 
   const r = native.todo(project, "ses_mm", parsed.list, parsed.ids)
   assert.deepEqual(r.added.map((t) => t.contract), [{ id: "C1", version: 1 }])
   assert.match(r.errors.join(), /other: job \S+ has no contract C7/)
+})
+
+test("a writer's tests are frozen: the checks name them, a changed one is put back and fails the gate", async () => {
+  const project = repo()
+  mkdirSync(join(project, "test"))
+  writeFileSync(join(project, "test", "add.test.js"), "const assert = require('node:assert')\nassert.equal(require('../add.js').add(2, 3), 5)\n")
+  writeFileSync(join(project, "bench.sh"), 'echo "MM_SCORE {\\"scores\\":{\\"n\\":1}}"\n')
+  git(project, "add", "-A")
+  git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "test")
+  assert.deepEqual(namedFiles("node --test ./test/add.test.js && test -f add.js; cat 'README.md' > /tmp/x", project), ["test/add.test.js", "README.md"])
+  const native = new Native()
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "add", prompt: "Write add.js.\nFrozen: bench.sh\nFiles: add.js\nChecks: node test/add.test.js" }, MODEL)
+  assert.deepEqual(Object.keys(d.task.frozen!), ["bench.sh", "test/add.test.js"])
+  assert.match(d.prompt, /Frozen, so read and run them but do not change them .*: bench\.sh, test\/add\.test\.js\./)
+  const w = native.claim("ses_w1", child(d.prompt))!
+  assert.deepEqual(native.frozenHit("ses_w1", ["test/add.test.js", join(w.dir, "bench.sh"), "add.js"]), ["test/add.test.js", join(w.dir, "bench.sh")])
+  assert.deepEqual(native.frozenHit("ses_mm", ["test/add.test.js"]), [], "only the writer's own files")
+  assert.deepEqual(native.workerAt(w.dir)!.frozen, [join(w.dir, "bench.sh"), join(w.dir, "test", "add.test.js")])
+
+  // The worker makes the test pass by changing it: the test is put back, so the checks fail on the real test.
+  writeFileSync(join(w.dir, "add.js"), "exports.add = (a, b) => a - b\n")
+  writeFileSync(join(w.dir, "test", "add.test.js"), "// fine\n")
+  const red = await native.finish("ses_w1", "done")
+  assert.match(red.text, /The checks fail in your directory \(fix round 1 of 2\)/)
+  assert.match(red.text, /\$ frozen files unchanged \(exit 1\)\nYou changed test\/add\.test\.js, which you may read and run but not change; they are restored/)
+  assert.match(readFileSync(join(w.dir, "test", "add.test.js"), "utf8"), /assert\.equal/)
+  writeFileSync(join(w.dir, "add.js"), "exports.add = (a, b) => a + b\n")
+  assert.match((await native.finish("ses_w1", "done")).text, /^Merged into/)
+
+  // A file of the task's own scope is never frozen, and after a restart the frozen set is known again.
+  const own = await native.delegate(project, "ses_mm", { agent: "coder", description: "tests", prompt: "Extend the tests.\nFiles: test/add.test.js\nChecks: node test/add.test.js" }, MODEL)
+  assert.equal(own.task.frozen, undefined)
+  const t = await native.delegate(project, "ses_mm", { agent: "coder", description: "sub", prompt: "Write sub.js.\nFiles: sub.js\nChecks: node test/add.test.js && test -f sub.js" }, MODEL)
+  const tw = native.claim("ses_w3", child(t.prompt))!
+  const again = new Native()
+  again.adopt(project)
+  assert.deepEqual(again.frozenOf("ses_w3"), [join(tw.dir, "test", "add.test.js")])
 })

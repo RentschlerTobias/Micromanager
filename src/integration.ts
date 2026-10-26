@@ -209,6 +209,22 @@ export async function hashFiles(worktree: string, files: readonly string[], run:
   return out
 }
 
+// The frozen files whose content is no longer what it was when they were frozen (changed, deleted or, for one that did
+// not exist, created). dir: the project directory inside the worktree, as for hashFiles.
+export async function frozenChanged(worktree: string, frozen: ReadonlyMap<string, string>, run: Exec = exec, dir = worktree): Promise<string[]> {
+  if (frozen.size === 0) return []
+  const now = await hashFiles(worktree, [...frozen.keys()], run, dir)
+  return [...frozen].filter(([f, h]) => now.get(f) !== h).map(([f]) => f)
+}
+
+// Frozen tests must not change: a changed or deleted one fails the gate like a failing check. The runner freezes the
+// tests its red stage wrote (P3); a native writer the tests its checks name and its contract's files.
+export async function frozenCheck(worktree: string, frozen: ReadonlyMap<string, string>, run: Exec = exec, dir = worktree, why = "changed after the red stage"): Promise<GateResult[]> {
+  if (frozen.size === 0) return []
+  const changed = await frozenChanged(worktree, frozen, run, dir)
+  return [{ command: "frozen tests unchanged", passed: changed.length === 0, code: changed.length ? 1 : 0, output: changed.length ? `${why}: ${changed.join(", ")}; restore them and change the code instead` : "" }]
+}
+
 // Undoes a worker's changes to the given files: tracked ones back to the last commit, new ones removed.
 // dir: the project directory inside the worktree, because the paths are project-relative (changedFiles). git resolves a
 // pathspec against the directory it runs in, so resolving the wrong one would silently touch a file of the same name.

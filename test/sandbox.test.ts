@@ -35,6 +35,9 @@ test("a writer writes its worktree only, a reader nothing; keys and env files st
   assert.deepEqual(writer.filesystem.allowRead, ["/p/.micromanager/worktrees/job--T1/sub/**/.env.example"])
   assert.ok(REGISTRIES.every((d) => writer.network.allowedDomains.includes(d)) && writer.network.allowedDomains.includes("api.example.com"))
   assert.deepEqual(rulesFor({ role: "explore", writer: false, dir: "/p" }).filesystem.allowWrite, [])
+  // A writer's frozen tests: inside its own worktree, and still not writable from its shell.
+  assert.deepEqual(writer.filesystem.denyWrite, [])
+  assert.deepEqual(rulesFor({ role: "code", writer: true, dir: "/w", worktree: "/w", frozen: ["/w/test/a.test.js"] }).filesystem.denyWrite, ["/w/test/a.test.js"])
 })
 
 // A real run through bubblewrap where the machine has it (skipped elsewhere): the spike's checks as a test.
@@ -48,8 +51,9 @@ test("the sandbox keeps a writer in its worktree, away from the user's keys and 
     mkdirSync(a)
     mkdirSync(b)
     writeFileSync(join(a, ".env"), "TOKEN=x\n")
+    writeFileSync(join(a, "frozen.test.js"), "ok\n")
     const run = async (dir: string, command: string) => {
-      const wrapped = await sandbox.wrap(command, rulesFor({ role: "code", writer: true, dir, worktree: dir, domains: [] }))
+      const wrapped = await sandbox.wrap(command, rulesFor({ role: "code", writer: true, dir, worktree: dir, domains: [], frozen: [join(a, "frozen.test.js")] }))
       try {
         return execFileSync("bash", ["-c", wrapped], { cwd: dir, env: cleanEnv(process.env), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
       } catch (err) {
@@ -62,6 +66,11 @@ test("the sandbox keeps a writer in its worktree, away from the user's keys and 
     assert.match(await run(a, "cat .env"), /failed/)
     assert.match(await run(a, "curl -sS -m 5 https://example.com -o /dev/null && echo reached"), /failed/)
     assert.equal(readFileSync(join(a, "own.txt"), "utf8"), "ok\n")
+    // A frozen test inside the writer's own worktree: readable and runnable, not writable from its shell either.
+    assert.equal(await run(a, "cat frozen.test.js"), "ok")
+    assert.match(await run(a, "sed -i s/ok/no/ frozen.test.js"), /failed/)
+    assert.match(await run(a, "echo no > frozen.test.js"), /failed/)
+    assert.equal(readFileSync(join(a, "frozen.test.js"), "utf8"), "ok\n")
   } finally {
     execFileSync("rm", ["-rf", root])
     await sandbox.stop()

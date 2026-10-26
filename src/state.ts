@@ -148,6 +148,10 @@ export interface Task {
   // A task that does another's work over, and the one it does over: "T19" in the same job, "job-…/T18" in another job of
   // the session. The sidebar shows a failed task as done once its replacement is (src/progress.ts).
   replaces?: string[]
+  // Files the worker may read and run but not change, with their content hash when it started (src/native.ts): the
+  // tests its checks name and its contract's evaluator and corpus. "" for one that did not exist.
+  frozen?: Record<string, string>
+  freeze?: string[] // files its todo or delegation asked to freeze, hashed into frozen when it starts
   replacedBy?: string
   difficulty?: number // the N5 estimate at a native delegation, 0..1 (src/trials.ts)
   // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has (src/trials.ts).

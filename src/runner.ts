@@ -17,7 +17,7 @@ import { n7Questions, n7State, triage, type N7Context, type Verdict } from "./fo
 import { checkGuards, flagsWithoutUser, gateAnswer, gateQuestion, injected, injectionScore, type Unchecked } from "./gate.ts"
 import { brief, fixPrompt, handoffText, lastAssistantText, parseReport, refused, skillLine, taskAcceptance, usage } from "./brief.ts"
 import {
-  changedFiles, commitTask, exec as defaultExec, fastForward, hashFiles, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, revertFiles,
+  changedFiles, commitTask, exec as defaultExec, fastForward, frozenCheck, hashFiles, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree, revertFiles,
   runGate, taskDir, workingDiff, type Exec, type GateResult,
 } from "./integration.ts"
 import { redact } from "./jev.ts"
@@ -1424,14 +1424,6 @@ function collectFollowUps(task: Task, items: readonly FollowUp[]): void {
   if (items.length === 0) return
   const seen = new Set((task.followUps ?? []).map((f) => f.what.toLowerCase()))
   task.followUps = [...(task.followUps ?? []), ...items.filter((f) => !seen.has(f.what.toLowerCase()))]
-}
-
-// Frozen tests (P3) must not change after red: a changed or deleted one fails the gate like a failing check.
-async function frozenCheck(worktree: string, frozen: ReadonlyMap<string, string>, run: Exec): Promise<GateResult[]> {
-  if (frozen.size === 0) return []
-  const now = await hashFiles(worktree, [...frozen.keys()], run)
-  const changed = [...frozen].filter(([f, h]) => now.get(f) !== h).map(([f]) => f)
-  return [{ command: "frozen tests unchanged", passed: changed.length === 0, code: changed.length ? 1 : 0, output: changed.length ? `changed after the red stage: ${changed.join(", ")}; restore them and change the code instead` : "" }]
 }
 
 function noteText(task: Task, report: string, results: readonly { command: string; code: number; output: string }[], outside: readonly string[]): string {

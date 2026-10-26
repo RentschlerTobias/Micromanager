@@ -88,6 +88,7 @@ export interface RuleInput {
   readonly dir: string // where the worker works: its worktree (writer), or what it reads
   readonly worktree?: string // a writer's worktree root, the one place it writes
   readonly domains?: readonly string[] // the user's "network" setting and the job's granted domains
+  readonly frozen?: readonly string[] // absolute paths a writer may read and run but not change (src/native.ts)
 }
 
 // A writer writes its own worktree, a reader nothing; both have a private temp directory (never /tmp as a whole: the
@@ -100,7 +101,8 @@ export function rulesFor(input: RuleInput): Rules {
       denyRead: [...DENY_READ, join(input.dir, "**/.env"), join(input.dir, "**/.env.*")],
       allowRead: [join(input.dir, "**/.env.example")],
       allowWrite: own,
-      denyWrite: [],
+      // A frozen test inside the writer's own worktree: `sed -i` must not get around what the edit tools may not do.
+      denyWrite: [...(input.frozen ?? [])],
     },
   }
 }

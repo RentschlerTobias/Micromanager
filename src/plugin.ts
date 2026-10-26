@@ -72,6 +72,7 @@ interface Evaluation {
 // and told to let the agents explore (design.md §3).
 const MICROMANAGER_READ_CAP = 12
 const READS = new Set(["read", "glob", "grep", "list"])
+const FILE_WRITES = new Set(["edit", "write", "patch"])
 
 // What the session hooks "prompt" and "context" get (opencode 2.0.18, Phase A1).
 interface SessionHookInput {
@@ -944,7 +945,7 @@ export default {
       const box = await sandbox
       if (!box.available) return
       const rules = found
-        ? rulesFor({ role: found.role, writer: found.writer, dir: found.dir, worktree: found.worktree, domains: [...settings.network, ...grants.network] })
+        ? rulesFor({ role: found.role, writer: found.writer, dir: found.dir, worktree: found.worktree, domains: [...settings.network, ...grants.network], frozen: found.frozen })
         : rulesFor({ role: "code", writer: true, dir: dir!, worktree: dir!, domains: [...settings.network] })
       const wrapped = await box.wrap(input.command, rules)
       const seen = (SHARED.unwrapped ??= new Map())
@@ -1236,6 +1237,15 @@ export default {
           }
           return
         }
+      }
+      // A native writer's frozen files (its checks' tests, its contract's evaluator): told at once rather than at the gate,
+      // where the plugin puts them back anyway. The gate is what holds; this saves the worker a fix round.
+      const frozenHit = evaluation.effect !== "deny" && FILE_WRITES.has(evaluation.action) ? native.frozenHit(evaluation.sessionID, evaluation.resources) : []
+      if (frozenHit.length) {
+        evaluation.effect = "deny"
+        evaluation.message = `${frozenHit.join(", ")} is frozen for this task: read and run it, but do not change it. Change the code instead; if the file itself is wrong, say so plainly in your report, with the line that shows it.`
+        record({ kind: "permission", sessionID: evaluation.sessionID, agent: evaluation.agent, action: evaluation.action, resources: evaluation.resources, verdict: "deny", reason: "frozen file" })
+        return
       }
       const narrowed = workerRules.get(evaluation.sessionID)?.find((r) => r.effect === "deny" && r.action === evaluation.action && r.resource === "*")
       if (narrowed && evaluation.effect !== "deny") {
