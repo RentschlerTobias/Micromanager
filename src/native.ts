@@ -19,7 +19,7 @@ import { isAbsolute, join, resolve } from "node:path"
 
 import { Graphs, graphBrief, queryGraph, type Graph } from "./graph.ts"
 import { HEADER } from "./hooks.ts"
-import { coarse, contractBrief, describe, guardViolations, heldOutDir, keepHeldOut, parseContract, reached, type Contract, type Measured } from "./contract.ts"
+import { better, coarse, contractBrief, describe, guardViolations, heldOutDir, keepHeldOut, median, parseContract, reached, type Contract, type Measured } from "./contract.ts"
 import {
   changedFiles, commitTask, exec as defaultExec, fastForward, frozenChanged, gradedOf, hashFiles, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree,
   repoRel, revertFiles, runEvaluator, runGate, taskDir,
@@ -33,6 +33,7 @@ import { isDone, moveTask, newJob, moveJob, stage, type Job, type Later, type Ta
 import { excludeFromGit, jobId, listJobs, saveContract, saveJob } from "./store.ts"
 import { draftFromLater, draftFromTrial, localBackend, type BacklogBackend, type BacklogItem } from "./backlog.ts"
 import { normalTarget, type ChangeAnswer, type ChangeKind } from "./checkchange.ts"
+import { applyPrefs, askWith, baselineForm, draftPrompt, loopholeForm, parseLoopholes, prefsForm, redteamPrompt, type Prefs } from "./contractround.ts"
 import { parseReport, sharedNote, skillLine, taskAcceptance } from "./brief.ts"
 import { settled, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
@@ -54,6 +55,7 @@ export interface Delegation {
   readonly attempt?: { readonly task: string; readonly job: string } // another attempt of a trial ("Attempt: T5 · job-…")
   readonly contract?: string // the fitness contract its work is measured against ("Contract: C1", src/contract.ts)
   readonly frozen?: string // files it may read and run but not change, as written ("Frozen: test/a.test.js")
+  readonly redteam?: { readonly contract: string; readonly job: string } // a contract's red team ("Red team: C1 · job-…")
 }
 
 // The "Files:" and "Checks:" lines of a delegation, wherever they stand; the checks go on over the following lines
@@ -67,8 +69,15 @@ export function parseDelegation(prompt: string): Delegation {
   let planned: Delegation["planned"]
   let attempt: Delegation["attempt"]
   let contract: string | undefined
+  let redteam: Delegation["redteam"]
   let inChecks = false
   for (const line of prompt.split("\n")) {
+    const rt = line.match(/^\s*red team:\s*(C\d+)\s*·\s*(job-[\w-]+)\s*$/i)
+    if (rt) {
+      redteam = { contract: rt[1]!.toUpperCase(), job: rt[2]! }
+      inChecks = false
+      continue
+    }
     const k = line.match(/^\s*contract:\s*(C\d+)\s*$/i)
     if (k) {
       contract = k[1]!.toUpperCase()
@@ -113,7 +122,7 @@ export function parseDelegation(prompt: string): Delegation {
       body.push(line)
     }
   }
-  return { body: body.join("\n").trim(), files, checks, replaces, ...(frozen ? { frozen } : {}), ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}), ...(contract ? { contract } : {}) }
+  return { body: body.join("\n").trim(), files, checks, replaces, ...(frozen ? { frozen } : {}), ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}), ...(contract ? { contract } : {}), ...(redteam ? { redteam } : {}) }
 }
 
 // How much two task texts are about the same thing: the share of their words they have in common (Jaccard over the
@@ -416,6 +425,7 @@ export class Native {
     const d = parseDelegation(input.prompt)
     if (d.attempt) return this.#attempt(project, parent, role, d, d.attempt, model)
     if (d.planned) return this.#planned(project, parent, role, d, d.planned, model, assess)
+    if (d.redteam) return this.#redteam(project, parent, role, d, d.redteam, model)
     if (this.#planFirst && WRITERS.has(role.id)) {
       throw new DelegationError(`Not started: a ${role.agent} starts from a todo. Write it down with the todo tool first (with "after" for what it waits for, "replaces" for a task it does over), then start it with the prompt line "Task: T… · job-…".`)
     }
@@ -466,6 +476,9 @@ export class Native {
     const c = job.contracts?.find((x) => x.id === id)
     if (!c) throw new DelegationError(`Not started: job ${job.id} has no contract ${id}; define it with the contract tool first.`)
     if (!c.baseline) throw new DelegationError(`Not started: contract ${id} has no baseline, because its evaluator did not give a valid result on today's code; fix the contract with the contract tool first.`)
+    // What "better" means is the user's: a draft has not been through the round (their preferences, the red team, the
+    // baseline check) yet.
+    if (c.status !== "frozen") throw new DelegationError(`Not started: contract ${id} is a draft; finish its round first (contract_round with input "${id}"), so the user decides what it measures.`)
     return c
   }
 
@@ -477,7 +490,8 @@ export class Native {
 
   // The contract tool: a contract for the job (the session's own when jobId is empty), new or as a new version of the
   // one with its id, with its baseline measured on the job's branch as it is now. Returns the answer to the micromanager.
-  async contract(project: string, parent: string, jobId: string, json: string): Promise<string> {
+  // byUser: a change the user accepted (request_check_change kind contract); it may change a frozen contract.
+  async contract(project: string, parent: string, jobId: string, json: string, byUser = false): Promise<string> {
     const job = jobId ? this.#jobs.get(key(project, jobId)) ?? listJobs(project).find((j) => j.id === jobId) : this.job(project, parent)
     if (!job) return `There is no job ${jobId} in this project. Nothing was stored.`
     const parsed = parseContract(json)
@@ -485,12 +499,17 @@ export class Native {
     const wanted = String((JSON.parse(json) as { id?: unknown }).id ?? "").toUpperCase()
     const old = wanted ? job.contracts?.find((c) => c.id === wanted) : undefined
     if (wanted && !old) return `Not stored: job ${job.id} has no contract ${wanted} to change; leave out the id for a new one.`
-    if (old?.status === "frozen") return `Not stored: contract ${old.id} is frozen; only the user changes it.`
+    if (old?.status === "frozen" && !byUser) return `Not stored: contract ${old.id} is frozen; only the user changes it.`
     const at = new Date().toISOString()
     const n = Math.max(0, ...(job.contracts ?? []).map((c) => Number(c.id.slice(1)))) + 1
     const c: Contract = old
       ? { ...old, ...parsed.contract, version: old.version + 1, baseline: undefined, history: [...old.history, { version: old.version + 1, change: "changed with the contract tool", at }] }
       : { id: `C${n}`, version: 1, status: "draft", ...parsed.contract, history: [{ version: 1, change: "defined with the contract tool", at }] }
+    if (old) {
+      c.status = "draft" // a new version goes through the round again, unless the user changed it (applyCheckChange)
+      c.round = undefined
+      c.frozen = undefined
+    }
     // The held-out cases come from a directory outside the project and go to the plugin's state directory; a new
     // version without them keeps the ones it had.
     if (parsed.heldOutFrom) {
@@ -520,7 +539,7 @@ export class Native {
     saveContract(project, job.id, c)
     if (!measured.valid) return `Contract ${c.id} (version ${c.version}) is stored for job ${job.id}, but its evaluator gave no valid result on today's code (${measured.error}), so it has no baseline and no writer can be measured against it yet. Fix the evaluator and send the contract again with "id": "${c.id}".`
     const held = c.corpus.heldOut ? ` It has ${c.corpus.heldOut.cases} held-out cases, which only the evaluator sees${c.baseline?.heldOut ? "" : "; on them today's code gave no valid result"}.` : ""
-    return `Contract ${c.id} (version ${c.version}, ${c.status}) is stored for job ${job.id}. Baseline${c.baseline?.commit ? ` on ${c.baseline.commit}` : ""}: ${describe({ ...c, baseline: undefined }, measured)} (${c.costPerEval}s per run).${held} Start the writers it measures with a line "Contract: ${c.id}" (or "contract" in a todo).`
+    return `Contract ${c.id} (version ${c.version}, ${c.status}) is stored for job ${job.id}. Baseline${c.baseline?.commit ? ` on ${c.baseline.commit}` : ""}: ${describe({ ...c, baseline: undefined }, measured)} (${c.costPerEval}s per run).${held} It is a draft: before a writer is measured against it, take it through its round with contract_round (input "${c.id}"), where the user decides what it measures.`
   }
 
   // The files a writer may read and run but not change, hashed as its worktree has them now: the ones its todo or
@@ -650,9 +669,13 @@ export class Native {
       } catch {
         return { ok: false, text: "the proposal is no contract JSON", steer: [] }
       }
-      const text = await this.contract(project, entry.parent, job.id, JSON.stringify({ ...proposal, id: c.id }))
+      const wasFrozen = c.status === "frozen"
+      const text = await this.contract(project, entry.parent, job.id, JSON.stringify({ ...proposal, id: c.id }), true)
       if (!text.startsWith(`Contract ${c.id} (version`)) return { ok: false, text, steer: [] }
       const now = job.contracts!.find((x) => x.id === c.id)!
+      if (!now.baseline) return { ok: false, text, steer: [] }
+      // The user decided this change, which is what the round is for: frozen again as it is now.
+      if (wasFrozen) await this.#freezeContract(project, job, now)
       for (const e of entries) this.#bind(job, job.tasks.find((t) => t.id === e.taskId)!, c.id)
       return { ok: true, text: `contract ${c.id} is version ${now.version} now`, steer: steer(`contract ${c.id} is version ${now.version} now`) }
     }
@@ -694,6 +717,210 @@ export class Native {
     }
     saveJob(project, job)
     return { ok: true, text: `${path} is changed as proposed${entry.frozen?.has(path) ? " and frozen again" : ""}`, steer: steer(`${path} is changed as proposed`) }
+  }
+
+  // --- the contract round (src/contractround.ts) ---------------------------------------------------------------
+
+  // contract_round: a new round from a goal (the drafter's prompt), a draft from the drafter's JSON, or an existing
+  // draft by its id. Returns what the micromanager does next.
+  async contractRound(project: string, parent: string, jobId: string, goal: string, input: string): Promise<string> {
+    const job = jobId ? this.#jobs.get(key(project, jobId)) ?? listJobs(project).find((j) => j.id === jobId) : this.job(project, parent)
+    if (!job) return `There is no job ${jobId} in this project.`
+    const text = input.trim()
+    if (!text) {
+      if (!goal.trim()) return "contract_round needs the goal (to start a round), or as input the drafter's contract JSON or a draft's id."
+      return `Start a planner with the subagent tool (agent planner, description "contract draft"), with this prompt, and wait for its report. Then call contract_round with job "${job.id}" and its JSON as input (if it says a measuring script is missing, have a coder write that script first, with a check that it runs and prints MM_SCORE).
+
+${draftPrompt(goal.trim())}`
+    }
+    let c: Contract | undefined
+    if (/^c\d+$/i.test(text)) c = job.contracts?.find((x) => x.id === text.toUpperCase())
+    else {
+      const stored = await this.contract(project, parent, job.id, text)
+      const id = stored.match(/^Contract (C\d+) \(version/)?.[1]
+      if (!id) return stored
+      c = job.contracts?.find((x) => x.id === id)
+      if (!c?.baseline) return stored
+    }
+    if (!c) return `Job ${job.id} has no contract ${text}.`
+    if (c.status === "frozen") return `Contract ${c.id} is frozen already; writers are measured against it with a line "Contract: ${c.id}".`
+    if (!c.baseline) return `Contract ${c.id} has no baseline yet: its evaluator gave no valid result on today's code. Fix it with the contract tool first.`
+    c.round = { step: "prefs", loopholes: [] }
+    saveJob(project, job)
+    saveContract(project, job.id, c)
+    return askWith(prefsForm(c), `Contract ${c.id} (version ${c.version}) is a draft, measured on today's code: ${describe({ ...c, baseline: undefined }, { valid: true, values: c.baseline.values })}. The user decides what it measures.`)
+  }
+
+  // The job a contract in its round belongs to, for the round's forms (they name only the contract).
+  roundJob(project: string, parent: string, id: string): { job: Job; contract: Contract } | undefined {
+    const jobs = [...[...this.#jobs.entries()].filter(([k]) => k.startsWith(`${project}\0`)).map(([, j]) => j), ...listJobs(project)]
+    const mine = jobs.filter((j) => j.facilitator === parent || j.facilitator === undefined)
+    for (const job of [...mine, ...jobs]) {
+      const contract = job.contracts?.find((c) => c.id === id && c.round && c.round.step !== "frozen")
+      if (contract) return { job: this.#jobs.get(key(project, job.id)) ?? job, contract }
+    }
+    return undefined
+  }
+
+  // The user's preferences: applied as a new version, then the red team, or straight to the baseline check.
+  async roundPrefs(project: string, parent: string, id: string, prefs: Prefs): Promise<string> {
+    const found = this.roundJob(project, parent, id)
+    if (!found || found.contract.round?.step !== "prefs") return `Contract ${id} waits for no preferences.`
+    const { job, contract: c } = found
+    if (prefs.said) return `"${prefs.said}" is no answer to the form for contract ${c.id}; ask with the same form again, or change the contract with the contract tool and start its round again.`
+    applyPrefs(c, prefs)
+    c.version++
+    c.history.push({ version: c.version, change: `the user's preferences: ${c.scores[0]!.name} decides, guards ${c.guards.map((g) => g.name).join(", ") || "none"}${c.stop.target ? `, target ${JSON.stringify(c.stop.target)}` : ""}`, at: new Date().toISOString() })
+    this.#jobs.set(key(project, job.id), job)
+    if (prefs.redteam) {
+      c.round!.step = "redteam"
+      saveJob(project, job)
+      saveContract(project, job.id, c)
+      return `Contract ${c.id} is version ${c.version} with the user's preferences. Now its red team: start a coder with the subagent tool (description "${c.id} red team", on another model family than the drafter if you can), with this prompt, filling in the files a worker on this goal would change:
+Red team: ${c.id} · ${job.id}
+Files: <those files>
+Its change is measured and never merged; its LOOPHOLE lines come to you when it ends.`
+    }
+    return this.#roundBaseline(project, job, c)
+  }
+
+  // "Red team: C1 · job-…": a writer that tries to game the draft contract, in its own worktree; never merged.
+  async #redteam(project: string, parent: string, role: Role, d: Delegation, ref: NonNullable<Delegation["redteam"]>, model: string): Promise<Delegated> {
+    const job = this.#jobs.get(key(project, ref.job)) ?? listJobs(project).find((j) => j.id === ref.job)
+    if (!job) throw new DelegationError(`Not started: there is no job ${ref.job} in this project.`)
+    const c = job.contracts?.find((x) => x.id === ref.contract)
+    if (!c || c.round?.step !== "redteam") throw new DelegationError(`Not started: contract ${ref.contract} of job ${job.id} is not waiting for its red team.`)
+    if (!WRITERS.has(role.id)) throw new DelegationError("Not started: a red team changes files; start it with agent coder.")
+    const parsed = parseFiles(d.files, project)
+    if (parsed.problem || !parsed.files.length) throw new DelegationError(`Not started: ${parsed.problem ?? "a red team needs a line \"Files: <the files a worker on this goal would change>\""}.`)
+    const checks = d.checks.length ? d.checks : ["true"]
+    const why = checkSetProblems(checks, true)
+    if (why) throw new DelegationError(`Not started: ${why}`)
+    this.#jobs.set(key(project, job.id), job)
+    const rel = await this.#integrate(project, job, true)
+    const added = addDelegated(job, { title: `${c.id} red team`, prompt: redteamPrompt(c), files: parsed.files, dependsOn: [], checks })
+    if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
+    const task = added.task
+    task.role = role.id
+    task.model = model
+    task.redteam = c.id
+    task.contract = { id: c.id, version: c.version }
+    c.round!.redteam = task.id
+    for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
+    stage(task, "delegate", "pass", `${role.agent} on ${model}, red team of ${c.id}`)
+    return this.#start(project, parent, job, task, role, model, { ...d, body: [redteamPrompt(c), d.body].filter(Boolean).join("\n\n") }, checks, rel)
+  }
+
+  // The red team's report as it ended: its loopholes go to the round, and the user picks the ones to close; without
+  // any, the round goes on to the baseline. A red team whose change raised the score is a loophole in itself.
+  async noteLoopholes(session: string, report: string): Promise<string | undefined> {
+    const entry = this.#entry(session)
+    const job = entry && this.#job(entry)
+    const task = job?.tasks.find((t) => t.id === entry!.taskId)
+    const c = task?.redteam ? job!.contracts?.find((x) => x.id === task.redteam) : undefined
+    if (!entry || !job || !task || !c || c.round?.step !== "redteam") return undefined
+    const found = parseLoopholes(report)
+    const raised = task.score?.valid && c.baseline && better(c, task.score, { valid: true, values: c.baseline.values }) > 0
+    if (raised && !found.length) found.push({ what: `the red team raised the score (${describe(c, task.score!)}) without improving the goal; see its report in session ${session}` })
+    c.round.loopholes = found
+    if (!found.length) {
+      c.history.push({ version: c.version, change: "the red team found no loophole", at: new Date().toISOString() })
+      return `[micromanager] The red team of contract ${c.id} found no loophole. ${await this.#roundBaseline(entry.project, job, c)}`
+    }
+    c.round.step = "loopholes"
+    saveJob(entry.project, job)
+    saveContract(entry.project, job.id, c)
+    return `[micromanager] ${askWith(loopholeForm(c), `The red team of contract ${c.id} found ${found.length} way${found.length > 1 ? "s" : ""} to raise the score without improving the goal.`)}`
+  }
+
+  // The loopholes the user chose to close: a guard each where the red team named one; then the baseline check.
+  async roundLoopholes(project: string, parent: string, id: string, picked: readonly number[]): Promise<string> {
+    const found = this.roundJob(project, parent, id)
+    if (!found || found.contract.round?.step !== "loopholes") return `Contract ${id} waits for no answer about loopholes.`
+    const { job, contract: c } = found
+    const chosen = picked.map((i) => c.round!.loopholes[i]).filter((l): l is NonNullable<typeof l> => Boolean(l))
+    const guards = chosen.flatMap((l) => (l.guard && !c.guards.some((g) => g.name === l.guard!.name) ? [l.guard] : []))
+    c.guards = [...c.guards, ...guards]
+    if (chosen.length) {
+      c.version++
+      const unguarded = chosen.filter((l) => !l.guard)
+      c.history.push({ version: c.version, change: `closed ${chosen.length} loophole(s) of the red team${guards.length ? `, guards ${guards.map((g) => g.name).join(", ")}` : ""}${unguarded.length ? `; without a guard: ${unguarded.map((l) => l.what.slice(0, 80)).join("; ")}` : ""}`, at: new Date().toISOString() })
+    }
+    const open = chosen.filter((l) => !l.guard)
+    const note = open.length ? ` ${open.length} of them name no value the evaluator prints: change the evaluator or the corpus to catch ${open.length > 1 ? "them" : "it"} (the contract tool with "id": "${c.id}"), or go on.` : ""
+    return `${guards.length ? `Contract ${c.id} has ${guards.length} new guard(s).` : "No guard was added."}${note} ${await this.#roundBaseline(project, job, c)}`
+  }
+
+  // The baseline the user checks before the freeze: three runs on each corpus, shown with their spread.
+  async #roundBaseline(project: string, job: Job, c: Contract): Promise<string> {
+    c.round = { ...(c.round ?? { loopholes: [] }), step: "baseline" }
+    const rel = await this.#integrate(project, job, false)
+    const dir = taskDir(job.integrationWorktree ?? project, rel)
+    const once = { ...c, repeats: 1 }
+    const visible: Measured[] = []
+    const heldOut: Measured[] = []
+    let seconds = 0
+    for (let i = 0; i < Math.max(3, c.repeats); i++) {
+      const r = await runEvaluator(dir, once, "visible", this.#exec)
+      visible.push(r.measured)
+      seconds += r.seconds
+      if (c.corpus.heldOut) {
+        const h = await runEvaluator(dir, once, "heldout", this.#exec, heldOutDir(project, job.id, c.id))
+        heldOut.push(h.measured)
+        seconds += h.seconds
+      }
+    }
+    this.#count(job, c, seconds)
+    const med = median(visible)
+    if (med.valid) c.baseline = { ...c.baseline!, values: { ...med.values }, at: new Date().toISOString() }
+    const medHeld = heldOut.length ? median(heldOut) : undefined
+    if (medHeld?.valid) c.baseline = { ...c.baseline!, heldOut: { ...medHeld.values } }
+    this.#jobs.set(key(project, job.id), job)
+    saveJob(project, job)
+    saveContract(project, job.id, c)
+    return askWith(baselineForm(c, { visible, heldOut }, Math.round(seconds * 10) / 10), `Contract ${c.id} (version ${c.version}) is measured on today's code again; the user checks it before it is frozen.`)
+  }
+
+  // The user's answer to the baseline: freeze, measure again, or back to a draft.
+  async roundBaseline(project: string, parent: string, id: string, decision: "plausible" | "again" | "change" | undefined, said?: string): Promise<string> {
+    const found = this.roundJob(project, parent, id)
+    if (!found || found.contract.round?.step !== "baseline") return `Contract ${id} waits for no baseline answer.`
+    const { job, contract: c } = found
+    if (decision === "again") return this.#roundBaseline(project, job, c)
+    if (decision === "plausible") {
+      await this.#freezeContract(project, job, c)
+      return `Contract ${c.id} is frozen (version ${c.version}): its evaluator and visible corpus may not change any more, and writers are measured against it with a line "Contract: ${c.id}" (or "contract" in a todo).`
+    }
+    c.round = undefined
+    saveJob(project, job)
+    return `The user wants contract ${c.id} changed${said ? `: "${said}"` : decision === "change" ? "" : " (their answer was no choice of the form)"}. Ask what is wrong if it is not clear, send the changed contract with the contract tool ("id": "${c.id}"), then start its round again with contract_round (input "${c.id}").`
+  }
+
+  // A contract frozen: the files its evaluator names and its visible corpus, hashed on the job's branch.
+  async #freezeContract(project: string, job: Job, c: Contract): Promise<void> {
+    const rel = await this.#integrate(project, job, false)
+    const worktree = job.integrationWorktree ?? project
+    const dir = taskDir(worktree, rel)
+    const corpus: string[] = []
+    for (const p of c.corpus.visible) {
+      const listed = await this.#exec("git", ["ls-files", "--", p], { cwd: dir })
+      corpus.push(...listed.stdout.split("\n").map((l) => l.trim()).filter(Boolean))
+    }
+    const files = [...new Set([...namedFiles(c.evaluator, dir), ...corpus])].sort()
+    c.frozen = { files: Object.fromEntries(await hashFiles(worktree, files, this.#exec, dir)), at: new Date().toISOString() }
+    c.status = "frozen"
+    c.round = { ...(c.round ?? { loopholes: [] }), step: "frozen" }
+    c.history.push({ version: c.version, change: "frozen after the user checked the baseline", at: c.frozen.at })
+    this.#jobs.set(key(project, job.id), job)
+    saveJob(project, job)
+    saveContract(project, job.id, c)
+  }
+
+  // For a contract the user settled outside the round (and the tests): frozen as it is.
+  async freezeContract(project: string, jobId: string, id: string): Promise<void> {
+    const job = this.#jobs.get(key(project, jobId)) ?? listJobs(project).find((j) => j.id === jobId)
+    const c = job?.contracts?.find((x) => x.id === id)
+    if (job && c) await this.#freezeContract(project, job, c)
   }
 
   // What a contract's evaluations cost: on the contract (its stop rule) and on the job (its counters).
@@ -1188,7 +1415,8 @@ export class Native {
     // Another attempt of its trial won while these checks ran (and took the worktree away).
     if (task.status === "cancelled") return { text: lostText(job, task) }
     // The contract's evaluator runs only once the checks pass: it may take minutes, and a broken build measures nothing.
-    const fitness = failed.length ? {} : await this.#measure(entry, job, task)
+    // A red team is measured without its guards (src/contractround.ts): gaming them is what it is for.
+    const fitness = failed.length || task.redteam ? {} : await this.#measure(entry, job, task)
     // The evaluator can take minutes, and the trial may be decided meanwhile (TypeScript cannot see that across await).
     if ((task.status as Task["status"]) === "cancelled") return { text: lostText(job, task) }
     if (fitness.failed) {
@@ -1253,6 +1481,7 @@ export class Native {
     stage(task, "gate", "pass", entry.checks.length ? entry.checks.join(", ") : "no checks given")
     if (fitness.evidence) stage(task, "fitness", "pass", fitness.evidence)
     const commit = await commitTask(entry.worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${task.model ?? "?"} (${task.role}), session ${session}${task.summary ? `\n\n${task.summary}` : ""}`, this.#exec)
+    if (task.redteam) return this.#redteamDone(entry, job, task)
     moveTask(task, "passed")
     const scored = task.trial && entry.contract ? job.contracts?.find((x) => x.id === entry.contract) : undefined
     if (scored) return this.#hold(entry, job, task, scored, fitness.evidence)
@@ -1324,6 +1553,23 @@ export class Native {
       text: `Your checks pass${measured ? ` (${measured})` : ""}, and your commit waits in your worktree: the attempt with the best score is merged once every attempt of this trial is done. There is nothing more to do; end now with your short report.`,
       ...(settled ? { note: settled.note, parent: entry.parent, stop: settled.stop } : {}),
     }
+  }
+
+  // A red team that passed its checks: measured on the visible corpus without its guards (gaming them is the point),
+  // never committed or merged. What it found is in its report.
+  async #redteamDone(entry: Entry, job: Job, task: Task): Promise<{ text: string }> {
+    const c = job.contracts?.find((x) => x.id === task.redteam)
+    let seen = "nothing measured"
+    if (c) {
+      const { measured, seconds } = await runEvaluator(entry.dir, c, "visible", this.#exec)
+      this.#count(job, c, seconds)
+      if (measured.valid) task.score = { ...measured, corpus: "visible", at: new Date().toISOString() }
+      seen = describe(c, measured)
+    }
+    moveTask(task, "passed")
+    stage(task, "redteam", "pass", seen)
+    saveJob(entry.project, job)
+    return { text: `Measured: ${seen}. Your change is not merged. Now end with your report and one LOOPHOLE line per way you tried, as your brief says.` }
   }
 
   // The trial's deadline, armed once per trial from its first held attempt; after a restart from the time it had.
@@ -1484,6 +1730,9 @@ export class Native {
     } else if (task.trial && task.status === "cancelled") {
       // Stopped because another attempt won: its work is not needed, and the winner's note said so.
       await this.#dropWorktree(entry, task)
+    } else if (task.redteam) {
+      // A red team's change is never merged: its worktree goes, its report is what it leaves.
+      await this.#dropWorktree(entry, task)
     } else if (task.held && task.status === "passed") {
       // Passed and waiting for its trial to be decided by score: its commit stays in its worktree until then.
     } else {
@@ -1620,7 +1869,7 @@ export class Native {
           ? `Checks the plugin runs when you finish: ${entry.checks.join("; ")}`
           : "No checks were given: test your change yourself as far as you can."
         : "",
-      entry.contract && job.contracts?.find((c) => c.id === entry.contract) ? contractBrief(job.contracts.find((c) => c.id === entry.contract)!) : "",
+      entry.contract && !task.redteam && job.contracts?.find((c) => c.id === entry.contract) ? contractBrief(job.contracts.find((c) => c.id === entry.contract)!) : "",
       entry.frozen?.size ? `Frozen, so read and run them but do not change them (the plugin puts them back and counts it as a failing check): ${[...entry.frozen.keys()].join(", ")}.` : "",
       entry.writer ? "If a check or a frozen test is itself wrong (a path that does not exist, a typo, a test that contradicts the task), do not work around it: ask with request_check_change ({ kind: \"check_bug\" | \"test_contradicts_spec\" | \"spec_incomplete\" | \"contract\", target: the check command or file, problem, evidence: the output or spec line that shows it, proposal: the new command or a unified diff }), inside the execute tool. Someone else decides; it waits for the answer. Twice per task at most, and a refused change stays refused." : "",
       others.length ? `Other workers change other files at the same time (not yours): ${others.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",

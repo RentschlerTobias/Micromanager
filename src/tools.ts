@@ -27,6 +27,8 @@ export const TOOL_IDS = [
   "backlog",
   // A writer's request to change a check, decided (src/checkchange.ts).
   "decide_change",
+  // A fitness contract worked out with the user before it measures anyone (src/contractround.ts).
+  "contract_round",
 ] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
@@ -60,6 +62,7 @@ export interface Handlers {
   contract(job: string, json: string, ctx: ToolContext): Promise<string>
   backlog(action: string, slug: string, value: string, ctx: ToolContext): Promise<string>
   decideChange(id: string, decision: string, note: string, ctx: ToolContext): Promise<string>
+  contractRound(job: string, goal: string, input: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -195,6 +198,13 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     description: "The project's backlog: jobs that wait, one file each in .micromanager/backlog/ (the user commits them). action \"list\" shows them in the order they run; \"show\" with slug shows one; \"add\" with value a JSON object {\"title\", \"kind\": \"build\"|\"fix\"|\"optimize\", \"goal\", \"acceptance\": [{\"text\", \"verify\"}], \"checks\": [shell commands], \"fitness\": a contract as the contract tool takes it, \"order\", \"status\": \"draft\"|\"ready\"} writes a new one (add only what the user asked to keep for later); \"set\" with slug and value \"status=ready\" or \"order=10\" changes one. A job's follow-ups that no task took up become drafts by themselves when the job is merged or discarded. Start an item with plan_job and the goal \"backlog:<slug>\", or write its tasks as todos.",
     input: input("action", "slug", "value"),
     execute: guarded(([action, slug, value], ctx) => handlers.backlog(action!, slug!, value!, ctx), "action", "slug", "value"),
+  })
+  draft.add({
+    id: "contract_round",
+    name: "contract_round",
+    description: "Work out a fitness contract with the user before any writer is measured against it; a writer's \"Contract: C…\" line is refused until its contract is frozen. With goal (what to make better) and no input: answers with the prompt for a planner that drafts the contract. With input the planner's contract JSON (or a draft's id, \"C1\"): stores it, measures its baseline, and answers with the form for the user's preferences. The plugin goes on by itself from the user's answers: the red team (a coder you start with the line \"Red team: C… · job-…\"), the loopholes to close, the baseline check, the freeze; follow the notes it gives you. job: empty for this session's job.",
+    input: input("job", "goal", "input"),
+    execute: guarded(([job, goal, inp], ctx) => handlers.contractRound(job!, goal!, inp!, ctx), "job", "goal", "input"),
   })
   draft.add({
     id: "decide_change",

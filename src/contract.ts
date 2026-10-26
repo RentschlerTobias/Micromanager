@@ -81,6 +81,9 @@ export interface Contract {
   stop: { target?: Record<string, number>; plateau?: number; evaluations?: number; seconds?: number }
   costPerEval?: number // seconds per run, measured with the baseline
   used?: { evaluations: number; seconds: number }
+  // When the round froze it (src/contractround.ts): the evaluator's files and the visible corpus with their hashes in
+  // the job's branch. A worker measured against it has these frozen as well (src/native.ts #freeze).
+  frozen?: { files: Record<string, string>; at: string }
   history: { version: number; change: string; at: string }[]
 }
 

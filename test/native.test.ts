@@ -786,8 +786,11 @@ test("a fitness contract: its baseline is measured, a writer is measured against
   const native = new Native()
   const json = JSON.stringify({ goal: "faster", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], guards: [{ name: "hits", direction: "max", tolerance: 0 }] })
   const stored = await native.contract(project, "ses_mm", "", json)
-  assert.match(stored, /^Contract C1 \(version 1, draft\) is stored for job job-\S+\. Baseline on [0-9a-f]+: ms 100 \([\d.]+s per run\)\. Start the writers it measures with a line "Contract: C1"/)
+  assert.match(stored, /^Contract C1 \(version 1, draft\) is stored for job job-\S+\. Baseline on [0-9a-f]+: ms 100 \([\d.]+s per run\)\. It is a draft: before a writer is measured against it, take it through its round with contract_round \(input "C1"\)/)
   const job = native.job(project, "ses_mm")
+  await assert.rejects(native.delegate(project, "ses_mm", { agent: "coder", description: "speed", prompt: "Make it faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt" }, MODEL), /contract C1 is a draft; finish its round first/)
+  await native.freezeContract(project, job.id, "C1")
+  assert.deepEqual(job.contracts![0]!.frozen!.files, { "bench.sh": git(project, "hash-object", "bench.sh") })
   assert.ok(existsSync(join(project, ".micromanager", "contracts", job.id, "C1.json")))
   assert.deepEqual(job.contracts![0]!.baseline!.values, { ms: 100, hits: 10 })
   assert.equal(job.counters.evals, 1)
@@ -815,20 +818,22 @@ test("a fitness contract: its baseline is measured, a writer is measured against
   assert.deepEqual(task.stages.map((s) => `${s.stage}:${s.result}`), ["delegate:pass", "gate:pass", "fitness:fail", "gate:pass", "fitness:pass", "merge:pass"])
   assert.equal(saved.counters.evals, 3)
 
-  // A new version is measured again; an evaluator that gives nothing valid leaves the contract without a baseline, and
-  // no writer is measured against it.
-  const broken = await native.contract(project, "ses_mm", "", JSON.stringify({ id: "C1", goal: "faster", evaluator: "sh missing.sh", scores: [{ name: "ms", direction: "min" }] }))
-  assert.match(broken, /Contract C1 \(version 2\) is stored .* gave no valid result on today's code \(the evaluator exited \d+/)
-  await assert.rejects(ask("Make it faster still.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt"), /contract C1 has no baseline/)
+  // A frozen contract is the user's: the tool changes it no more. An evaluator that gives nothing valid leaves a new
+  // contract without a baseline, and no writer is measured against it.
+  assert.equal(await native.contract(project, "ses_mm", "", JSON.stringify({ id: "C1", goal: "faster", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "max" }] })), "Not stored: contract C1 is frozen; only the user changes it.")
+  const broken = await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "faster", evaluator: "sh missing.sh", scores: [{ name: "ms", direction: "min" }] }))
+  assert.match(broken, /Contract C2 \(version 1\) is stored .* gave no valid result on today's code \(the evaluator exited \d+/)
+  await assert.rejects(ask("Make it faster still.\nContract: C2\nFiles: ms.txt\nChecks: test -s ms.txt"), /contract C2 has no baseline/)
 
   // The stop rule: an evaluation budget that is used up blocks the worker at once instead of handing back fix rounds.
-  assert.match(await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "smaller", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], stop: { evaluations: 1 } })), /^Contract C2/)
-  const e = await ask("Make it smaller.\nContract: C2\nFiles: ms.txt\nChecks: test -s ms.txt")
+  assert.match(await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "smaller", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], stop: { evaluations: 1 } })), /^Contract C3/)
+  await native.freezeContract(project, job.id, "C3")
+  const e = await ask("Make it smaller.\nContract: C3\nFiles: ms.txt\nChecks: test -s ms.txt")
   const ew = native.claim("ses_w2", child(e.prompt))!
   writeFileSync(join(ew.dir, "ms.txt"), "70\n")
   const spent = await native.finish("ses_w2", "smaller")
   assert.match(spent.text, /still fail after 2 rounds/)
-  assert.match(spent.text, /contract C2 allows 1 evaluations, and they are used up/)
+  assert.match(spent.text, /contract C3 allows 1 evaluations, and they are used up/)
   assert.equal(loadJob(project, job.id)!.tasks.find((t) => t.id === e.task.id)!.status, "blocked")
 })
 
@@ -948,6 +953,7 @@ test("a trial measured against a contract merges the best score once every attem
   const decided = new Promise<void>((resolve) => (done = resolve))
   const native = new Native({ onSettled: (r) => { settled.push({ note: r.note, stop: r.stop, measured: r.measured.map((t) => t.id) }); if (r.note) done() } })
   await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "faster", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min", noise: 0.05 }] }))
+  await native.freezeContract(project, native.job(project, "ses_mm").id, "C1")
   const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "faster", prompt: "Make it faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt" }, MODEL, { difficulty: 0.9, trials: 3 })
   assert.match(native.trialNote(project, d.job.id, d.task.id)!, /the one with the best score against contract C1 is merged once all are done/)
   assert.match(d.prompt, /the one with the best score is merged once all are done/)
@@ -990,6 +996,7 @@ test("an attempt that reaches the contract's target wins at once; held-out cases
   const stored = await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "g", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], corpus: { heldOutFrom: outside }, stop: { target: { ms: 50 } } }))
   assert.match(stored, /It has 3 held-out cases, which only the evaluator sees\./)
   const job0 = native.job(project, "ses_mm")
+  await native.freezeContract(project, job0.id, "C1")
   assert.deepEqual(job0.contracts![0]!.baseline!.heldOut, { ms: 100 })
   assert.equal(job0.contracts![0]!.corpus.heldOut!.cases, 3)
 
@@ -1013,6 +1020,7 @@ test("a trial decided by score is decided at its deadline, by a process that ado
   const project = benchRepo()
   const native = new Native({ trialDeadlineMs: 60_000 })
   await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "g", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }] }))
+  await native.freezeContract(project, native.job(project, "ses_mm").id, "C1")
   const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "faster", prompt: "Make it faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt" }, MODEL, { difficulty: 0.9, trials: 2 })
   const a2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "attempt", prompt: `Attempt: ${d.task.id} · ${d.job.id}` }, "opencode-go/kimi-k3")
   const w1 = native.claim("ses_c1", child(d.prompt))!
@@ -1034,4 +1042,56 @@ test("a trial decided by score is decided at its deadline, by a process that ado
   assert.match(r.note!, new RegExp(`${d.task.id} won the trial of ${d.task.id} with the best score \\(ms 70`))
   assert.deepEqual(r.stop, [], "the other attempt's session ended with the restart")
   assert.equal(loadJob(project, d.job.id)!.tasks.find((t) => t.id === a2.task.id)!.status, "cancelled")
+})
+
+test("a contract's round: the user's preferences, a red team that is measured and never merged, its loopholes, the baseline, the freeze", async () => {
+  const project = repo()
+  writeFileSync(join(project, "bench.sh"), 'echo "MM_SCORE {\\"scores\\":{\\"ms\\":$(cat ms.txt),\\"hits\\":$(cat hits.txt)}}"\n')
+  writeFileSync(join(project, "ms.txt"), "100\n")
+  writeFileSync(join(project, "hits.txt"), "10\n")
+  git(project, "add", "-A")
+  git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "bench")
+  const native = new Native()
+  assert.match(await native.contractRound(project, "ses_mm", "", "make search faster", ""), /^Start a planner with the subagent tool .*\n\nWork out a fitness contract for this goal: make search faster/s)
+  const draft = JSON.stringify({ goal: "faster search", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }, { name: "hits", direction: "max" }], guards: [{ name: "hits", direction: "max", tolerance: 0 }] })
+  const prefs = await native.contractRound(project, "ses_mm", "", "", draft)
+  assert.match(prefs, /^Contract C1 \(version 1\) is a draft, measured on today's code: ms 100, hits 10\. The user decides what it measures\. Ask the user with the question tool/)
+  const form = JSON.parse(prefs.slice(prefs.indexOf("{"))) as { questions: { header: string }[] }
+  assert.deepEqual(form.questions.map((q) => q.header), ["C1 decides", "C1 guards", "C1 preferences", "C1 target", "C1 red team"])
+  const job = native.job(project, "ses_mm")
+  assert.equal(native.roundJob(project, "ses_mm", "C1")!.job.id, job.id)
+
+  const redteam = await native.roundPrefs(project, "ses_mm", "C1", { decides: "ms", guards: ["hits"], tolerance: 0, target: 0.25, redteam: true })
+  assert.match(redteam, new RegExp(`Contract C1 is version 2 with the user's preferences\\. Now its red team: .*\\nRed team: C1 · ${job.id}\\nFiles: <those files>`, "s"))
+  assert.deepEqual(job.contracts![0]!.stop.target, { ms: 75 })
+  await assert.rejects(native.delegate(project, "ses_mm", { agent: "coder", description: "speed", prompt: "Faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt" }, MODEL), /contract C1 is a draft/)
+
+  // The red team games the number: measured without its guards, never committed, its worktree gone when it ends.
+  const rt = await native.delegate(project, "ses_mm", { agent: "coder", description: "C1 red team", prompt: `Red team: C1 · ${job.id}\nFiles: ms.txt, hits.txt` }, "opencode-go/kimi-k3")
+  assert.equal(rt.task.redteam, "C1")
+  assert.match(rt.prompt, /You are the red team of fitness contract C1: faster search/)
+  const w = native.claim("ses_rt", child(rt.prompt))!
+  writeFileSync(join(w.dir, "ms.txt"), "50\n")
+  writeFileSync(join(w.dir, "hits.txt"), "3\n")
+  assert.match((await native.finish("ses_rt", "gamed")).text, /^Measured: ms 50 \(baseline 100\), hits 3 \(baseline 10\)\. Your change is not merged\./)
+  const loopholes = await native.noteLoopholes("ses_rt", "STATUS: DONE\nLOOPHOLE: dropped most hits to skip work | guard: hits max 0\nLOOPHOLE: cached the timings | guard: wall max 0")
+  assert.match(loopholes!, /found 2 ways to raise the score without improving the goal\. Ask the user/)
+  await native.ended("ses_rt")
+  assert.ok(!existsSync(w.dir))
+  assert.equal(readFileSync(join(job.integrationWorktree!, "ms.txt"), "utf8"), "100\n", "nothing of the red team is merged")
+
+  const baseline = await native.roundLoopholes(project, "ses_mm", "C1", [0, 1])
+  assert.match(baseline, /^Contract C1 has 1 new guard\(s\)\. Contract C1 \(version 3\) is measured on today's code again/)
+  assert.match(baseline, /"header":"C1 baseline"/)
+  assert.match(baseline, /3 runs \([\d.]+s in all\): ms: 100; hits: 10\./)
+  assert.match(await native.roundBaseline(project, "ses_mm", "C1", "again"), /"header":"C1 baseline"/)
+  assert.match(await native.roundBaseline(project, "ses_mm", "C1", "plausible"), /^Contract C1 is frozen \(version 3\)/)
+  const c = job.contracts![0]!
+  assert.equal(c.status, "frozen")
+  assert.deepEqual(c.guards.map((g) => `${g.name}:${g.origin}`), ["hits:user", "wall:redteam"])
+  assert.deepEqual(Object.keys(c.frozen!.files), ["bench.sh"])
+  assert.match(c.history.map((h) => h.change).join("\n"), /the user's preferences: ms decides, guards hits, target \{"ms":75\}\nclosed 2 loophole\(s\) of the red team, guards wall\nfrozen after the user checked the baseline/)
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "speed", prompt: "Faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt" }, MODEL)
+  assert.deepEqual(d.task.contract, { id: "C1", version: 3 })
+  assert.equal(await native.contractRound(project, "ses_mm", "", "", "C1"), 'Contract C1 is frozen already; writers are measured against it with a line "Contract: C1".')
 })

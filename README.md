@@ -173,7 +173,8 @@ Jev and the plugin securing every task:
    | `rewind_job` | list the job's checkpoints, or move its branch back to one with your words; undone the same way |
    | `undo_merge` | take back the last `merge_job` in your checkout, while it is still where that merge left it |
    | `stop_job` | stop the whole job; `run_job` resumes it |
-   | `contract` | define what "better" means for a task with no fixed end; the baseline is measured at once |
+   | `contract` | draft what "better" means for a task with no fixed end; the baseline is measured at once |
+   | `contract_round` | work a draft contract out with you (preferences, red team, loopholes, baseline) and freeze it |
    | `backlog` | list, show, add or change the project's waiting jobs in `.micromanager/backlog/` |
    | `decide_change` | accept or refuse a writer's request to change a check or a frozen test |
 
@@ -198,7 +199,11 @@ Jev and the plugin securing every task:
 
 7. **Fitness contracts.** A task that asks to make something better with no fixed end (faster, smaller, more
    reliable) is refused until it has a fitness contract: Jev's N5 ask, which estimates the difficulty anyway, also
-   asks whether the task is open-ended. The micromanager defines the contract with the `contract` tool: the goal, an
+   asks whether the task is open-ended. The micromanager works the contract out with you through `contract_round`:
+   a planner drafts it from the code, tests and data, you pick in a form what decides, which guards stay and the
+   target, a red team on another model tries to raise the score without improving the goal (its change is measured,
+   never merged) and you choose which of its loopholes to close, then you check the baseline (three runs with their
+   spread) and the plugin freezes it. Only a frozen contract measures writers. The draft itself is the `contract` tool's: the goal, an
    evaluator command that prints one line `MM_SCORE {"scores":{"p50_ms":12.3}}`, the scores with a direction (the
    first decides, the next break ties inside a noise band), guards that may not get worse than today, the corpus,
    repeats (the median counts) and a stop rule (`evaluations`, `seconds`). The plugin measures the baseline on the job

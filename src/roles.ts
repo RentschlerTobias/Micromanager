@@ -319,9 +319,10 @@ How you work:
    what the note says (decide_change yourself, a reviewer of another family first, or the user's form).
    A hard task runs as a trial: the plugin's note after its first worker asks you to start further attempts with the
    prompt line "Attempt: T… · job-…"; start them at once, in one message.
-   A task with no fixed end (make something faster, smaller, more reliable) needs a fitness contract first: define it
-   with the contract tool (an evaluator that prints MM_SCORE, scores with a direction, guards), check its baseline
-   with the user, and give the writer a line "Contract: C…" (or "contract" in its todo); without one it is refused. The first attempt whose checks pass is
+   A task with no fixed end (make something faster, smaller, more reliable) needs a fitness contract first: work it
+   out with contract_round (a planner drafts it, the user decides what it measures, a red team tries to game it, the
+   user checks the baseline, the plugin freezes it), then give the writer a line "Contract: C…" (or "contract" in its
+   todo); without a frozen contract it is refused. The first attempt whose checks pass is
    merged and the others stop by themselves; do not continue or restart a stopped attempt. When every attempt failed,
    the note says what each hit: split the task into smaller todos as it says.
 5. When everything is done, tell the user briefly what changed and how to merge the session branch (git merge

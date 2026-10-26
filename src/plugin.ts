@@ -53,6 +53,7 @@ import {
   CHECK_CHANGE_ID, FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installCheckChangeTool, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installTools, planText,
   TOOL_IDS, type ToolDraft,
 } from "./tools.ts"
+import { readBaseline, readLoopholes, readPrefs, roundFormOf, roundHeader } from "./contractround.ts"
 import { ChangeRequests, changeNote, changeResult, normalTarget, readChange, route, validateRequest, type ChangeAnswer, type ChangeKind } from "./checkchange.ts"
 import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
@@ -1723,6 +1724,22 @@ export default {
         tell(`${change.id}: the user ${change.accepted ? "accepted the change; the plugin applies it" : "refused the change; it stays as it is"}, and the worker goes on.`)
         return
       }
+      // A contract's round (src/contractround.ts): its forms are named by the contract, and its answers move it on.
+      const round = answers && project ? roundFormOf(asked) : undefined
+      if (round && answers) {
+        const tell = (text: string) => rewriteResult(call.result, (was) => `${was}\n[micromanager] ${text}`)
+        const found = native.roundJob(project, sessionID, round.id)
+        if (!found) return
+        const at = (header: string) => answers[asked.findIndex((q) => q.header === header)] ?? []
+        const text = round.part === "prefs"
+          ? await native.roundPrefs(project, sessionID, round.id, readPrefs(found.contract, asked, answers))
+          : round.part === "loopholes"
+            ? await native.roundLoopholes(project, sessionID, round.id, readLoopholes(at(roundHeader(found.contract, "loopholes"))))
+            : await native.roundBaseline(project, sessionID, round.id, readBaseline(at(roundHeader(found.contract, "baseline"))).decision, readBaseline(at(roundHeader(found.contract, "baseline"))).said)
+        record({ kind: "contract-round", sessionID, contract: round.id, part: round.part, text: text.slice(0, 300) })
+        tell(text)
+        return
+      }
       const form = answers && readForm(asked, answers)
       if (!form || !project) return
       record({ kind: "form", sessionID, form })
@@ -2059,6 +2076,12 @@ export default {
           backlog: async (action, slug, value, tctx) => {
             const text = backlogTool(project, action, slug, value)
             record({ kind: "backlog", sessionID: tctx.sessionID, action: action.trim(), slug: slug.trim() || undefined, text: text.slice(0, 300) })
+            return text
+          },
+          contractRound: async (id, goal, inp, tctx) => {
+            if (!tctx.sessionID) return "contract_round needs a session."
+            const text = await native.contractRound(project, tctx.sessionID, id.trim(), goal, inp)
+            record({ kind: "contract-round", sessionID: tctx.sessionID, job: id.trim() || undefined, text: text.slice(0, 300) })
             return text
           },
           decideChange: async (id, decision, note, tctx) => {
@@ -2427,6 +2450,9 @@ export default {
               const report = lastAssistantText(messages)
               // Its follow-ups stay with the job and become backlog drafts when the job ends (src/backlog.ts).
               native.noteFollowUps(worker, report)
+              // A contract's red team: its loopholes move the contract's round on (src/contractround.ts).
+              const loopholes = await native.noteLoopholes(worker, report)
+              if (loopholes) await ctx.session.synthetic({ sessionID: parent, text: loopholes, resume: true }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
               for (const line of learnedLines(report).slice(0, 5)) await memory.capture({ text: line, source: `LEARNED ${worker}` }, project)
             })().catch((err: unknown) => log("warn", `memory capture failed: ${String(err)}`))
             if (note) void ctx.session.synthetic({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))

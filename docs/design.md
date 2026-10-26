@@ -1098,6 +1098,29 @@ could otherwise only fail or cheat (src/checkchange.ts).
   ones are stopped. Held attempts get their outcome rows when the trial is decided. Without a contract the first
   green attempt still wins (§23).
 
+**P5: the contract round (implemented).** A draft says what one model thinks "better" means; the round makes it the
+user's (src/contractround.ts, state on `contract.round`). `contract_round` drives it with the micromanager:
+1. **Draft:** with a goal it answers with the prompt for a planner that reads the code, tests and data and writes the
+   contract JSON (or says which measuring script a coder has to write first). With that JSON as input the contract is
+   stored and its baseline measured.
+2. **Preferences**, as one form: which score decides, which guards stay (none ticked keeps none), how far they may
+   give (0, 5 or 20 %, or a typed number), the target (10, 25, 50 % better than today, or none), and whether a red
+   team goes first. A new version.
+3. **Red team:** a coder started with `Red team: C… · job-…` and a Files line, on another family if the pool allows.
+   It is told to raise the score without improving the goal, is measured after its checks without its guards, and
+   is never committed or merged; its worktree goes when it ends. Its `LOOPHOLE: what | guard: name min|max tolerance`
+   lines, or its raised score alone, go to the round.
+4. **Loopholes**, as a form: the user ticks the ones to close; one that names a guard adds it (origin `redteam`), one
+   that does not is noted in the history for the evaluator or the corpus.
+5. **Baseline**, as a form: three runs on each corpus with their spread; "plausible", "measure again", or "change"
+   (back to a draft for the contract tool).
+6. **Freeze:** the files the evaluator names and the visible corpus are hashed on the job branch (`contract.frozen`);
+   status `frozen`.
+
+From now on `Contract: C…` needs a frozen contract, and the contract tool no longer changes a frozen one; only a
+`contract` change the user accepts through `request_check_change` does, and it is frozen again at once. A changed
+draft goes through the round again.
+
 **P6: the local backlog (implemented).** Jobs that wait, one Markdown file each in `.micromanager/backlog/<slug>.md`,
 committed with the project (src/backlog.ts). Items are jobs, never a job's internal tasks.
 - **Format:** a YAML front matter in a small subset the plugin reads and writes itself (scalars, lists, lists of
@@ -1120,8 +1143,6 @@ committed with the project (src/backlog.ts). Items are jobs, never a job's inter
   when it is discarded. The `backlog` tool lists (open first, ready before draft, then by order), shows, adds and
   changes items. There is no runner that works the backlog off by itself.
 
-- **Not yet:** the contract round (P5) and its freeze; until then a contract is a draft the micromanager writes, and
-  it should show the baseline to the user before writers start.
 - **Known weak spot:** a task's checks are kept as one `verify` string joined with `" && "` and split again after a
   restart, so a check that contains `&&` itself comes back as two. The evaluator is kept out of that path.
 
