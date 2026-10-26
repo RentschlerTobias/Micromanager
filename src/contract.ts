@@ -10,7 +10,10 @@
 // makes the result invalid, which scores below everything (the hard constraints).
 
 import { createHash } from "node:crypto"
+import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs"
+import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 
+import { journalPath } from "./journal.ts"
 import { checkProblem, checkSafetyProblem } from "./plan.ts"
 import type { Run } from "./integration.ts"
 
@@ -24,6 +27,10 @@ declare module "./state.ts" {
     contract?: { id: string; version: number } // the contract its work is measured against
     score?: Measured & { corpus: "visible" | "heldout"; at: string } // its last valid measurement
     graded?: { passed: number; total: number } // what its checks' own MM_SCORE lines counted, at its last gate
+    // A trial attempt measured against a contract whose checks passed: committed, kept in its worktree, and waiting for
+    // the trial to be decided by score (src/native.ts settle) instead of merging first.
+    held?: boolean
+    settleBy?: string // on a trial's first attempt: when the trial is decided at the latest
   }
 }
 
@@ -70,7 +77,7 @@ export interface Contract {
   scores: Score[] // the first is the primary score, the others break ties inside its noise band
   guards: Guard[]
   corpus: Corpus
-  baseline?: { values: Record<string, number>; at: string; commit?: string }
+  baseline?: { values: Record<string, number>; heldOut?: Record<string, number>; at: string; commit?: string }
   stop: { target?: Record<string, number>; plateau?: number; evaluations?: number; seconds?: number }
   costPerEval?: number // seconds per run, measured with the baseline
   used?: { evaluations: number; seconds: number }
@@ -203,6 +210,45 @@ function fmt(n: number): string {
   return Math.abs(n) >= 100 || Number.isInteger(n) ? String(Math.round(n * 100) / 100) : n.toPrecision(3)
 }
 
+// The held-out cases of a contract (design.md §25, P4): outside the project and every worktree, in the plugin's state
+// directory, which the sandbox keeps from every worker. Only the evaluator sees them, through MM_CORPUS_DIR, and a
+// worker only hears how many passed.
+export function heldOutRoot(): string {
+  return join(dirname(journalPath()), "heldout")
+}
+
+export function heldOutDir(project: string, jobId: string, contractId: string): string {
+  return join(heldOutRoot(), createHash("sha256").update(resolve(project)).digest("hex").slice(0, 12), jobId, contractId)
+}
+
+// Copies the held-out cases from a directory outside the project into the contract's held-out directory: their hash
+// and count go into the contract, never their content. Returns why not instead when the directory will not do: it
+// has to exist, hold files, and lie outside the project, because anything inside it is in every worker's checkout.
+export function keepHeldOut(from: string, project: string, to: string): { heldOut?: { hash: string; cases: number }; problem?: string } {
+  if (!isAbsolute(from)) return { problem: "corpus.heldOutFrom must be an absolute path" }
+  const rel = relative(resolve(project), resolve(from))
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) return { problem: "corpus.heldOutFrom must lie outside the project: anything inside it reaches every worker" }
+  if (!existsSync(from) || !statSync(from).isDirectory()) return { problem: `corpus.heldOutFrom ${from} is no directory` }
+  const files = (readdirSync(from, { recursive: true }) as string[]).filter((f) => statSync(join(from, f)).isFile()).sort()
+  if (!files.length) return { problem: `corpus.heldOutFrom ${from} holds no files` }
+  rmSync(to, { recursive: true, force: true })
+  cpSync(from, to, { recursive: true })
+  const hash = createHash("sha256")
+  for (const f of files) hash.update(f).update("\0").update(readFileSync(join(from, f)))
+  return { heldOut: { hash: hash.digest("hex").slice(0, 16), cases: files.length } }
+}
+
+// Whether a measurement reaches the contract's target on every score it names.
+export function reached(c: Contract, m: Measured | undefined): boolean {
+  const target = c.stop.target
+  if (!m?.valid || !target || !Object.keys(target).length) return false
+  return Object.entries(target).every(([name, goal]) => {
+    const v = m.values[name]
+    const s = c.scores.find((x) => x.name === name) ?? c.guards.find((x) => x.name === name)
+    return v !== undefined && s !== undefined && (s.direction === "min" ? v <= goal : v >= goal)
+  })
+}
+
 // The parts that define what is measured; a change to any of them is a new version.
 export function contractHash(c: Contract): string {
   const { goal, evaluator, scores, guards, corpus, stop, repeats } = c
@@ -214,7 +260,7 @@ const NAME = /^[A-Za-z_][\w.-]{0,47}$/
 
 // A contract from the micromanager's JSON, validated; the id, version and status are the caller's. errors is empty when
 // it is usable. The evaluator goes through the same rules as a check: it is a model-written string handed to `sh -c`.
-export function parseContract(json: string): { contract?: Omit<Contract, "id" | "version" | "status" | "history">; errors: string[] } {
+export function parseContract(json: string): { contract?: Omit<Contract, "id" | "version" | "status" | "history">; heldOutFrom?: string; errors: string[] } {
   let o: Record<string, unknown>
   try {
     o = JSON.parse(json) as Record<string, unknown>
@@ -269,8 +315,9 @@ export function parseContract(json: string): { contract?: Omit<Contract, "id" | 
   }
   const repeats = Math.min(10, Math.max(1, Math.round(num(o.repeats) ?? 1)))
   const timeoutMs = Math.min(3_600_000, Math.max(1000, Math.round((num(o.timeoutSeconds) ?? 300) * 1000)))
+  const heldOutFrom = typeof c.heldOutFrom === "string" && c.heldOutFrom.trim() ? c.heldOutFrom.trim() : undefined
   if (errors.length) return { errors }
-  return { contract: { goal, evaluator, timeoutMs, repeats, scores, guards, corpus: { visible }, stop }, errors }
+  return { contract: { goal, evaluator, timeoutMs, repeats, scores, guards, corpus: { visible }, stop }, ...(heldOutFrom ? { heldOutFrom } : {}), errors }
 }
 
 // What a writer measured against a contract is told about it.

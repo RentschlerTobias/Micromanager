@@ -883,7 +883,24 @@ export default {
       const form = gitForm(dir, survey.files, humanSize(survey.bytes), recommend, shown)
       return `${dir} is ${state === "no-commit" ? "a git repository without a commit" : "no git repository"}, so the workers cannot get a worktree each. Ask the user how to go on: call the question tool with exactly this input (a form; their answer reaches the plugin by itself), then end your turn:\n${formInput(form)}`
     }
-    const native = (SHARED.native ??= new Native({ installedSkills: installedSkills(), planFirst: true, noGit: (dir) => noGitNote(dir) }))
+    // A trial decided by score (src/contract.ts): the attempts that waited get their outcome rows once it is decided, and a
+    // decision nobody's finish_task carried (its deadline, its last attempt ending) reaches the micromanager as a note.
+    const settledTrial = async (r: { project: string; job: Job; parent: string; note?: string; stop: string[]; measured: Task[] }): Promise<void> => {
+      for (const other of r.stop) {
+        ended.add(other)
+        await ctx.session.interrupt({ sessionID: other }).catch((err: unknown) => log("warn", `interrupt failed: ${String(err)}`))
+        await release(other, "another attempt of its trial won")
+      }
+      for (const t of r.measured) {
+        const messages = t.session ? await ctx.session.context({ sessionID: t.session }).catch(() => undefined) : undefined
+        recordOutcome(outcomeOf(r.project, r.job, t, messages ? sessionUsage(messages) : undefined))
+      }
+      if (r.note && r.parent) await ctx.session.synthetic({ sessionID: r.parent, text: r.note, resume: true }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
+    }
+    const native = (SHARED.native ??= new Native({
+      installedSkills: installedSkills(), planFirst: true, noGit: (dir) => noGitNote(dir),
+      trialDeadlineMs: settings.trialDeadline * 60_000, onSettled: (r) => void settledTrial(r).catch((err: unknown) => log("warn", `trial settle failed: ${String(err)}`)),
+    }))
     const workerJobs = SHARED.workerJobs
     const workerDirs = SHARED.workerDirs
     // A worker's request for a variable or a host (src/grants.ts): every worker may ask for a variable, writers and
@@ -2405,7 +2422,8 @@ export default {
             // A writer's attempt goes to the outcome log with what its session cost (src/outcomes.ts).
             void (async () => {
               const messages = await ctx.session.context({ sessionID: worker }).catch(() => undefined)
-              if (r.writer) recordOutcome(outcomeOf(r.project, r.job, r.task, messages ? sessionUsage(messages) : undefined))
+              // An attempt held for a decision by score gets its row when the trial is decided (settledTrial).
+              if (r.writer && !r.task.held) recordOutcome(outcomeOf(r.project, r.job, r.task, messages ? sessionUsage(messages) : undefined))
               const report = lastAssistantText(messages)
               // Its follow-ups stay with the job and become backlog drafts when the job ends (src/backlog.ts).
               native.noteFollowUps(worker, report)

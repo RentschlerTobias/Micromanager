@@ -16,6 +16,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 
 import type { RoleId } from "./roles.ts"
+import { heldOutRoot } from "./contract.ts"
 
 // The registries a build or a test run reaches for its dependencies.
 export const REGISTRIES: readonly string[] = [
@@ -98,7 +99,9 @@ export function rulesFor(input: RuleInput): Rules {
   return {
     network: { allowedDomains: [...new Set([...REGISTRIES, ...(input.domains ?? [])])], deniedDomains: [] },
     filesystem: {
-      denyRead: [...DENY_READ, join(input.dir, "**/.env"), join(input.dir, "**/.env.*")],
+      // The held-out cases of fitness contracts (src/contract.ts) live in the plugin's state directory, which DENY_READ
+      // names by its default place; with XDG_STATE_HOME set it is elsewhere, so it is named by where it is.
+      denyRead: [...DENY_READ, heldOutRoot(), join(input.dir, "**/.env"), join(input.dir, "**/.env.*")],
       allowRead: [join(input.dir, "**/.env.example")],
       allowWrite: own,
       // A frozen test inside the writer's own worktree: `sed -i` must not get around what the edit tools may not do.

@@ -39,7 +39,8 @@ export interface Outcome {
   readonly gate: Gate // the last gate result
   readonly fixRounds: number
   readonly merged: boolean
-  readonly end: "merged" | "sibling_won" | "blocked" | "unfinished" | "cancelled"
+  // lost_on_score: its checks passed, but another attempt of its trial had the better score (src/contract.ts).
+  readonly end: "merged" | "sibling_won" | "lost_on_score" | "blocked" | "unfinished" | "cancelled"
   readonly seconds?: number // from its delegation to its end
   readonly tokens?: number
   readonly cost?: number
@@ -66,7 +67,7 @@ export function outcomeOf(project: string, job: Job, task: Task, usage?: { token
   const last = gates.at(-1)
   const gate: Gate = !last ? "none" : last.result === "pass" ? "pass" : /changed no file/.test(last.evidence ?? "") ? "unverified" : "fail"
   const won = task.stages.some((s) => s.stage === "trial" && s.result === "pass" && /won by/.test(s.evidence ?? ""))
-  const end: Outcome["end"] = task.status === "merged" ? "merged" : task.status === "cancelled" ? (won ? "sibling_won" : "cancelled") : task.status === "blocked" ? "blocked" : "unfinished"
+  const end: Outcome["end"] = task.status === "merged" ? "merged" : task.status === "cancelled" ? (won ? (task.held ? "lost_on_score" : "sibling_won") : "cancelled") : task.status === "blocked" ? "blocked" : "unfinished"
   const started = task.stages.find((s) => s.stage === "delegate")?.at
   const verify = job.acceptance.filter((a) => task.acceptance.includes(a.id)).map((a) => a.verify).filter((v): v is string => Boolean(v))
   const contract = task.contract && job.contracts?.find((c) => c.id === task.contract!.id)

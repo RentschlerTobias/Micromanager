@@ -4,10 +4,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 
-import { parseTrials } from "../src/config.ts"
+import { parseTrialDeadline, parseTrials } from "../src/config.ts"
 import { classOf, needsTrials, outcomeOf, readOutcomes, recordOutcome, routerRows, type Outcome } from "../src/outcomes.ts"
 import { newJob, stage, type Task } from "../src/state.ts"
-import { DEEP, trialSize } from "../src/trials.ts"
+import { DEEP, ranked, standing, trialSize } from "../src/trials.ts"
 
 test("a writer task runs as a trial when it is hard, does failed work over, or its class mostly fails alone", () => {
   const base = { retry: false, setting: 3, parallel: 3 }
@@ -75,8 +75,26 @@ test("the router rows join a trial's attempts and keep the stopped ones as censo
 })
 
 test("the trials setting: 3 by default, 1 turns trials off, at most 4", () => {
+  assert.equal(parseTrialDeadline("{}"), 20)
+  assert.equal(parseTrialDeadline('{ "trialDeadline": 5 }'), 5)
+  assert.throws(() => parseTrialDeadline('{ "trialDeadline": 0 }'), /minutes above 0/)
   assert.equal(parseTrials("{}"), 3)
   assert.equal(parseTrials('{ "trials": 1 }'), 1)
   assert.equal(parseTrials('{ "trials": 7 } // more than the cap'), 4)
   assert.throws(() => parseTrials('{ "trials": 0 }'), /whole number from 1/)
+})
+
+test("a trial decided by score holds its passed attempts apart from the live and the failed ones, best first", () => {
+  const job = newJob("job-1", "goal")
+  const c = { id: "C1", version: 1, status: "draft" as const, goal: "g", evaluator: "sh b.sh", timeoutMs: 1000, repeats: 1, scores: [{ name: "ms", direction: "min" as const }], guards: [], corpus: { visible: [] }, stop: {}, history: [] }
+  const t = (id: string, extra: Partial<Task>) => task(id, { trial: { of: "T1", n: 4 }, ...extra })
+  job.tasks = [
+    t("T1", { status: "passed", held: true, score: { valid: true, values: { ms: 80 }, corpus: "visible", at: "" } }),
+    t("T2", { status: "passed", held: true, score: { valid: true, values: { ms: 60 }, corpus: "visible", at: "" } }),
+    t("T3", { status: "running" }),
+    t("T4", { status: "blocked" }),
+  ]
+  const now = standing(job, job.tasks[0]!)
+  assert.deepEqual([now.held, now.live, now.failed].map((ts) => ts.map((x) => x.id)), [["T1", "T2"], ["T3"], ["T4"]])
+  assert.deepEqual(ranked(c, now.held).map((x) => x.id), ["T2", "T1"])
 })

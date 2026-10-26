@@ -10,6 +10,7 @@
 // Native.delegate makes the first attempt; the micromanager starts the others when the plugin tells it to ("Attempt:
 // T5 · job-…"), because only its subagent calls make children that OpenCode reports back to it.
 
+import { better, type Contract } from "./contract.ts"
 import { HEADER } from "./hooks.ts"
 import { roleById } from "./roles.ts"
 import type { Job, Task } from "./state.ts"
@@ -44,13 +45,21 @@ export function attempts(job: Job, task: Task): Task[] {
 
 const LIVE = new Set<Task["status"]>(["running", "gating", "fixing", "reviewing", "passed"])
 
-// Where a trial stands: the winner once one merged, the attempts still at work, and the ones that failed.
-export function standing(job: Job, task: Task): { winner?: Task; live: Task[]; failed: Task[]; all: Task[] } {
+// Where a trial stands: the winner once one merged, the attempts still at work, the ones that passed and wait for the
+// trial to be decided by score (held, src/contract.ts), and the ones that failed.
+export function standing(job: Job, task: Task): { winner?: Task; live: Task[]; held: Task[]; failed: Task[]; all: Task[] } {
   const all = attempts(job, task)
   const winner = all.find((t) => t.status === "merged")
-  const live = all.filter((t) => LIVE.has(t.status) && t.stages.at(-1)?.stage !== "end")
-  const failed = all.filter((t) => t !== winner && !live.includes(t) && t.status !== "cancelled")
-  return { winner, live, failed, all }
+  const held = all.filter((t) => t.held && t.status === "passed")
+  const live = all.filter((t) => !held.includes(t) && LIVE.has(t.status) && t.stages.at(-1)?.stage !== "end")
+  const failed = all.filter((t) => t !== winner && !live.includes(t) && !held.includes(t) && t.status !== "cancelled")
+  return { winner, live, held, failed, all }
+}
+
+// The held attempts best first, by the contract: the held-out score where there is one, else the visible one.
+export function ranked(c: Contract, held: readonly Task[]): Task[] {
+  const invalid = { valid: false, values: {} }
+  return [...held].sort((a, b) => better(c, b.score ?? invalid, a.score ?? invalid))
 }
 
 // The prompt line that starts another attempt; native.ts parseDelegation reads it back.
@@ -64,7 +73,7 @@ export function fanOutText(job: Job, head: Task): string | undefined {
   const agent = roleById(head.role)?.agent ?? head.role
   const why = head.difficulty !== undefined && head.difficulty >= DEEP ? `it is hard (difficulty ${head.difficulty.toFixed(2)})` : "an earlier attempt at this work failed"
   return [
-    `${HEADER} ${head.id} runs as a trial of ${head.trial.n} attempts, because ${why}: each attempt works in its own worktree on another model, the first whose checks pass is merged, and the others are stopped.`,
+    `${HEADER} ${head.id} runs as a trial of ${head.trial.n} attempts, because ${why}: each attempt works in its own worktree on another model, ${head.contract ? `and of those whose checks pass, the one with the best score against contract ${head.contract.id} is merged once all are done` : "the first whose checks pass is merged, and the others are stopped"}.`,
     `Start the other ${missing} attempt${missing > 1 ? "s" : ""} now, in one message, with the subagent tool (background = true), each with agent ${agent}, description "${head.id} attempt", and only this prompt:`,
     attemptLine(head.id, job.id),
     "The plugin gives each the same task, files and checks. Do not wait for the first attempt, and do not start the task again yourself: the trial's result comes to you as a note.",
@@ -75,7 +84,9 @@ export function fanOutText(job: Job, head: Task): string | undefined {
 export function attemptBrief(task: Task): string {
   if (!task.trial) return ""
   const index = Number(task.title.match(/\(attempt (\d+)\//)?.[1] ?? 1)
-  return `You are attempt ${index} of ${task.trial.n} at this task: other workers try the same task at the same time, each in its own worktree on another model. The first whose checks pass is merged and the others are stopped, so take the approach you think is most likely to pass, and do not wait for anyone.`
+  return task.contract
+    ? `You are attempt ${index} of ${task.trial.n} at this task: other workers try the same task at the same time, each in its own worktree on another model. Of the attempts whose checks pass, the one with the best score is merged once all are done, so aim for the best result the contract can measure, not only for passing, and do not wait for anyone.`
+    : `You are attempt ${index} of ${task.trial.n} at this task: other workers try the same task at the same time, each in its own worktree on another model. The first whose checks pass is merged and the others are stopped, so take the approach you think is most likely to pass, and do not wait for anyone.`
 }
 
 // Why each failed attempt failed, from its last failing stage: the brief for splitting the task.
@@ -102,7 +113,8 @@ export function attemptFailedText(task: Task, live: readonly Task[]): string {
   return `${HEADER} ${task.id} (${task.title}) failed, but ${live.map((t) => t.id).join(", ")} of its trial still ${live.length > 1 ? "run" : "runs"}: nothing to do, the trial's result comes as a note.`
 }
 
-// The micromanager's note when an attempt won.
-export function wonText(job: Job, winner: Task, stopped: readonly Task[], failed: number, head?: string): string {
-  return `${HEADER} ${winner.id} won the trial of ${head ?? winner.trial?.of ?? winner.id}: merged into ${job.integrationBranch}${failed ? ` after ${failed} other attempt${failed > 1 ? "s" : ""} failed` : ""}.${stopped.length ? ` Stopped: ${stopped.map((t) => t.id).join(", ")}; their work is not needed.` : ""}`
+// The micromanager's note when an attempt won. score: how it won on score, for a trial decided by its contract.
+export function wonText(job: Job, winner: Task, stopped: readonly Task[], failed: number, head?: string, score?: { beaten: readonly Task[]; how: string }): string {
+  const by = score ? ` with the best score (${score.how})${score.beaten.length ? `, ahead of ${score.beaten.map((t) => t.id).join(", ")}` : ""}` : ""
+  return `${HEADER} ${winner.id} won the trial of ${head ?? winner.trial?.of ?? winner.id}${by}: merged into ${job.integrationBranch}${failed ? ` after ${failed} other attempt${failed > 1 ? "s" : ""} failed` : ""}.${stopped.length ? ` Stopped: ${stopped.map((t) => t.id).join(", ")}; their work is not needed.` : ""}`
 }

@@ -199,6 +199,15 @@ export function parseTrials(text: string): number {
   return Math.min(raw, MAX_TRIALS)
 }
 
+// "trialDeadline": minutes a trial decided by score (an attempt measured against a fitness contract, src/contract.ts)
+// waits after its first passing attempt for the others; then the best of the passed ones is merged. Default 20.
+export function parseTrialDeadline(text: string): number {
+  const raw = (JSON.parse(stripComments(text)) as { trialDeadline?: unknown }).trialDeadline
+  if (raw === undefined) return 20
+  if (typeof raw !== "number" || !(raw > 0)) throw new Error("trialDeadline must be a number of minutes above 0")
+  return raw
+}
+
 // "cloudOnly": true (the default for now, the user's choice of 2026-10-05) routes no task to a local model and asks
 // cloud Jev for the guards instead of the local GLiNER server. false brings the local fleet and GLiNER back.
 export function parseCloudOnly(text: string): boolean {
@@ -288,6 +297,7 @@ export interface Settings {
   readonly parallel: number
   readonly perModel: number
   readonly trials: number
+  readonly trialDeadline: number // minutes
   readonly budget: Budget
   readonly notify: NotifyMode
   readonly routing: Routing
@@ -308,6 +318,7 @@ const DEFAULTS: Omit<Settings, "registry"> = {
   parallel: 3,
   perModel: 2,
   trials: DEFAULT_TRIALS,
+  trialDeadline: 20,
   budget: DEFAULT_BUDGET,
   notify: "jobs",
   routing: DEFAULT_ROUTING,
@@ -328,7 +339,7 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text), memory: parseMemory(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), trialDeadline: parseTrialDeadline(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), ...parseSandbox(text), memory: parseMemory(text) }
   } catch (err) {
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }

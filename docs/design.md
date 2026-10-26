@@ -938,7 +938,8 @@ k/n is how many attempts pass, and the group is the task class (role, difficulty
   worker (`needsTrials`). The first attempt starts as usual; the plugin's note on its subagent result asks the
   micromanager to start the others with `Attempt: T… · job-…`, because only its subagent calls make children that
   OpenCode reports back to it. Each attempt is a task of its own and avoids its siblings' model families.
-- **Settling.** The first attempt that passes its checks and merges wins. Every other attempt is cancelled with
+- **Settling.** The first attempt that passes its checks and merges wins (a trial measured against a fitness
+  contract is decided by score instead, §25 P4). Every other attempt is cancelled with
   `replacedBy` set to the winner, so dependants of the first attempt wait for the winner, and its session is
   interrupted and its worktree removed. An attempt that fails while others run reports nothing to act on; when all
   of them failed (k = 0), the note lists what each hit and asks for a split.
@@ -1077,6 +1078,25 @@ could otherwise only fail or cheat (src/checkchange.ts).
   `verify` with it), a file gets the diff with `git apply` and is frozen again as patched, a contract gets a new
   version, and `spec_incomplete` adds the decision to the job. In a trial every attempt still at work gets the same
   change and a steer note. Each decision is a `check-change` stage and goes to the outcome log (`checkChanges`).
+
+**P4: best-score trials and the held-out corpus (implemented).**
+- **Held-out cases.** The contract tool takes `corpus.heldOutFrom`, a directory outside the project (anything inside
+  it is in every worker's checkout), and copies it to `$XDG_STATE_HOME/micromanager/heldout/<project>/<job>/<id>/`.
+  The contract keeps only their hash and count. The sandbox denies that root to every worker; the evaluator gets it
+  as `MM_CORPUS_DIR` with `MM_CORPUS=heldout`. The baseline is measured on both corpora.
+- **Coarse feedback.** A worker, the micromanager and the stages hear only how many held-out cases passed (or the
+  evaluator's category), never values or cases; the full measurement goes to the task and the outcome log. A held-out
+  result never causes a fix round, which would leak the cases through the loop.
+- **Held instead of merged.** In a trial measured against a contract, an attempt whose checks and visible measurement
+  pass is measured on the held-out cases, committed, and held in its worktree (`task.held`); `standing()` keeps a
+  `held` bucket apart from the live and the failed attempts. The trial is decided when no attempt is at work any
+  more, at its deadline (`trialDeadline`, 20 minutes after the first held attempt; `settleBy` on the first attempt
+  re-arms it after a restart), or at once when an attempt reaches the contract's `stop.target`.
+- **Deciding.** The held attempts are ranked by `better()`; the two best are measured again one after the other, so
+  load on the machine during one measurement does not decide it. The best one goes through the merge train; when it
+  cannot merge, the next is tried. The others are cancelled ("won by X on score", outcome end `lost_on_score`), live
+  ones are stopped. Held attempts get their outcome rows when the trial is decided. Without a contract the first
+  green attempt still wins (§23).
 
 **P6: the local backlog (implemented).** Jobs that wait, one Markdown file each in `.micromanager/backlog/<slug>.md`,
 committed with the project (src/backlog.ts). Items are jobs, never a job's internal tasks.

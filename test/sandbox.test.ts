@@ -5,6 +5,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 
+import { heldOutRoot } from "../src/contract.ts"
 import { cleanEnv, looksSecret, neverHanded, REGISTRIES, rulesFor, startSandbox, WorkerShells } from "../src/sandbox.ts"
 
 test("a worker's environment is an allowlist; the never list beats any grant", () => {
@@ -35,6 +36,7 @@ test("a writer writes its worktree only, a reader nothing; keys and env files st
   assert.deepEqual(writer.filesystem.allowRead, ["/p/.micromanager/worktrees/job--T1/sub/**/.env.example"])
   assert.ok(REGISTRIES.every((d) => writer.network.allowedDomains.includes(d)) && writer.network.allowedDomains.includes("api.example.com"))
   assert.deepEqual(rulesFor({ role: "explore", writer: false, dir: "/p" }).filesystem.allowWrite, [])
+  assert.ok(writer.filesystem.denyRead.includes(heldOutRoot()), "the held-out cases of contracts, wherever the state directory is")
   // A writer's frozen tests: inside its own worktree, and still not writable from its shell.
   assert.deepEqual(writer.filesystem.denyWrite, [])
   assert.deepEqual(rulesFor({ role: "code", writer: true, dir: "/w", worktree: "/w", frozen: ["/w/test/a.test.js"] }).filesystem.denyWrite, ["/w/test/a.test.js"])

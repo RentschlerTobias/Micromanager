@@ -19,7 +19,7 @@ import { isAbsolute, join, resolve } from "node:path"
 
 import { Graphs, graphBrief, queryGraph, type Graph } from "./graph.ts"
 import { HEADER } from "./hooks.ts"
-import { contractBrief, describe, guardViolations, parseContract, type Contract } from "./contract.ts"
+import { coarse, contractBrief, describe, guardViolations, heldOutDir, keepHeldOut, parseContract, reached, type Contract, type Measured } from "./contract.ts"
 import {
   changedFiles, commitTask, exec as defaultExec, fastForward, frozenChanged, gradedOf, hashFiles, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree,
   repoRel, revertFiles, runEvaluator, runGate, taskDir,
@@ -38,7 +38,7 @@ import { settled, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
 import { formInput, startForm } from "./forms.ts"
 import { gitState } from "./nogit.ts"
-import { allFailedText, attemptBrief, attemptFailedText, attempts, fanOutText, standing, wonText, type Assessment } from "./trials.ts"
+import { allFailedText, attemptBrief, attemptFailedText, attempts, fanOutText, ranked, standing, wonText, type Assessment } from "./trials.ts"
 
 // The first line OpenCode puts before a new subagent's prompt; how the prompt hook tells a child's first turn.
 export const CHILD_PREFIX = "You are a subagent spawned by another session."
@@ -166,7 +166,16 @@ export interface NativeDeps {
   // The note when the project is no git repository: the form that asks the user how to go on (src/plugin.ts, with
   // Jev's recommendation). Without it a plain note says the same.
   readonly noGit?: (project: string) => Promise<string>
+  // A trial decided by score (src/contract.ts) waits this long after its first passing attempt for the others (the
+  // "trialDeadline" setting); then the best of the passed ones is merged and the rest are stopped.
+  readonly trialDeadlineMs?: number
+  // A trial was decided by score. note and stop are set when nobody's finish_task carries them (a deadline, the last
+  // attempt ending): the note goes to the micromanager, the sessions are interrupted. measured: the attempts that
+  // waited for the decision, whose outcomes the log gets now that they are known.
+  readonly onSettled?: (r: { project: string; job: Job; parent: string; note?: string; stop: string[]; measured: Task[] }) => void
 }
+
+export const TRIAL_DEADLINE_MS = 20 * 60_000
 
 // The project is no git repository, or one without a commit: nothing starts until the user said how to go on.
 export class NoGitError extends DelegationError {}
@@ -262,7 +271,13 @@ export class Native {
     this.#graphs = deps.graphs ?? new Graphs(this.#exec)
     this.#planFirst = deps.planFirst ?? false
     this.#noGit = deps.noGit
+    this.#deadlineMs = deps.trialDeadlineMs ?? TRIAL_DEADLINE_MS
+    this.#onSettled = deps.onSettled
   }
+
+  readonly #deadlineMs: number
+  readonly #onSettled?: NativeDeps["onSettled"]
+  readonly #deadlines = new Map<string, ReturnType<typeof setTimeout>>() // "<job>/<head>" -> its trial's deadline
 
   readonly #noGit?: (project: string) => Promise<string>
 
@@ -341,6 +356,11 @@ export class Native {
         this.#entries.set(k, entry)
         for (const s of new Set([task.session, ...(task.sessions ?? [])])) this.#bySession.set(s, k)
         adopted.push(k)
+      }
+      // A trial decided by score whose deadline lived in the process that ended: armed again, from the time it had.
+      for (const head of job.tasks.filter((t) => t.settleBy && t.trial?.of === t.id)) {
+        const now = standing(job, head)
+        if (!now.winner && now.held.length) this.#arm(project, job, head)
       }
     }
     return adopted
@@ -471,6 +491,13 @@ export class Native {
     const c: Contract = old
       ? { ...old, ...parsed.contract, version: old.version + 1, baseline: undefined, history: [...old.history, { version: old.version + 1, change: "changed with the contract tool", at }] }
       : { id: `C${n}`, version: 1, status: "draft", ...parsed.contract, history: [{ version: 1, change: "defined with the contract tool", at }] }
+    // The held-out cases come from a directory outside the project and go to the plugin's state directory; a new
+    // version without them keeps the ones it had.
+    if (parsed.heldOutFrom) {
+      const kept = keepHeldOut(parsed.heldOutFrom, project, heldOutDir(project, job.id, c.id))
+      if (!kept.heldOut) return `Not stored: ${kept.problem}.`
+      c.corpus = { ...c.corpus, heldOut: kept.heldOut }
+    } else if (old?.corpus.heldOut) c.corpus = { ...c.corpus, heldOut: old.corpus.heldOut }
     // The baseline is today's code on the job's branch, where the workers start from; a folder without git has only
     // itself.
     const rel = await this.#integrate(project, job, false)
@@ -481,13 +508,19 @@ export class Native {
       const commit = job.integrationWorktree ? (await this.#exec("git", ["rev-parse", "--short", "HEAD"], { cwd: job.integrationWorktree })).stdout.trim() : undefined
       c.baseline = { values: { ...measured.values }, at, ...(commit ? { commit } : {}) }
       c.costPerEval = Math.round((seconds / c.repeats) * 10) / 10
+      if (c.corpus.heldOut) {
+        const held = await runEvaluator(dir, c, "heldout", this.#exec, heldOutDir(project, job.id, c.id))
+        this.#count(job, c, held.seconds)
+        if (held.measured.valid) c.baseline.heldOut = { ...held.measured.values }
+      }
     }
     job.contracts = [...(job.contracts ?? []).filter((x) => x.id !== c.id), c]
     this.#jobs.set(key(project, job.id), job)
     saveJob(project, job)
     saveContract(project, job.id, c)
     if (!measured.valid) return `Contract ${c.id} (version ${c.version}) is stored for job ${job.id}, but its evaluator gave no valid result on today's code (${measured.error}), so it has no baseline and no writer can be measured against it yet. Fix the evaluator and send the contract again with "id": "${c.id}".`
-    return `Contract ${c.id} (version ${c.version}, ${c.status}) is stored for job ${job.id}. Baseline${c.baseline?.commit ? ` on ${c.baseline.commit}` : ""}: ${describe({ ...c, baseline: undefined }, measured)} (${c.costPerEval}s per run). Start the writers it measures with a line "Contract: ${c.id}" (or "contract" in a todo).`
+    const held = c.corpus.heldOut ? ` It has ${c.corpus.heldOut.cases} held-out cases, which only the evaluator sees${c.baseline?.heldOut ? "" : "; on them today's code gave no valid result"}.` : ""
+    return `Contract ${c.id} (version ${c.version}, ${c.status}) is stored for job ${job.id}. Baseline${c.baseline?.commit ? ` on ${c.baseline.commit}` : ""}: ${describe({ ...c, baseline: undefined }, measured)} (${c.costPerEval}s per run).${held} Start the writers it measures with a line "Contract: ${c.id}" (or "contract" in a todo).`
   }
 
   // The files a writer may read and run but not change, hashed as its worktree has them now: the ones its todo or
@@ -1176,7 +1209,7 @@ export class Native {
         stage(task, what, "fail", failed.map((f) => f.command).join(", "))
         moveTask(task, "blocked")
         task.summary = `its checks still fail after ${FIX_ROUNDS} fix round(s): ${failed.map((f) => f.command).join(", ")}`
-        const note = this.#trialFailed(job, task) ?? `[micromanager] ${task.id} ${task.title}: its worker hit the limit of ${FIX_ROUNDS} fix rounds with the checks still failing (${failed.map((f) => f.command).join(", ")}). If the check is what is wrong -- a path that does not exist in the worktree, a command the gate refuses -- correct the task with steer_task and its sessionID ${session} rather than starting a new worker.`
+        const note = this.#trialFailed(job, task, entry.project) ?? `[micromanager] ${task.id} ${task.title}: its worker hit the limit of ${FIX_ROUNDS} fix rounds with the checks still failing (${failed.map((f) => f.command).join(", ")}). If the check is what is wrong -- a path that does not exist in the worktree, a command the gate refuses -- correct the task with steer_task and its sessionID ${session} rather than starting a new worker.`
         saveJob(entry.project, job)
         return {
           text: `Your checks still fail after ${FIX_ROUNDS} rounds, so I am stopping here rather than spending the rest of your budget on them:\n\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}\n\nIf the work is done and the CHECK is what cannot be satisfied here, say so plainly in your report (request_check_change is the way to have a wrong check changed). If the work is not done, name what is missing.`,
@@ -1213,7 +1246,7 @@ export class Native {
       saveJob(entry.project, job)
       return {
         text: `Your checks pass, but you changed no file, so there is nothing to commit and nothing was verified. If the task was already done by someone else, say so in your report. Otherwise make the change the task asked for and call finish_task again.`,
-        note: this.#trialFailed(job, task) ?? `[micromanager] ${task.id} ${task.title}: its checks passed but it changed no file, so nothing was committed. Continue it with the subagent tool and sessionID ${session}, or tell the user.`,
+        note: this.#trialFailed(job, task, entry.project) ?? `[micromanager] ${task.id} ${task.title}: its checks passed but it changed no file, so nothing was committed. Continue it with the subagent tool and sessionID ${session}, or tell the user.`,
         parent: entry.parent,
       }
     }
@@ -1221,6 +1254,8 @@ export class Native {
     if (fitness.evidence) stage(task, "fitness", "pass", fitness.evidence)
     const commit = await commitTask(entry.worktree, `${task.id}: ${task.title}`, `Job: ${job.id}\nWorker: ${task.model ?? "?"} (${task.role}), session ${session}${task.summary ? `\n\n${task.summary}` : ""}`, this.#exec)
     moveTask(task, "passed")
+    const scored = task.trial && entry.contract ? job.contracts?.find((x) => x.id === entry.contract) : undefined
+    if (scored) return this.#hold(entry, job, task, scored, fitness.evidence)
     const train = this.#trains.get(job.id) ?? Promise.resolve()
     const step = train.then(() => (task.status === "cancelled" ? { ok: false as const, text: lostText(job, task) } : this.#merge(entry, job, task)))
     this.#trains.set(job.id, step.catch(() => undefined))
@@ -1241,31 +1276,139 @@ export class Native {
 
   // A trial's attempt merged: it won. Every other attempt is done over by it (replacedBy, so what waits for the first
   // attempt waits for the winner), cancelled, and its worktree goes; the ones still at work are returned to be stopped.
-  async #settleTrial(winner: Entry, job: Job, task: Task): Promise<{ note: string; stop: string[] }> {
+  // score: how the winner won a trial decided by its contract, for the note; the held attempts it beat lost on score.
+  async #settleTrial(winner: Entry, job: Job, task: Task, score?: string): Promise<{ note: string; stop: string[] }> {
     const now = standing(job, task)
     const stop: string[] = []
+    const stopped = now.live.filter((t) => t !== task)
+    const beaten = now.held.filter((t) => t !== task)
     for (const other of now.all) {
       if (other === task || other.status === "merged" || other.status === "cancelled") continue
       const e = this.#entries.get(`${job.id}/${other.id}`)
       if (e?.session && !e.ended && now.live.includes(other)) stop.push(e.session)
       moveTask(other, "cancelled")
-      stage(other, "trial", "pass", `won by ${task.id}`)
+      stage(other, "trial", "pass", other.held ? `won by ${task.id} on score` : `won by ${task.id}`)
       other.replacedBy = task.id
       if (e) await this.#dropWorktree(e, other)
     }
     // The first attempt is what the plan and the dependants know: done over by the winner, it counts as done.
-    stage(task, "trial", "pass", `won the trial of ${task.trial!.of} (${now.failed.length} failed, ${now.live.length - 1} stopped)`)
+    stage(task, "trial", "pass", `won the trial of ${task.trial!.of}${score ? ` on score (${score})` : ""} (${now.failed.length} failed, ${stopped.length} stopped${beaten.length ? `, ${beaten.length} beaten` : ""})`)
     saveJob(winner.project, job)
-    return { note: wonText(job, task, now.live.filter((t) => t !== task), now.failed.length), stop }
+    return { note: wonText(job, task, stopped, now.failed.length, undefined, score !== undefined ? { beaten, how: score } : undefined), stop }
+  }
+
+  // A passed attempt of a trial decided by score: measured on the held-out cases too, committed, and held in its
+  // worktree instead of merged. The worker hears only how many held-out cases passed. The trial is decided when no
+  // attempt is at work any more, at its deadline, or at once when one reaches the contract's target.
+  async #hold(entry: Entry, job: Job, task: Task, c: Contract, visible?: string): Promise<{ text: string; note?: string; parent?: string; stop?: string[] }> {
+    let held: Measured | undefined
+    if (c.corpus.heldOut) {
+      const r = await runEvaluator(entry.dir, c, "heldout", this.#exec, heldOutDir(entry.project, job.id, c.id))
+      this.#count(job, c, r.seconds)
+      held = r.measured
+      task.score = { ...held, corpus: "heldout", at: new Date().toISOString() }
+    }
+    task.held = true
+    stage(task, "trial", "pass", `passed, waits for the trial to be decided by score${held ? `; held-out ${coarse(held)}` : ""}`)
+    const head = job.tasks.find((t) => t.id === task.trial!.of) ?? task
+    this.#arm(entry.project, job, head)
+    saveJob(entry.project, job)
+    const settled = await this.#settleQueued(entry.project, job, head, false)
+    // Decided here: finish_task carries the note and the sessions to stop; the outcomes are known now.
+    if (settled) this.#onSettled?.({ project: entry.project, job, parent: entry.parent, stop: [], measured: settled.measured })
+    if (settled?.winner === task) {
+      return { text: `Your attempt won the trial on score and is merged into ${job.integrationBranch}. Now end with your short report.`, note: settled.note, parent: entry.parent, stop: settled.stop }
+    }
+    const measured = [visible ? `measured: ${visible}` : "", held ? `on the held-out cases, which you cannot see: ${coarse(held)}` : ""].filter(Boolean).join("; ")
+    return {
+      text: `Your checks pass${measured ? ` (${measured})` : ""}, and your commit waits in your worktree: the attempt with the best score is merged once every attempt of this trial is done. There is nothing more to do; end now with your short report.`,
+      ...(settled ? { note: settled.note, parent: entry.parent, stop: settled.stop } : {}),
+    }
+  }
+
+  // The trial's deadline, armed once per trial from its first held attempt; after a restart from the time it had.
+  #arm(project: string, job: Job, head: Task): void {
+    head.settleBy ??= new Date(Date.now() + this.#deadlineMs).toISOString()
+    const k = `${job.id}/${head.id}`
+    if (this.#deadlines.has(k)) return
+    const timer = setTimeout(() => {
+      this.#deadlines.delete(k)
+      this.#settleLater(project, job, head)
+    }, Math.max(0, Date.parse(head.settleBy) - Date.now()))
+    timer.unref?.()
+    this.#deadlines.set(k, timer)
+  }
+
+  // A settle nobody's finish_task waits for (the deadline, the last attempt failing or ending): its note goes to the
+  // micromanager through onSettled.
+  #settleLater(project: string, job: Job, head: Task): void {
+    void this.#settleQueued(project, job, head, true).then((r) => {
+      if (r) this.#onSettled?.({ project, job, parent: job.facilitator ?? this.#entries.get(`${job.id}/${head.id}`)?.parent ?? "", note: r.note, stop: r.stop, measured: r.measured })
+    }).catch(() => undefined)
+  }
+
+  // On the job's merge train: one merge at a time, and a trial is decided once.
+  #settleQueued(project: string, job: Job, head: Task, force: boolean): Promise<{ winner?: Task; note: string; stop: string[]; measured: Task[] } | undefined> {
+    const train = this.#trains.get(job.id) ?? Promise.resolve()
+    const step = train.then(() => this.#settle(project, job, head, force))
+    this.#trains.set(job.id, step.catch(() => undefined))
+    return step
+  }
+
+  // Decides a trial by score once no attempt is at work (or force: the deadline, or every other attempt ended): the
+  // best held attempt is merged, the others are cancelled. The two best are measured again one after the other, so a
+  // machine that was busier during one attempt's measurement does not decide it. One that reached the target wins at
+  // once. When the best cannot be merged (a conflict), the next is tried.
+  async #settle(project: string, job: Job, head: Task, force: boolean): Promise<{ winner?: Task; note: string; stop: string[]; measured: Task[] } | undefined> {
+    const c = job.contracts?.find((x) => x.id === head.contract?.id)
+    const now = standing(job, head)
+    if (!c || now.winner || !now.held.length) return undefined
+    const target = now.held.find((t) => reached(c, t.score))
+    if (!force && !target && now.live.length) return undefined
+    const corpus = c.corpus.heldOut ? "heldout" : "visible"
+    let order = target ? [target, ...ranked(c, now.held).filter((t) => t !== target)] : ranked(c, now.held)
+    if (!target && order.length >= 2) {
+      for (const t of order.slice(0, 2)) {
+        const e = this.#entries.get(`${job.id}/${t.id}`)
+        if (!e || e.removed) continue
+        const r = await runEvaluator(e.dir, c, corpus, this.#exec, corpus === "heldout" ? heldOutDir(project, job.id, c.id) : undefined)
+        this.#count(job, c, r.seconds)
+        t.score = { ...r.measured, corpus, at: new Date().toISOString() }
+      }
+      order = [...ranked(c, order.slice(0, 2)), ...order.slice(2)]
+    }
+    const k = `${job.id}/${head.id}`
+    for (const cand of order) {
+      const e = this.#entries.get(`${job.id}/${cand.id}`)
+      if (!e || e.removed) continue
+      const how = cand.score ? (corpus === "heldout" ? `held-out ${coarse(cand.score)}` : describe(c, cand.score)) : "no score"
+      const merged = await this.#merge(e, job, cand)
+      if (!merged.ok) {
+        stage(cand, "trial", "fail", "had the best score but did not merge")
+        continue
+      }
+      const won = await this.#settleTrial(e, job, cand, how)
+      clearTimeout(this.#deadlines.get(k))
+      this.#deadlines.delete(k)
+      saveJob(project, job)
+      return { winner: cand, note: won.note, stop: won.stop, measured: now.held }
+    }
+    saveJob(project, job)
+    return { note: `${HEADER} The trial of ${head.id} is decided by score, but none of its passed attempts (${order.map((t) => t.id).join(", ")}) merged onto ${job.integrationBranch}: each conflicts with what other tasks merged meanwhile. Continue the best one with the subagent tool and its sessionID to resolve the conflict.`, stop: [], measured: now.held }
   }
 
   // The note when a trial's attempt failed: the trial's state (others still run, or all failed); undefined outside one.
-  #trialFailed(job: Job, task: Task): string | undefined {
+  #trialFailed(job: Job, task: Task, project: string): string | undefined {
     if (!task.trial) return undefined
     const now = standing(job, task)
     if (now.winner) return undefined
     if (now.live.length) return attemptFailedText(task, now.live)
     const head = job.tasks.find((t) => t.id === task.trial!.of) ?? task
+    // Others passed and wait for the decision by score: it is due now, and its note says how it came out.
+    if (now.held.length) {
+      this.#settleLater(project, job, head)
+      return undefined
+    }
     return allFailedText(job, head, now.failed)
   }
 
@@ -1341,11 +1484,13 @@ export class Native {
     } else if (task.trial && task.status === "cancelled") {
       // Stopped because another attempt won: its work is not needed, and the winner's note said so.
       await this.#dropWorktree(entry, task)
+    } else if (task.held && task.status === "passed") {
+      // Passed and waiting for its trial to be decided by score: its commit stays in its worktree until then.
     } else {
       const blocked = task.status === "blocked"
       stage(task, "end", "fail", reason ?? "ended without finish_task")
       // In a trial, finish_task reported a blocked attempt already; one that ended unfinished is a failed attempt.
-      if (task.trial) note = blocked ? undefined : this.#trialFailed(job, task)
+      if (task.trial) note = blocked ? undefined : this.#trialFailed(job, task, entry.project)
       else note = `[micromanager] ${task.id} ${task.title}: its worker ended${reason ? ` (${reason})` : ""} without passing finish_task, so nothing was checked or merged; its change is still in ${entry.dir}. Continue it with the subagent tool and sessionID ${session} to finish, or tell the user.`
     }
     saveJob(entry.project, job)

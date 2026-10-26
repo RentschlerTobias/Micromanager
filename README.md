@@ -206,7 +206,12 @@ Jev and the plugin securing every task:
    with a line `Contract: C1` (or `"contract"` in its todo) is measured after its checks pass: an invalid result (a
    non-zero exit, a timeout, no `MM_SCORE` line, a missing score) or a broken guard is a fix round like a failing
    check, and after a rebase it is measured again. Its score, the contract's version and the reward (the first
-   score's improvement over the baseline) go into the outcome log. Any ordinary check may print
+   score's improvement over the baseline) go into the outcome log. In a trial measured against a contract the first
+   attempt to pass is not merged at once: the passed attempts wait, and the one with the best score is merged once
+   none is at work any more (or after `trialDeadline` minutes, default 20; at once when one reaches the contract's
+   `stop.target`). Held-out cases (`corpus.heldOutFrom`, a directory outside the project) are copied to the plugin's
+   state directory, which no worker can read; the evaluator gets them in `MM_CORPUS_DIR`, and workers only hear how
+   many of them passed. Any ordinary check may print
    `MM_SCORE {"cases":{"passed":7,"total":8}}` too; that grades a build task in the outcome log without deciding it.
 
 8. **The backlog.** Jobs that wait live in `.micromanager/backlog/<slug>.md` (front matter plus Markdown), and you commit
@@ -298,6 +303,7 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "parallel": 3,          // tasks of one job at the same time (1: one after another)
   "perModel": 2,          // sessions of one cloud model at the same time; a local model serves one
   "trials": 3,            // attempts a hard writer task runs as, each on another model (1: no trials; at most 4)
+  "trialDeadline": 20,    // minutes a trial decided by a fitness contract waits for its last attempts
   "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // optional limits per job; none by default
   "notify": "jobs",       // desktop notifications: "jobs", "tasks" (also per task) or "off"
   "sandbox": true,        // worker commands in the sandbox (default); false runs them unwrapped

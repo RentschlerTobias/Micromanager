@@ -8,6 +8,7 @@ import { test } from "node:test"
 import { segments } from "../src/decide.ts"
 import { CHILD_PREFIX, DelegationError, Native, NoGitError, namedFiles, parseDelegation, parseTodo, replaceIds, similarity } from "../src/native.ts"
 import { nextStep, settled } from "../src/continuation.ts"
+import { outcomeOf } from "../src/outcomes.ts"
 import { roleByAgent } from "../src/roles.ts"
 import { moveJob, newJob, type Task } from "../src/state.ts"
 import { loadJob, saveJob } from "../src/store.ts"
@@ -919,4 +920,118 @@ test("an accepted check change is applied from outside: a wrong check is replace
   for (const dir of [a1.dir, a2.dir]) assert.match(readFileSync(join(dir, "test", "slug.test.js"), "utf8"), /'cafe-a-carte'/)
   writeFileSync(join(a1.dir, "slug.js"), "exports.slug = (s) => s.normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase().split(' ').filter((w) => w !== 'la').join('-')\n")
   assert.match((await native.finish("ses_a1", "slug")).text, /^Merged into/, "the patched test is not put back as a frozen change")
+})
+
+// A project whose evaluator reads ms.txt (lower is better); on the held-out corpus it also counts the cases in
+// MM_CORPUS_DIR and how many pass (pass.txt).
+function benchRepo(): string {
+  const project = repo()
+  writeFileSync(join(project, "bench.sh"), [
+    'if [ "$MM_CORPUS" = heldout ]; then',
+    '  echo "MM_SCORE {\\"scores\\":{\\"ms\\":$(cat ms.txt)},\\"cases\\":{\\"passed\\":$(cat pass.txt),\\"total\\":$(ls "$MM_CORPUS_DIR" | wc -l)}}"',
+    "else",
+    '  echo "MM_SCORE {\\"scores\\":{\\"ms\\":$(cat ms.txt)}}"',
+    "fi",
+    "",
+  ].join("\n"))
+  writeFileSync(join(project, "ms.txt"), "100\n")
+  writeFileSync(join(project, "pass.txt"), "1\n")
+  git(project, "add", "-A")
+  git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "bench")
+  return project
+}
+
+test("a trial measured against a contract merges the best score once every attempt is done, not the first to pass", async () => {
+  const project = benchRepo()
+  const settled: { note?: string; stop: string[]; measured: string[] }[] = []
+  let done!: () => void
+  const decided = new Promise<void>((resolve) => (done = resolve))
+  const native = new Native({ onSettled: (r) => { settled.push({ note: r.note, stop: r.stop, measured: r.measured.map((t) => t.id) }); if (r.note) done() } })
+  await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "faster", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min", noise: 0.05 }] }))
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "faster", prompt: "Make it faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt" }, MODEL, { difficulty: 0.9, trials: 3 })
+  assert.match(native.trialNote(project, d.job.id, d.task.id)!, /the one with the best score against contract C1 is merged once all are done/)
+  assert.match(d.prompt, /the one with the best score is merged once all are done/)
+  const a2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "attempt", prompt: `Attempt: ${d.task.id} · ${d.job.id}` }, "opencode-go/kimi-k3")
+  const a3 = await native.delegate(project, "ses_mm", { agent: "coder", description: "attempt", prompt: `Attempt: ${d.task.id} · ${d.job.id}` }, "opencode-go/qwen3.8-flash")
+  assert.deepEqual(a2.task.contract, { id: "C1", version: 1 })
+  const w1 = native.claim("ses_a1", child(d.prompt))!
+  const w2 = native.claim("ses_a2", child(a2.prompt))!
+  native.claim("ses_a3", child(a3.prompt))
+
+  writeFileSync(join(w1.dir, "ms.txt"), "80\n")
+  const first = await native.finish("ses_a1", "80")
+  assert.match(first.text, /^Your checks pass \(measured: ms 80 \(baseline 100\)\), and your commit waits in your worktree/)
+  assert.equal(first.note, undefined, "nothing to decide while others run")
+  writeFileSync(join(w2.dir, "ms.txt"), "60\n")
+  assert.match((await native.finish("ses_a2", "60")).text, /waits in your worktree/)
+  assert.ok(!existsSync(join(d.job.integrationWorktree!, "ms.txt")) || readFileSync(join(d.job.integrationWorktree!, "ms.txt"), "utf8") === "100\n", "nothing merged yet")
+
+  // The third attempt ends without passing: no attempt is at work any more, so the trial is decided.
+  await native.ended("ses_a3", "gave up")
+  await decided
+  const r = settled.find((s) => s.note)!
+  assert.match(r.note!, new RegExp(`${a2.task.id} won the trial of ${d.task.id} with the best score \\(ms 60 \\(baseline 100\\)\\), ahead of ${d.task.id}: merged into`))
+  assert.deepEqual(r.measured.sort(), [d.task.id, a2.task.id].sort())
+  assert.equal(readFileSync(join(d.job.integrationWorktree!, "ms.txt"), "utf8"), "60\n")
+  const job = loadJob(project, d.job.id)!
+  const loser = job.tasks.find((t) => t.id === d.task.id)!
+  assert.equal(loser.status, "cancelled")
+  assert.match(loser.stages.at(-1)!.evidence!, new RegExp(`won by ${a2.task.id} on score`))
+  assert.equal(outcomeOf(project, job, loser).end, "lost_on_score")
+  assert.equal(outcomeOf(project, job, job.tasks.find((t) => t.id === a2.task.id)!).reward, 0.4)
+})
+
+test("an attempt that reaches the contract's target wins at once; held-out cases reach the worker only as a count", async () => {
+  const project = benchRepo()
+  const outside = mkdtempSync(join(tmpdir(), "jd-heldout-"))
+  for (const n of ["a", "b", "c"]) writeFileSync(join(outside, `${n}.txt`), n)
+  const native = new Native()
+  assert.match(await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "g", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], corpus: { heldOutFrom: project } })), /^Not stored: corpus\.heldOutFrom must lie outside the project/)
+  const stored = await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "g", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], corpus: { heldOutFrom: outside }, stop: { target: { ms: 50 } } }))
+  assert.match(stored, /It has 3 held-out cases, which only the evaluator sees\./)
+  const job0 = native.job(project, "ses_mm")
+  assert.deepEqual(job0.contracts![0]!.baseline!.heldOut, { ms: 100 })
+  assert.equal(job0.contracts![0]!.corpus.heldOut!.cases, 3)
+
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "faster", prompt: "Make it faster.\nContract: C1\nFiles: ms.txt, pass.txt\nChecks: test -s ms.txt" }, MODEL, { difficulty: 0.9, trials: 2 })
+  const a2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "attempt", prompt: `Attempt: ${d.task.id} · ${d.job.id}` }, "opencode-go/kimi-k3")
+  const w1 = native.claim("ses_b1", child(d.prompt))!
+  native.claim("ses_b2", child(a2.prompt))
+  writeFileSync(join(w1.dir, "ms.txt"), "40\n")
+  writeFileSync(join(w1.dir, "pass.txt"), "2\n")
+  const won = await native.finish("ses_b1", "fast")
+  assert.match(won.text, /^Your attempt won the trial on score and is merged/)
+  assert.match(won.note!, /won the trial of T\d+ with the best score \(held-out 2\/3 passed\)/)
+  assert.doesNotMatch(won.note!, /ms 40/, "the micromanager hears no held-out values either")
+  assert.deepEqual(won.stop, ["ses_b2"], "the attempt still at work is stopped")
+  const task = loadJob(project, d.job.id)!.tasks.find((t) => t.id === d.task.id)!
+  assert.equal(task.score!.corpus, "heldout")
+  assert.match(task.stages.find((s) => s.stage === "trial")!.evidence!, /held-out 2\/3 passed$/)
+})
+
+test("a trial decided by score is decided at its deadline, by a process that adopted it too", async () => {
+  const project = benchRepo()
+  const native = new Native({ trialDeadlineMs: 60_000 })
+  await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "g", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }] }))
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "faster", prompt: "Make it faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt" }, MODEL, { difficulty: 0.9, trials: 2 })
+  const a2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "attempt", prompt: `Attempt: ${d.task.id} · ${d.job.id}` }, "opencode-go/kimi-k3")
+  const w1 = native.claim("ses_c1", child(d.prompt))!
+  native.claim("ses_c2", child(a2.prompt))
+  writeFileSync(join(w1.dir, "ms.txt"), "70\n")
+  await native.finish("ses_c1", "70")
+  const head = loadJob(project, d.job.id)!.tasks.find((t) => t.id === d.task.id)!
+  assert.ok(Date.parse(head.settleBy!) > Date.now() + 50_000)
+
+  // The server restarts with a deadline that has passed: the trial is decided at once, the live attempt stopped.
+  const job = loadJob(project, d.job.id)!
+  job.tasks.find((t) => t.id === d.task.id)!.settleBy = new Date(Date.now() - 1000).toISOString()
+  saveJob(project, job)
+  let done!: (r: { note?: string; stop: string[] }) => void
+  const decided = new Promise<{ note?: string; stop: string[] }>((resolve) => (done = resolve))
+  const again = new Native({ onSettled: (r) => { if (r.note) done(r) } })
+  again.adopt(project)
+  const r = await decided
+  assert.match(r.note!, new RegExp(`${d.task.id} won the trial of ${d.task.id} with the best score \\(ms 70`))
+  assert.deepEqual(r.stop, [], "the other attempt's session ended with the restart")
+  assert.equal(loadJob(project, d.job.id)!.tasks.find((t) => t.id === a2.task.id)!.status, "cancelled")
 })
