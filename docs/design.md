@@ -1064,6 +1064,20 @@ told "make the test pass" could change the test.
   puts the frozen paths into `denyWrite`, so `sed -i` cannot get around it (checked with bubblewrap). The brief lists
   the frozen files. A wrong test is to be named in the report; P3 gives the worker a tool to ask for the change.
 
+**P3: `request_check_change` (implemented).** Frozen tests are only fair with a valve: a worker with a wrong test
+could otherwise only fail or cheat (src/checkchange.ts).
+- **The worker asks, someone else decides.** A native writer calls `request_check_change` with `kind`, `target` (the
+  check command or the file), `problem`, `evidence` and `proposal` (a new command, a unified diff, or contract JSON);
+  the call waits up to 20 minutes. `check_bug` goes through Jev's prefilter (`CHECK_BUG`, floor 0.2, refused below
+  it), then to the micromanager (`decide_change`); `test_contradicts_spec` too, after a reviewer of another family
+  checked the claim; `spec_incomplete` and `contract` always go to the user as a form (`Change K…`).
+- **Against loopholes:** evidence is required (a quote, not "too hard"); two requests per task; a refused target is
+  final for the job, stored normalized in the control file (`refused.check`), so rewording does not help.
+- **Applied from outside** (`Native.applyCheckChange`): a check command is replaced (and the acceptance point's
+  `verify` with it), a file gets the diff with `git apply` and is frozen again as patched, a contract gets a new
+  version, and `spec_incomplete` adds the decision to the job. In a trial every attempt still at work gets the same
+  change and a steer note. Each decision is a `check-change` stage and goes to the outcome log (`checkChanges`).
+
 **P6: the local backlog (implemented).** Jobs that wait, one Markdown file each in `.micromanager/backlog/<slug>.md`,
 committed with the project (src/backlog.ts). Items are jobs, never a job's internal tasks.
 - **Format:** a YAML front matter in a small subset the plugin reads and writes itself (scalars, lists, lists of

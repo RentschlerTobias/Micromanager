@@ -25,6 +25,8 @@ export const TOOL_IDS = [
   "contract",
   // Jobs that wait, in the project (src/backlog.ts).
   "backlog",
+  // A writer's request to change a check, decided (src/checkchange.ts).
+  "decide_change",
 ] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
@@ -57,6 +59,7 @@ export interface Handlers {
   todo(items: string, ctx: ToolContext): Promise<string>
   contract(job: string, json: string, ctx: ToolContext): Promise<string>
   backlog(action: string, slug: string, value: string, ctx: ToolContext): Promise<string>
+  decideChange(id: string, decision: string, note: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -194,6 +197,13 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     execute: guarded(([action, slug, value], ctx) => handlers.backlog(action!, slug!, value!, ctx), "action", "slug", "value"),
   })
   draft.add({
+    id: "decide_change",
+    name: "decide_change",
+    description: "Decide a worker's request to change a check or a frozen test (a note \"[micromanager] K…: worker … asks to change …\" names it). id: the K-number. decision: accept (the plugin applies the proposed change, freezes it again and gives it to every attempt of the task) or refuse (it stays as it is for this job). note: why, in one sentence for the worker. Accept a check that is wrong in itself; refuse one that only fails because the work is not done. A request the note says only the user decides goes to them with its form instead.",
+    input: input("id", "decision", "note"),
+    execute: guarded(([id, decision, note], ctx) => handlers.decideChange(id!, decision!, note!, ctx), "id", "decision", "note"),
+  })
+  draft.add({
     id: "undo_merge",
     name: "undo_merge",
     description: "Take back the last merge_job of a job: the user's checkout goes back to where it was before that merge. Only while the checkout is exactly where the merge left it and has no uncommitted changes. job: the job id, or empty for this session's job. Without ack it shows which commits would leave the checkout and changes nothing; with ack (the user's own words, repeated) it moves it back. The commits stay on the job branch; merge_job brings them back.",
@@ -313,6 +323,32 @@ export function installGrantTools(draft: ToolDraft, request: (kind: "env" | "net
       },
     })
   }
+}
+
+// A writer's request to have a check or a frozen test changed (src/checkchange.ts): it never changes them itself. The
+// call waits until the micromanager, a reviewer or the user decided it. The context hook hides it from every session
+// that is no native writer.
+export const CHECK_CHANGE_ID = "request_check_change"
+
+export function installCheckChangeTool(draft: ToolDraft, request: (args: Record<string, string>, ctx: ToolContext) => Promise<string>, allowed: (sessionID: string) => boolean): void {
+  const read = draft.get("read")
+  const str = read?.input?.fields?.path
+  if (!read?.input?.mapFields || !str) throw new Error("the built-in read tool has no input schema to build from")
+  const fields = ["kind", "target", "problem", "evidence", "proposal"] as const
+  draft.add({
+    id: CHECK_CHANGE_ID,
+    name: CHECK_CHANGE_ID,
+    description: "Ask for a change to one of your checks or frozen tests when it is wrong itself; never change or get around it yourself. kind: check_bug (a wrong path, a typo, a command that cannot run here), test_contradicts_spec (the test expects what the task says not to do), spec_incomplete (the task did not think of this case; the user decides), contract (the fitness contract; the user decides). target: the check command or the file's path. problem: what is wrong, in a sentence. evidence: the output or the line of the task that shows it; \"too hard\" is no evidence. proposal: the new command, or a unified diff of the file (for a contract, its JSON). The call waits for the decision, up to twenty minutes. Twice per task at most, and a refused change stays refused.",
+    input: read.input.mapFields(() => Object.fromEntries(fields.map((f) => [f, str]))),
+    execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+      if (!ctx?.sessionID || !allowed(ctx.sessionID)) return { content: "Only a worker that changes files for the micromanager may use this tool." }
+      try {
+        return { content: await request(Object.fromEntries(fields.map((f) => [f, String(args?.[f] ?? "").trim()])), ctx) }
+      } catch (err) {
+        return { content: `failed: ${err instanceof Error ? err.message : String(err)}` }
+      }
+    },
+  })
 }
 
 // The plan as the micromanager shows it to the user.

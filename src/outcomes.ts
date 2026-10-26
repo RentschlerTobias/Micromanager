@@ -50,6 +50,9 @@ export interface Outcome {
   readonly score?: { readonly valid: boolean; readonly values: Readonly<Record<string, number>> }
   readonly reward?: number
   readonly graded?: number // the share of cases its checks' own MM_SCORE lines passed, at its last gate
+  // Its requests to change a check (src/checkchange.ts): how often the checks or the spec were wrong, and who said so,
+  // is something to learn about the tasks and their planners.
+  readonly checkChanges?: readonly { readonly kind: string; readonly accepted: boolean; readonly by: string }[]
 }
 
 // The class a task is compared in: what a router could know before it starts.
@@ -94,6 +97,7 @@ export function outcomeOf(project: string, job: Job, task: Task, usage?: { token
     ...(task.score ? { score: { valid: task.score.valid, values: task.score.values } } : {}),
     ...(r !== undefined ? { reward: r } : {}),
     ...(task.graded ? { graded: Math.round((task.graded.passed / task.graded.total) * 1000) / 1000 } : {}),
+    ...(task.checkChanges?.length ? { checkChanges: task.checkChanges } : {}),
   }
 }
 

@@ -881,3 +881,42 @@ test("a writer's tests are frozen: the checks name them, a changed one is put ba
   again.adopt(project)
   assert.deepEqual(again.frozenOf("ses_w3"), [join(tw.dir, "test", "add.test.js")])
 })
+
+test("an accepted check change is applied from outside: a wrong check is replaced, a frozen test patched in every attempt", async () => {
+  const project = repo()
+  mkdirSync(join(project, "test"))
+  writeFileSync(join(project, "test", "slug.test.js"), "const assert = require('node:assert')\nassert.equal(require('../slug.js').slug('Café à la carte'), 'cafe-a-la-carte')\n")
+  git(project, "add", "-A")
+  git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "test")
+  const native = new Native()
+
+  // A check with a wrong path: replaced by the proposed command, and the worker's next finish runs the new one.
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "a", prompt: "Write a.js.\nFiles: a.js\nChecks: test -f src/a.js" }, MODEL)
+  const w = native.claim("ses_w1", child(d.prompt))!
+  assert.equal(native.changeContext("ses_w1")!.asked, 0)
+  writeFileSync(join(w.dir, "a.js"), "x\n")
+  assert.match((await native.finish("ses_w1", "a")).text, /test -f src\/a\.js \(exit 1\)/)
+  const fixed = await native.applyCheckChange(project, d.job.id, d.task.id, { kind: "check_bug", target: "test -f  src/a.js", problem: "wrong path", proposal: "test -f a.js", id: "K1" })
+  assert.deepEqual(fixed, { ok: true, text: 'the check "test -f src/a.js" is "test -f a.js" now', steer: [] })
+  native.recordChange(project, d.job.id, d.task.id, "check_bug", { accepted: true, by: "micromanager" }, "K1", "test -f src/a.js")
+  assert.equal(native.changeContext("ses_w1")!.asked, 1)
+  assert.equal(native.current(project, d.job.id)!.acceptance.find((a) => d.task.acceptance.includes(a.id))!.verify, "test -f a.js")
+  assert.match((await native.finish("ses_w1", "a")).text, /^Merged into .*checks passed: test -f a\.js/)
+  assert.deepEqual((await native.applyCheckChange(project, d.job.id, d.task.id, { kind: "check_bug", target: "nope.js", problem: "", proposal: "x", id: "K2" })).ok, false)
+
+  // A frozen test that contradicts the task, in a trial: the diff lands in both attempts' worktrees, the test is frozen
+  // again as patched, and the other attempt is told.
+  const t = await native.delegate(project, "ses_mm", { agent: "coder", description: "slug", prompt: "Write slug.js; drop articles like la.\nFiles: slug.js\nChecks: node test/slug.test.js" }, MODEL, { difficulty: 0.9, trials: 2 })
+  const t2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "T attempt", prompt: `Attempt: ${t.task.id} · ${t.job.id}` }, "opencode-go/kimi-k3")
+  const a1 = native.claim("ses_a1", child(t.prompt))!
+  const a2 = native.claim("ses_a2", child(t2.prompt))!
+  const diff = ["--- a/test/slug.test.js", "+++ b/test/slug.test.js", "@@ -1,2 +1,2 @@", " const assert = require('node:assert')", "-assert.equal(require('../slug.js').slug('Café à la carte'), 'cafe-a-la-carte')", "+assert.equal(require('../slug.js').slug('Café à la carte'), 'cafe-a-carte')", ""].join("\n")
+  const patched = await native.applyCheckChange(project, t.job.id, t.task.id, { kind: "test_contradicts_spec", target: "./test/slug.test.js", problem: "articles are dropped", proposal: diff, id: "K3" })
+  assert.equal(patched.ok, true, patched.text)
+  assert.equal(patched.text, "test/slug.test.js is changed as proposed and frozen again")
+  assert.deepEqual(patched.steer.map((s) => s.session), ["ses_a2"])
+  assert.match(patched.steer[0]!.note, /K3: the check change another attempt asked for is accepted/)
+  for (const dir of [a1.dir, a2.dir]) assert.match(readFileSync(join(dir, "test", "slug.test.js"), "utf8"), /'cafe-a-carte'/)
+  writeFileSync(join(a1.dir, "slug.js"), "exports.slug = (s) => s.normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase().split(' ').filter((w) => w !== 'la').join('-')\n")
+  assert.match((await native.finish("ses_a1", "slug")).text, /^Merged into/, "the patched test is not put back as a frozen change")
+})

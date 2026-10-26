@@ -22,7 +22,7 @@ function fakeDraft() {
 const ok = async () => "ok"
 // The user's own checkout, the directory the stand-in host below reports: what a worker must never be able to write.
 const PROJECT = "/home/t1dde/Fun/Projects/Repos/micromanager"
-const noop = { tasks: ok, plan: ok, questions: ok, run: ok, status: ok, stop: ok, steer: ok, stopTask: ok, merge: ok, discard: ok, access: ok, permission: ok, rewind: ok, undoMerge: ok, takeOver: ok, todo: ok, contract: ok, backlog: ok }
+const noop = { tasks: ok, plan: ok, questions: ok, run: ok, status: ok, stop: ok, steer: ok, stopTask: ok, merge: ok, discard: ok, access: ok, permission: ok, rewind: ok, undoMerge: ok, takeOver: ok, todo: ok, contract: ok, backlog: ok, decideChange: ok }
 const byId = (added: Record<string, unknown>[], id: string) => {
   const tool = added.find((t) => t.id === id)!
   return { input: tool.input, run: tool.execute as (a: Record<string, unknown>, c: object) => Promise<{ content: string }> }

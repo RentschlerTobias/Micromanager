@@ -29,6 +29,7 @@ export interface Control extends Partial<JobOptions> {
 export interface Names {
   readonly env?: readonly string[]
   readonly network?: readonly string[]
+  readonly check?: readonly string[] // targets of refused check changes (src/checkchange.ts normalTarget); refused only
 }
 
 export function controlPath(project: string, jobId: string): string {

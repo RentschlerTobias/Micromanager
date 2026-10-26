@@ -76,6 +76,15 @@ export const OPEN_ENDED: Question = {
 }
 export const OPEN_ENDED_FLOOR = 0.8
 
+// Jev's prefilter on a worker's request to change a check it calls broken (src/checkchange.ts check_bug). Below the
+// floor it is refused without asking the micromanager; the floor is low on purpose, because a wrong check that stays
+// costs a whole task, and the micromanager still decides everything above it.
+export const CHECK_BUG: Question = {
+  type: "noul",
+  instructions: "The evidence shows that the check itself is wrong (a path that does not exist, a typo, a command that cannot run in this environment), not that the work it checks is unfinished or wrong.",
+}
+export const CHECK_BUG_FLOOR = 0.2
+
 // N2b: which open question to ask next; the criteria are built per turn from the frontier.
 export function nextQuestionChoice(options: Record<string, string>): Question {
   return {

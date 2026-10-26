@@ -153,6 +153,7 @@ export interface Task {
   // tests its checks name and its contract's evaluator and corpus. "" for one that did not exist.
   frozen?: Record<string, string>
   freeze?: string[] // files its todo or delegation asked to freeze, hashed into frozen when it starts
+  checkChanges?: { kind: string; accepted: boolean; by: string }[] // its request_check_change decisions (src/checkchange.ts)
   replacedBy?: string
   difficulty?: number // the N5 estimate at a native delegation, 0..1 (src/trials.ts)
   // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has (src/trials.ts).

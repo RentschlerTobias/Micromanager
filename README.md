@@ -133,6 +133,12 @@ Jev and the plugin securing every task:
      contract's evaluator and corpus, and any it was given with `Frozen:` (or `"frozen"` in its todo) may be read and
      run but not changed: an edit is refused at once, the sandbox denies the write, and a changed one is put back at
      `finish_task` and counts as a failing check.
+   - **A wrong check can be changed, not dodged.** A writer that finds a check or a frozen test wrong calls
+     `request_check_change` with the evidence and a proposal, and waits. A broken check (a wrong path, a typo) goes
+     through Jev's prefilter to the micromanager (`decide_change`); a test that contradicts the task is checked by a
+     reviewer of another model family first; a gap in the spec or a change to the fitness contract is always yours, as
+     a form. The plugin applies an accepted change itself, to every attempt of a trial. Two requests per task, and a
+     refused change stays refused.
    - **A task that changed nothing does not merge.** A gate that passes over an empty diff verified nothing, so it is
      reported as unverified instead. Failing checks come back at most twice; then the worker stops and says the
      check is the likely problem, because an unsatisfiable one otherwise burns the whole session.
@@ -169,6 +175,7 @@ Jev and the plugin securing every task:
    | `stop_job` | stop the whole job; `run_job` resumes it |
    | `contract` | define what "better" means for a task with no fixed end; the baseline is measured at once |
    | `backlog` | list, show, add or change the project's waiting jobs in `.micromanager/backlog/` |
+   | `decide_change` | accept or refuse a writer's request to change a check or a frozen test |
 
 6. **Checkpoints and rewind.** Every merged task is a commit `Tn: title` on `jev/<job>`, and the job remembers where
    the branch started, so the branch is a row of checkpoints: `start`, then the state after each task. `rewind_job`

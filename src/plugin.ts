@@ -40,7 +40,7 @@ import { addGrant, isStarted, lastOptions, loadControl, optionsOf, saveLastOptio
 import { badName, GRANT_FLOOR, grantNote, harmlessQuestion, grantResult, GrantRequests, grantState, triage, type GrantKind } from "./grants.ts"
 import { accessForm, answersOf, formInput, gitForm, readForm, type Question } from "./forms.ts"
 import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
-import { CLASSIFY, NOUL_FLOOR, OPEN_ENDED, OPEN_ENDED_FLOOR } from "./catalog.ts"
+import { CHECK_BUG, CHECK_BUG_FLOOR, CLASSIFY, NOUL_FLOOR, OPEN_ENDED, OPEN_ENDED_FLOOR } from "./catalog.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { installedSkills, SKILLS } from "./skills.ts"
 import { backlogIgnored, listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
@@ -49,7 +49,11 @@ import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "
 import { exec, repoRel, type Exec } from "./integration.ts"
 import { readFileSync } from "node:fs"
 import { join, relative, resolve } from "node:path"
-import { FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installTools, planText, TOOL_IDS, type ToolDraft } from "./tools.ts"
+import {
+  CHECK_CHANGE_ID, FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installCheckChangeTool, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installTools, planText,
+  TOOL_IDS, type ToolDraft,
+} from "./tools.ts"
+import { ChangeRequests, changeNote, changeResult, normalTarget, readChange, route, validateRequest, type ChangeAnswer, type ChangeKind } from "./checkchange.ts"
 import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
 import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo } from "./native.ts"
@@ -176,6 +180,9 @@ interface Shared {
   code?: { commit: string; dirty: boolean | "unknown" } // the plugin code this server loaded
   asks: Asks // workers' paused permission requests, answered by the micromanager or the user (src/ask.ts)
   grantRequests: GrantRequests // workers' requests for a variable or a host, waiting for the user (src/grants.ts)
+  // Writers' requests to change a check, waiting for a decision (src/checkchange.ts); made on first use, so a server that
+  // loaded an older plugin first gets one too.
+  changeRequests?: ChangeRequests
   helperOf: Map<string, string> // helper session -> the writer it answers (src/helpers.ts)
   // What every session of a native job used, so the job is charged only what is new (src/budget.ts), and the jobs
   // whose used-up budget the micromanager was told about already.
@@ -930,6 +937,53 @@ export default {
       const r = await answer
       return grantResult(kind, name, r.granted, r.by)
     }
+    // A writer's request to change a check or a frozen test (src/checkchange.ts): validated, prefiltered by Jev for a check
+    // it calls broken, put to whoever decides its kind, and applied from outside when accepted. The call waits.
+    const requestChange = async (args: Record<string, string>, sessionID: string): Promise<string> => {
+      const here = native.changeContext(sessionID)
+      if (!here) return "Only a worker that changes files for the micromanager may use this tool."
+      const changes = (SHARED.changeRequests ??= new ChangeRequests(record))
+      const r = { kind: args.kind as ChangeKind, target: args.target ?? "", problem: args.problem ?? "", evidence: args.evidence ?? "", proposal: args.proposal ?? "" }
+      const bad = validateRequest(r, here.asked, loadControl(here.project, here.job.id).refused?.check ?? [])
+      if (bad) return `Not asked: ${bad}`
+      const task = `${here.task.id} ${here.task.title}`
+      const decided = (id: string, a: ChangeAnswer) => {
+        native.recordChange(here.project, here.job.id, here.task.id, r.kind, a, id, r.target)
+        if (!a.accepted && a.by !== "timeout") addGrant(here.project, here.job.id, "check", normalTarget(r.target), false)
+      }
+      if (r.kind === "check_bug" && jev) {
+        try {
+          const answer = (await jev.ask(`A worker's check failed and the worker says the check itself is wrong.\nTask: ${task}\nCheck: ${r.target}\nProblem: ${r.problem}\nEvidence: ${r.evidence.slice(0, 2000)}`, { check_bug: CHECK_BUG })).answers.check_bug
+          const p = answer?.type === "noul" ? answer.noul : 1
+          if (p < CHECK_BUG_FLOOR) {
+            const a: ChangeAnswer = { accepted: false, by: "jev", note: "the evidence does not show the check is wrong" }
+            decided("K-", a)
+            return changeResult({ id: "The request", target: r.target }, a)
+          }
+        } catch (err) {
+          log("warn", `Jev on a check change failed: ${String(err)}`)
+        }
+      }
+      const by = route(r.kind)
+      const { pending, answer } = changes.open({ ...r, sessionID, parent: here.parent, task, taskId: here.task.id, project: here.project, jobId: here.job.id })
+      await ctx.session.synthetic({ sessionID: here.parent, text: changeNote(pending, by, here.task.model), resume: true }).catch((err: unknown) => log("warn", `change note failed: ${String(err)}`))
+      if (by === "user" && notify !== "off") execFile("notify-send", ["-a", "micromanager", `${pending.id}: a worker asks to change a check`, r.target.slice(0, 120)], () => {})
+      const a = await answer
+      if (!a.accepted) {
+        decided(pending.id, a)
+        return changeResult(pending, a)
+      }
+      const applied = await native.applyCheckChange(here.project, here.job.id, here.task.id, { ...r, id: pending.id })
+      if (!applied.ok) {
+        const failed: ChangeAnswer = { accepted: false, by: a.by, note: `accepted, but ${applied.text}` }
+        native.recordChange(here.project, here.job.id, here.task.id, r.kind, failed, pending.id, r.target)
+        void ctx.session.synthetic({ sessionID: here.parent, text: `[micromanager] ${pending.id} was accepted, but the plugin could not apply it: ${applied.text}. The worker is told; correct the task with steer_task if the change is still needed.`, resume: false }).catch(() => undefined)
+        return `${pending.id} was accepted, but the plugin could not apply it: ${applied.text}. Nothing changed; make the work pass the checks as they are, or say so in your report.`
+      }
+      decided(pending.id, a)
+      for (const s of applied.steer) steering.set(s.session, s.note)
+      return changeResult(pending, a, applied.text)
+    }
     // Whether a job's worker commands run in the sandbox, written once per job into its control file for the sidebar.
     const marked = new Set<string>()
     const markSandbox = async (project: string, jobId: string): Promise<void> => {
@@ -1196,6 +1250,7 @@ export default {
     const release = async (session: string, why: string): Promise<void> => {
       const helpers = [...SHARED.helperOf].filter(([, writer]) => writer === session).map(([helper]) => helper)
       SHARED.grantRequests.drop([session])
+      SHARED.changeRequests?.drop([session])
       for (const helper of helpers) {
         if (ended.has(helper)) continue
         ended.add(helper)
@@ -1635,7 +1690,23 @@ export default {
     // What a submitted form says, applied, and told to the micromanager under the tool's result.
     const answered = async (sessionID: string, call: ToolCall): Promise<void> => {
       const answers = answersOf(call.result)
-      const form = answers && readForm((call.input.questions ?? []) as Partial<Question>[], answers)
+      // A change request only the user decides (src/checkchange.ts): its own header, its own labels.
+      const asked = (call.input.questions ?? []) as Partial<Question>[]
+      const change = answers && asked[0]?.header ? readChange(asked[0].header, answers[0] ?? []) : undefined
+      if (change && project) {
+        const changes = (SHARED.changeRequests ??= new ChangeRequests(record))
+        const pending = changes.get(change.id)
+        if (!pending || pending.parent !== sessionID) return
+        const tell = (text: string) => rewriteResult(call.result, (was) => `${was}\n[micromanager] ${text}`)
+        if (change.accepted === undefined) {
+          tell(`${change.id}: "${change.said ?? ""}" is no answer to the form; the worker still waits. Ask with the same form again if the user wants to decide.`)
+          return
+        }
+        changes.answer(change.id, { accepted: change.accepted, by: "user" })
+        tell(`${change.id}: the user ${change.accepted ? "accepted the change; the plugin applies it" : "refused the change; it stays as it is"}, and the worker goes on.`)
+        return
+      }
+      const form = answers && readForm(asked, answers)
       if (!form || !project) return
       record({ kind: "form", sessionID, form })
       const auto = autoJob(sessionID)
@@ -1973,6 +2044,16 @@ export default {
             record({ kind: "backlog", sessionID: tctx.sessionID, action: action.trim(), slug: slug.trim() || undefined, text: text.slice(0, 300) })
             return text
           },
+          decideChange: async (id, decision, note, tctx) => {
+            const changes = (SHARED.changeRequests ??= new ChangeRequests(record))
+            const pending = changes.get(id)
+            if (!pending || pending.parent !== tctx.sessionID) return `There is no change request ${id.trim()} waiting for you: it was decided already, timed out, or belongs to another session.`
+            if (route(pending.kind) === "user") return `${pending.id} changes what is wanted (${pending.kind}), so only the user decides it: put the form from its note to them with the question tool.`
+            const d = decision.trim().toLowerCase()
+            if (d !== "accept" && d !== "refuse") return 'decision must be "accept" or "refuse".'
+            changes.answer(pending.id, { accepted: d === "accept", by: "micromanager", ...(note.trim() ? { note: note.trim().slice(0, 300) } : {}) })
+            return `${pending.id} is ${d === "accept" ? "accepted; the plugin applies it and the worker goes on" : "refused; the worker goes on without it and may not ask for it again"}.`
+          },
           contract: async (id, json, tctx) => {
             if (!tctx.sessionID) return "contract needs a session."
             const text = await native.contract(project, tctx.sessionID, id.trim(), json)
@@ -2075,6 +2156,11 @@ export default {
         installGrantTools(draft, (kind, name, why, tctx) => requestGrant(kind, name, why, tctx.sessionID!), grantAllowed)
       } catch (err) {
         log("error", `request_env and request_network not installed: ${String(err)}`)
+      }
+      try {
+        installCheckChangeTool(draft, (args, tctx) => requestChange(args, tctx.sessionID!), (sessionID) => native.isWriter(sessionID))
+      } catch (err) {
+        log("error", `${CHECK_CHANGE_ID} not installed: ${String(err)}`)
       }
       try {
         installGraphTool(draft, async (a, tctx) => {
@@ -2306,6 +2392,7 @@ export default {
         if (input.tools && !(input.sessionID && native.hasGraph(input.sessionID))) delete input.tools[GRAPH_ID]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
         if (input.tools) for (const kind of ["env", "network"] as const) if (!(input.sessionID && grantAllowed(kind, input.sessionID))) delete input.tools[GRANT_IDS[kind]]
+        if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[CHECK_CHANGE_ID]
         // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
         if (input.sessionID && (native.isWorker(input.sessionID) || SHARED.helperOf.has(input.sessionID))) void charge(input.sessionID).catch((err: unknown) => log("warn", `budget count failed: ${String(err)}`))
         if (input.sessionID && native.isWorker(input.sessionID)) {

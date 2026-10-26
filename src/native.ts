@@ -13,7 +13,8 @@
 //
 // Every plugin instance of one server shares this state (a moved worker is served by the instance of its worktree).
 
-import { statSync } from "node:fs"
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 
 import { Graphs, graphBrief, queryGraph, type Graph } from "./graph.ts"
@@ -31,6 +32,7 @@ import { ROLES, roleByAgent, roleById, type Role, type RoleId } from "./roles.ts
 import { isDone, moveTask, newJob, moveJob, stage, type Job, type Later, type Task } from "./state.ts"
 import { excludeFromGit, jobId, listJobs, saveContract, saveJob } from "./store.ts"
 import { draftFromLater, draftFromTrial, localBackend, type BacklogBackend, type BacklogItem } from "./backlog.ts"
+import { normalTarget, type ChangeAnswer, type ChangeKind } from "./checkchange.ts"
 import { parseReport, sharedNote, skillLine, taskAcceptance } from "./brief.ts"
 import { settled, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
@@ -575,6 +577,92 @@ export class Native {
     return { drafts, source }
   }
 
+  // What a writer asking for a check change is, for the request: its job, task, model and how often it asked.
+  changeContext(session: string): { project: string; job: Job; task: Task; parent: string; asked: number } | undefined {
+    const entry = this.#entry(session)
+    const job = entry && this.#job(entry)
+    const task = job?.tasks.find((t) => t.id === entry!.taskId)
+    if (!entry?.writer || !job || !task) return undefined
+    return { project: entry.project, job, task, parent: entry.parent, asked: task.checkChanges?.length ?? 0 }
+  }
+
+  // A decided check change, on the task (and the outcome log after it).
+  recordChange(project: string, jobId: string, taskId: string, kind: ChangeKind, a: ChangeAnswer, id: string, target: string): void {
+    const job = this.#jobs.get(key(project, jobId))
+    const task = job?.tasks.find((t) => t.id === taskId)
+    if (!job || !task) return
+    task.checkChanges = [...(task.checkChanges ?? []), { kind, accepted: a.accepted, by: a.by }]
+    stage(task, "check-change", a.accepted ? "pass" : "fail", `${id} ${kind}: ${target.slice(0, 120)}${a.note ? ` (${a.note.slice(0, 120)})` : ""}`)
+    saveJob(project, job)
+  }
+
+  // An accepted check change, applied from outside: the worker never touches the check itself. A check command is
+  // replaced; a frozen file gets the proposed diff and is frozen again as it is now; a contract gets a new version. In a
+  // trial every attempt still at work gets the same change and a note, so all are measured by the same rule. Returns
+  // what was done, or why it could not be, and the notes for the other attempts.
+  async applyCheckChange(project: string, jobId: string, taskId: string, r: { kind: ChangeKind; target: string; problem: string; proposal: string; id: string }): Promise<{ ok: boolean; text: string; steer: { session: string; note: string }[] }> {
+    const job = this.#jobs.get(key(project, jobId))
+    const task = job?.tasks.find((t) => t.id === taskId)
+    const entry = this.#entries.get(`${jobId}/${taskId}`)
+    if (!job || !task || !entry) return { ok: false, text: "the task is gone", steer: [] }
+    const siblings = task.trial ? standing(job, task).live.filter((t) => t !== task) : []
+    const entries = [entry, ...siblings.map((t) => this.#entries.get(`${job.id}/${t.id}`)).filter((e): e is Entry => Boolean(e && !e.ended))]
+    const steer = (what: string) => entries.slice(1).filter((e) => e.session).map((e) => ({ session: e.session!, note: `[micromanager] ${r.id}: the check change another attempt asked for is accepted and applied to your worktree as well: ${what}. Your checks run against it from now on. This note comes from your own plugin; it is trusted.` }))
+    if (r.kind === "contract") {
+      const c = job.contracts?.find((x) => x.id === task.contract?.id)
+      if (!c) return { ok: false, text: "the task is measured against no contract", steer: [] }
+      let proposal: Record<string, unknown>
+      try {
+        proposal = JSON.parse(r.proposal) as Record<string, unknown>
+      } catch {
+        return { ok: false, text: "the proposal is no contract JSON", steer: [] }
+      }
+      const text = await this.contract(project, entry.parent, job.id, JSON.stringify({ ...proposal, id: c.id }))
+      if (!text.startsWith(`Contract ${c.id} (version`)) return { ok: false, text, steer: [] }
+      const now = job.contracts!.find((x) => x.id === c.id)!
+      for (const e of entries) this.#bind(job, job.tasks.find((t) => t.id === e.taskId)!, c.id)
+      return { ok: true, text: `contract ${c.id} is version ${now.version} now`, steer: steer(`contract ${c.id} is version ${now.version} now`) }
+    }
+    if (r.kind === "spec_incomplete") job.decisions.push({ id: `D${job.decisions.length + 1}`, text: `${r.problem.slice(0, 300)} Decided: ${r.proposal.slice(0, 300)}`, origin: "user" })
+    const target = normalTarget(r.target)
+    const check = entry.checks.find((c) => normalTarget(c) === target)
+    if (check) {
+      const next = r.proposal.trim()
+      const why = checkSetProblems([next], true)
+      if (why) return { ok: false, text: `the proposed check is not one: ${why}`, steer: [] }
+      for (const e of entries) {
+        e.checks = e.checks.map((c) => (normalTarget(c) === target ? next : c))
+        const t = job.tasks.find((x) => x.id === e.taskId)!
+        job.acceptance = job.acceptance.map((a) => (t.acceptance.includes(a.id) && a.verify ? { ...a, verify: e.checks.join(" && ") } : a))
+      }
+      saveJob(project, job)
+      return { ok: true, text: `the check "${check}" is "${next}" now`, steer: steer(`the check "${check}" is "${next}" now`) }
+    }
+    const path = r.target.trim().replace(/^\.\//, "")
+    const known = entry.frozen?.has(path) || (() => { try { return statSync(join(entry.dir, path)).isFile() } catch { return false } })()
+    if (!known) return { ok: false, text: `${r.target.trim()} is neither a check of the task nor a file in its directory`, steer: [] }
+    const scratch = mkdtempSync(join(tmpdir(), "mm-change-"))
+    try {
+      const patch = join(scratch, "change.patch")
+      writeFileSync(patch, r.proposal.endsWith("\n") ? r.proposal : `${r.proposal}\n`)
+      for (const e of entries) {
+        const args = ["apply", "--whitespace=nowarn", ...(e.rel ? [`--directory=${e.rel}`] : []), patch]
+        const applied = await this.#exec("git", args, { cwd: e.worktree })
+        if (applied.code !== 0) return { ok: false, text: `the diff does not apply to ${path}${e === entry ? "" : ` in ${e.taskId}'s worktree`}: ${applied.stderr.trim().slice(0, 300)}`, steer: [] }
+        if (e.frozen?.has(path)) {
+          const hash = (await hashFiles(e.worktree, [path], this.#exec, e.dir)).get(path) ?? ""
+          e.frozen.set(path, hash)
+          const t = job.tasks.find((x) => x.id === e.taskId)!
+          t.frozen = Object.fromEntries(e.frozen)
+        }
+      }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+    }
+    saveJob(project, job)
+    return { ok: true, text: `${path} is changed as proposed${entry.frozen?.has(path) ? " and frozen again" : ""}`, steer: steer(`${path} is changed as proposed`) }
+  }
+
   // What a contract's evaluations cost: on the contract (its stop rule) and on the job (its counters).
   #count(job: Job, c: Contract, seconds: number): void {
     c.used = { evaluations: (c.used?.evaluations ?? 0) + 1, seconds: Math.round(((c.used?.seconds ?? 0) + seconds) * 10) / 10 }
@@ -1060,7 +1148,7 @@ export class Native {
     const frozen = entry.frozen ? await frozenChanged(entry.worktree, entry.frozen, this.#exec, entry.dir) : []
     if (frozen.length) await revertFiles(entry.worktree, frozen, this.#exec, entry.dir)
     const results = await runGate(entry.worktree, entry.checks, this.#exec, undefined, entry.dir)
-    if (frozen.length) results.push({ command: "frozen files unchanged", passed: false, code: 1, output: `You changed ${frozen.join(", ")}, which you may read and run but not change; they are restored to how they were. Change the code instead. If one of them is wrong, say so plainly in your report, with the line that shows it.` })
+    if (frozen.length) results.push({ command: "frozen files unchanged", passed: false, code: 1, output: `You changed ${frozen.join(", ")}, which you may read and run but not change; they are restored to how they were. Change the code instead. If one of them is wrong, ask for the change with request_check_change, with the line that shows it.` })
     const graded = gradedOf(results)
     if (graded) task.graded = graded
     const failed = results.filter((r) => !r.passed)
@@ -1091,7 +1179,7 @@ export class Native {
         const note = this.#trialFailed(job, task) ?? `[micromanager] ${task.id} ${task.title}: its worker hit the limit of ${FIX_ROUNDS} fix rounds with the checks still failing (${failed.map((f) => f.command).join(", ")}). If the check is what is wrong -- a path that does not exist in the worktree, a command the gate refuses -- correct the task with steer_task and its sessionID ${session} rather than starting a new worker.`
         saveJob(entry.project, job)
         return {
-          text: `Your checks still fail after ${FIX_ROUNDS} rounds, so I am stopping here rather than spending the rest of your budget on them:\n\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}\n\nIf the work is done and the CHECK is what cannot be satisfied here, say so plainly in your report. If the work is not done, name what is missing.`,
+          text: `Your checks still fail after ${FIX_ROUNDS} rounds, so I am stopping here rather than spending the rest of your budget on them:\n\n${failed.map((f) => `$ ${f.command} (exit ${f.code})\n${f.output}`).join("\n\n")}\n\nIf the work is done and the CHECK is what cannot be satisfied here, say so plainly in your report (request_check_change is the way to have a wrong check changed). If the work is not done, name what is missing.`,
           note,
           parent: entry.parent,
         }
@@ -1389,6 +1477,7 @@ export class Native {
         : "",
       entry.contract && job.contracts?.find((c) => c.id === entry.contract) ? contractBrief(job.contracts.find((c) => c.id === entry.contract)!) : "",
       entry.frozen?.size ? `Frozen, so read and run them but do not change them (the plugin puts them back and counts it as a failing check): ${[...entry.frozen.keys()].join(", ")}.` : "",
+      entry.writer ? "If a check or a frozen test is itself wrong (a path that does not exist, a typo, a test that contradicts the task), do not work around it: ask with request_check_change ({ kind: \"check_bug\" | \"test_contradicts_spec\" | \"spec_incomplete\" | \"contract\", target: the check command or file, problem, evidence: the output or spec line that shows it, proposal: the new command or a unified diff }), inside the execute tool. Someone else decides; it waits for the answer. Twice per task at most, and a refused change stays refused." : "",
       others.length ? `Other workers change other files at the same time (not yours): ${others.map((t) => `${t.id} ${t.title}`).join("; ")}` : "",
       "Keys and tokens show as <secret> in what you read; never write <secret> into a file, leave such lines as they are.",
       // The sandbox's limits, and how to ask past them (src/grants.ts).

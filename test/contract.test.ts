@@ -136,7 +136,7 @@ test("the outcome row of a measured task keeps its contract, score and reward; t
   const task: Task = {
     id: "T1", title: "t", description: "faster", role: "code", acceptance: ["A1"], dependsOn: [], files: ["a.js"], wave: 0, status: "merged",
     attempts: 1, stages: [], signatures: [], contract: { id: "C1", version: 1 }, score: { valid: true, values: { ms: 50, hits: 10 }, corpus: "visible", at: "" },
-    graded: { passed: 3, total: 4 },
+    graded: { passed: 3, total: 4 }, checkChanges: [{ kind: "check_bug", accepted: true, by: "micromanager" }],
   }
   stage(task, "gate", "pass")
   stage(task, "fitness", "fail", "guard broken")
@@ -145,6 +145,7 @@ test("the outcome row of a measured task keeps its contract, score and reward; t
   assert.deepEqual(row.contract, { id: "C1", version: 1, hash: contractHash(contract()) })
   assert.equal(row.reward, 0.5)
   assert.equal(row.graded, 0.75)
+  assert.deepEqual(row.checkChanges, [{ kind: "check_bug", accepted: true, by: "micromanager" }])
   assert.equal(row.fixRounds, 1, "a failed measurement is a fix round")
   assert.equal((routerRows([row])[0]!.outcome as { reward: number }).reward, 0.5)
 })
