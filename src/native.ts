@@ -523,6 +523,11 @@ export class Native {
     const dir = taskDir(job.integrationWorktree ?? project, rel)
     const { measured, seconds } = await runEvaluator(dir, c, "visible", this.#exec)
     this.#count(job, c, seconds)
+    // A guard or a target on a value the evaluator does not print is never checked (live run, 2026-10-26: a drafted
+    // guard "cases.passed", which is no score, held nothing): refused while the draft can still be fixed.
+    const named = [...c.guards.map((g) => g.name), ...Object.keys(c.stop.target ?? {})]
+    const unmeasured = measured.valid ? [...new Set(named.filter((n) => !(n in measured.values)))] : []
+    if (unmeasured.length) return `Not stored: ${unmeasured.join(", ")} ${unmeasured.length > 1 ? "are no values" : "is no value"} the evaluator prints, so ${unmeasured.length > 1 ? "they" : "it"} would never be checked. It prints ${Object.keys(measured.values).join(", ") || "no scores"}: name a guard or a target after one of those, or make the evaluator print it among its scores.`
     if (measured.valid) {
       const commit = job.integrationWorktree ? (await this.#exec("git", ["rev-parse", "--short", "HEAD"], { cwd: job.integrationWorktree })).stdout.trim() : undefined
       c.baseline = { values: { ...measured.values }, at, ...(commit ? { commit } : {}) }
@@ -839,6 +844,10 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
     if (!found || found.contract.round?.step !== "loopholes") return `Contract ${id} waits for no answer about loopholes.`
     const { job, contract: c } = found
     const chosen = picked.map((i) => c.round!.loopholes[i]).filter((l): l is NonNullable<typeof l> => Boolean(l))
+    // A guard the red team named on a value the evaluator does not print would never be checked: noted instead, like a
+    // loophole without a guard.
+    const measurable = (l: (typeof chosen)[number]) => Boolean(l.guard && c.baseline && l.guard.name in c.baseline.values)
+    for (const l of chosen) if (l.guard && !measurable(l)) Object.assign(l, { guard: undefined })
     const guards = chosen.flatMap((l) => (l.guard && !c.guards.some((g) => g.name === l.guard!.name) ? [l.guard] : []))
     c.guards = [...c.guards, ...guards]
     if (chosen.length) {

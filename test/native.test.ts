@@ -1046,7 +1046,7 @@ test("a trial decided by score is decided at its deadline, by a process that ado
 
 test("a contract's round: the user's preferences, a red team that is measured and never merged, its loopholes, the baseline, the freeze", async () => {
   const project = repo()
-  writeFileSync(join(project, "bench.sh"), 'echo "MM_SCORE {\\"scores\\":{\\"ms\\":$(cat ms.txt),\\"hits\\":$(cat hits.txt)}}"\n')
+  writeFileSync(join(project, "bench.sh"), 'echo "MM_SCORE {\\"scores\\":{\\"ms\\":$(cat ms.txt),\\"hits\\":$(cat hits.txt),\\"mem\\":7}}"\n')
   writeFileSync(join(project, "ms.txt"), "100\n")
   writeFileSync(join(project, "hits.txt"), "10\n")
   git(project, "add", "-A")
@@ -1056,6 +1056,8 @@ test("a contract's round: the user's preferences, a red team that is measured an
   const draft = JSON.stringify({ goal: "faster search", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }, { name: "hits", direction: "max" }], guards: [{ name: "hits", direction: "max", tolerance: 0 }] })
   const prefs = await native.contractRound(project, "ses_mm", "", "", draft)
   assert.match(prefs, /^Contract C1 \(version 1\) is a draft, measured on today's code: ms 100, hits 10\. The user decides what it measures\. Ask the user with the question tool/)
+  // A guard on a value the evaluator does not print would never be checked: refused while it is a draft.
+  assert.match(await native.contractRound(project, "ses_mm", "", "", JSON.stringify({ goal: "g", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], guards: [{ name: "cases.passed", direction: "max", tolerance: 0 }] })), /^Not stored: cases\.passed is no value the evaluator prints, so it would never be checked\. It prints ms, hits, mem/)
   const form = JSON.parse(prefs.slice(prefs.indexOf("{"))) as { questions: { header: string }[] }
   assert.deepEqual(form.questions.map((q) => q.header), ["C1 decides", "C1 guards", "C1 preferences", "C1 target", "C1 red team"])
   const job = native.job(project, "ses_mm")
@@ -1074,23 +1076,23 @@ test("a contract's round: the user's preferences, a red team that is measured an
   writeFileSync(join(w.dir, "ms.txt"), "50\n")
   writeFileSync(join(w.dir, "hits.txt"), "3\n")
   assert.match((await native.finish("ses_rt", "gamed")).text, /^Measured: ms 50 \(baseline 100\), hits 3 \(baseline 10\)\. Your change is not merged\./)
-  const loopholes = await native.noteLoopholes("ses_rt", "STATUS: DONE\nLOOPHOLE: dropped most hits to skip work | guard: hits max 0\nLOOPHOLE: cached the timings | guard: wall max 0")
-  assert.match(loopholes!, /found 2 ways to raise the score without improving the goal\. Ask the user/)
+  const loopholes = await native.noteLoopholes("ses_rt", "STATUS: DONE\nLOOPHOLE: dropped most hits to skip work | guard: hits max 0\nLOOPHOLE: kept everything in memory | guard: mem min 0\nLOOPHOLE: cached the timings | guard: wall max 0")
+  assert.match(loopholes!, /found 3 ways to raise the score without improving the goal\. Ask the user/)
   await native.ended("ses_rt")
   assert.ok(!existsSync(w.dir))
   assert.equal(readFileSync(join(job.integrationWorktree!, "ms.txt"), "utf8"), "100\n", "nothing of the red team is merged")
 
-  const baseline = await native.roundLoopholes(project, "ses_mm", "C1", [0, 1])
-  assert.match(baseline, /^Contract C1 has 1 new guard\(s\)\. Contract C1 \(version 3\) is measured on today's code again/)
+  const baseline = await native.roundLoopholes(project, "ses_mm", "C1", [0, 1, 2])
+  assert.match(baseline, /^Contract C1 has 1 new guard\(s\)\. 1 of them name no value the evaluator prints: .* Contract C1 \(version 3\) is measured on today's code again/)
   assert.match(baseline, /"header":"C1 baseline"/)
   assert.match(baseline, /3 runs \([\d.]+s in all\): ms: 100; hits: 10\./)
   assert.match(await native.roundBaseline(project, "ses_mm", "C1", "again"), /"header":"C1 baseline"/)
   assert.match(await native.roundBaseline(project, "ses_mm", "C1", "plausible"), /^Contract C1 is frozen \(version 3\)/)
   const c = job.contracts![0]!
   assert.equal(c.status, "frozen")
-  assert.deepEqual(c.guards.map((g) => `${g.name}:${g.origin}`), ["hits:user", "wall:redteam"])
+  assert.deepEqual(c.guards.map((g) => `${g.name}:${g.origin}`), ["hits:user", "mem:redteam"])
   assert.deepEqual(Object.keys(c.frozen!.files), ["bench.sh"])
-  assert.match(c.history.map((h) => h.change).join("\n"), /the user's preferences: ms decides, guards hits, target \{"ms":75\}\nclosed 2 loophole\(s\) of the red team, guards wall\nfrozen after the user checked the baseline/)
+  assert.match(c.history.map((h) => h.change).join("\n"), /the user's preferences: ms decides, guards hits, target \{"ms":75\}\nclosed 3 loophole\(s\) of the red team, guards mem; without a guard: cached the timings\nfrozen after the user checked the baseline/)
   const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "speed", prompt: "Faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt" }, MODEL)
   assert.deepEqual(d.task.contract, { id: "C1", version: 3 })
   assert.equal(await native.contractRound(project, "ses_mm", "", "", "C1"), 'Contract C1 is frozen already; writers are measured against it with a line "Contract: C1".')
