@@ -345,6 +345,34 @@ export function installGrantTools(draft: ToolDraft, request: (kind: "env" | "net
   }
 }
 
+// A visual worker's eyes (src/look.ts): a page, an svg or an image of its directory as a picture, rendered by the
+// plugin outside the sandbox. The context hook hides it from every session that is no designer of the micromanager.
+export const LOOK_ID = "look"
+
+export function installLookTool(draft: ToolDraft, look: (args: Record<string, string>, ctx: ToolContext) => Promise<{ text: string; image?: { data: Buffer; mime: string } }>, allowed: (sessionID: string) => boolean): void {
+  const read = draft.get("read")
+  const str = read?.input?.fields?.path
+  if (!read?.input?.mapFields || !str) throw new Error("the built-in read tool has no input schema to build from")
+  const fields = ["path", "url", "width", "height", "full"] as const
+  draft.add({
+    id: LOOK_ID,
+    name: LOOK_ID,
+    description: "See your work as a picture. path: a page (.html), an svg, an image, or a directory with an index.html, relative to your directory; or url: a page on a host this job may reach. width: the window width in px (default 1280; try 390 for a phone). height: the window height (default 800). full: false for only the first screen instead of the whole page. The page is served from your directory, so absolute paths like /assets/app.css work; build first if the project has a build step. Leave fields you do not need empty.",
+    input: read.input.mapFields(() => Object.fromEntries(fields.map((f) => [f, str]))),
+    execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+      if (!ctx?.sessionID || !allowed(ctx.sessionID)) return { content: "Only a designer of the micromanager may use this tool." }
+      try {
+        const r = await look(Object.fromEntries(fields.map((f) => [f, String(args?.[f] ?? "")])), ctx)
+        if (!r.image) return { content: r.text }
+        const ext = r.image.mime.split("/")[1] ?? "png"
+        return { content: [{ type: "text", text: r.text }, { type: "file", uri: `data:${r.image.mime};base64,${r.image.data.toString("base64")}`, mime: r.image.mime, name: `look.${ext}` }] }
+      } catch (err) {
+        return { content: `failed: ${err instanceof Error ? err.message : String(err)}` }
+      }
+    },
+  })
+}
+
 // A writer's request to have a check or a frozen test changed (src/checkchange.ts): it never changes them itself. The
 // call waits until the micromanager, a reviewer or the user decided it. The context hook hides it from every session
 // that is no native writer.

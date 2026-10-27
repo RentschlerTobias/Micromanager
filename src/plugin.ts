@@ -14,6 +14,7 @@ import { backstop, DELEGATION_TOOLS, delegationRole, notRouted, resultText, rewr
 import { Jev, apiKey, redact, type Question as JevQuestion } from "./jev.ts"
 import { journalPath, record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
+import { look } from "./look.ts"
 import { DEFAULT_LABELS, gitAuthor, knownSecrets, mapStrings, PLACEHOLDER_NOTE, requestTexts, restoreScope, scanNames, useVault, Vault, type NameSettings } from "./redact.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe, type Availability } from "./registry.ts"
@@ -52,7 +53,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, extname, join, relative, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import {
-  CHECK_CHANGE_ID, FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installCheckChangeTool, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installTools, planText,
+  CHECK_CHANGE_ID, FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installCheckChangeTool, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installLookTool, installTools, LOOK_ID, planText,
   TOOL_IDS, type ToolDraft,
 } from "./tools.ts"
 import { readBaseline, readLoopholes, readPrefs, roundFormOf, roundHeader } from "./contractround.ts"
@@ -1020,6 +1021,8 @@ export default {
     const workerDirs = SHARED.workerDirs
     // A worker's request for a variable or a host (src/grants.ts): every worker may ask for a variable, writers and
     // researchers for a host.
+    // look: the designers among the micromanager's writers (src/look.ts).
+    const lookAllowed = (sessionID: string): boolean => native.isWriter(sessionID) && native.roleOf(sessionID) === "visual"
     const grantAllowed = (kind: GrantKind, sessionID: string): boolean =>
       native.isWorker(sessionID) && (kind === "env" || native.isWriter(sessionID) || native.roleOf(sessionID) === "research")
     const requestGrant = async (kind: GrantKind, asked: string, why: string, sessionID: string): Promise<string> => {
@@ -2460,6 +2463,19 @@ export default {
         log("error", `explore and research not installed: ${String(err)}`)
       }
       try {
+        installLookTool(draft, async (args, tctx) => {
+          const at = native.writerOf(tctx.sessionID!)
+          const where = native.jobOf(tctx.sessionID!)
+          if (!at || !where) return { text: "Only a designer of the micromanager may use this tool." }
+          const allowed = [...settings.network, ...jobGrants(where.project, where.job.id).network]
+          const r = await look(args, at.dir, allowed)
+          record({ kind: "look", sessionID: tctx.sessionID, path: args.path || undefined, url: args.url || undefined, image: r.image ? r.image.data.length : 0, note: r.image ? undefined : r.text.slice(0, 200) })
+          return r
+        }, lookAllowed)
+      } catch (err) {
+        log("error", `look not installed: ${String(err)}`)
+      }
+      try {
         installGrantTools(draft, (kind, name, why, tctx) => requestGrant(kind, name, why, tctx.sessionID!), grantAllowed)
       } catch (err) {
         log("error", `request_env and request_network not installed: ${String(err)}`)
@@ -2711,6 +2727,7 @@ export default {
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
         if (input.tools) for (const kind of ["env", "network"] as const) if (!(input.sessionID && grantAllowed(kind, input.sessionID))) delete input.tools[GRANT_IDS[kind]]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[CHECK_CHANGE_ID]
+        if (input.tools && !(input.sessionID && lookAllowed(input.sessionID))) delete input.tools[LOOK_ID]
         // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
         if (input.sessionID && (native.isWorker(input.sessionID) || SHARED.helperOf.has(input.sessionID))) void charge(input.sessionID).catch((err: unknown) => log("warn", `budget count failed: ${String(err)}`))
         if (input.sessionID && native.isWorker(input.sessionID)) {
@@ -2771,6 +2788,7 @@ export default {
       if (input.tools) {
         delete input.tools[FINISH_ID]
         delete input.tools[GRAPH_ID]
+        delete input.tools[LOOK_ID]
         for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
       }
       await manageContext(input, true)
