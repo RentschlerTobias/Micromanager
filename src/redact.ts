@@ -377,11 +377,13 @@ const NOT_SECRET_NAME = /(_ID|_IDS|_ADDRESS|_PATH|_DIR|_HOME|_TYPE|_CLASS|_DESKT
 // A variable's value worth guarding: its name says secret, or it has the shape of one (long, random). Paths, plain
 // words, identifiers and URLs without credentials stay out, or every "/home/…" in a context would turn into a
 // placeholder.
-export function guardedValue(name: string, value: string): boolean {
-  if (value.length < 8 || /^[/~.]/.test(value) || /^[a-z][\w+.-]*:\/\/(?![^/\s:@]+:[^/\s@]+@)/i.test(value)) return false
+// The shape alone counts only in a project's .env files, where every value is the project's configuration: in the
+// server's own environment it caught EDITOR, MANPAGER and the desktop's instance ids (2026-10-27).
+export function guardedValue(name: string, value: string, envFile = false): boolean {
+  if (value.length < 8 || /\s/.test(value) || /^[/~.]/.test(value) || /^[a-z][\w+.-]*:\/\/(?![^/\s:@]+:[^/\s@]+@)/i.test(value)) return false
   if (NOT_SECRET_NAME.test(name)) return false
-  if (looksSecret(name)) return secretShaped(value) || (value.length >= 12 && !/^[a-z]+$/.test(value))
-  return value.length >= 20 && secretShaped(value) && entropy(value) >= 3.5
+  if (looksSecret(name, value)) return secretShaped(value) || (value.length >= 12 && !/^[a-z]+$/.test(value))
+  return envFile && value.length >= 20 && secretShaped(value) && entropy(value) >= 3.5
 }
 
 export function knownSecrets(env: NodeJS.ProcessEnv, projectDir?: string, extra: readonly string[] = []): string[] {
@@ -396,7 +398,7 @@ export function knownSecrets(env: NodeJS.ProcessEnv, projectDir?: string, extra:
     }
     for (const f of names) {
       try {
-        for (const { name, value } of envFileValues(readFileSync(join(projectDir, f), "utf8"))) if (guardedValue(name, value)) values.add(value)
+        for (const { name, value } of envFileValues(readFileSync(join(projectDir, f), "utf8"))) if (guardedValue(name, value, true)) values.add(value)
       } catch {
         // unreadable: skipped
       }

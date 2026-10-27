@@ -105,9 +105,10 @@ test("known secrets: variables and .env files by name and shape; paths, words an
   const dir = mkdtempSync(join(tmpdir(), "env-"))
   writeFileSync(join(dir, ".env"), 'DB_PASSWORD="pa55-Word-x9"\nPORT=3000\nexport SESSION_SECRET=abcdefghijklmnop1234\n')
   writeFileSync(join(dir, ".env.example"), "DB_PASSWORD=example-only-123\n")
-  const env = { HOME: "/home/x", MY_API_KEY: "q8Zk2LmN4pR7sT1v", AUTH_MODE: "password", LONG_RANDOM: "9f8e7d6c5b4a39281706f5e4d3c2b1a0ff" }
+  writeFileSync(join(dir, ".env.local"), "WEBHOOK=9f8e7d6c5b4a39281706f5e4d3c2b1a0ff\n")
+  const env = { HOME: "/home/x", MY_API_KEY: "q8Zk2LmN4pR7sT1v", AUTH_MODE: "password", LONG_RANDOM: "8e7d6c5b4a39281706f5e4d3c2b1a0ff9f", EDITOR: "omarchy-launch-editor --wait" }
   const values = knownSecrets(env, dir)
-  assert.deepEqual(values.sort(), ["9f8e7d6c5b4a39281706f5e4d3c2b1a0ff", "abcdefghijklmnop1234", "pa55-Word-x9", "q8Zk2LmN4pR7sT1v"].sort())
+  assert.deepEqual(values.sort(), ["9f8e7d6c5b4a39281706f5e4d3c2b1a0ff", "abcdefghijklmnop1234", "pa55-Word-x9", "q8Zk2LmN4pR7sT1v"].sort(), "in the environment only a secret name counts; in a .env file the shape too")
   assert.ok(!guardedValue("CALLBACK_URL", "https://example.com/cb"))
   assert.ok(!guardedValue("CLAUDE_CODE_SESSION_ID", "23d5d6cc-e883-4350-b37c-ae130ea22f1f"), "an id is no secret, even under a session name")
   assert.ok(!guardedValue("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"))
