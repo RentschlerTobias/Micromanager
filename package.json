@@ -10,7 +10,10 @@
   },
   "files": [
     "src",
-    "skills"
+    "skills",
+    "evolver/pyproject.toml",
+    "evolver/uv.lock",
+    "evolver/mm_evolve"
   ],
   "keywords": [
     "opencode",

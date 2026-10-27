@@ -1404,6 +1404,90 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
     const job = entry && this.#job(entry)
     const task = job?.tasks.find((t) => t.id === entry!.taskId)
     if (!entry || !job || !task) return { text: "This session has no task of the micromanager; there is nothing to finish." }
+    return this.#finish(entry, job, task, summary, session)
+  }
+
+  // The evolver's best candidate (src/evolver.ts), written into its task's worktree: through the same gate as a
+  // writer's finish_task (checks, frozen files, the contract, the merge train). There is no session to hand a failure
+  // back to, so a failing round blocks the task at once.
+  async finishEvolved(project: string, jobId: string, taskId: string, code: string, summary: string): Promise<{ text: string; note?: string; parent?: string; stop?: string[] }> {
+    const entry = this.#entries.get(`${jobId}/${taskId}`)
+    const job = this.#jobs.get(key(project, jobId))
+    const task = job?.tasks.find((t) => t.id === taskId)
+    if (!entry || !job || !task) return { text: `there is no evolving task ${taskId} in job ${jobId}` }
+    writeFileSync(join(entry.dir, task.files[0]!), code)
+    task.attempts = FIX_ROUNDS // no session to fix it: a failure is final
+    return this.#finish(entry, job, task, summary, `the evolver of ${task.id}`)
+  }
+
+  // An evolving task: a writer task with its own worktree like any other, but no session; the evolver works on a
+  // copy of its directory and its best candidate comes back through finishEvolved. Returns the task and its directory,
+  // or why not.
+  async prepareEvolve(project: string, parent: string, jobId: string, r: { contract: string; file: string; block: string; checks: readonly string[] }): Promise<{ job?: Job; task?: Task; dir?: string; contract?: Contract; problem?: string }> {
+    const job = jobId ? this.#jobs.get(key(project, jobId)) ?? listJobs(project).find((j) => j.id === jobId) : this.job(project, parent)
+    if (!job) return { problem: `there is no job ${jobId} in this project` }
+    const parsed = parseFiles(r.file, project)
+    if (parsed.problem || parsed.files.length !== 1) return { problem: parsed.problem ?? "file: the one file whose block evolves" }
+    const checks = checkSetProblems(r.checks, true)
+    if (checks) return { problem: checks }
+    let c: Contract | undefined
+    try {
+      c = this.#contractFor(job, true, r.contract.toUpperCase())
+    } catch (err) {
+      return { problem: err instanceof Error ? err.message.replace(/^Not started: /, "") : String(err) }
+    }
+    if (!c) return { problem: "contract: the frozen contract that measures the evolution" }
+    this.#jobs.set(key(project, job.id), job)
+    const rel = await this.#integrate(project, job, true)
+    const added = addDelegated(job, { title: `evolve ${parsed.files[0]}: ${r.block}`.slice(0, 120), prompt: `The evolver improves ${r.block} in ${parsed.files[0]} against contract ${c.id}.`, files: parsed.files, dependsOn: [], checks: [...r.checks] })
+    if (!added.task) return { problem: added.errors!.join("; ") }
+    const task = added.task
+    task.role = "code"
+    task.model = "evolver"
+    this.#bind(job, task, c.id)
+    for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
+    stage(task, "delegate", "pass", `evolver on ${parsed.files[0]} (${r.block}), contract ${c.id}`)
+    const role = roleById("code")!
+    await this.#start(project, parent, job, task, role, "evolver", { body: task.description, files: parsed.files.join(", "), checks: [...r.checks], replaces: [] }, [...r.checks], rel)
+    const entry = this.#entries.get(`${job.id}/${task.id}`)!
+    return { job, task, dir: entry.dir, contract: c }
+  }
+
+  // A model call of the evolver's bridge, charged to the job as a worker's request is (src/budget.ts).
+  chargeEvolve(project: string, jobId: string, used: { tokens: number; cost: number; requests: number }): void {
+    const job = this.#jobs.get(key(project, jobId))
+    if (!job) return
+    const c = job.counters
+    c.tokens = (c.tokens ?? 0) + used.tokens
+    c.cost = (c.cost ?? 0) + used.cost
+    c.requests = (c.requests ?? 0) + used.requests
+    saveJob(project, job)
+  }
+
+  // The evolver's state on its task, saved as it goes: the sidebar and job_status read it from the job file.
+  noteEvolve(project: string, jobId: string, taskId: string, state: NonNullable<Task["evolve"]>): void {
+    const job = this.#jobs.get(key(project, jobId))
+    const task = job?.tasks.find((t) => t.id === taskId)
+    if (!job || !task) return
+    task.evolve = state
+    task.summary = `evolving: ${state.evaluations} candidates measured (${state.valid} valid)${state.best ? `, best ${Object.entries(state.best).filter(([k]) => k !== "combined_score" && k !== "valid").map(([k, v]) => `${k} ${v}`).join(", ")}` : ""}`
+    saveJob(project, job)
+  }
+
+  // An evolution that ended without a candidate to merge: the task is blocked with why.
+  evolveFailed(project: string, jobId: string, taskId: string, why: string): void {
+    const job = this.#jobs.get(key(project, jobId))
+    const task = job?.tasks.find((t) => t.id === taskId)
+    if (!job || !task) return
+    if (["running", "gating", "fixing"].includes(task.status)) moveTask(task, "blocked")
+    stage(task, "evolve", "fail", why.slice(0, 300))
+    task.summary = `the evolver found nothing to merge: ${why.slice(0, 300)}`
+    const entry = this.#entries.get(`${jobId}/${taskId}`)
+    if (entry) entry.ended = true
+    saveJob(project, job)
+  }
+
+  async #finish(entry: Entry, job: Job, task: Task, summary: string, session: string): Promise<{ text: string; note?: string; parent?: string; stop?: string[] }> {
     if (!entry.writer) return { text: "You only read: there is nothing to check or merge. End with your findings; they are your result." }
     if (task.status === "merged") return { text: `${task.id} is already merged into ${job.integrationBranch}. End with your short report.` }
     if (task.trial && task.status === "cancelled") return { text: lostText(job, task) }

@@ -322,7 +322,9 @@ How you work:
    A task with no fixed end (make something faster, smaller, more reliable) needs a fitness contract first: work it
    out with contract_round (a planner drafts it, the user decides what it measures, a red team tries to game it, the
    user checks the baseline, the plugin freezes it), then give the writer a line "Contract: C…" (or "contract" in its
-   todo); without a frozen contract it is refused. The first attempt whose checks pass is
+   todo); without a frozen contract it is refused. When the gain lies in one function or block and the contract
+   measures in seconds, evolve_task can do it instead of a worker: OpenEvolve tries many small variants in the
+   sandbox and the best one goes through the checks (ask an explorer first which block it is). The first attempt whose checks pass is
    merged and the others stop by themselves; do not continue or restart a stopped attempt. When every attempt failed,
    the note says what each hit: split the task into smaller todos as it says.
 5. When everything is done, tell the user briefly what changed and how to merge the session branch (git merge

@@ -32,7 +32,11 @@ class Spec:
     baseline: dict[str, float]  # the contract's baseline on the visible corpus
     output: str  # where the run writes evals.jsonl, llm.jsonl and result.json
     models: list[dict] = field(default_factory=lambda: [{"name": "opencode-go/glm-5.3-flash", "weight": 1.0}])
-    server: str = "http://127.0.0.1:4096"  # the OpenCode server the models are reached through
+    server: str = "http://127.0.0.1:4096"  # the OpenCode server the models are reached through (`opencode run`)
+    # Or an OpenAI-compatible endpoint: the plugin's own bridge (src/evolver.ts), which generates through its session
+    # API and charges the job; the key is the bridge's one-run token. When set, `server` is not used.
+    api_base: str | None = None
+    api_key: str | None = None
     iterations: int = 20
     timeout_s: float = 300.0  # per evaluator run
     target: dict[str, float] = field(default_factory=dict)  # the contract's stop.target

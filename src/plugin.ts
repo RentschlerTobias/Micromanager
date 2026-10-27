@@ -12,7 +12,7 @@ import { allowedOutside, decide, forbiddenOutside, forbiddenOutsideWhat, inJobAr
 import { injected, injectionScore } from "./gate.ts"
 import { backstop, DELEGATION_TOOLS, delegationRole, notRouted, resultText, rewriteResult, routeDelegation, unownedDelegation, type ChildSession, type ToolCall } from "./hooks.ts"
 import { Jev, apiKey, redact, type Question as JevQuestion } from "./jev.ts"
-import { record } from "./journal.ts"
+import { journalPath, record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe, type Availability } from "./registry.ts"
@@ -47,8 +47,9 @@ import { backlogIgnored, listJobs, loadJob, notesDir, reconcileJob, saveJob } fr
 import { backlogDir, backlogTool, githubIssue, githubIssues, githubRepo, goalOf, localBackend, publishForm, publishIssue, readPublish, type BacklogItem } from "./backlog.ts"
 import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "./state.ts"
 import { exec, repoRel, type Exec } from "./integration.ts"
-import { mkdirSync, readFileSync } from "node:fs"
-import { join, relative, resolve } from "node:path"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { dirname, extname, join, relative, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import {
   CHECK_CHANGE_ID, FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installCheckChangeTool, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installTools, planText,
   TOOL_IDS, type ToolDraft,
@@ -59,6 +60,8 @@ import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
 import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo } from "./native.ts"
 import { classOf, needsTrials, outcomeOf, readOutcomes, recordOutcome } from "./outcomes.ts"
+import { heldOutDir } from "./contract.ts"
+import { heldOutProblem, markBlock, runEvolver, specOf, startBridge, type Progress, type Running } from "./evolver.ts"
 import { DEEP, trialSize, type Assessment } from "./trials.ts"
 import { Accountant, limitsOf, overBudget, overNote, sessionUsage, wrapUpNote } from "./budget.ts"
 import { seedFromJournal, Usage } from "./usage.ts"
@@ -1040,6 +1043,83 @@ export default {
       decided(pending.id, a)
       for (const s of applied.steer) steering.set(s.session, s.note)
       return changeResult(pending, a, applied.text)
+    }
+    // evolve_task (src/evolver.ts): OpenEvolve on one block, measured by a frozen contract, in the background. Its models
+    // are reached through a bridge this process answers with tool-less sessions, so every call is charged to the job;
+    // every candidate runs in the sandbox, and without one nothing starts. The best candidate goes through the task's
+    // gate; a held-out measurement worse than the baseline keeps it out.
+    const evolving = new Map<string, Running>() // "<job>/<task>" -> its run
+    const startEvolve = async (jobId: string, json: string, parent: string): Promise<string> => {
+      if (!project) return "Not started: this session has no project directory."
+      const proj = project
+      let o: { contract?: unknown; file?: unknown; block?: unknown; checks?: unknown; iterations?: unknown }
+      try {
+        o = JSON.parse(json) as typeof o
+      } catch (err) {
+        return `Not started: json is no JSON object (${err instanceof Error ? err.message : String(err)}).`
+      }
+      const checks = (Array.isArray(o.checks) ? o.checks : []).map(String).map((c) => c.trim()).filter(Boolean)
+      if (typeof o.contract !== "string" || typeof o.file !== "string" || typeof o.block !== "string") return 'Not started: json needs "contract", "file" and "block" (and "checks").'
+      const box = await sandbox
+      if (!box.available) return `Not started: the evolver runs model-written code, and there is no sandbox here (${box.reason}).`
+      const uv = await exec("uv", ["--version"], { cwd: proj, timeoutMs: 10_000 })
+      if (uv.code !== 0) return "Not started: the evolver needs uv (https://docs.astral.sh/uv/), which is not installed here."
+      const prep = await native.prepareEvolve(proj, parent, jobId, { contract: o.contract, file: o.file, block: o.block, checks })
+      if (!prep.task || !prep.job || !prep.dir || !prep.contract) return `Not started: ${prep.problem}.`
+      const { job, task, dir, contract } = prep
+      const file = task.files[0]!
+      const marked = markBlock(readFileSync(join(dir, file), "utf8"), file, o.block)
+      if (!marked.text) {
+        native.evolveFailed(proj, job.id, task.id, marked.problem!)
+        return `Not started: ${marked.problem}.`
+      }
+      const out = join(dirname(journalPath()), "evolve", job.id, task.id)
+      mkdirSync(out, { recursive: true })
+      const initial = join(out, `initial${extname(file)}`)
+      writeFileSync(initial, marked.text)
+      const iterations = Math.max(1, Math.min(200, typeof o.iterations === "number" ? Math.round(o.iterations) : Math.min(contract.stop.evaluations ?? 30, 30)))
+      const models = ["opencode-go/glm-5.3-flash", "opencode-go/deepseek-v4.1-flash"]
+      const bridge = await startBridge(async (model, system, prompt) => {
+        const s = await ctx.session.create({ title: `[evolve] ${task.id} mutation`, agent: SUMMARIZER_AGENT, model: toModel(model || models[0]!), location: { directory: dir } })
+        await ctx.session.prompt({ sessionID: s.id, text: system ? `${system}\n\n${prompt}` : prompt })
+        await ctx.session.wait({ sessionID: s.id })
+        const messages = await ctx.session.context({ sessionID: s.id }).catch(() => undefined)
+        const used = sessionUsage(messages)
+        native.chargeEvolve(proj, job.id, used)
+        return { text: lastAssistantText(messages), tokens: used.tokens, cost: used.cost }
+      })
+      const started = new Date().toISOString()
+      const state = (p: Progress, s: "running" | "done" | "failed") => ({ state: s, iterations, evaluations: p.evaluations, valid: p.valid, ...(p.best ? { best: p.best } : {}), ...bridge.calls(), started })
+      let last: Progress = { evaluations: 0, valid: 0 }
+      const run = runEvolver(
+        specOf({ workdir: dir, file, initial, checks, contract, output: out, models, iterations, runner: ["node", fileURLToPath(new URL("./cli.ts", import.meta.url)), "sandboxed", "--dir", "{dir}", "--"], bridge, ...(contract.corpus.heldOut ? { heldOutDir: heldOutDir(proj, job.id, contract.id) } : {}) }),
+        (p) => {
+          last = p
+          native.noteEvolve(proj, job.id, task.id, state(p, "running"))
+          const live = native.current(proj, job.id) ?? job
+          if (loadControl(proj, job.id).stopped || overNow(live)) evolving.get(`${job.id}/${task.id}`)?.stop()
+        },
+      )
+      evolving.set(`${job.id}/${task.id}`, run)
+      void run.done.then(async ({ result, problem }) => {
+        evolving.delete(`${job.id}/${task.id}`)
+        await bridge.close()
+        const tell = (text: string) => ctx.session.synthetic({ sessionID: parent, text, resume: true }).catch((err: unknown) => log("warn", `evolve note failed: ${String(err)}`))
+        const why = problem ?? (result ? heldOutProblem(contract, result.heldOut) : "no result")
+        if (!result || why) {
+          native.noteEvolve(proj, job.id, task.id, state(last, "failed"))
+          native.evolveFailed(proj, job.id, task.id, why ?? "no result")
+          await tell(`[micromanager] The evolver on ${task.id} (${file}: ${o.block}) found nothing to merge: ${why}. ${last.evaluations} candidates were measured (${last.valid} valid).`)
+        } else {
+          native.noteEvolve(proj, job.id, task.id, state(last, "done"))
+          const r = await native.finishEvolved(proj, job.id, task.id, readFileSync(result.best, "utf8"), `evolved ${o.block} in ${file}: ${last.evaluations} candidates, ${bridge.calls().calls} model calls`)
+          await tell(r.note ?? `[micromanager] The evolver on ${task.id}: ${r.text}`)
+        }
+        const live = native.current(proj, job.id) ?? job
+        const t = live.tasks.find((x) => x.id === task.id)
+        if (t) recordOutcome(outcomeOf(proj, live, t, { tokens: bridge.calls().tokens, cost: bridge.calls().cost }))
+      })
+      return `The evolver runs on ${task.id} (${file}: lines ${marked.lines!.join("-")}), ${iterations} iterations against contract ${contract.id}, in the sandbox, in the background. job_status shows its progress; a note comes when it ends and the best candidate went through the checks. Go on with other work meanwhile.`
     }
     // Whether a job's worker commands run in the sandbox, written once per job into its control file for the sidebar.
     const marked = new Set<string>()
@@ -2157,6 +2237,12 @@ export default {
               text += gh.problem ? `\n${gh.problem}; the local backlog above is all there is for now.` : `\nGitHub issues in ${repo} labelled micromanager${open.length ? `:\n${open.map((i) => `- ${i.slug} [${i.status}, ${i.kind}] ${i.title} (${i.issue})`).join("\n")}` : ": none open."}`
             }
             record({ kind: "backlog", sessionID: tctx.sessionID, action: action.trim(), slug: slug.trim() || undefined, text: text.slice(0, 300) })
+            return text
+          },
+          evolve: async (id, json, tctx) => {
+            if (!tctx.sessionID) return "evolve_task needs a session."
+            const text = await startEvolve(id.trim(), json, tctx.sessionID)
+            record({ kind: "evolve", sessionID: tctx.sessionID, job: id.trim() || undefined, text: text.slice(0, 300) })
             return text
           },
           contractRound: async (id, goal, inp, tctx) => {

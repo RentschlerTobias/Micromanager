@@ -1115,3 +1115,39 @@ test("a contract's round: the user's preferences, a red team that is measured an
   assert.deepEqual(d.task.contract, { id: "C1", version: 3 })
   assert.equal(await native.contractRound(project, "ses_mm", "", "", "C1"), 'Contract C1 is frozen already; writers are measured against it with a line "Contract: C1".')
 })
+
+test("an evolving task gets a worktree but no session; its best candidate goes through the gate like a writer's change", async () => {
+  const project = benchRepo()
+  writeFileSync(join(project, "speed.js"), "function speed() {\n  return 100\n}\nmodule.exports = { speed }\n")
+  git(project, "add", "-A")
+  git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "speed")
+  const native = new Native()
+  await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "faster", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }] }))
+  const job = native.job(project, "ses_mm")
+  const r = { contract: "C1", file: "speed.js", block: "speed", checks: ["node -e \"require('./speed.js')\""] }
+  assert.match((await native.prepareEvolve(project, "ses_mm", "", r)).problem!, /contract C1 is a draft/)
+  await native.freezeContract(project, job.id, "C1")
+  assert.match((await native.prepareEvolve(project, "ses_mm", "", { ...r, file: "a.js, b.js" })).problem!, /the one file whose block evolves/)
+  const prep = await native.prepareEvolve(project, "ses_mm", "", r)
+  assert.equal(prep.problem, undefined)
+  assert.equal(prep.task!.status, "running")
+  assert.equal(prep.task!.session, undefined)
+  assert.ok(existsSync(join(prep.dir!, "speed.js")))
+  native.noteEvolve(project, job.id, prep.task!.id, { state: "running", iterations: 5, evaluations: 3, valid: 2, best: { combined_score: 2, ms: 50 }, calls: 3, tokens: 900, cost: 0.002, started: "" })
+  assert.match(loadJob(project, job.id)!.tasks.find((t) => t.id === prep.task!.id)!.summary!, /^evolving: 3 candidates measured \(2 valid\), best ms 50$/)
+  native.chargeEvolve(project, job.id, { tokens: 900, cost: 0.002, requests: 3 })
+  assert.equal(loadJob(project, job.id)!.counters.requests, 3)
+
+  // The best candidate: written into the worktree, checked, measured, committed and merged.
+  writeFileSync(join(prep.dir!, "ms.txt"), "100\n") // the contract measures ms.txt, unchanged here
+  const merged = await native.finishEvolved(project, job.id, prep.task!.id, "function speed() {\n  return 1\n}\nmodule.exports = { speed }\n", "evolved speed")
+  assert.match(merged.text, /^Merged into jev\//)
+  assert.match(readFileSync(join(job.integrationWorktree!, "speed.js"), "utf8"), /return 1/)
+
+  // A candidate whose checks fail is blocked at once: there is no session to hand a fix round to.
+  const again = await native.prepareEvolve(project, "ses_mm", "", r)
+  const blocked = await native.finishEvolved(project, job.id, again.task!.id, "function speed( {\n", "broken")
+  assert.match(blocked.text, /still fail after 2 rounds/)
+  assert.equal(loadJob(project, job.id)!.tasks.find((t) => t.id === again.task!.id)!.status, "blocked")
+  native.evolveFailed(project, job.id, again.task!.id, "nothing better")
+})

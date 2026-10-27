@@ -29,6 +29,8 @@ export const TOOL_IDS = [
   "decide_change",
   // A fitness contract worked out with the user before it measures anyone (src/contractround.ts).
   "contract_round",
+  // OpenEvolve on one block of code, measured by a frozen contract (src/evolver.ts).
+  "evolve_task",
 ] as const
 
 // The tool draft of ctx.tool.transform, as far as this file uses it.
@@ -63,6 +65,7 @@ export interface Handlers {
   backlog(action: string, slug: string, value: string, ctx: ToolContext): Promise<string>
   decideChange(id: string, decision: string, note: string, ctx: ToolContext): Promise<string>
   contractRound(job: string, goal: string, input: string, ctx: ToolContext): Promise<string>
+  evolve(job: string, json: string, ctx: ToolContext): Promise<string>
 }
 
 export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micromanager", runnerSession: (id: string) => boolean = () => false): string[] {
@@ -198,6 +201,13 @@ export function installTools(draft: ToolDraft, handlers: Handlers, agent = "micr
     description: "The project's backlog: jobs that wait, one file each in .micromanager/backlog/ (the user commits them). action \"list\" shows them in the order they run; \"show\" with slug shows one; \"add\" with value a JSON object {\"title\", \"kind\": \"build\"|\"fix\"|\"optimize\", \"goal\", \"acceptance\": [{\"text\", \"verify\"}], \"checks\": [shell commands], \"fitness\": a contract as the contract tool takes it, \"order\", \"status\": \"draft\"|\"ready\"} writes a new one (add only what the user asked to keep for later); \"set\" with slug and value \"status=ready\" or \"order=10\" changes one; \"publish\" with slug hands you the form that asks the user whether to make it a GitHub issue (only where the user opted the repository in). In an opted-in repository the list also shows its issues labelled micromanager, as gh-<number>. A job's follow-ups that no task took up become drafts by themselves when the job is merged or discarded. Start an item with plan_job and the goal \"backlog:<slug>\", or write its tasks as todos.",
     input: input("action", "slug", "value"),
     execute: guarded(([action, slug, value], ctx) => handlers.backlog(action!, slug!, value!, ctx), "action", "slug", "value"),
+  })
+  draft.add({
+    id: "evolve_task",
+    name: "evolve_task",
+    description: "Improve one block of code by evolution (OpenEvolve) instead of a worker: many small model-written variants, each measured by a frozen fitness contract, the best one merged through the usual checks. Suits a single function or block whose contract measures in seconds; not a change across many files, and not a search for parameter values. json: {\"contract\": \"C1\" (frozen), \"file\": the file, \"block\": the function's name or a line range like \"12-40\" (ask an explorer which block it is), \"checks\": [shell commands that must still pass, e.g. the tests], \"iterations\": how many variants (default 30)}. It runs in the background in the sandbox; job_status shows its progress, and a note comes when it ends. job: empty for this session's job.",
+    input: input("job", "json"),
+    execute: guarded(([job, json], ctx) => handlers.evolve(job!, json!, ctx), "job", "json"),
   })
   draft.add({
     id: "contract_round",

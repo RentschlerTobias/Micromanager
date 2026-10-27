@@ -1163,6 +1163,47 @@ committed with the project (src/backlog.ts). Items are jobs, never a job's inter
 - **Known weak spot:** a task's checks are kept as one `verify` string joined with `" && "` and split again after a
   restart, so a check that contains `&&` itself comes back as two. The evaluator is kept out of that path.
 
+## 26. The evolver (2026-10-27)
+
+OpenEvolve evolves code, not parameter values: many small model-written variants of one block, each measured, the
+best kept. It suits a single function whose fitness contract measures in seconds; a search over parameter values
+stays with DE or NSGA-II, and a change across many files with workers and trials.
+
+**The spike (2026-10-26).** OpenEvolve 0.4.0 installs with `uv`. Its `init_client` hook takes a custom backend, and a
+backend that generates through `opencode run` needs no API key. 4 iterations with glm-5.3-flash brought `countWords`
+from 894 ms to 54 ms in 124 s; half the iterations failed on the diff format. The best candidate also changed
+behaviour on inputs neither the tests nor the corpus covered, which is what the guards and the held-out cases are
+for.
+
+**E1: the sidecar (`evolver/`, implemented).** A Python package that runs one evolution from a spec.
+- **Measure:** every candidate is measured in a fresh copy of the project: its checks first (one failing scores 0),
+  then the contract's evaluator with its scores and its guards against the baseline. `combined_score` is the first
+  score's improvement as a ratio. Each evaluation goes to `evals.jsonl`.
+- **Held-out cases** are measured once, for the best, after the evolution.
+- **Models:** through an OpenAI-compatible endpoint (the plugin's bridge, E2) or, standalone, through `opencode run`
+  (whose stdin has to be closed: it waited for input in OpenEvolve's worker processes).
+
+**E2: `evolve_task` (implemented, manual start).**
+- **Start:** the micromanager names the frozen contract, the file, the block (a function's name, found by its
+  definition and its braces or indentation, or a line range) and the checks.
+- **The task:** a writer task with its own worktree and no session. The sidecar works on a copy of its directory;
+  the markers go into a copy in the state directory, never into the worktree.
+- **The bridge (src/evolver.ts):** an OpenAI-compatible `/v1/chat/completions` on 127.0.0.1 with a one-run token,
+  answered with a tool-less session per call. The evolver needs no API key, and every call is charged to the job's
+  counters, so the job's budget holds. stop_job or a used-up budget ends the run.
+- **Sandbox:** every candidate command runs under `node src/cli.ts sandboxed --dir <copy> --`, the writer's
+  sandbox of that copy. Without a sandbox, or without `uv`, nothing starts.
+- **Progress:** `task.evolve` holds the candidates measured, the valid ones, the best, the calls and the cost;
+  job_status shows it in the task's summary.
+- **End:** a held-out measurement that is invalid, or worse than today's code on the deciding score, keeps the best
+  out. Otherwise it is written into the task's worktree and goes through the writer's gate (checks, frozen files,
+  the contract, the merge train). A failure blocks the task at once: there is no session to fix it. The outcome log
+  records `method: "evolver"`.
+
+**Next (E3):** the plugin offers the evolver itself. N5 asks `local_block`, and the code checks for a frozen
+contract, a measurement under 10 s and 1–2 files; the micromanager then puts "Evolver / Trial / One worker" to the
+user as a form, with the estimated cost.
+
 ## Sources
 - **Orchestration:**
   - Magentic-One ledgers (github.com/microsoft/autogen, `_magentic_one`)

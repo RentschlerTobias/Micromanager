@@ -29,7 +29,8 @@ and research [docs/plan.md](docs/plan.md). Development happens on the branch `om
 - For the sandbox: on Linux `bubblewrap`, `socat` and `ripgrep`; on macOS nothing extra (Seatbelt). Without them
   commands run unwrapped, and the plugin says so.
 - Optional: the local embedding service for the memory (`./install.sh --embedding`, a systemd user unit), and `uv`
-  for the GLiNER decision server in `decider/`.
+  for the GLiNER decision server in `decider/` and for the evolver in `evolver/` (`evolve_task`; `uv` sets up its
+  environment, OpenEvolve pinned, on the first run).
 
 ## Install
 
@@ -192,6 +193,7 @@ Jev and the plugin securing every task:
    | `stop_job` | stop the whole job; `run_job` resumes it |
    | `contract` | draft what "better" means for a task with no fixed end; the baseline is measured at once |
    | `contract_round` | work a draft contract out with you (preferences, red team, loopholes, baseline) and freeze it |
+   | `evolve_task` | improve one function by evolution (OpenEvolve) against a frozen contract, in the sandbox |
    | `backlog` | list, show, add or change the project's waiting jobs in `.micromanager/backlog/` |
    | `decide_change` | accept or refuse a writer's request to change a check or a frozen test |
 

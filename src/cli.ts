@@ -3,7 +3,10 @@
 //               npm run bench-guards -- [--cases bench/guard_cases.json] [--url http://127.0.0.1:8781/v1/systemone] [--repeat]
 //               npm run bench-n7 -- [--cases bench/followup_cases.json]
 //               node src/cli.ts status [--project dir] [--all] [--watch]   (an ASCII board of the newest job, or of all)
+//               node src/cli.ts sandboxed --dir D -- <command…>  (one command in the writer's sandbox of D, offline;
+//                                                                the evolver's candidates run under it, src/evolver.ts)
 
+import { spawnSync } from "node:child_process"
 import { writeFileSync } from "node:fs"
 
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
@@ -15,14 +18,40 @@ import { journalPath, readJournal } from "./journal.ts"
 import { board } from "./board.ts"
 import { listJobs } from "./store.ts"
 import { outcomesPath, readOutcomes, routerRows } from "./outcomes.ts"
+import { cleanEnv, rulesFor, startSandbox } from "./sandbox.ts"
 
 function flag(args: readonly string[], name: string): string | undefined {
   const i = args.indexOf(`--${name}`)
   return i >= 0 ? args[i + 1] : undefined
 }
 
+// A word as the shell reads it back: single-quoted unless it needs nothing.
+const quote = (w: string) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `'${w.replace(/'/g, "'\\''")}'`)
+
 export async function main(argv: readonly string[]): Promise<number> {
   const [command, ...args] = argv
+  if (command === "sandboxed") {
+    // Model-written code the evolver measures: it may write its own directory and nothing else, reaches no network
+    // beyond the package registries, and gets the cleaned environment. Without a sandbox it does not run at all.
+    const dir = flag(args, "dir")
+    const sep = args.indexOf("--")
+    if (!dir || sep < 0 || sep === args.length - 1) {
+      console.error("usage: sandboxed --dir D -- <command…>")
+      return 2
+    }
+    const box = await startSandbox()
+    if (!box.available) {
+      console.error(`no sandbox here (${box.reason}); the command is not run`)
+      return 126
+    }
+    try {
+      const wrapped = await box.wrap(args.slice(sep + 1).map(quote).join(" "), rulesFor({ role: "code", writer: true, dir, worktree: dir, domains: [] }))
+      const r = spawnSync("bash", ["-c", wrapped], { cwd: dir, stdio: "inherit", env: cleanEnv(process.env, ["MM_CORPUS", "MM_CORPUS_DIR", "MM_REPEAT"]) })
+      return r.status ?? 1
+    } finally {
+      await box.stop()
+    }
+  }
   if (command === "status") {
     const project = flag(args, "project") ?? process.cwd()
     const draw = () => {

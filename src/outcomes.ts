@@ -54,6 +54,9 @@ export interface Outcome {
   // Its requests to change a check (src/checkchange.ts): how often the checks or the spec were wrong, and who said so,
   // is something to learn about the tasks and their planners.
   readonly checkChanges?: readonly { readonly kind: string; readonly accepted: boolean; readonly by: string }[]
+  // A task the evolver did instead of a worker (src/evolver.ts): the method a router chose, and what it took.
+  readonly method?: "evolver"
+  readonly evolve?: { readonly evaluations: number; readonly valid: number; readonly calls: number }
 }
 
 // The class a task is compared in: what a router could know before it starts.
@@ -99,6 +102,7 @@ export function outcomeOf(project: string, job: Job, task: Task, usage?: { token
     ...(r !== undefined ? { reward: r } : {}),
     ...(task.graded ? { graded: Math.round((task.graded.passed / task.graded.total) * 1000) / 1000 } : {}),
     ...(task.checkChanges?.length ? { checkChanges: task.checkChanges } : {}),
+    ...(task.evolve ? { method: "evolver" as const, evolve: { evaluations: task.evolve.evaluations, valid: task.evolve.valid, calls: task.evolve.calls } } : {}),
   }
 }
 

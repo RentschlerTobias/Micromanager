@@ -91,3 +91,14 @@ def test_a_spec_file_is_read_back(tmp_path):
     path.write_text(json.dumps({"workdir": "/w", "file": "a.js", "initial": "/i.js", "checks": [], "evaluator": "node b.js", "scores": [{"name": "ms", "direction": "min"}], "guards": [{"name": "hits", "direction": "max", "tolerance": 0.05}], "baseline": {"ms": 9}, "output": "/o", "iterations": 3}))
     s = load(path)
     assert s.scores == [Score("ms", "min")] and s.guards == [Guard("hits", "max", 0.05)] and s.iterations == 3 and s.runner == []
+
+
+def test_the_bridge_replaces_the_opencode_backend(tmp_path):
+    from mm_evolve.run import config_for
+
+    via_cli = config_for(spec(tmp_path))
+    assert via_cli.llm.models[0].init_client is not None
+    via_bridge = config_for(spec(tmp_path, api_base="http://127.0.0.1:5555/v1", api_key="t0k"))
+    m = via_bridge.llm.models[0]
+    assert (m.api_base, m.api_key, getattr(m, "init_client", None)) == ("http://127.0.0.1:5555/v1", "t0k", None)
+    assert via_bridge.diff_based_evolution is True and config_for(spec(tmp_path, full_rewrite=True)).diff_based_evolution is False

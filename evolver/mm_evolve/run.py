@@ -24,7 +24,11 @@ def config_for(spec):
     models = [LLMModelConfig(name=m["name"], weight=float(m.get("weight", 1.0)), timeout=int(m.get("timeout", 300))) for m in spec.models]
     cfg.llm.models = models
     cfg.llm.evaluator_models = models
-    cfg.llm.update_model_params({"init_client": init_opencode_client})
+    if spec.api_base:
+        # OpenEvolve's own OpenAI client against the plugin's bridge.
+        cfg.llm.update_model_params({"api_base": spec.api_base, "api_key": spec.api_key or "none"})
+    else:
+        cfg.llm.update_model_params({"init_client": init_opencode_client})
     cfg.diff_based_evolution = not spec.full_rewrite
     cfg.database.num_islands = 2
     cfg.evaluator.parallel_evaluations = 1  # one measurement at a time: parallel timings disturb each other
