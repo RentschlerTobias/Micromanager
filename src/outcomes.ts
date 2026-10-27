@@ -42,8 +42,9 @@ export interface Outcome {
   readonly merged: boolean
   // lost_on_score: its checks passed, but another attempt of its trial had the better score (src/contract.ts);
   // lost_on_quality: passed, ranked below another (a "best" trial); lost_on_pick: passed, the user chose another.
+  // combined: passed, and the user had parts of it taken into another attempt, which went on.
   // These are observed results; only sibling_won (stopped by a "first" trial's winner) is censored.
-  readonly end: "merged" | "sibling_won" | "lost_on_score" | "lost_on_quality" | "lost_on_pick" | "blocked" | "unfinished" | "cancelled"
+  readonly end: "merged" | "sibling_won" | "lost_on_score" | "lost_on_quality" | "lost_on_pick" | "combined" | "blocked" | "unfinished" | "cancelled"
   // How the winner of a trial was chosen (src/trials.ts Pick): the first to pass, by quality, by a review, by score, or
   // by the user.
   readonly chosenBy?: "first" | "quality" | "review" | "score" | "user"
@@ -79,9 +80,12 @@ export function outcomeOf(project: string, job: Job, task: Task, usage?: { token
   const won = task.stages.some((s) => s.stage === "trial" && s.result === "pass" && /won by/.test(s.evidence ?? ""))
   const pick = task.trial ? pickOf(task) : undefined
   const lost = pick === "best" ? "lost_on_quality" : pick === "user" ? "lost_on_pick" : "lost_on_score"
-  const end: Outcome["end"] = task.status === "merged" ? "merged" : task.status === "cancelled" ? (won ? (task.held ? lost : "sibling_won") : "cancelled") : task.status === "blocked" ? "blocked" : "unfinished"
+  const combined = task.stages.some((s) => s.stage === "trial" && /^combined into /.test(s.evidence ?? ""))
+  const end: Outcome["end"] = task.status === "merged" ? "merged" : task.status === "cancelled" ? (won ? (task.held ? lost : "sibling_won") : combined ? "combined" : "cancelled") : task.status === "blocked" ? "blocked" : "unfinished"
   const winning = task.status === "merged" && task.trial ? task.stages.findLast((s) => s.stage === "trial" && /^won the trial/.test(s.evidence ?? ""))?.evidence : undefined
-  const chosenBy: Outcome["chosenBy"] = !winning ? undefined : /as the user's pick/.test(winning) ? "user" : /on quality \(on review/.test(winning) ? "review" : /on quality/.test(winning) ? "quality" : /on score/.test(winning) ? "score" : "first"
+  // A combination the user asked for won by its next pass, a "first" pick after the fact: the user chose it.
+  const asked = task.stages.some((s) => s.stage === "trial" && /^the user asked for a combination/.test(s.evidence ?? ""))
+  const chosenBy: Outcome["chosenBy"] = !winning ? undefined : asked || /as the user's pick/.test(winning) ? "user" : /on quality \(on review/.test(winning) ? "review" : /on quality/.test(winning) ? "quality" : /on score/.test(winning) ? "score" : "first"
   const started = task.stages.find((s) => s.stage === "delegate")?.at
   const verify = job.acceptance.filter((a) => task.acceptance.includes(a.id)).map((a) => a.verify).filter((v): v is string => Boolean(v))
   const contract = task.contract && job.contracts?.find((c) => c.id === task.contract!.id)

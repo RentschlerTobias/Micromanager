@@ -764,6 +764,22 @@ readingTime with tests):
 - A new worktree's first model turn came about 30 s after the move: the server starts an instance (and the plugin)
   for each new directory.
 
+**Live, 2026-10-27: trial picks, the user's pick and look** (private `opencode serve`, glm-5.3-flash as micromanager,
+a one-page site with a slugify module graded by eight cases):
+- A `best` trial of the slugify task: T5 passed first (8/8) and was held; T3 passed (8/8) inside the window; the tie
+  went to a review by claude-haiku-5-5 (a third family), which preferred T3's single lookup table; T3 merged, T5 is
+  `lost_on_quality`, the original attempt T2 was stopped when the window closed. Found: the window was half of T5's
+  12 s, so 6 s, and the slower attempt never had a chance; fixed with a two-minute floor (184c551).
+- A `user` trial of the hero (designers T1 on qwen, T4 on mimo): both called `look` and checked their page at several
+  widths, both passed and were held with no deadline; when the second ended, the comparison page and the pick form
+  came. Answered with Combine ("the layout and ring of T4, with the leaf mark of T1"): T4 was continued with T1's
+  diff, looked again, and merged; the result has both.
+- Found and fixed on the way: restoring placeholders wrote every field of a tool's input back, and the question
+  tool's input is frozen, so every form failed (9de11a2); variables like CLAUDE_CODE_SESSION_ID, EDITOR and MANPAGER
+  became known secrets and their values placeholders in paths (ce0f81d, bc88a9f); bare digit runs became card numbers
+  (the card commit after it); a worker adopted after a restart and continued by its session had its request parked
+  with nobody to answer (afd473d); a combination's rows now say `combined` and `chosenBy: user`.
+
 ## Verification
 - **Per phase: tests** with a fake Jev:
   - the FSMs refuse illegal jumps;

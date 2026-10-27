@@ -1371,6 +1371,9 @@ test("a user trial: a combination continues one version with the other's change;
   writeFileSync(join(w2?.dir ?? native.writerOf("ses_u2")!.dir, "index.html"), "<h1>bold</h1>\n<p>with more air</p>\n")
   const r = await native.finish("ses_u2", "combined")
   assert.match(r.text, /^Merged into/)
+  tasks = native.jobOf("ses_u2")!.job.tasks
+  assert.equal(outcomeOf(project, native.jobOf("ses_u2")!.job, tasks[0]!).end, "combined")
+  assert.equal(outcomeOf(project, native.jobOf("ses_u2")!.job, tasks[1]!).chosenBy, "user", "the combination is the user's choice")
 
   const other = repo()
   const n2 = new Native()
