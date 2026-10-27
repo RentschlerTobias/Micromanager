@@ -357,7 +357,7 @@ export function installLookTool(draft: ToolDraft, look: (args: Record<string, st
   draft.add({
     id: LOOK_ID,
     name: LOOK_ID,
-    description: "See your work as a picture. path: a page (.html), an svg, an image, or a directory with an index.html, relative to your directory; or url: a page on a host this job may reach. width: the window width in px (default 1280; try 390 for a phone). height: the window height (default 800). full: false for only the first screen instead of the whole page. The page is served from your directory, so absolute paths like /assets/app.css work; build first if the project has a build step. Leave fields you do not need empty.",
+    description: "See your work as a picture. path: a page (.html), an svg, an image, or a directory with an index.html, relative to your directory; or url: a page on a host this job may reach. width: the window width in px (default 1280; try 390 for a phone). height: the window height (default 800). full: false for only the first screen instead of the whole page. The page is served from your directory, so absolute paths like /assets/app.css work; build first if the project has a build step. Every field must be given: pass \"\" for the ones you do not need.",
     input: read.input.mapFields(() => Object.fromEntries(fields.map((f) => [f, str]))),
     execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
       if (!ctx?.sessionID || !allowed(ctx.sessionID)) return { content: "Only a designer of the micromanager may use this tool." }

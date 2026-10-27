@@ -1627,13 +1627,17 @@ export default {
       // worker's inspection instead of asking Jev, whose confidence on those sits below the read floor.
       const root = runnerSessions.has(evaluation.sessionID) ? workerDirs.get(evaluation.sessionID) ?? ctx.location?.directory : undefined
       const outcome = await decide(jev, request, floors, undefined, preset, root, [...allowOutside, ...grantedPaths(job)], (await sandbox).available)
+      // A worker of the plugin's, also one adopted after a restart and continued by its session, which the prompt hook
+      // does not claim again (live run, 2026-10-27: such a worker's request was neither paused nor refused, so OpenCode
+      // parked it with nobody to answer, and the worker waited for good).
+      const managed = runnerSessions.has(evaluation.sessionID) || native.isWorker(evaluation.sessionID)
       if (outcome.verdict !== "user") {
         evaluation.effect = outcome.verdict
         // A refusal says why, so the worker can choose another way instead of guessing from a bare "denied".
         if (outcome.verdict === "deny") evaluation.message = `Refused: ${outcome.reason}.`
-      } else if (runnerSessions.has(evaluation.sessionID) && pause(evaluation, outcome.reason, outcome.reason.startsWith("always the user"))) {
+      } else if (managed && pause(evaluation, outcome.reason, outcome.reason.startsWith("always the user"))) {
         // paused: the micromanager or the user answers it (src/ask.ts)
-      } else if (runnerSessions.has(evaluation.sessionID)) {
+      } else if (managed) {
         evaluation.effect = "deny"
         evaluation.message = `This is refused, not queued: nobody is asked while you run (${outcome.reason}), and asking again would not bring the question back. It does not stop your task: carry on without it, and say in your report what you wanted it for and what you did instead. Report STATUS: NEEDS_CONTEXT only if you genuinely cannot proceed without it. Still, do not reach the same result by a route around this permission.`
       }
@@ -2577,6 +2581,18 @@ export default {
         watchdog.watch(sessionID, { maxSteps: MAX_STEPS })
         log("info", `worker ${sessionID} moved to ${claimed.dir}`)
         return
+      }
+      // A worker the plugin adopted after a restart (src/native.ts adopt) and the micromanager continued by its session:
+      // its continuation is no first turn, so nothing above claimed it. It is watched and treated as a worker again.
+      if (native.isWorker(sessionID) && !runnerSessions.has(sessionID)) {
+        runnerSessions.add(sessionID)
+        const w = native.writerOf(sessionID)
+        if (w) {
+          workerDirs.set(sessionID, w.dir)
+          workerTasks.set(sessionID, w.task)
+        }
+        watchdog.watch(sessionID, { maxSteps: MAX_STEPS })
+        record({ kind: "adopt", sessionID, event: "continued" })
       }
       // A note is replaced at the user's next turn. A worker's prompts are its own continuations, not the user's: clearing
       // the note there would drop a steer_task note before the worker ever saw it (the prompt hook runs first).
