@@ -944,7 +944,7 @@ k/n is how many attempts pass, and the group is the task class (role, difficulty
   micromanager to start the others with `Attempt: T… · job-…`, because only its subagent calls make children that
   OpenCode reports back to it. Each attempt is a task of its own and avoids its siblings' model families.
 - **Settling.** The first attempt that passes its checks and merges wins (a trial measured against a fitness
-  contract is decided by score instead, §25 P4). Every other attempt is cancelled with
+  contract is decided by score instead, §25 P4; since 2026-10-27 a trial has a pick that decides it, §27). Every other attempt is cancelled with
   `replacedBy` set to the winner, so dependants of the first attempt wait for the winner, and its session is
   interrupted and its worktree removed. An attempt that fails while others run reports nothing to act on; when all
   of them failed (k = 0), the note lists what each hit and asks for a split.
@@ -1232,6 +1232,45 @@ for.
 
 **Next (E4):** the outcome log has `method` and reward per task; once there are enough rows, the router learns when the
 evolver pays and the offer can lead with what the data says.
+
+## 27. Who decides a trial, and a designer's eyes (2026-10-27)
+
+**Why.** With "the first to pass wins", the fastest family won every trial, whatever the quality or cost of the
+slower attempts, and the outcome log filed the stopped ones as censored, so a router trained on it would have learned
+speed. Design drafts have no check that says which one is better at all. And visual workers could not see their work:
+they started Chromium through the shell, and it crashed in the sandbox.
+
+**Pick (src/trials.ts, src/native.ts).** Each trial carries `pick`: `first`, `best`, `contract` (a contract always
+wins) or `user`; the default comes from `trialPick` by role (writers `best`, designers `user`), a `Pick:` line
+overrides it.
+- `best`: the first passing attempt is held (`task.held`, as for a contract) and arms a grace window, `trialGrace`
+  (factor × its own time since delegation, capped). Live attempts the watchdog counts as idle (`idleAttempt`: no write
+  in 20 calls, 25 calls since the last write, or 8 recent failures) are stopped at that moment. The trial is decided
+  on the merge train when no attempt is at work or the window closes: `rankQuality` orders by the share of MM_SCORE
+  cases passed; on a tie the two best diffs go to a pairwise review (a hidden, tool-less session on a reviewer-pool
+  model of a third family, its cost charged to the task; skipped when the diffs are near-identical or no third family
+  is available); then cost, then lines changed.
+- `user`: held without a deadline; when no attempt is live, `#settleUser` renders each held attempt's preview with
+  the `look` renderer, writes the comparison page, notifies, and hands the micromanager the pick form
+  (src/pick.ts). `pickAnswer` applies the user's answer: merge one, combine (the base's session is continued, the
+  others' diffs written next to the page, the base's pick switched to `first`), or none.
+- Outcome rows: `lost_on_quality`, `lost_on_pick`, `chosenBy`; router rows add the winner, how it was chosen and the
+  models that passed but lost. Only `sibling_won` stays censored.
+
+**look (src/look.ts).** Spike, 2026-10-27, Chromium 152 in the worker sandbox (sandbox-runtime 0.0.81):
+1. sandbox-runtime sets `TMPDIR=/tmp/claude`, which did not exist: every worker's `mktemp` failed (fixed in a46f6dd,
+   a temp directory per worker);
+2. Chromium's sandbox needs user namespaces, refused inside bubblewrap ("No usable sandbox"); `--no-sandbox` gets
+   past it;
+3. its process singleton calls `socket(AF_UNIX)`, which the seccomp filter blocks (`socketpair` passes).
+   `allowAllUnixSockets` exists only for the whole sandbox and would open D-Bus, Docker and agent sockets to every
+   worker.
+So the plugin renders on the host: Chromium with its own sandbox, a throwaway profile, `--host-resolver-rules` that
+resolve only `127.0.0.1` and the job's hosts, the worker's directory served read-only by a small server in the plugin
+(no `.env`, `.git` or state directories), and DevTools over `--remote-debugging-pipe` for full-page shots (0.3 s for a
+1000 × 2219 page; capped at 8000 px). The picture returns as a `file` part of the tool's content, the shape the built-in
+`read` returns for images (read in the 2.0.18 bundle). A dev server inside the sandbox lives in its own network
+namespace and cannot be reached, so the brief says to build first.
 
 ## Sources
 - **Orchestration:**

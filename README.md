@@ -10,8 +10,9 @@ An [OpenCode](https://opencode.ai) v2 plugin that turns one agent into an orches
   train onto the session's branch `jev/<job>`; you merge that into your checkout when you say so.
 - **Decisions by Jev:** which role, model and skills a task gets, how hard it is, and which permission requests are
   answered on your behalf; the rest is paused and put to you.
-- **Hard tasks run as trials:** several attempts at once on different model families; the first whose checks pass
-  wins. Every attempt's outcome and cost is logged, the data for a router that learns.
+- **Hard tasks run as trials:** several attempts at once on different model families; the best one is merged, by its
+  checks, a review and cost, and a design draft is yours to pick from a comparison. Every attempt's outcome and cost
+  is logged, the data for a router that learns.
 - **Budget, watchdog, memory:** per-job limits on tokens, requests and cost; a watchdog against loops and stalls; a
   memory across sessions and projects, and context management for long sessions.
 
@@ -144,6 +145,13 @@ Jev and the plugin securing every task:
      because the two together are what it takes to send it away. A grant holds for the job and lands in its control
      file, names only: no model ever sees a value (Jev gets its length and kinds of characters). Workers are told
      never to fill in a missing variable with a value they made up.
+   - **Designers can look.** No browser can run in the sandbox (its own sandbox needs user namespaces, and it needs
+     Unix sockets, which the sandbox blocks for every worker), so a designer has `look`: a page, an svg, an image or a
+     directory with an `index.html` of its own directory, or a URL on a host its job may reach, comes back to it as a
+     picture. The plugin renders it on the host with headless Chromium (its own sandbox on, a throwaway profile), the
+     directory served read-only from `127.0.0.1` without `.env` files, and a resolver that knows no other host but
+     the job's. A dev server inside the sandbox cannot be reached from there, so a designer builds first and looks at
+     the output. Chromium, Chrome or Playwright's Chromium has to be installed where the plugin runs.
    - **Writers can ask.** A writer has two tools of its own: `explore` starts an explorer that reads the writer's
      directory, its uncommitted change included, and `research` starts a researcher with the web. The writer waits for
      the answer, which comes back as the tool's result. A helper is no task of the job: no worktree, no merge, no place
@@ -347,6 +355,8 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "perModel": 2,          // sessions of one cloud model at the same time; a local model serves one
   "trials": 3,            // attempts a hard writer task runs as, each on another model (1: no trials; at most 4)
   "trialDeadline": 20,    // minutes a trial decided by a fitness contract waits for its last attempts
+  "trialPick": { "designer": "user", "*": "best" }, // who decides a trial, per agent: "first", "best" or "user"
+  "trialGrace": { "factor": 0.5, "maxMinutes": 10 }, // a "best" trial's grace window after its first pass
   "githubBacklog": [],    // repositories ("owner/name") whose issues labelled micromanager join the backlog
   "evolver": { "maxEvalSeconds": 600 },  // the longest full measurement the evolver is still offered for
   "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // optional limits per job; none by default
@@ -372,10 +382,27 @@ measures them; the journal
 
 A hard writer task (N5 difficulty "hard" or "very hard"), a task that does failed work over, and a task of a class
 that mostly fails on one worker run as a **trial**: `trials` attempts at once, each in its own worktree on another
-model family, and the first whose checks pass is merged while the others stop. When all of them fail, the
-micromanager is told what each hit and splits the task. Every writer's end, with its model, difficulty, gate result,
-tokens and cost, goes to `~/.local/state/micromanager/outcomes.jsonl`; `npm run export-dataset -- --target router`
-turns it into one row per task, the training data for a router (docs/design.md §23).
+model family. Who decides it is the trial's **pick** (`"trialPick"`, or a line `Pick: me | best | first` in the
+task's prompt):
+
+- **best** (writers by default): the first attempt to pass is held, not merged, and the others get a grace window of
+  half its time, at most ten minutes (`"trialGrace"`); attempts the watchdog sees getting nowhere are stopped when the
+  window opens. The passed ones are ranked by the share of the checks' `MM_SCORE` cases they pass, then, on a tie, by
+  a review of the two best changes by a model of a third family, then by cost and size. The note says why the winner
+  won.
+- **user** (designers by default): every attempt runs to its end, and those that pass are held with no deadline.
+  When the last one ends you get a desktop notification and a comparison page, `.micromanager/trials/<job>-<task>.html`,
+  with each version's picture (the task's `Preview:` page, or its `index.html`), model, cost and size, and the
+  micromanager asks you with a form: one version (merged), **combine** (the version your words name first is continued
+  with the others' changes beside it, and merges when it passes), or **none** (the task is done again with your
+  feedback, on other models). Only tasks that depend on it wait.
+- **contract**: a task with a fitness contract is decided by score (see "Fitness contracts").
+- **first**: the first attempt whose checks pass is merged and the others stop.
+
+When all attempts fail, the micromanager is told what each hit and splits the task. Every writer's end, with its model, difficulty, gate result,
+tokens and cost, goes to `~/.local/state/micromanager/outcomes.jsonl`, with how a trial's winner was chosen and which
+attempts passed but lost; `npm run export-dataset -- --target router` turns it into one row per task, the training
+data for a router (docs/design.md §23).
 
 A job's `budget` (tokens, requests, cost; none by default) holds for the micromanager's own workers too: every
 request of a worker, its helpers and the micromanager is counted against its job. A used-up budget cuts nothing: no
