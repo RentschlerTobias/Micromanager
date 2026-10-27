@@ -77,7 +77,10 @@ export interface Contract {
   scores: Score[] // the first is the primary score, the others break ties inside its noise band
   guards: Guard[]
   corpus: Corpus
-  baseline?: { values: Record<string, number>; heldOut?: Record<string, number>; at: string; commit?: string }
+  baseline?: { values: Record<string, number>; heldOut?: Record<string, number>; quick?: Record<string, number>; at: string; commit?: string }
+  // A quick stage for a slow evaluator (the evolver's cascade, src/evolver.ts): the same scores on small instances, in
+  // seconds. A candidate only gets the full measurement once its checks pass and it beats the baseline here.
+  quick?: { evaluator: string; costPerEval?: number }
   stop: { target?: Record<string, number>; plateau?: number; evaluations?: number; seconds?: number }
   costPerEval?: number // seconds per run, measured with the baseline
   used?: { evaluations: number; seconds: number }
@@ -319,8 +322,13 @@ export function parseContract(json: string): { contract?: Omit<Contract, "id" | 
   const repeats = Math.min(10, Math.max(1, Math.round(num(o.repeats) ?? 1)))
   const timeoutMs = Math.min(3_600_000, Math.max(1000, Math.round((num(o.timeoutSeconds) ?? 300) * 1000)))
   const heldOutFrom = typeof c.heldOutFrom === "string" && c.heldOutFrom.trim() ? c.heldOutFrom.trim() : undefined
+  const quick = typeof o.quick === "string" ? o.quick.trim() : ""
+  if (quick) {
+    const why = checkProblem(quick) ?? checkSafetyProblem(quick)
+    if (why) errors.push(`quick: ${why}`)
+  }
   if (errors.length) return { errors }
-  return { contract: { goal, evaluator, timeoutMs, repeats, scores, guards, corpus: { visible }, stop }, ...(heldOutFrom ? { heldOutFrom } : {}), errors }
+  return { contract: { goal, evaluator, timeoutMs, repeats, scores, guards, corpus: { visible }, stop, ...(quick ? { quick: { evaluator: quick } } : {}) }, ...(heldOutFrom ? { heldOutFrom } : {}), errors }
 }
 
 // What a writer measured against a contract is told about it.

@@ -225,6 +225,15 @@ export function parseGithubBacklog(text: string): readonly string[] {
   return raw.map((r: string) => r.toLowerCase())
 }
 
+// "evolver": { "maxEvalSeconds": 600 }: the longest full measurement for which the plugin still offers the evolver
+// (src/evolver.ts). Long ones are what a multi-step algorithm takes; a quick stage in the contract keeps them affordable.
+export function parseEvolver(text: string): number {
+  const raw = (JSON.parse(stripComments(text)) as { evolver?: { maxEvalSeconds?: unknown } }).evolver?.maxEvalSeconds
+  if (raw === undefined) return 600
+  if (typeof raw !== "number" || !(raw > 0)) throw new Error("evolver.maxEvalSeconds must be a number of seconds above 0")
+  return raw
+}
+
 // "allowOutside": absolute paths (or path prefixes) a worker may reach even where src/decide.ts refuses, e.g.
 // ["/home/u/.config/omarchy"]. Empty by default: the user's list is the only thing that lifts those rules, and it lifts
 // nothing until they write it. A wrong entry here is a widened rule, so the value is checked, not cast: a list of
@@ -315,6 +324,7 @@ export interface Settings {
   readonly registry: readonly ModelEntry[]
   readonly allowOutside: readonly string[]
   readonly githubBacklog: readonly string[]
+  readonly evolverMaxEvalSeconds: number
   readonly sandbox: boolean
   readonly env: readonly string[]
   readonly network: readonly string[]
@@ -336,6 +346,7 @@ const DEFAULTS: Omit<Settings, "registry"> = {
   decisions: {},
   allowOutside: [],
   githubBacklog: [],
+  evolverMaxEvalSeconds: 600,
   sandbox: true,
   env: [],
   network: [],
@@ -350,7 +361,7 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), trialDeadline: parseTrialDeadline(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), githubBacklog: parseGithubBacklog(text), ...parseSandbox(text), memory: parseMemory(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), trialDeadline: parseTrialDeadline(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), githubBacklog: parseGithubBacklog(text), evolverMaxEvalSeconds: parseEvolver(text), ...parseSandbox(text), memory: parseMemory(text) }
   } catch (err) {
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }

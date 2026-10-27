@@ -1166,7 +1166,8 @@ committed with the project (src/backlog.ts). Items are jobs, never a job's inter
 ## 26. The evolver (2026-10-27)
 
 OpenEvolve evolves code, not parameter values: many small model-written variants of one block, each measured, the
-best kept. It suits a single function whose fitness contract measures in seconds; a search over parameter values
+best kept. It suits a single function or block, measured in seconds or in minutes (a multi-step algorithm of 2–10
+minutes is what is most worth speeding up, with a quick stage to keep it affordable); a search over parameter values
 stays with DE or NSGA-II, and a change across many files with workers and trials.
 
 **The spike (2026-10-26).** OpenEvolve 0.4.0 installs with `uv`. Its `init_client` hook takes a custom backend, and a
@@ -1204,8 +1205,15 @@ for.
 - **Jev:** a writer delegation that names a contract gets one more question in its N5 ask, `local_block` ("the
   improvement can come from rewriting a single function or block in isolation", floor 0.7). It costs no extra
   request.
-- **Code:** `evolverFits` requires a frozen contract, a measurement of at most 10 s (`costPerEval × repeats`), 1–2
-  files, and uv plus a sandbox on this machine.
+- **Code:** `evolverFits` requires a frozen contract, a full measurement of at most `evolver.maxEvalSeconds`
+  (600 s by default; `costPerEval × repeats`), 1–2 files, and uv plus a sandbox on this machine. The limit was 10 s
+  until the user's objection of 2026-10-27: the slow multi-step algorithms are the ones they want to speed up.
+- **Quick stage:** a contract may name `quick`, the same scores on small instances (e.g. `MM_STAGE=quick node
+  bench.js`); it gets a baseline of its own when the contract is stored. The evolver then runs every candidate there
+  first, and in full only when it beats that baseline. A candidate stopped there scores half its quick ratio, below
+  every one that went on. OpenEvolve's own evaluation timeout is set from the contract's, so minutes-long runs are
+  not cut. The offer prices the quick stage, plus the full run for the 30 % of candidates assumed to pass it, and
+  says hours where it takes them.
 - **The offer:** when both agree, the writer does not start. The micromanager gets the form `Method M…`: "Evolver /
   Trial / One worker", with the iterations (the stop rule's evaluations, 30 at most), the minutes and the cost. The
   cost is priced per call from earlier evolver runs in the outcome log, 0.004 before any.

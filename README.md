@@ -225,7 +225,8 @@ Jev and the plugin securing every task:
    spread) and the plugin freezes it. Only a frozen contract measures writers. The draft itself is the `contract` tool's: the goal, an
    evaluator command that prints one line `MM_SCORE {"scores":{"p50_ms":12.3}}`, the scores with a direction (the
    first decides, the next break ties inside a noise band), guards that may not get worse than today, the corpus,
-   repeats (the median counts) and a stop rule (`evaluations`, `seconds`). The plugin measures the baseline on the job
+   repeats (the median counts), a stop rule (`evaluations`, `seconds`) and, for a slow evaluator, a `quick` stage on
+   small instances that the evolver runs first. The plugin measures the baseline on the job
    branch at once and keeps the contract in the job and in `.micromanager/contracts/<job>/C1.json`. A writer started
    with a line `Contract: C1` (or `"contract"` in its todo) is measured after its checks pass: an invalid result (a
    non-zero exit, a timeout, no `MM_SCORE` line, a missing score) or a broken guard is a fix round like a failing
@@ -331,6 +332,7 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "trials": 3,            // attempts a hard writer task runs as, each on another model (1: no trials; at most 4)
   "trialDeadline": 20,    // minutes a trial decided by a fitness contract waits for its last attempts
   "githubBacklog": [],    // repositories ("owner/name") whose issues labelled micromanager join the backlog
+  "evolver": { "maxEvalSeconds": 600 },  // the longest full measurement the evolver is still offered for
   "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // optional limits per job; none by default
   "notify": "jobs",       // desktop notifications (notify-send on Linux, osascript on macOS): "jobs", "tasks" (also per task) or "off"
   "sandbox": true,        // worker commands in the sandbox (default); false runs them unwrapped

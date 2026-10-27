@@ -32,7 +32,10 @@ def config_for(spec):
     cfg.diff_based_evolution = not spec.full_rewrite
     cfg.database.num_islands = 2
     cfg.evaluator.parallel_evaluations = 1  # one measurement at a time: parallel timings disturb each other
-    cfg.evaluator.cascade_evaluation = False  # the checks are the cascade's first stage, inside measure()
+    cfg.evaluator.cascade_evaluation = False  # the checks and the quick stage are the cascade, inside measure()
+    # OpenEvolve stops an evaluation after its own timeout (300 s by default), which a multi-step algorithm of minutes
+    # outlasts: room for every check, the quick stage and the full run, each bounded by the contract's timeout.
+    cfg.evaluator.timeout = int(spec.timeout_s * (len(spec.checks) + (2 if spec.quick_evaluator else 1)) + 60)
     cfg.max_iterations = spec.iterations
     return cfg
 

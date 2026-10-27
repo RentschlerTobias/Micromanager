@@ -106,6 +106,8 @@ export interface EvolveSpec {
   readonly runner: readonly string[]
   readonly api_base: string
   readonly api_key: string
+  readonly quick_evaluator: string | null
+  readonly quick_baseline: Readonly<Record<string, number>>
 }
 
 export function specOf(o: {
@@ -132,6 +134,8 @@ export function specOf(o: {
     runner: [...o.runner],
     api_base: `${o.bridge.url}/v1`,
     api_key: o.bridge.token,
+    quick_evaluator: c.quick && c.baseline?.quick ? c.quick.evaluator : null,
+    quick_baseline: { ...(c.baseline?.quick ?? {}) },
   }
 }
 
@@ -218,19 +222,31 @@ export function heldOutProblem(c: Contract, held: Readonly<Record<string, number
 // --- the offer ----------------------------------------------------------------------------------------------------
 
 // Whether the evolver suits a writer measured against this contract: the code's half of the rule (Jev's local_block is
-// the other). A frozen contract, a measurement of at most 10 s, and one or two files: the evolver measures every
-// candidate, and a slow or wide task is a worker's or a trial's.
-export const EVOLVER_MAX_EVAL_S = 10
+// the other). A frozen contract, a full measurement of at most maxEvalSeconds (the "evolver.maxEvalSeconds" setting,
+// 600 by default: multi-step algorithms of minutes are what is worth speeding up), and one or two files.
+export const EVOLVER_MAX_EVAL_S = 600
 
-export function evolverFits(c: Contract, files: readonly string[]): boolean {
-  return c.status === "frozen" && c.costPerEval !== undefined && c.costPerEval * c.repeats <= EVOLVER_MAX_EVAL_S && files.length >= 1 && files.length <= 2
+export function evolverFits(c: Contract, files: readonly string[], maxEvalSeconds = EVOLVER_MAX_EVAL_S): boolean {
+  return c.status === "frozen" && c.costPerEval !== undefined && c.costPerEval * c.repeats <= maxEvalSeconds && files.length >= 1 && files.length <= 2
 }
 
-// What a run would take: iterations from the contract's stop rule (30 at most by default), a model call and a
-// measurement each, the call priced at what earlier evolver calls cost.
-export function estimate(c: Contract, perCall: number): { iterations: number; minutes: number; cost: number } {
+// The share of candidates that pass a contract's quick stage and get the full measurement, before a run has measured
+// it: most model-written variants are no better than their parent.
+export const QUICK_PASS = 0.3
+
+// What a run would take: iterations from the contract's stop rule (30 at most by default), each a model call (about
+// 25 s) and a measurement: the full one, or with a quick stage that one and the full one for the share that pass it.
+// The call is priced at what earlier evolver calls cost.
+export function estimate(c: Contract, perCall: number, quickPass = QUICK_PASS): { iterations: number; minutes: number; cost: number } {
   const iterations = Math.min(c.stop.evaluations ?? 30, 30)
-  return { iterations, minutes: Math.max(1, Math.round((iterations * (25 + (c.costPerEval ?? 1) * c.repeats)) / 60)), cost: Math.round(iterations * perCall * 1000) / 1000 }
+  const full = (c.costPerEval ?? 1) * c.repeats
+  const measure = c.quick?.costPerEval !== undefined ? c.quick.costPerEval + quickPass * full : full
+  return { iterations, minutes: Math.max(1, Math.round((iterations * (25 + measure)) / 60)), cost: Math.round(iterations * perCall * 1000) / 1000 }
+}
+
+// Minutes as the form says them: "45 min", "about 3.5 h".
+export function duration(minutes: number): string {
+  return minutes < 90 ? `${minutes} min` : `${Math.round(minutes / 30) / 2} h`
 }
 
 const METHOD = { evolver: "Evolver", trial: "Trial", worker: "One worker" } as const
@@ -239,9 +255,9 @@ const METHOD = { evolver: "Evolver", trial: "Trial", worker: "One worker" } as c
 export function evolverForm(id: string, title: string, files: readonly string[], c: Contract, e: { iterations: number; minutes: number; cost: number }): { header: string; question: string; options: { label: string; description: string }[] }[] {
   return [{
     header: `Method ${id}`,
-    question: `"${title.slice(0, 100)}" improves ${files.join(", ")} against contract ${c.id}, which measures in ${c.costPerEval}s, and its gain lies in one function or block. How should it be done?`,
+    question: `"${title.slice(0, 100)}" improves ${files.join(", ")} against contract ${c.id}, which measures in ${c.costPerEval}s${c.quick?.costPerEval !== undefined ? ` (its quick stage in ${c.quick.costPerEval}s)` : ""}, and its gain lies in one function or block. How should it be done?`,
     options: [
-      { label: `${METHOD.evolver} (Recommended)`, description: `OpenEvolve tries about ${e.iterations} variants in the sandbox, the best goes through the checks; about ${e.minutes} min and ${e.cost} in model calls` },
+      { label: `${METHOD.evolver} (Recommended)`, description: `OpenEvolve tries about ${e.iterations} variants in the sandbox${c.quick ? `, each on the quick stage first and in full only when it is better there` : ""}, the best goes through the checks; about ${duration(e.minutes)} and ${e.cost} in model calls` },
       { label: METHOD.trial, description: "Two or more workers on different models at once; the best score wins" },
       { label: METHOD.worker, description: "One worker, as usual" },
     ],

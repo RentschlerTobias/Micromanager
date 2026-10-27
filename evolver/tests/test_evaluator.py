@@ -102,3 +102,26 @@ def test_the_bridge_replaces_the_opencode_backend(tmp_path):
     m = via_bridge.llm.models[0]
     assert (m.api_base, m.api_key, getattr(m, "init_client", None)) == ("http://127.0.0.1:5555/v1", "t0k", None)
     assert via_bridge.diff_based_evolution is True and config_for(spec(tmp_path, full_rewrite=True)).diff_based_evolution is False
+
+
+def test_a_slow_evaluator_runs_in_full_only_for_candidates_better_on_its_quick_stage(tmp_path):
+    project(tmp_path)
+    s = spec(
+        tmp_path, checks=[],
+        evaluator='echo "MM_SCORE {\\"scores\\":{\\"ms\\":$(cat value.txt),\\"hits\\":10}}"',
+        quick_evaluator='[ "$MM_STAGE" = quick ] && echo "MM_SCORE {\\"scores\\":{\\"ms\\":$(( $(cat value.txt) / 10 )),\\"hits\\":10}}"',
+        quick_baseline={"ms": 10.0, "hits": 10.0},
+    )
+    better = tmp_path / "better.txt"
+    better.write_text("40\n")
+    assert measure(s, str(better)) == {"combined_score": 2.5, "valid": 1.0, "ms": 40, "hits": 10}
+    same = tmp_path / "same.txt"
+    same.write_text("100\n")
+    stopped = measure(s, str(same))
+    assert stopped["stage"] == 1.0 and stopped["combined_score"] == 0.5, "no better on the quick stage: no full run, half its ratio"
+    assert config_timeout(s) == 300 * 2 + 60
+
+
+def config_timeout(s):
+    from mm_evolve.run import config_for
+    return config_for(s).evaluator.timeout

@@ -38,7 +38,7 @@ import { parseReport, sharedNote, skillLine, taskAcceptance } from "./brief.ts"
 import { settled, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
 import { formInput, startForm } from "./forms.ts"
-import { estimate, evolverFits, evolverForm } from "./evolver.ts"
+import { estimate, EVOLVER_MAX_EVAL_S, evolverFits, evolverForm } from "./evolver.ts"
 import { gitState } from "./nogit.ts"
 import { allFailedText, attemptBrief, attemptFailedText, attempts, fanOutText, ranked, standing, wonText, type Assessment } from "./trials.ts"
 
@@ -195,6 +195,7 @@ export interface NativeDeps {
   // average: without the first it is never offered, the second prices the offer.
   readonly evolverReady?: () => boolean
   readonly evolverCallCost?: () => number
+  readonly evolverMaxEvalSeconds?: () => number // the "evolver.maxEvalSeconds" setting
 }
 
 export const TRIAL_DEADLINE_MS = 20 * 60_000
@@ -297,7 +298,10 @@ export class Native {
     this.#onSettled = deps.onSettled
     this.#evolverReady = deps.evolverReady ?? (() => false)
     this.#evolverCallCost = deps.evolverCallCost ?? (() => 0.004)
+    this.#evolverMax = deps.evolverMaxEvalSeconds ?? (() => EVOLVER_MAX_EVAL_S)
   }
+
+  readonly #evolverMax: () => number
 
   readonly #evolverReady: () => boolean
   readonly #evolverCallCost: () => number
@@ -309,7 +313,7 @@ export class Native {
   // "Method:" line is the answer and skips the question; "Method: trial" asks for a trial whatever the difficulty.
   #offerEvolver(project: string, job: Job, c: Contract | undefined, files: readonly string[], title: string, checks: readonly string[], d: Delegation, assess?: Assessment): void {
     if (d.method === "evolver") throw new DelegationError("Not started: the evolver is not a worker; ask an explorer which function or block holds the work, then call evolve_task with the contract, the file, the block and the checks.")
-    if (d.method || !c || !assess?.localBlock || !this.#evolverReady() || !evolverFits(c, files)) return
+    if (d.method || !c || !assess?.localBlock || !this.#evolverReady() || !evolverFits(c, files, this.#evolverMax())) return
     const id = `M${++this.#offered}`
     this.#offers.set(id, { project, jobId: job.id, contract: c.id, files: [...files], title, checks: [...checks] })
     const form = evolverForm(id, title, files, c, estimate(c, this.#evolverCallCost()))
@@ -573,6 +577,15 @@ export class Native {
       const commit = job.integrationWorktree ? (await this.#exec("git", ["rev-parse", "--short", "HEAD"], { cwd: job.integrationWorktree })).stdout.trim() : undefined
       c.baseline = { values: { ...measured.values }, at, ...(commit ? { commit } : {}) }
       c.costPerEval = Math.round((seconds / c.repeats) * 10) / 10
+      if (c.quick) {
+        // The quick stage's own baseline: the cascade compares a candidate there with today's code there.
+        const q = await runEvaluator(dir, { ...c, evaluator: c.quick.evaluator, repeats: 1 }, "visible", this.#exec)
+        this.#count(job, c, q.seconds)
+        if (q.measured.valid) {
+          c.baseline.quick = { ...q.measured.values }
+          c.quick = { ...c.quick, costPerEval: q.seconds }
+        }
+      }
       if (c.corpus.heldOut) {
         const held = await runEvaluator(dir, c, "heldout", this.#exec, heldOutDir(project, job.id, c.id))
         this.#count(job, c, held.seconds)

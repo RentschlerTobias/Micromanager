@@ -323,7 +323,7 @@ How you work:
    out with contract_round (a planner drafts it, the user decides what it measures, a red team tries to game it, the
    user checks the baseline, the plugin freezes it), then give the writer a line "Contract: C…" (or "contract" in its
    todo); without a frozen contract it is refused. When the gain lies in one function or block and the contract
-   measures in seconds, evolve_task can do it instead of a worker: OpenEvolve tries many small variants in the
+   measures in seconds or minutes, evolve_task can do it instead of a worker: OpenEvolve tries many small variants in the
    sandbox and the best one goes through the checks (ask an explorer first which block it is). When the plugin finds
    such a task itself, it does not start it and hands you a form for the user ("Evolver / Trial / One worker"); their
    answer tells you the next step, and a line "Method: trial" or "Method: worker" starts the task the chosen way. The first attempt whose checks pass is

@@ -104,6 +104,8 @@ test("a contract from JSON is validated like a check, and only what it measures 
   assert.equal(bad.contract, undefined)
   assert.equal(bad.errors.length, 6, bad.errors.join("\n"))
   assert.match(parseContract("{").errors[0]!, /no JSON object/)
+  assert.deepEqual(parseContract(JSON.stringify({ goal: "g", evaluator: "node bench.js", quick: "MM_STAGE=quick node bench.js", scores: [{ name: "ms", direction: "min" }] })).contract!.quick, { evaluator: "MM_STAGE=quick node bench.js" })
+  assert.match(parseContract(JSON.stringify({ goal: "g", evaluator: "node bench.js", quick: "Run it quickly.", scores: [{ name: "ms", direction: "min" }] })).errors[0]!, /^quick: /)
   assert.match(parseContract(JSON.stringify({ goal: "g", evaluator: "rm -rf /", scores: [{ name: "a", direction: "min" }] })).errors.join(), /evaluator: /)
   assert.equal(contractHash(contract()), contractHash(contract({ used: { evaluations: 3, seconds: 9 }, version: 2 })))
   assert.notEqual(contractHash(contract()), contractHash(contract({ evaluator: "sh other.sh" })))

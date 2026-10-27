@@ -42,6 +42,10 @@ class Spec:
     target: dict[str, float] = field(default_factory=dict)  # the contract's stop.target
     full_rewrite: bool = False  # whole-program answers instead of diffs (cheap models often miss the diff format)
     held_out_dir: str | None = None  # measured once, for the best candidate only
+    # The contract's quick stage (a slow evaluator's cascade): the same scores on small instances, against its own
+    # baseline. A candidate gets the full measurement only when it is better there.
+    quick_evaluator: str | None = None
+    quick_baseline: dict[str, float] = field(default_factory=dict)
     # The command prefix every candidate command runs under: the plugin's sandbox. "{dir}" is the candidate's
     # directory. Empty: unsandboxed, for tests only.
     runner: list[str] = field(default_factory=list)

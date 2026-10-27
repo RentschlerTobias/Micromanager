@@ -1179,3 +1179,13 @@ test("a writer whose gain lies in one block, under a fast frozen contract, is of
   ready.on = true
   assert.ok((await ask("Trim the pass file.\nContract: C1\nFiles: pass.txt\nChecks: test -s pass.txt", { trials: 1 }, "pass")).task)
 })
+
+test("a contract's quick stage gets a baseline of its own when the contract is stored", async () => {
+  const project = benchRepo()
+  const native = new Native()
+  await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "faster", evaluator: "sh bench.sh", quick: "MM_STAGE=quick sh bench.sh", scores: [{ name: "ms", direction: "min" }] }))
+  const c = native.job(project, "ses_mm").contracts![0]!
+  assert.deepEqual(c.baseline!.quick, { ms: 100 })
+  assert.equal(typeof c.quick!.costPerEval, "number")
+  assert.equal(c.quick!.evaluator, "MM_STAGE=quick sh bench.sh")
+})

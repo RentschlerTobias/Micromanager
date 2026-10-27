@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import type { Contract } from "../src/contract.ts"
-import { estimate, evolverFits, evolverForm, heldOutProblem, markBlock, progressOf, readMethod, runEvolver, specOf, startBridge } from "../src/evolver.ts"
+import { duration, estimate, evolverFits, evolverForm, heldOutProblem, markBlock, progressOf, readMethod, runEvolver, specOf, startBridge } from "../src/evolver.ts"
 
 const contract = (extra: Partial<Contract> = {}): Contract => ({
   id: "C1", version: 2, status: "frozen", goal: "faster", evaluator: "node bench.js", timeoutMs: 60_000, repeats: 1,
@@ -35,7 +35,9 @@ test("progress is read off evals.jsonl, the best by combined score among the val
 
 test("the spec carries the contract's measure, the bridge and the sandbox runner", () => {
   const s = specOf({ workdir: "/w", file: "search.js", initial: "/o/initial.js", checks: ["npm test"], contract: contract(), output: "/o", models: ["m/a"], iterations: 12, heldOutDir: "/held", runner: ["node", "cli.ts", "sandboxed", "--dir", "{dir}", "--"], bridge: { url: "http://127.0.0.1:9", token: "t" } })
-  assert.deepEqual([s.evaluator, s.scores, s.guards, s.baseline, s.target, s.timeout_s, s.api_base, s.api_key, s.held_out_dir], ["node bench.js", [{ name: "ms", direction: "min" }], [{ name: "correct", direction: "max", tolerance: 0 }], { ms: 200, correct: 2 }, { ms: 50 }, 60, "http://127.0.0.1:9/v1", "t", "/held"])
+  assert.deepEqual([s.evaluator, s.scores, s.guards, s.baseline, s.target, s.timeout_s, s.api_base, s.api_key, s.held_out_dir, s.quick_evaluator], ["node bench.js", [{ name: "ms", direction: "min" }], [{ name: "correct", direction: "max", tolerance: 0 }], { ms: 200, correct: 2 }, { ms: 50 }, 60, "http://127.0.0.1:9/v1", "t", "/held", null])
+  const quick = specOf({ workdir: "/w", file: "a.js", initial: "/i", checks: [], contract: contract({ quick: { evaluator: "MM_STAGE=quick node bench.js", costPerEval: 2 }, baseline: { values: { ms: 200 }, quick: { ms: 20 }, at: "" } }), output: "/o", models: [], iterations: 1, runner: [], bridge: { url: "u", token: "t" } })
+  assert.deepEqual([quick.quick_evaluator, quick.quick_baseline], ["MM_STAGE=quick node bench.js", { ms: 20 }])
 })
 
 test("the best is kept out when the held-out cases say it learned the corpus, not the task", () => {
@@ -94,11 +96,20 @@ test("the evolver is offered for a frozen contract that measures fast, on one or
   const fast = contract({ costPerEval: 0.4 })
   assert.equal(evolverFits(fast, ["search.js"]), true)
   assert.equal(evolverFits(fast, ["a.js", "b.js", "c.js"]), false, "a wide change is a worker's")
-  assert.equal(evolverFits(contract({ costPerEval: 4, repeats: 3 }), ["a.js"]), false, "12 s per measurement is too slow")
+  assert.equal(evolverFits(contract({ costPerEval: 240, repeats: 2 }), ["a.js"]), true, "a multi-step algorithm of minutes is what is worth speeding up")
+  assert.equal(evolverFits(contract({ costPerEval: 400, repeats: 2 }), ["a.js"]), false, "beyond evolver.maxEvalSeconds")
+  assert.equal(evolverFits(contract({ costPerEval: 400, repeats: 2 }), ["a.js"], 1000), true)
   assert.equal(evolverFits(contract({ costPerEval: 0.4, status: "draft" }), ["a.js"]), false)
   assert.equal(evolverFits(contract(), ["a.js"]), false, "never measured")
   assert.deepEqual(estimate(fast, 0.004), { iterations: 30, minutes: 13, cost: 0.12 })
   assert.deepEqual(estimate(contract({ costPerEval: 0.4, stop: { evaluations: 10 } }), 0.004), { iterations: 10, minutes: 4, cost: 0.04 })
+  // A slow evaluator with a quick stage: the full run only for the share of candidates that pass it.
+  const slow = contract({ costPerEval: 300, quick: { evaluator: "MM_STAGE=quick node bench.js", costPerEval: 5 } })
+  assert.deepEqual(estimate(slow, 0.004), { iterations: 30, minutes: 60, cost: 0.12 })
+  assert.deepEqual(estimate(contract({ costPerEval: 300 }), 0.004), { iterations: 30, minutes: 163, cost: 0.12 })
+  assert.equal(duration(60), "60 min")
+  assert.equal(duration(163), "2.5 h")
+  assert.match(evolverForm("M3", "faster mesh", ["mesh.py"], { ...slow, status: "frozen" }, estimate(slow, 0.004))[0]!.options[0]!.description, /each on the quick stage first and in full only when it is better there, .* about 60 min/)
   const form = evolverForm("M2", "faster search", ["search.js"], fast, estimate(fast, 0.004))
   assert.equal(form[0]!.header, "Method M2")
   assert.match(form[0]!.options[0]!.description, /about 30 variants in the sandbox, .* about 13 min and 0\.12 in model calls/)

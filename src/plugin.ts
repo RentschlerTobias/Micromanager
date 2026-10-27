@@ -957,7 +957,7 @@ export default {
       return calls ? runs.reduce((n, r) => n + (r.cost ?? 0), 0) / calls : 0.004
     }
     const native = (SHARED.native ??= new Native({
-      installedSkills, planFirst: true, noGit: (dir) => noGitNote(dir), evolverReady: () => evolverReady, evolverCallCost,
+      installedSkills, planFirst: true, noGit: (dir) => noGitNote(dir), evolverReady: () => evolverReady, evolverCallCost, evolverMaxEvalSeconds: () => loadSettings().evolverMaxEvalSeconds,
       trialDeadlineMs: settings.trialDeadline * 60_000, onSettled: (r) => void settledTrial(r).catch((err: unknown) => log("warn", `trial settle failed: ${String(err)}`)),
     }))
     const workerJobs = SHARED.workerJobs
