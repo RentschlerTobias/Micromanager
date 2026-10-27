@@ -40,6 +40,8 @@ test("structured personal data: e-mail, phone, IBAN and card, each checked; exam
   assert.deepEqual(kinds("card 4111-1111-1111-1111"), ["card:4111-1111-1111-1111"])
   assert.deepEqual(kinds("IBAN DE89 3704 0044 0532 0130 00 and +49 711 1234567"), ["iban:DE89 3704 0044 0532 0130 00", "phone:+49 711 1234567"])
   assert.deepEqual(kinds("card 4111-1111-1111-1112"), [])
+  assert.deepEqual(kinds("card 3782 822463 10005"), ["card:3782 822463 10005"])
+  assert.deepEqual(kinds("id 38800000000000003 and 4432000000000002"), [], "bare digit runs are ids, not cards")
 })
 
 test("the vault: one value, one placeholder, in every text; words only as whole words", () => {

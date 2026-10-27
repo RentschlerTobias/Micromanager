@@ -82,7 +82,10 @@ const SAFE_LOCAL = /^(?:git|noreply|no-reply)$/i
 const PHONE_INTL = /(?<![\w+])\+\d{1,3}[ /-]?(?:\(0\)[ /-]?)?\d{2,5}(?:[ /-]?\d{2,}){1,4}(?![\w])/g
 const PHONE_NATIONAL = /(?<![\w./-])0\d{2,5}[ /-]\d{3,}(?:[ -]\d{2,})*(?![\w./-])/g
 const IBAN = /\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]){11,30}\b/g
-const CARD = /(?<![\d-])[3456]\d{3}(?:[ -]?\d{2,4}){2,4}(?![\d-])/g
+// A card number as people write one, in groups: 4-4-4-4 (13 to 19 digits) or Amex's 4-6-5. A bare run of digits is
+// left alone: in a context it is far more often an id, a size or a timestamp, and one in ten passes the Luhn check
+// (live run, 2026-10-27: three such runs became CARD_1..3).
+const CARD = /(?<![\d-])(?:[3456]\d{3}([ -])\d{4}\1\d{4}\1\d{1,4}(?:\1\d{1,3})?|3[47]\d{2}([ -])\d{6}\2\d{5})(?![\d-])/g
 
 const digits = (s: string): string => s.replace(/\D/g, "")
 
