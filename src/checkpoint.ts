@@ -34,7 +34,31 @@ export function signalFor(v: Verdict, p: Progress): Signal | undefined {
     : { kind: "handback", detail: `task checkpoint: the task looks unclear or blocked (${facts}); back to the micromanager` }
 }
 
-export async function review(decider: Decider, task: string, p: Progress): Promise<{ verdict: Verdict; decision?: string }> {
+export async function review(decider: Decider, task: string, p: Progress): Promise<{ verdict: Verdict; decision?: string; confidence?: number }> {
   const asked = await decider.ask("N16", { task: task.slice(0, 1500), progress: p }, CHECKPOINT).catch(() => undefined)
-  return { verdict: verdict(asked?.decision.answers ?? {}, p), decision: asked?.id }
+  const answers = asked?.decision.answers ?? {}
+  const progressing = answers.making_progress?.type === "noul" ? (answers.making_progress as { noul: number }).noul : undefined
+  return { verdict: verdict(answers, p), decision: asked?.id, ...(progressing !== undefined ? { confidence: progressing } : {}) }
+}
+
+// --- the adaptive interval (decided by the user after the Ralph spike, design.md §24) --------------------------------
+
+export const MIN_INTERVAL = 15
+export const MAX_INTERVAL = 180
+
+// The first interval of a worker: about the steps merged tasks of its class needed (the outcome log's 75th
+// percentile), so a review comes when a task like it would usually be done; without such data, from N5's difficulty.
+export function firstInterval(difficulty?: number, learned?: number): number {
+  if (learned !== undefined) return Math.min(MAX_INTERVAL, Math.max(MIN_INTERVAL * 2, Math.round(learned)))
+  if (difficulty === undefined) return 60
+  return difficulty < 0.34 ? 40 : difficulty < 0.67 ? 60 : 90
+}
+
+// The next interval after a review that let the worker go on: longer when Jev is sure it makes progress, shorter when
+// it barely let it (a stall is caught sooner), the same in between.
+export function nextInterval(prev: number, confidence?: number): number {
+  if (confidence === undefined) return prev
+  if (confidence >= 0.8) return Math.min(MAX_INTERVAL, Math.round(prev * 1.5))
+  if (confidence < 0.5) return Math.max(MIN_INTERVAL, Math.round(prev * 0.5))
+  return prev
 }

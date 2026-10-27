@@ -71,6 +71,10 @@ export const MAX_STEPS = 400
 // at the facts below and says whether it still makes progress (go on), needs another approach (a fresh session on
 // another family), or goes back to the micromanager.
 export const CHECKPOINT_STEPS = 60
+// The signs that pull a checkpoint forward (the user's choice after the Ralph spike, 2026-10-25).
+export const PULL_GAP = 10
+export const PULL_SINCE_WRITE = 25
+export const PULL_FAILURES = 6
 
 // What a checkpoint is decided on: facts the watchdog has anyway, no estimate.
 export interface Progress {
@@ -110,6 +114,11 @@ interface State {
   writes: number
   lastWrite: number // index into calls of the last write, -1 before any
   failed: boolean[] // per call: did it fail
+  // The adaptive checkpoint (src/checkpoint.ts): how many steps until the next review, and the step of the last one.
+  // Without an interval the review comes every CHECKPOINT_STEPS steps, as before.
+  interval?: number
+  next?: number
+  lastCheck: number
 }
 
 function stable(value: unknown): string {
@@ -141,7 +150,29 @@ export class Watchdog {
       writes: 0,
       lastWrite: -1,
       failed: [],
+      lastCheck: 0,
     })
+  }
+
+  // The session's first checkpoint interval, set once (from the task's class or difficulty, src/checkpoint.ts).
+  schedule(sessionID: string, interval: number): void {
+    const s = this.#sessions.get(sessionID)
+    if (!s || s.interval !== undefined) return
+    s.interval = interval
+    s.next = s.lastCheck + interval
+  }
+
+  scheduled(sessionID: string): number | undefined {
+    return this.#sessions.get(sessionID)?.interval
+  }
+
+  // A checkpoint was held: the next one comes after interval more steps.
+  checked(sessionID: string, interval: number): void {
+    const s = this.#sessions.get(sessionID)
+    if (!s) return
+    s.lastCheck = s.steps
+    s.interval = interval
+    s.next = s.steps + interval
   }
 
   unwatch(sessionID: string): void {
@@ -205,10 +236,17 @@ export class Watchdog {
     return undefined
   }
 
-  // A checkpoint is due at every CHECKPOINT_STEPS steps of a watched session.
+  // A checkpoint is due when the session's interval is reached, or earlier when the watchdog sees signs of a stall: a
+  // long stretch without a write, or many failures among the last calls (at least PULL_GAP steps after the last
+  // review, so one bad patch does not ask Jev on every step). Unscheduled: every CHECKPOINT_STEPS steps.
   checkpointDue(sessionID: string, every = CHECKPOINT_STEPS): boolean {
     const s = this.#sessions.get(sessionID)
-    return Boolean(s && s.steps > 0 && s.steps % every === 0)
+    if (!s || s.steps === 0) return false
+    if (s.next === undefined) return s.steps % every === 0
+    if (s.steps >= s.next) return true
+    const sinceWrite = s.calls.length - 1 - s.lastWrite
+    const failing = s.failed.slice(-12).filter(Boolean).length
+    return s.steps - s.lastCheck >= PULL_GAP && (sinceWrite >= PULL_SINCE_WRITE || failing >= PULL_FAILURES)
   }
 
   progress(sessionID: string): Progress | undefined {

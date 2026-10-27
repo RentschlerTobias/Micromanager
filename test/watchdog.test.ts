@@ -227,3 +227,28 @@ test("reading one long file in parts is no read loop; the same part three times 
   w.onTool("t", "read", { path: "/r/a.py", offset: 10, limit: 50 })
   assert.equal(w.onTool("t", "read", { path: "/r/a.py", offset: 10, limit: 50 })?.kind, "read_loop")
 })
+
+test("the checkpoint comes at the session's interval, and sooner on signs of a stall", () => {
+  const d = w({ noNewFiles: 0, sameCall: 999, maxSteps: 999 })
+  const step = () => d.onTurn("s", [])
+  // Unscheduled: every 60 steps, as before.
+  for (let i = 0; i < 59; i++) step()
+  assert.equal(d.checkpointDue("s"), false)
+  step()
+  assert.equal(d.checkpointDue("s"), true)
+  const e = w({ noNewFiles: 0, sameCall: 999, maxSteps: 999 })
+  e.schedule("s", 20)
+  e.schedule("s", 99) // set once
+  assert.equal(e.scheduled("s"), 20)
+  for (let i = 0; i < 19; i++) e.onTurn("s", [])
+  assert.equal(e.checkpointDue("s"), false)
+  e.onTurn("s", [])
+  assert.equal(e.checkpointDue("s"), true)
+  e.checked("s", 40)
+  // Six failures among the last calls, ten steps after the last review: the next one comes now, not at step 60.
+  for (let i = 0; i < 10; i++) {
+    e.onTurn("s", [])
+    e.onTool("s", "shell", { command: `npm test ${i}` }, i >= 4)
+  }
+  assert.equal(e.checkpointDue("s"), true)
+})

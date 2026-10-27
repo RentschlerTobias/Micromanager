@@ -160,7 +160,9 @@ Jev and the plugin securing every task:
    - **A task that changed nothing does not merge.** A gate that passes over an empty diff verified nothing, so it is
      reported as unverified instead. Failing checks come back at most twice; then the worker stops and says the
      check is the likely problem, because an unsatisfiable one otherwise burns the whole session.
-   - **Limits.** The watchdog stops loops and stalled workers; every 60 steps Jev reviews a worker's progress. A
+   - **Limits.** The watchdog stops loops and stalled workers, and Jev reviews a worker's progress at an interval that
+     adapts: first about the steps merged tasks of its kind needed (60 by default), sooner when it stops writing or keeps
+     failing, then longer or shorter by how sure Jev is that it gets on. A
      command that ran and did not fail is progress, so a worker verifying its work is not mistaken for a stuck one.
 5. **Reports come back.** The plugin's note "T… merged into …" lands in the micromanager's session, then OpenCode
    adds the worker's report and wakes the micromanager. It decides what comes next, continues a worker by its

@@ -160,6 +160,7 @@ export interface Task {
   // What its sessions used, the worker's and its helpers' (and the evolver's model calls): the job's counters split by
   // task, for the sidebar and job_status (src/budget.ts charges both).
   usage?: { tokens: number; cost: number; requests: number }
+  steps?: number // its worker's steps, counted by the watchdog, as of its last end
   replacedBy?: string
   difficulty?: number // the N5 estimate at a native delegation, 0..1 (src/trials.ts)
   // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has (src/trials.ts).

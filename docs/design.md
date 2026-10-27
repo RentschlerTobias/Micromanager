@@ -1005,8 +1005,14 @@ model sees? The alternative, plugin-made sessions, was ruled out by the user. Th
   - the context ceiling: start over instead of summarizing.
 - **Adaptive checkpoint interval** (decided by the user). The first interval comes from the N5 difficulty, later from
   the outcome log (about the 75th percentile of the steps that merged tasks of the class needed). Watchdog signs pull
-  it earlier, and Jev's confidence lengthens or shortens the next one. The outcome log needs the steps per attempt for
-  this.
+  it earlier, and Jev's confidence lengthens or shortens the next one. Implemented 2026-10-27 (src/checkpoint.ts,
+  src/watchdog.ts):
+  - first interval: the class's 75th percentile of steps once the outcome log has 5 merged rows of it (clamped to
+    30–180), else 40/60/90 for easy, moderate and hard;
+  - pulled forward, at least 10 steps after the last review, when 25 calls passed without a write or 6 of the last 12
+    failed;
+  - next interval ×1.5 when Jev's `making_progress` is ≥ 0.8, ×0.5 below 0.5, between 15 and 180 steps;
+  - the outcome log records each worker's steps.
 - **Workers try to reach hidden test data.** One worker went looking for the held-out cases although the prompt
   forbade it; the permission layer refused it (shell `cat …/holdout.json`, then a search of `~/.local/share` and
   `~/.config`). Held-out checks need the sandbox and the permission rules, not the prompt.

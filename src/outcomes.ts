@@ -56,6 +56,7 @@ export interface Outcome {
   readonly checkChanges?: readonly { readonly kind: string; readonly accepted: boolean; readonly by: string }[]
   // A task the evolver did instead of a worker (src/evolver.ts): the method a router chose, and what it took.
   readonly method?: "evolver"
+  readonly steps?: number // the worker's steps until it ended (the adaptive checkpoint learns its first interval from them)
   readonly evolve?: { readonly evaluations: number; readonly valid: number; readonly calls: number }
 }
 
@@ -102,6 +103,7 @@ export function outcomeOf(project: string, job: Job, task: Task, usage?: { token
     ...(r !== undefined ? { reward: r } : {}),
     ...(task.graded ? { graded: Math.round((task.graded.passed / task.graded.total) * 1000) / 1000 } : {}),
     ...(task.checkChanges?.length ? { checkChanges: task.checkChanges } : {}),
+    ...(task.steps ? { steps: task.steps } : {}),
     ...(task.evolve ? { method: "evolver" as const, evolve: { evaluations: task.evolve.evaluations, valid: task.evolve.valid, calls: task.evolve.calls } } : {}),
   }
 }
@@ -138,6 +140,14 @@ export function needsTrials(rows: readonly Outcome[], cls: string, window = 20, 
   if (tries < min) return false
   const passed = singles.filter((r) => r.merged).length + trials.filter((t) => t.k > 0).length
   return passed / tries < 0.5
+}
+
+// The steps merged tasks of a class needed, at their 75th percentile: when a task like it is usually done. Undefined
+// below min rows, where a percentile says nothing.
+export function learnedSteps(rows: readonly Outcome[], cls: string, min = 5): number | undefined {
+  const steps = rows.filter((r) => r.cls === cls && r.merged && r.steps).map((r) => r.steps!).sort((a, b) => a - b)
+  if (steps.length < min) return undefined
+  return steps[Math.min(steps.length - 1, Math.ceil(steps.length * 0.75) - 1)]
 }
 
 export interface TrialRow {

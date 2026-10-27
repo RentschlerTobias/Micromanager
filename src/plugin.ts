@@ -32,7 +32,7 @@ import { Summarizer } from "./context/summary.ts"
 import { writeMemoryStats, writeStatus } from "./context/status.ts"
 import { installMemoryTools, MEMORY_IDS } from "./context/tools.ts"
 import { lastAssistantText } from "./brief.ts"
-import { review, signalFor } from "./checkpoint.ts"
+import { firstInterval, nextInterval, review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
 import { cleanEnv, looksSecret, rulesFor, startSandbox, WorkerShells, type Wrapper } from "./sandbox.ts"
@@ -59,13 +59,13 @@ import { ChangeRequests, changeNote, changeResult, normalTarget, readChange, rou
 import { HELPER_STEPS, Helpers } from "./helpers.ts"
 import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
 import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo } from "./native.ts"
-import { classOf, needsTrials, outcomeOf, readOutcomes, recordOutcome } from "./outcomes.ts"
+import { classOf, learnedSteps, needsTrials, outcomeOf, readOutcomes, recordOutcome } from "./outcomes.ts"
 import { heldOutDir } from "./contract.ts"
 import { heldOutProblem, markBlock, readMethod, runEvolver, specOf, startBridge, type Progress, type Running } from "./evolver.ts"
 import { DEEP, trialSize, type Assessment } from "./trials.ts"
 import { Accountant, chargeTask, limitsOf, overBudget, overNote, sessionUsage, wrapUpNote } from "./budget.ts"
 import { seedFromJournal, Usage } from "./usage.ts"
-import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
+import { CHECKPOINT_STEPS, MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
 // What the permission hook "evaluate" gets (opencode 2.0.18): the planned effect can be changed in place.
 interface Evaluation {
@@ -2651,6 +2651,9 @@ export default {
         if (input.sessionID && native.isWorker(input.sessionID)) {
           const worker = input.sessionID
           native.watchEnd(worker, () => ctx.session.wait({ sessionID: worker }), () => stops.get(worker)?.detail, (note, parent, r) => {
+            // Its steps, for the outcome row: what the adaptive checkpoint learns a class's first interval from.
+            const steps = watchdog.progress(worker)?.steps
+            if (steps) r.task.steps = steps
             // Its end is the one thing reconcileJob needs to stop calling this worker alive (src/state.ts).
             ended.add(worker)
             void release(worker, "the worker that asked it has ended")
@@ -2678,14 +2681,24 @@ export default {
         if (input.sessionID && watchdog.watching(input.sessionID)) {
           const signal = watchdog.onTurn(input.sessionID, input.messages)
           if (signal) stop(input.sessionID, signal)
-          // Task checkpoint: every CHECKPOINT_STEPS steps Jev reviews the progress; the worker goes on unless it stalls.
-          else if (watchdog.checkpointDue(input.sessionID)) {
-            const progress = watchdog.progress(input.sessionID)!
-            const r = await review(decider, workerTasks.get(input.sessionID) ?? "", progress)
-            record({ kind: "checkpoint", sessionID: input.sessionID, verdict: r.verdict, progress, decision: r.decision })
-            log("info", `checkpoint ${input.sessionID}: ${r.verdict} after ${progress.steps} steps`)
-            const s = signalFor(r.verdict, progress)
-            if (s) stop(input.sessionID, s)
+          // Task checkpoint: Jev reviews the progress at an interval that adapts (src/checkpoint.ts): the first from what
+          // merged tasks of the class needed (or the difficulty), sooner on signs of a stall, then longer or shorter by
+          // how sure Jev is. The worker goes on unless it stalls.
+          else {
+            if (watchdog.scheduled(input.sessionID) === undefined) {
+              const t = native.taskOfSession(input.sessionID)
+              if (t) watchdog.schedule(input.sessionID, firstInterval(t.difficulty, learnedSteps(readOutcomes(), classOf(t.role, t.difficulty, t.files.length))))
+            }
+            if (watchdog.checkpointDue(input.sessionID)) {
+              const progress = watchdog.progress(input.sessionID)!
+              const r = await review(decider, workerTasks.get(input.sessionID) ?? "", progress)
+              const s = signalFor(r.verdict, progress)
+              const next = nextInterval(watchdog.scheduled(input.sessionID) ?? CHECKPOINT_STEPS, r.confidence)
+              if (!s) watchdog.checked(input.sessionID, next)
+              record({ kind: "checkpoint", sessionID: input.sessionID, verdict: r.verdict, progress, decision: r.decision, confidence: r.confidence, next: s ? undefined : next })
+              log("info", `checkpoint ${input.sessionID}: ${r.verdict} after ${progress.steps} steps${s ? "" : `, next in ${next}`}`)
+              if (s) stop(input.sessionID, s)
+            }
           }
         }
         return

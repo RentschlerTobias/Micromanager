@@ -45,3 +45,23 @@ test("a task's usage adds up what its sessions were charged", () => {
   chargeTask(t, { tokens: 50, cost: 0.005, requests: 2 })
   assert.deepEqual(t.usage, { tokens: 150, cost: 0.015, requests: 3 })
 })
+
+test("the first checkpoint interval comes from the class's merged tasks, else the difficulty; the next from Jev's confidence", async () => {
+  const { firstInterval, nextInterval } = await import("../src/checkpoint.ts")
+  const { learnedSteps } = await import("../src/outcomes.ts")
+  assert.equal(firstInterval(undefined), 60)
+  assert.equal(firstInterval(0.2), 40)
+  assert.equal(firstInterval(0.9), 90)
+  assert.equal(firstInterval(0.9, 47), 47)
+  assert.equal(firstInterval(0.9, 5), 30, "never below twice the minimum")
+  assert.equal(firstInterval(0.1, 900), 180)
+  assert.equal(nextInterval(60, 0.9), 90)
+  assert.equal(nextInterval(60, 0.4), 30)
+  assert.equal(nextInterval(60, 0.6), 60)
+  assert.equal(nextInterval(20, 0.1), 15)
+  assert.equal(nextInterval(150, 0.95), 180)
+  assert.equal(nextInterval(60), 60)
+  const row = (steps: number, merged = true, cls = "code:moderate:1") => ({ cls, merged, steps }) as never
+  assert.equal(learnedSteps([row(10), row(20), row(30), row(40)], "code:moderate:1"), undefined, "too few to say")
+  assert.equal(learnedSteps([row(10), row(20), row(30), row(40), row(50), row(99, false), row(5, true, "other")], "code:moderate:1"), 40)
+})
