@@ -63,7 +63,7 @@ import { classOf, needsTrials, outcomeOf, readOutcomes, recordOutcome } from "./
 import { heldOutDir } from "./contract.ts"
 import { heldOutProblem, markBlock, readMethod, runEvolver, specOf, startBridge, type Progress, type Running } from "./evolver.ts"
 import { DEEP, trialSize, type Assessment } from "./trials.ts"
-import { Accountant, limitsOf, overBudget, overNote, sessionUsage, wrapUpNote } from "./budget.ts"
+import { Accountant, chargeTask, limitsOf, overBudget, overNote, sessionUsage, wrapUpNote } from "./budget.ts"
 import { seedFromJournal, Usage } from "./usage.ts"
 import { MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
 
@@ -1101,7 +1101,7 @@ export default {
         await ctx.session.wait({ sessionID: s.id })
         const messages = await ctx.session.context({ sessionID: s.id }).catch(() => undefined)
         const used = sessionUsage(messages)
-        native.chargeEvolve(proj, job.id, used)
+        native.chargeEvolve(proj, job.id, used, task.id)
         return { text: lastAssistantText(messages), tokens: used.tokens, cost: used.cost }
       })
       const started = new Date().toISOString()
@@ -1712,6 +1712,9 @@ export default {
       if (!messages) return
       const d = accountant.charge(owned.job, sessionID, sessionUsage(messages))
       if (!d.tokens && !d.cost && !d.requests) return
+      // A helper's usage is its writer's task's: the helper answers that task's questions.
+      const task = native.taskOfSession(sessionID) ?? native.taskOfSession(SHARED.helperOf.get(sessionID) ?? "")
+      if (task) chargeTask(task, d)
       saveJob(owned.project, owned.job)
       const why = overNow(owned.job)
       if (!why) {

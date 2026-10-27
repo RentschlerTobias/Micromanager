@@ -8,7 +8,7 @@
 
 import { usage } from "./brief.ts"
 import type { Budget } from "./config.ts"
-import type { Job } from "./state.ts"
+import type { Job, Task } from "./state.ts"
 
 export interface Used {
   readonly tokens: number
@@ -37,6 +37,12 @@ export class Accountant {
     c.requests = (c.requests ?? 0) + delta.requests
     return delta
   }
+}
+
+// What a task's sessions used so far, with this charge added: the job's counters split by task.
+export function chargeTask(task: Task, delta: Used): void {
+  const u = task.usage ?? { tokens: 0, cost: 0, requests: 0 }
+  task.usage = { tokens: u.tokens + delta.tokens, cost: Math.round((u.cost + delta.cost) * 1e6) / 1e6, requests: u.requests + delta.requests }
 }
 
 // The limits that hold for a job: its own where it has them, else the config's.

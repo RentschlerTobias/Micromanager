@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { Accountant, limitsOf, overBudget, overNote, sessionUsage, wrapUpNote } from "../src/budget.ts"
+import { Accountant, chargeTask, limitsOf, overBudget, overNote, sessionUsage, wrapUpNote } from "../src/budget.ts"
 import { newJob } from "../src/state.ts"
 
 const assistant = (input: number, output: number, cost: number) => ({ type: "assistant", tokens: { input, output }, cost })
@@ -37,4 +37,11 @@ test("the notes: the micromanager asks the user, running workers wrap up and kee
   const job = newJob("job-1", "goal")
   assert.match(overNote(job, "cost budget of 1 used up (1.20)", ["T3", "T4"]), /No new worker starts .* The running workers \(T3, T4\) are asked to wrap up/)
   assert.match(wrapUpNote("x"), /call finish_task; if not, stop and end with a short report/)
+})
+
+test("a task's usage adds up what its sessions were charged", () => {
+  const t = { id: "T1" } as Parameters<typeof chargeTask>[0]
+  chargeTask(t, { tokens: 100, cost: 0.01, requests: 1 })
+  chargeTask(t, { tokens: 50, cost: 0.005, requests: 2 })
+  assert.deepEqual(t.usage, { tokens: 150, cost: 0.015, requests: 3 })
 })

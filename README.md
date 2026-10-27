@@ -254,8 +254,9 @@ Jobs and task notes live in `.micromanager/` (`.jev-micromanager/` in older proj
 with `git rev-parse --git-common-dir`, so it works when the project is a subdirectory of a larger repository and when
 it is itself a worktree.
 
-**Overview.** `job_status` shows an ASCII board of the job: each task with its state, role, model and what it does
-or waits for, plus tokens, requests and cost. In a terminal, in the project:
+**Overview.** `job_status` shows an ASCII board of the job: each task with its state, role, model, what it does or
+waits for and what it cost so far (its worker and helpers, or the evolver's model calls), plus the job's tokens,
+requests and cost. The sidebar puts each task's cost after its line too. In a terminal, in the project:
 
 ```bash
 node ~/Fun/Projects/Repos/micromanager/src/cli.ts status --watch   # redraws every 2 s; --all for every job

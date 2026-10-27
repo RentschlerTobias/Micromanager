@@ -157,6 +157,9 @@ export interface Task {
   // The checks its worker is gated by, each as given. An acceptance point's verify holds them joined with " && ", which
   // cannot be split back when a check holds "&&" itself; a restart reads them from here (src/native.ts adopt).
   checks?: string[]
+  // What its sessions used, the worker's and its helpers' (and the evolver's model calls): the job's counters split by
+  // task, for the sidebar and job_status (src/budget.ts charges both).
+  usage?: { tokens: number; cost: number; requests: number }
   replacedBy?: string
   difficulty?: number // the N5 estimate at a native delegation, 0..1 (src/trials.ts)
   // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has (src/trials.ts).

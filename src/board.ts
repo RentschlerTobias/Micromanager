@@ -20,6 +20,13 @@ export const ICON: Record<Task["status"], string> = {
 }
 
 const short = (model?: string) => (model ? model.slice(model.indexOf("/") + 1).replace(/-flash$|-v[\d.]+/g, "") : "-")
+// A cost as the sidebar and the board show it: "$0.03", "<$0.01" for a little, nothing for none. Here rather than in
+// budget.ts, so the TUI (src/progress.ts) does not load the plugin's budget code.
+export function costText(cost: number | undefined): string {
+  if (!cost) return ""
+  return cost < 0.01 ? "<$0.01" : `$${cost.toFixed(2)}`
+}
+
 const pad = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s.padEnd(n))
 const k = (n?: number) => (n === undefined ? "0" : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n))
 
@@ -52,7 +59,7 @@ export function board(job: Job, width = 110, now = Date.now(), plugin?: string):
   ]
   const rows = job.tasks.map((t) => {
     const left = `│ ${ICON[t.status]} ${pad(t.id, 6)} ${pad(t.status, 9)} ${pad(t.role, 8)} ${pad(short(t.model), 12)} ${pad(t.session ?? "-", 31)} `
-    const rest = `${t.title}${detail(t, now) ? `  ← ${detail(t, now)}` : ""}`
+    const rest = `${t.title}${detail(t, now) ? `  ← ${detail(t, now)}` : ""}${t.usage?.cost ? `  ${costText(t.usage.cost)}` : ""}`
     return `${left}${pad(rest, Math.max(20, width - left.length))}`
   })
   const open = `│   open a task's session: opencode -s <session>  (in another terminal; it shows what the worker does)`

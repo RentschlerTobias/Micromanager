@@ -31,6 +31,7 @@ import { FIX_ROUNDS } from "./watchdog.ts"
 import { ROLES, roleByAgent, roleById, type Role, type RoleId } from "./roles.ts"
 import { isDone, moveTask, newJob, moveJob, stage, type Job, type Later, type Task } from "./state.ts"
 import { excludeFromGit, jobId, listJobs, saveContract, saveJob } from "./store.ts"
+import { chargeTask } from "./budget.ts"
 import { draftFromLater, draftFromTrial, localBackend, type BacklogBackend, type BacklogItem } from "./backlog.ts"
 import { normalTarget, type ChangeAnswer, type ChangeKind } from "./checkchange.ts"
 import { applyPrefs, askWith, baselineForm, draftPrompt, loopholeForm, parseLoopholes, prefsForm, redteamPrompt, type Prefs } from "./contractround.ts"
@@ -1512,10 +1513,18 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
     return { job, task, dir: entry.dir, contract: c }
   }
 
-  // A model call of the evolver's bridge, charged to the job as a worker's request is (src/budget.ts).
-  chargeEvolve(project: string, jobId: string, used: { tokens: number; cost: number; requests: number }): void {
+  // The task a worker session works on, or the writer's task for one of its helpers: what its usage is charged to.
+  taskOfSession(session: string): Task | undefined {
+    const entry = this.#entry(session)
+    return entry ? this.#job(entry)?.tasks.find((t) => t.id === entry.taskId) : undefined
+  }
+
+  // A model call of the evolver's bridge, charged to the job as a worker's request is (src/budget.ts), and to its task.
+  chargeEvolve(project: string, jobId: string, used: { tokens: number; cost: number; requests: number }, taskId?: string): void {
     const job = this.#jobs.get(key(project, jobId))
     if (!job) return
+    const task = taskId ? job.tasks.find((t) => t.id === taskId) : undefined
+    if (task) chargeTask(task, used)
     const c = job.counters
     c.tokens = (c.tokens ?? 0) + used.tokens
     c.cost = (c.cost ?? 0) + used.cost

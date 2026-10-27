@@ -1202,3 +1202,14 @@ test("a check that holds && itself comes back whole after a restart", async () =
   const done = await again.finish("ses_w1", "a")
   assert.match(done.text, /checks passed: test -f a\.js && test -s a\.js; node -e "require\('\.\/a\.js'\)"\./)
 })
+
+test("a worker session is charged to its task", async () => {
+  const project = repo()
+  const native = new Native()
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "a", prompt: "Write a.js.\nFiles: a.js\nChecks: test -f a.js" }, MODEL)
+  native.claim("ses_w1", child(d.prompt))
+  assert.equal(native.taskOfSession("ses_w1")!.id, d.task.id)
+  assert.equal(native.taskOfSession("ses_nobody"), undefined)
+  native.chargeEvolve(project, d.job.id, { tokens: 10, cost: 0.002, requests: 1 }, d.task.id)
+  assert.deepEqual(native.taskOfSession("ses_w1")!.usage, { tokens: 10, cost: 0.002, requests: 1 })
+})

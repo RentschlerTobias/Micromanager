@@ -149,3 +149,16 @@ test("a task whose worker ended unfinished shows as STOPPED, not as running", ()
   const resumed = { ...stopped, stages: [...stopped.stages, { stage: "resume", result: "pass" as const, at: "2026-10-20T10:06:00Z" }] }
   assert.deepEqual(sidebarGroups(view(job("job-1", { tasks: [resumed] }))).map((g) => g.name), ["RUNNING"], "continued, it runs again")
 })
+
+test("a task's cost goes after its line: running ones beside model and time, finished ones alone", () => {
+  const now = Date.parse("2026-10-27T10:10:00Z")
+  const started = [{ stage: "delegate", result: "pass" as const, at: "2026-10-27T10:06:00Z" }]
+  const j = job("job-1", { tasks: [
+    task("T1", "running", { model: "opencode-go/glm-5.3-flash", stages: started, usage: { tokens: 9000, cost: 0.034, requests: 12 } }),
+    task("T2", "merged", { usage: { tokens: 200, cost: 0.004, requests: 1 } }),
+    task("T3", "merged"),
+  ] })
+  const groups = sidebarGroups(view(j, now), new Map(), now)
+  const lines = groups.flatMap((g) => g.lines.map((l) => `${l.id}:${l.detail ?? ""}`))
+  assert.deepEqual(lines, ["T1:glm 4m $0.03", "T2:<$0.01", "T3:"])
+})

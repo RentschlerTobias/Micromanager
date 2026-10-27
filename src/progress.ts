@@ -5,7 +5,7 @@
 // not be found in the TUI (the host drops parentID on the plugin's session.create). The job file already is the todo
 // list, with every task's status and worker sessions; this reads it.
 
-import { detail, ICON } from "./board.ts"
+import { costText, detail, ICON } from "./board.ts"
 import { settled, startable } from "./continuation.ts"
 import { family } from "./roles.ts"
 import type { Job, Task, TaskStatus } from "./state.ts"
@@ -33,6 +33,7 @@ export interface TaskRow {
   readonly stopped?: boolean // its worker ended without finishing (STOP, a crash, a restart); continuing it runs again
   readonly replacedBy?: string // the task that does it over ("T26", or "job-…/T17" in another job)
   readonly replacement?: TaskStatus // that task's status, when it is known
+  readonly cost?: number // what its sessions cost so far (task.usage)
 }
 
 export interface JobView {
@@ -122,6 +123,7 @@ export function view(job: Job, now = Date.now(), resolve: Resolve = () => undefi
       ...(stopped(t) ? { stopped: true } : {}),
       ...(t.replacedBy ? { replacedBy: t.replacedBy } : {}),
       ...(t.replacedBy && replaced(t) ? { replacement: replaced(t) } : {}),
+      ...(t.usage?.cost ? { cost: t.usage.cost } : {}),
     })),
   }
 }
@@ -199,10 +201,13 @@ export function markOf(row: TaskRow, waiting: ReadonlySet<string>): Mark | undef
 export function sidebarGroups(v: JobView, waiting: ReadonlyMap<string, string> = new Map(), now = Date.now()): SidebarGroup[] {
   const asking = new Set(waiting.keys())
   const line = (r: TaskRow, mark: Mark): SidebarLine => {
-    const detail = mark === "running" ? `${shortModel(r.model)} ${elapsed(r.since, now)}`.trim()
+    // What it cost so far goes after a running or finished task's line: the job's total is in the header already.
+    const cost = costText(r.cost)
+    const detail = mark === "running" ? [shortModel(r.model), elapsed(r.since, now), cost].filter(Boolean).join(" ")
       : mark === "waiting" ? waiting.get(r.session!)
       : mark === "open" && !r.startable && r.waitsFor.length ? `⧗ ${r.waitsFor.join(" ")}`
       : mark === "done" && r.replacedBy && !DONE.includes(r.status) ? `↻ ${r.replacedBy.split("/").pop()}`
+      : ["done", "stopped", "failed"].includes(mark) && cost ? cost
       : undefined
     return { mark, id: r.id, title: r.title, ...(detail ? { detail } : {}), ...(r.session ? { session: r.session } : {}), ...(r.sessions?.length ? { sessions: r.sessions } : {}) }
   }
