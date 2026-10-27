@@ -8,8 +8,8 @@ import { DEFAULT_FLOORS, type Floors } from "./decide.ts"
 import { validatePolicies, type PolicySet } from "./policy.ts"
 import { DEFAULT_REGISTRY, mergeRegistry, type ModelEntry } from "./registry.ts"
 import { DEFAULT_ROUTING, type Routing } from "./routing.ts"
-import { roleById, type RoleId } from "./roles.ts"
-import { DEFAULT_TRIALS, MAX_TRIALS } from "./trials.ts"
+import { roleById, ROLES, type RoleId } from "./roles.ts"
+import { DEFAULT_GRACE, DEFAULT_PICK, DEFAULT_TRIALS, MAX_TRIALS, type Grace, type Pick as TrialPick } from "./trials.ts"
 import type { NotifyMode } from "./scheduler.ts"
 
 // The name before 2026-10-19 (jev-micromanager.jsonc) is still read while the new one does not exist.
@@ -208,6 +208,36 @@ export function parseTrialDeadline(text: string): number {
   return raw
 }
 
+// "trialPick": who decides a trial, by agent ("designer") or role id ("visual"), "*" for the rest: "first", "best" or
+// "user" (src/trials.ts; a contract always decides by score). Keys not named keep their default.
+export function parseTrialPick(text: string): Record<string, TrialPick> {
+  const raw = (JSON.parse(stripComments(text)) as { trialPick?: unknown }).trialPick
+  const out: Record<string, TrialPick> = { ...DEFAULT_PICK }
+  if (raw === undefined) return out
+  const shape = 'trialPick must be { "<agent or *>": "first" | "best" | "user" }'
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error(shape)
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (v !== "first" && v !== "best" && v !== "user") throw new Error(shape)
+    const role = k === "*" ? undefined : ROLES.find((r) => r.agent === k || r.id === k)
+    if (k !== "*" && !role) throw new Error(`trialPick: unknown agent ${JSON.stringify(k)}`)
+    out[role?.id ?? "*"] = v
+  }
+  return out
+}
+
+// "trialGrace": the grace window of a "best" trial: the others get factor x the first passing attempt's time, at most
+// maxMinutes. Default 0.5 and 10.
+export function parseTrialGrace(text: string): Grace {
+  const raw = (JSON.parse(stripComments(text)) as { trialGrace?: unknown }).trialGrace
+  if (raw === undefined) return DEFAULT_GRACE
+  const shape = 'trialGrace must be { "factor": 0.., "maxMinutes": 0.. }'
+  if (typeof raw !== "object" || raw === null) throw new Error(shape)
+  const g = raw as { factor?: unknown; maxMinutes?: unknown }
+  if (g.factor !== undefined && (typeof g.factor !== "number" || g.factor < 0)) throw new Error(shape)
+  if (g.maxMinutes !== undefined && (typeof g.maxMinutes !== "number" || g.maxMinutes < 0)) throw new Error(shape)
+  return { factor: (g.factor as number | undefined) ?? DEFAULT_GRACE.factor, maxMs: g.maxMinutes === undefined ? DEFAULT_GRACE.maxMs : (g.maxMinutes as number) * 60_000 }
+}
+
 // "cloudOnly": true (the default for now, the user's choice of 2026-10-05) routes no task to a local model and asks
 // cloud Jev for the guards instead of the local GLiNER server. false brings the local fleet and GLiNER back.
 export function parseCloudOnly(text: string): boolean {
@@ -363,6 +393,8 @@ export interface Settings {
   readonly network: readonly string[]
   readonly memory: MemorySettings
   readonly redact: RedactSettings
+  readonly trialPick: Readonly<Record<string, TrialPick>>
+  readonly trialGrace: Grace
 }
 
 // The settings a config file that is missing or broken falls back to. One place, so the two returns below cannot drift
@@ -386,6 +418,8 @@ const DEFAULTS: Omit<Settings, "registry"> = {
   network: [],
   memory: DEFAULT_MEMORY,
   redact: DEFAULT_REDACT,
+  trialPick: DEFAULT_PICK,
+  trialGrace: DEFAULT_GRACE,
 }
 
 export function loadSettings(path = configPath()): Settings & { error?: string } {
@@ -396,7 +430,7 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), trialDeadline: parseTrialDeadline(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), githubBacklog: parseGithubBacklog(text), evolverMaxEvalSeconds: parseEvolver(text), ...parseSandbox(text), memory: parseMemory(text), redact: parseRedact(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), trialDeadline: parseTrialDeadline(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), githubBacklog: parseGithubBacklog(text), evolverMaxEvalSeconds: parseEvolver(text), ...parseSandbox(text), memory: parseMemory(text), redact: parseRedact(text), trialPick: parseTrialPick(text), trialGrace: parseTrialGrace(text) }
   } catch (err) {
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }

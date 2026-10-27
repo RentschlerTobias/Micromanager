@@ -710,11 +710,11 @@ test("an Attempt line names the trial it joins", () => {
 
 test("a hard task runs as a trial: its attempts are no duplicates, the first to pass wins and the others stop", async () => {
   const project = repo()
-  const native = new Native()
+  const native = new Native({ trialPick: { "*": "first" } })
   const OTHER = "opencode-go/kimi-k3"
   const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "add add.js", prompt: "Create add.js.\nFiles: add.js\nChecks: test -f add.js" }, MODEL, { difficulty: 0.8, trials: 3 })
   const job = d.job
-  assert.deepEqual(d.task.trial, { of: "T1", n: 3 })
+  assert.deepEqual(d.task.trial, { of: "T1", n: 3, pick: "first" })
   assert.equal(d.task.difficulty, 0.8)
   assert.match(d.task.title, /\(attempt 1\/3\)$/)
   assert.match(d.prompt, /You are attempt 1 of 3/)
@@ -725,7 +725,7 @@ test("a hard task runs as a trial: its attempts are no duplicates, the first to 
   const attempt = (model: string) => native.delegate(project, "ses_mm", { agent: "coder", description: "T1 attempt", prompt: `Attempt: T1 · ${job.id}` }, model)
   const a2 = await attempt(OTHER)
   assert.equal(a2.task.id, "T2")
-  assert.deepEqual(a2.task.trial, { of: "T1", n: 3 })
+  assert.deepEqual(a2.task.trial, { of: "T1", n: 3, pick: "first" })
   assert.match(a2.prompt, /Create add\.js\./)
   assert.match(a2.prompt, /Checks the plugin runs when you finish: test -f add\.js/)
   assert.match(a2.prompt, /You are attempt 2 of 3/)
@@ -912,7 +912,7 @@ test("an accepted check change is applied from outside: a wrong check is replace
   writeFileSync(join(project, "test", "slug.test.js"), "const assert = require('node:assert')\nassert.equal(require('../slug.js').slug('Café à la carte'), 'cafe-a-la-carte')\n")
   git(project, "add", "-A")
   git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "test")
-  const native = new Native()
+  const native = new Native({ trialPick: { "*": "first" } })
 
   // A check with a wrong path: replaced by the proposed command, and the worker's next finish runs the new one.
   const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "a", prompt: "Write a.js.\nFiles: a.js\nChecks: test -f src/a.js" }, MODEL)
@@ -1172,7 +1172,7 @@ test("a writer whose gain lies in one block, under a fast frozen contract, is of
   const worker = await ask(`${prompt}\nMethod: worker`, { trials: 1, localBlock: true })
   assert.equal(worker.task.trial, undefined)
   const trial = await ask("Count the hits in half the time.\nContract: C1\nFiles: hits.txt\nChecks: test -s hits.txt\nMethod: trial", { trials: 1, localBlock: true }, "hits")
-  assert.deepEqual(trial.task.trial, { of: trial.task.id, n: 2 })
+  assert.deepEqual(trial.task.trial, { of: trial.task.id, n: 2, pick: "best" })
   // No offer where the evolver cannot run, or where Jev sees no single block.
   ready.on = false
   assert.equal((await ask("Shrink the bench output.\nContract: C1\nFiles: bench.sh\nChecks: test -s bench.sh", { trials: 1, localBlock: true }, "bench")).task.contract!.id, "C1")
@@ -1231,4 +1231,74 @@ test("a trial whose best attempts lie inside the noise band says they are tied",
   const r = await native.finish("ses_n2", "70")
   const note = r.note ?? (await decided)
   assert.match(note, /with the best score \(ms 60 \(baseline 100\), tied with T\d+ inside the noise band\)/)
+})
+
+test("a best trial holds the first to pass, stops idle attempts, and merges the attempt that passes more cases", async () => {
+  const project = repo()
+  const native = new Native({ idle: (s) => s === "ses_b3" })
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "score", prompt: "Write score.txt.\nFiles: score.txt\nChecks: cat score.txt" }, MODEL, { difficulty: 0.9, trials: 3 })
+  assert.equal(d.task.trial?.pick, "best")
+  assert.match(d.prompt, /the best is merged: by how many of the checks' cases pass/)
+  assert.match(native.trialNote(project, d.job.id, "T1")!, /the best by quality is merged after a short grace window/)
+  const attempt = () => native.delegate(project, "ses_mm", { agent: "coder", description: "T1 attempt", prompt: `Attempt: T1 · ${d.job.id}` }, "opencode-go/kimi-k3")
+  const a2 = await attempt()
+  const a3 = await attempt()
+  const w1 = native.claim("ses_b1", child(d.prompt))!
+  const w2 = native.claim("ses_b2", child(a2.prompt))!
+  native.claim("ses_b3", child(a3.prompt))
+  writeFileSync(join(w1.dir, "score.txt"), 'MM_SCORE {"cases":{"passed":5,"total":8}}\n')
+  const first = await native.finish("ses_b1", "five of eight")
+  assert.match(first.text, /waits in your worktree: once the other attempts had their grace window, the best one is merged/)
+  assert.deepEqual(first.stop, ["ses_b3"], "the attempt getting nowhere is stopped when the window opens")
+  let tasks = native.jobOf("ses_b1")!.job.tasks
+  assert.deepEqual(tasks.map((t) => [t.id, t.status, Boolean(t.held)]), [["T1", "passed", true], ["T2", "running", false], ["T3", "cancelled", false]])
+  assert.ok(tasks[0]!.settleBy, "the grace window is armed")
+
+  writeFileSync(join(w2.dir, "score.txt"), 'MM_SCORE {"cases":{"passed":8,"total":8}}\n')
+  const second = await native.finish("ses_b2", "all eight")
+  assert.match(second.text, /won the trial and is merged/)
+  assert.match(second.note!, /T2 won the trial of T1 as the best attempt \(more cases passed \(100% against 63%\)\), ahead of T1: merged into/)
+  tasks = native.jobOf("ses_b2")!.job.tasks
+  assert.deepEqual(tasks.map((t) => [t.id, t.status, t.replacedBy]), [["T1", "cancelled", "T2"], ["T2", "merged", undefined], ["T3", "cancelled", undefined]])
+  assert.equal(existsSync(w1.dir), false, "the beaten attempt's worktree goes")
+  assert.equal(outcomeOf(project, native.jobOf("ses_b2")!.job, tasks[0]!).end, "lost_on_quality")
+  assert.equal(outcomeOf(project, native.jobOf("ses_b2")!.job, tasks[1]!).chosenBy, "quality")
+})
+
+test("a best trial is decided when its grace window closes, and the attempts still at work are stopped", async () => {
+  const project = repo()
+  const settledWith: { note?: string; stop: string[] }[] = []
+  const native = new Native({ trialGrace: { factor: 1, maxMs: 100 }, onSettled: (r) => settledWith.push(r) })
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "add add.js", prompt: "Create add.js.\nFiles: add.js\nChecks: test -f add.js" }, MODEL, { difficulty: 0.9, trials: 2 })
+  const a2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "T1 attempt", prompt: `Attempt: T1 · ${d.job.id}` }, "opencode-go/kimi-k3")
+  const w1 = native.claim("ses_c1", child(d.prompt))!
+  native.claim("ses_c2", child(a2.prompt))
+  writeFileSync(join(w1.dir, "add.js"), "export const add = (a, b) => a + b\n")
+  assert.match((await native.finish("ses_c1", "done")).text, /once the other attempts had their grace window/)
+  await new Promise((r) => setTimeout(r, 600))
+  assert.equal(settledWith.length, 1)
+  assert.match(settledWith[0]!.note!, /T1 won the trial of T1 as the best attempt \(the only attempt that passed\)/)
+  assert.deepEqual(settledWith[0]!.stop, ["ses_c2"])
+})
+
+test("a best trial tied on the checks asks for a review of the two changes, and follows it", async () => {
+  const project = repo()
+  const asked: string[] = []
+  const native = new Native({
+    review: async (_task, a, b) => {
+      asked.push(`${a.task.id}:${b.task.id}`)
+      assert.match(a.diff + b.diff, /add\.js/)
+      return { better: a.task.id === "T2" ? "A" : "B", why: "handles strings too" }
+    },
+  })
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "add add.js", prompt: "Create add.js.\nFiles: add.js\nChecks: test -f add.js" }, MODEL, { difficulty: 0.9, trials: 2 })
+  const a2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "T1 attempt", prompt: `Attempt: T1 · ${d.job.id}` }, "opencode-go/kimi-k3")
+  const w1 = native.claim("ses_d1", child(d.prompt))!
+  const w2 = native.claim("ses_d2", child(a2.prompt))!
+  writeFileSync(join(w1.dir, "add.js"), "export const add = (a, b) => a + b\n")
+  await native.finish("ses_d1", "numbers")
+  writeFileSync(join(w2.dir, "add.js"), "export const add = (a, b) => Number(a) + Number(b)\n// strings are numbers too\n")
+  const r = await native.finish("ses_d2", "numbers and strings")
+  assert.equal(asked.length, 1)
+  assert.match(r.note!, /T2 won the trial of T1 as the best attempt \(on review: handles strings too\)/)
 })

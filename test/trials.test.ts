@@ -4,10 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 
-import { parseTrialDeadline, parseTrials } from "../src/config.ts"
+import { parseTrialDeadline, parseTrialGrace, parseTrialPick, parseTrials } from "../src/config.ts"
+import { parseDelegation } from "../src/native.ts"
 import { classOf, needsTrials, outcomeOf, readOutcomes, recordOutcome, routerRows, type Outcome } from "../src/outcomes.ts"
 import { newJob, stage, type Task } from "../src/state.ts"
-import { DEEP, ranked, standing, trialSize } from "../src/trials.ts"
+import { DEEP, DEFAULT_GRACE, DEFAULT_PICK, graceMs, idleAttempt, parseReview, pickFor, pickOf, rankQuality, ranked, reviewPrompt, standing, trialSize } from "../src/trials.ts"
 
 test("a writer task runs as a trial when it is hard, does failed work over, or its class mostly fails alone", () => {
   const base = { retry: false, setting: 3, parallel: 3 }
@@ -97,4 +98,67 @@ test("a trial decided by score holds its passed attempts apart from the live and
   const now = standing(job, job.tasks[0]!)
   assert.deepEqual([now.held, now.live, now.failed].map((ts) => ts.map((x) => x.id)), [["T1", "T2"], ["T3"], ["T4"]])
   assert.deepEqual(ranked(c, now.held).map((x) => x.id), ["T2", "T1"])
+})
+
+test("who decides a trial: the Pick line, else the role's setting, else best; a contract always by score", () => {
+  assert.equal(pickFor("visual"), "user")
+  assert.equal(pickFor("code"), "best")
+  assert.equal(pickFor("code", { "*": "first" }), "first")
+  assert.equal(pickFor("visual", DEFAULT_PICK, "best"), "best")
+  const t = { trial: { of: "T1", n: 2, pick: "user" } } as unknown as Task
+  assert.equal(pickOf(t), "user")
+  assert.equal(pickOf({ ...t, contract: { id: "C1", version: 1 } } as Task), "contract")
+  assert.equal(pickOf({ trial: { of: "T1", n: 2 } } as unknown as Task), "first", "a trial from before picks stays first")
+  assert.equal(parseDelegation("Do it.\nPick: me\nFiles: a\nChecks: true").pick, "user")
+  assert.equal(parseDelegation("Pick: BEST").pick, "best")
+  assert.equal(parseDelegation("Pick: whoever").pick, undefined)
+})
+
+test("the grace window is a share of the first attempt's time, capped; an idle attempt is one going nowhere", () => {
+  assert.equal(graceMs({ factor: 0.5, maxMs: 600_000 }, 240_000), 120_000)
+  assert.equal(graceMs({ factor: 0.5, maxMs: 600_000 }, 3_600_000), 600_000)
+  assert.equal(graceMs({ factor: 0, maxMs: 600_000 }, 240_000), 0)
+  assert.ok(idleAttempt({ calls: 30, writes: 0, callsSinceWrite: 30, recentFailures: 0 }))
+  assert.ok(idleAttempt({ calls: 60, writes: 3, callsSinceWrite: 26, recentFailures: 0 }))
+  assert.ok(idleAttempt({ calls: 20, writes: 2, callsSinceWrite: 3, recentFailures: 9 }))
+  assert.ok(!idleAttempt({ calls: 40, writes: 4, callsSinceWrite: 5, recentFailures: 2 }))
+  assert.ok(!idleAttempt(undefined))
+})
+
+test("quality: more cases passed first; on a tie the review, then cost, then size", async () => {
+  const t = (id: string) => ({ id } as Task)
+  const [a, b] = [t("T1"), t("T2")]
+  let r = await rankQuality([{ task: a, graded: 0.5, size: 10 }, { task: b, graded: 0.875, size: 90 }])
+  assert.deepEqual(r.order.map((x) => x.id), ["T2", "T1"])
+  assert.match(r.how, /more cases passed \(88% against 50%\)/)
+  let asked = 0
+  const review = async () => (asked++, { better: "B" as const, why: "handles the empty input" })
+  r = await rankQuality([{ task: a, graded: 1, cost: 0.01, size: 10 }, { task: b, graded: 1, cost: 0.02, size: 40 }], review)
+  assert.deepEqual(r.order.map((x) => x.id), ["T2", "T1"])
+  assert.match(r.how, /on review: handles the empty input/)
+  assert.equal(asked, 1)
+  r = await rankQuality([{ task: a, cost: 0.03, size: 10 }, { task: b, cost: 0.01, size: 40 }], async () => ({ better: "equal", why: "" }))
+  assert.deepEqual(r.order.map((x) => x.id), ["T2", "T1"])
+  assert.match(r.how, /the review found them equal; cheaper/)
+  r = await rankQuality([{ task: a, size: 50 }, { task: b, size: 12 }])
+  assert.match(r.how, /tied on the checks; smaller change \(12 against 50 lines\)/)
+  r = await rankQuality([{ task: a, size: 1 }])
+  assert.equal(r.how, "the only attempt that passed")
+})
+
+test("the review answers in one line of JSON; anything else is no verdict", () => {
+  assert.deepEqual(parseReview('Sure.\n{"better": "A", "why": "simpler"}'), { better: "A", why: "simpler" })
+  assert.equal(parseReview('{"better": "C"}'), undefined)
+  assert.equal(parseReview("A is better"), undefined)
+  assert.match(reviewPrompt("Add a flag", "diff a", "diff b"), /Change A:\ndiff a\n\nChange B:\ndiff b/)
+})
+
+test("settings: trialPick by agent or role id, trialGrace in minutes", () => {
+  assert.deepEqual(parseTrialPick("{}"), DEFAULT_PICK)
+  assert.deepEqual(parseTrialPick('{ "trialPick": { "coder": "first", "*": "user" } }'), { visual: "user", code: "first", "*": "user" })
+  assert.throws(() => parseTrialPick('{ "trialPick": { "coder": "fast" } }'), /trialPick must be/)
+  assert.throws(() => parseTrialPick('{ "trialPick": { "nobody": "best" } }'), /unknown agent/)
+  assert.deepEqual(parseTrialGrace('{ "trialGrace": { "maxMinutes": 3 } }'), { factor: 0.5, maxMs: 180_000 })
+  assert.deepEqual(parseTrialGrace("{}"), DEFAULT_GRACE)
+  assert.throws(() => parseTrialGrace('{ "trialGrace": { "factor": -1 } }'), /trialGrace must be/)
 })

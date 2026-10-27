@@ -26,6 +26,120 @@ export interface Assessment {
   readonly localBlock?: boolean
 }
 
+// Who decides a trial (the user, 2026-10-27: the first attempt to pass won, so the fastest model won, not the best or
+// the cheapest one):
+// - first: the first attempt whose checks pass is merged and the others are stopped;
+// - best: passed attempts are held; the others get a grace window, then the best by quality is merged;
+// - contract: the best score against the task's fitness contract (src/contract.ts);
+// - user: every attempt runs to its end and the user picks from a comparison (design drafts are a matter of taste).
+export type Pick = "first" | "best" | "contract" | "user"
+
+// Who decides by default, by role id; "*" for every other role.
+export const DEFAULT_PICK: Readonly<Record<string, Pick>> = { visual: "user", "*": "best" }
+
+// The pick for a new trial: the prompt's "Pick:" line, else the setting for its role.
+export function pickFor(role: string, setting: Readonly<Record<string, Pick>> = DEFAULT_PICK, line?: Pick): Pick {
+  return line ?? setting[role] ?? setting["*"] ?? "first"
+}
+
+// Who decides the trial a task belongs to: a contract always decides by score.
+export function pickOf(task: Task): Pick {
+  return task.contract ? "contract" : task.trial?.pick ?? "first"
+}
+
+// The grace window of a "best" trial: the other attempts get this share of the first passing one's time, at most this
+// long. factor 0 decides at once, as "first" does.
+export interface Grace {
+  readonly factor: number
+  readonly maxMs: number
+}
+
+export const DEFAULT_GRACE: Grace = { factor: 0.5, maxMs: 10 * 60_000 }
+
+export function graceMs(g: Grace, elapsedMs: number): number {
+  return Math.max(0, Math.min(g.factor * elapsedMs, g.maxMs))
+}
+
+// What each attempt is told about how its trial is decided.
+const HOW: Record<Pick, string> = {
+  first: "The first whose checks pass is merged and the others are stopped, so take the approach you think is most likely to pass",
+  best: "Of the attempts whose checks pass, the best is merged: by how many of the checks' cases pass, then a review of the changes, then cost and size. Once one passes, the others get a short grace window to finish. Aim for a correct, clean and small change, not only for passing",
+  contract: "Of the attempts whose checks pass, the one with the best score is merged once all are done, so aim for the best result the contract can measure, not only for passing",
+  user: "Every attempt runs to its end, and the user picks the one they like best from a comparison of all that pass. Make your own best version; do not hedge between styles",
+}
+
+// An attempt that is getting nowhere, by the watchdog's counts: it is stopped when a "best" trial's grace window opens
+// rather than paid for until the window closes.
+export function idleAttempt(p: { calls: number; writes: number; callsSinceWrite: number; recentFailures: number } | undefined): boolean {
+  if (!p) return false
+  return (p.writes === 0 && p.calls >= 20) || p.callsSinceWrite >= 25 || p.recentFailures >= 8
+}
+
+// What the quality ranking of a "best" trial knows about one passed attempt.
+export interface Quality {
+  readonly task: Task
+  readonly graded?: number // share of the checks' MM_SCORE cases passed
+  readonly cost?: number
+  readonly size: number // lines added and removed
+}
+
+// A pairwise review's verdict on two attempts (src/plugin.ts asks a model of a third family).
+export interface Review {
+  readonly better: "A" | "B" | "equal"
+  readonly why: string
+}
+
+const share = (q: Quality) => q.graded ?? -1
+const money = (n: number | undefined) => `$${(n ?? 0).toFixed(4)}`
+
+// The passed attempts best first, and why the first is first: the share of cases passed, then the review of the two
+// best (when there is one), then cost, then size. review is asked only when the two best are tied on cases.
+export async function rankQuality(held: readonly Quality[], review?: (a: Quality, b: Quality) => Promise<Review | undefined>): Promise<{ order: Task[]; how: string }> {
+  const byCases = [...held].sort((a, b) => share(b) - share(a) || (a.cost ?? 0) - (b.cost ?? 0) || a.size - b.size)
+  if (byCases.length < 2) return { order: byCases.map((q) => q.task), how: "the only attempt that passed" }
+  const [a, b] = byCases as [Quality, Quality]
+  if (share(a) > share(b)) return { order: byCases.map((q) => q.task), how: `more cases passed (${Math.round(share(a) * 100)}% against ${Math.round(share(b) * 100)}%)` }
+  const verdict = review ? await review(a, b).catch(() => undefined) : undefined
+  if (verdict && verdict.better !== "equal") {
+    const first = verdict.better === "A" ? a : b
+    return { order: [first.task, ...byCases.filter((q) => q !== first).map((q) => q.task)], how: `on review: ${verdict.why.slice(0, 200)}` }
+  }
+  const tied = verdict ? "the review found them equal" : "tied on the checks"
+  if ((a.cost ?? 0) !== (b.cost ?? 0)) return { order: byCases.map((q) => q.task), how: `${tied}; cheaper (${money(a.cost)} against ${money(b.cost)})` }
+  if (a.size !== b.size) return { order: byCases.map((q) => q.task), how: `${tied}; smaller change (${a.size} against ${b.size} lines)` }
+  return { order: byCases.map((q) => q.task), how: `${tied}, at the same cost and size` }
+}
+
+// The pairwise review's prompt: the task, and the two changes as A and B.
+export function reviewPrompt(task: string, a: string, b: string): string {
+  return [
+    "Two workers solved the same task, and both pass its checks. Judge which change is better: correct in the cases the checks may miss, simpler, easier to maintain, closer to what the task asked. Do not prefer the longer one.",
+    "Answer with one line of JSON and nothing else: {\"better\": \"A\" | \"B\" | \"equal\", \"why\": \"one sentence\"}",
+    "",
+    "Task:",
+    task.slice(0, 4000),
+    "",
+    "Change A:",
+    a,
+    "",
+    "Change B:",
+    b,
+  ].join("\n")
+}
+
+// The review's answer, or undefined when it is not the JSON asked for.
+export function parseReview(text: string): Review | undefined {
+  const m = text.match(/\{[^{}]*"better"[^{}]*\}/)
+  if (!m) return undefined
+  try {
+    const r = JSON.parse(m[0]) as { better?: unknown; why?: unknown }
+    if (r.better !== "A" && r.better !== "B" && r.better !== "equal") return undefined
+    return { better: r.better, why: typeof r.why === "string" ? r.why : "" }
+  } catch {
+    return undefined
+  }
+}
+
 // The difficulty from which a task runs as a trial: N5's "hard" and "very hard" (tierFor's deep tier).
 export const DEEP = 0.67
 export const DEFAULT_TRIALS = 3
@@ -68,6 +182,14 @@ export function ranked(c: Contract, held: readonly Task[]): Task[] {
 // The prompt line that starts another attempt; native.ts parseDelegation reads it back.
 export const attemptLine = (task: string, job: string) => `Attempt: ${task} · ${job}`
 
+// How the micromanager hears that a trial is decided.
+const DECIDED: Record<Pick, (head: Task) => string> = {
+  first: () => "the first whose checks pass is merged, and the others are stopped",
+  best: () => "and of those whose checks pass, the best by quality is merged after a short grace window for the others",
+  contract: (head) => `and of those whose checks pass, the one with the best score against contract ${head.contract?.id ?? "?"} is merged once all are done`,
+  user: () => "every attempt runs to its end, and the user picks one from a comparison of those that pass",
+}
+
 // What the micromanager reads after starting the first attempt: start the rest now, in one message.
 export function fanOutText(job: Job, head: Task): string | undefined {
   if (!head.trial || head.trial.of !== head.id) return undefined
@@ -76,7 +198,7 @@ export function fanOutText(job: Job, head: Task): string | undefined {
   const agent = roleById(head.role)?.agent ?? head.role
   const why = head.difficulty !== undefined && head.difficulty >= DEEP ? `it is hard (difficulty ${head.difficulty.toFixed(2)})` : "an earlier attempt at this work failed"
   return [
-    `${HEADER} ${head.id} runs as a trial of ${head.trial.n} attempts, because ${why}: each attempt works in its own worktree on another model, ${head.contract ? `and of those whose checks pass, the one with the best score against contract ${head.contract.id} is merged once all are done` : "the first whose checks pass is merged, and the others are stopped"}.`,
+    `${HEADER} ${head.id} runs as a trial of ${head.trial.n} attempts, because ${why}: each attempt works in its own worktree on another model, ${DECIDED[pickOf(head)](head)}.`,
     `Start the other ${missing} attempt${missing > 1 ? "s" : ""} now, in one message, with the subagent tool (background = true), each with agent ${agent}, description "${head.id} attempt", and only this prompt:`,
     attemptLine(head.id, job.id),
     "The plugin gives each the same task, files and checks. Do not wait for the first attempt, and do not start the task again yourself: the trial's result comes to you as a note.",
@@ -87,9 +209,7 @@ export function fanOutText(job: Job, head: Task): string | undefined {
 export function attemptBrief(task: Task): string {
   if (!task.trial) return ""
   const index = Number(task.title.match(/\(attempt (\d+)\//)?.[1] ?? 1)
-  return task.contract
-    ? `You are attempt ${index} of ${task.trial.n} at this task: other workers try the same task at the same time, each in its own worktree on another model. Of the attempts whose checks pass, the one with the best score is merged once all are done, so aim for the best result the contract can measure, not only for passing, and do not wait for anyone.`
-    : `You are attempt ${index} of ${task.trial.n} at this task: other workers try the same task at the same time, each in its own worktree on another model. The first whose checks pass is merged and the others are stopped, so take the approach you think is most likely to pass, and do not wait for anyone.`
+  return `You are attempt ${index} of ${task.trial.n} at this task: other workers try the same task at the same time, each in its own worktree on another model. ${HOW[pickOf(task)]}, and do not wait for anyone.`
 }
 
 // Why each failed attempt failed, from its last failing stage: the brief for splitting the task.
@@ -117,7 +237,8 @@ export function attemptFailedText(task: Task, live: readonly Task[]): string {
 }
 
 // The micromanager's note when an attempt won. score: how it won on score, for a trial decided by its contract.
-export function wonText(job: Job, winner: Task, stopped: readonly Task[], failed: number, head?: string, score?: { beaten: readonly Task[]; how: string }): string {
-  const by = score ? ` with the best score (${score.how})${score.beaten.length ? `, ahead of ${score.beaten.map((t) => t.id).join(", ")}` : ""}` : ""
+export function wonText(job: Job, winner: Task, stopped: readonly Task[], failed: number, head?: string, score?: { beaten: readonly Task[]; how: string; by?: "score" | "quality" | "user" }): string {
+  const label = { score: "with the best score", quality: "as the best attempt", user: "as the user's pick" }[score?.by ?? "score"]
+  const by = score ? ` ${label} (${score.how})${score.beaten.length ? `, ahead of ${score.beaten.map((t) => t.id).join(", ")}` : ""}` : ""
   return `${HEADER} ${winner.id} won the trial of ${head ?? winner.trial?.of ?? winner.id}${by}: merged into ${job.integrationBranch}${failed ? ` after ${failed} other attempt${failed > 1 ? "s" : ""} failed` : ""}.${stopped.length ? ` Stopped: ${stopped.map((t) => t.id).join(", ")}; their work is not needed.` : ""}`
 }

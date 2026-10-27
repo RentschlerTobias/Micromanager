@@ -41,7 +41,7 @@ import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
 import { formInput, startForm } from "./forms.ts"
 import { estimate, EVOLVER_MAX_EVAL_S, evolverFits, evolverForm } from "./evolver.ts"
 import { gitState } from "./nogit.ts"
-import { allFailedText, attemptBrief, attemptFailedText, attempts, fanOutText, ranked, standing, wonText, type Assessment } from "./trials.ts"
+import { allFailedText, attemptBrief, attemptFailedText, attempts, DEFAULT_GRACE, DEFAULT_PICK, fanOutText, graceMs, pickFor, pickOf, rankQuality, ranked, standing, wonText, type Assessment, type Grace, type Pick as TrialPick, type Quality, type Review } from "./trials.ts"
 
 // The first line OpenCode puts before a new subagent's prompt; how the prompt hook tells a child's first turn.
 export const CHILD_PREFIX = "You are a subagent spawned by another session."
@@ -59,6 +59,7 @@ export interface Delegation {
   readonly frozen?: string // files it may read and run but not change, as written ("Frozen: test/a.test.js")
   readonly redteam?: { readonly contract: string; readonly job: string } // a contract's red team ("Red team: C1 · job-…")
   readonly method?: "worker" | "trial" | "evolver" // how the user chose to have it done ("Method: trial", src/evolver.ts)
+  readonly pick?: "first" | "best" | "user" // who decides its trial ("Pick: me", src/trials.ts)
 }
 
 // The "Files:" and "Checks:" lines of a delegation, wherever they stand; the checks go on over the following lines
@@ -74,8 +75,16 @@ export function parseDelegation(prompt: string): Delegation {
   let contract: string | undefined
   let redteam: Delegation["redteam"]
   let method: Delegation["method"]
+  let pick: Delegation["pick"]
   let inChecks = false
   for (const line of prompt.split("\n")) {
+    const pk = line.match(/^\s*pick:\s*(me|user|best|first)\s*$/i)
+    if (pk) {
+      const v = pk[1]!.toLowerCase()
+      pick = v === "me" ? "user" : (v as Delegation["pick"])
+      inChecks = false
+      continue
+    }
     const mt = line.match(/^\s*method:\s*(worker|trial|evolver)\s*$/i)
     if (mt) {
       method = mt[1]!.toLowerCase() as Delegation["method"]
@@ -132,7 +141,7 @@ export function parseDelegation(prompt: string): Delegation {
       body.push(line)
     }
   }
-  return { body: body.join("\n").trim(), files, checks, replaces, ...(frozen ? { frozen } : {}), ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}), ...(contract ? { contract } : {}), ...(redteam ? { redteam } : {}), ...(method ? { method } : {}) }
+  return { body: body.join("\n").trim(), files, checks, replaces, ...(frozen ? { frozen } : {}), ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}), ...(contract ? { contract } : {}), ...(redteam ? { redteam } : {}), ...(method ? { method } : {}), ...(pick ? { pick } : {}) }
 }
 
 // How much two task texts are about the same thing: the share of their words they have in common (Jaccard over the
@@ -188,6 +197,14 @@ export interface NativeDeps {
   // A trial decided by score (src/contract.ts) waits this long after its first passing attempt for the others (the
   // "trialDeadline" setting); then the best of the passed ones is merged and the rest are stopped.
   readonly trialDeadlineMs?: number
+  // Who decides a trial by role id ("trialPick", src/trials.ts), and the grace window of a "best" trial ("trialGrace").
+  readonly trialPick?: Readonly<Record<string, TrialPick>>
+  readonly trialGrace?: Grace
+  // Whether an attempt's session is getting nowhere (the watchdog's counts, src/trials.ts idleAttempt): stopped when a
+  // "best" trial's grace window opens.
+  readonly idle?: (session: string) => boolean
+  // A pairwise review of two passed attempts by a model of a third family (src/plugin.ts); undefined when none can.
+  readonly review?: (task: Task, a: { task: Task; diff: string }, b: { task: Task; diff: string }) => Promise<Review | undefined>
   // A trial was decided by score. note and stop are set when nobody's finish_task carries them (a deadline, the last
   // attempt ending): the note goes to the micromanager, the sessions are interrupted. measured: the attempts that
   // waited for the decision, whose outcomes the log gets now that they are known.
@@ -296,6 +313,10 @@ export class Native {
     this.#planFirst = deps.planFirst ?? false
     this.#noGit = deps.noGit
     this.#deadlineMs = deps.trialDeadlineMs ?? TRIAL_DEADLINE_MS
+    this.#trialPick = deps.trialPick ?? DEFAULT_PICK
+    this.#grace = deps.trialGrace ?? DEFAULT_GRACE
+    this.#idle = deps.idle
+    this.#review = deps.review
     this.#onSettled = deps.onSettled
     this.#evolverReady = deps.evolverReady ?? (() => false)
     this.#evolverCallCost = deps.evolverCallCost ?? (() => 0.004)
@@ -330,6 +351,10 @@ export class Native {
 
   readonly #deadlineMs: number
   readonly #onSettled?: NativeDeps["onSettled"]
+  readonly #trialPick: Readonly<Record<string, TrialPick>>
+  readonly #grace: Grace
+  readonly #idle?: NativeDeps["idle"]
+  readonly #review?: NativeDeps["review"]
   readonly #deadlines = new Map<string, ReturnType<typeof setTimeout>>() // "<job>/<head>" -> its trial's deadline
 
   readonly #noGit?: (project: string) => Promise<string>
@@ -414,7 +439,7 @@ export class Native {
       // A trial decided by score whose deadline lived in the process that ended: armed again, from the time it had.
       for (const head of job.tasks.filter((t) => t.settleBy && t.trial?.of === t.id)) {
         const now = standing(job, head)
-        if (!now.winner && now.held.length) this.#arm(project, job, head)
+        if (!now.winner && now.held.length && pickOf(head) !== "user") this.#arm(project, job, head)
       }
     }
     return adopted
@@ -502,7 +527,7 @@ export class Native {
     this.#link(project, job, task, d.replaces)
     task.role = role.id
     task.model = model
-    this.#assess(project, job, task, assess)
+    this.#assess(project, job, task, assess, d.pick)
     for (const s of ["ready", "planned", "running"] as const) moveTask(task, s)
     stage(task, "delegate", "pass", `${role.agent} on ${model}`)
     return this.#start(project, parent, job, task, role, model, d, d.checks, rel)
@@ -1018,11 +1043,11 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
 
   // The difficulty on the task, and a trial when the plugin asked for one and the job can run one: in worktrees of its
   // own (no trial without git) and with Parallel on.
-  #assess(project: string, job: Job, task: Task, assess?: Assessment): void {
+  #assess(project: string, job: Job, task: Task, assess?: Assessment, pick?: Delegation["pick"]): void {
     if (assess?.difficulty !== undefined) task.difficulty = assess.difficulty
     if (!assess || assess.trials < 2 || !WRITERS.has(task.role) || job.isolation === "none") return
     if (!optionsOf(loadControl(project, job.id), lastOptions(project)).parallel) return
-    task.trial = { of: task.id, n: assess.trials }
+    task.trial = { of: task.id, n: assess.trials, pick: pickFor(task.role, this.#trialPick, pick) }
     task.title = `${task.title.replace(/ \(attempt \d+\/\d+\)$/, "")} (attempt 1/${assess.trials})`.slice(0, 140)
   }
 
@@ -1207,7 +1232,7 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
     task.attempts = 0
     // A task started again starts a new trial, if it gets one: the old attempts' trial is over.
     task.trial = undefined
-    this.#assess(project, job, task, assess)
+    this.#assess(project, job, task, assess, d.pick)
     this.#bind(job, task, contract)
     if (d.frozen) task.freeze = [...new Set([...(task.freeze ?? []), ...parseFiles(d.frozen, project).files])]
     stage(task, "delegate", "pass", `${role.agent} on ${model}, planned task`)
@@ -1646,6 +1671,8 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
     moveTask(task, "passed")
     const scored = task.trial && entry.contract ? job.contracts?.find((x) => x.id === entry.contract) : undefined
     if (scored) return this.#hold(entry, job, task, scored, fitness.evidence)
+    const mode = task.trial ? pickOf(task) : undefined
+    if ((mode === "best" && this.#grace.factor > 0) || mode === "user") return this.#holdPick(entry, job, task, mode)
     const train = this.#trains.get(job.id) ?? Promise.resolve()
     const step = train.then(() => (task.status === "cancelled" ? { ok: false as const, text: lostText(job, task) } : this.#merge(entry, job, task)))
     this.#trains.set(job.id, step.catch(() => undefined))
@@ -1667,7 +1694,7 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
   // A trial's attempt merged: it won. Every other attempt is done over by it (replacedBy, so what waits for the first
   // attempt waits for the winner), cancelled, and its worktree goes; the ones still at work are returned to be stopped.
   // score: how the winner won a trial decided by its contract, for the note; the held attempts it beat lost on score.
-  async #settleTrial(winner: Entry, job: Job, task: Task, score?: string): Promise<{ note: string; stop: string[] }> {
+  async #settleTrial(winner: Entry, job: Job, task: Task, score?: string, by: "score" | "quality" | "user" = "score"): Promise<{ note: string; stop: string[] }> {
     const now = standing(job, task)
     const stop: string[] = []
     const stopped = now.live.filter((t) => t !== task)
@@ -1682,9 +1709,9 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
       if (e) await this.#dropWorktree(e, other)
     }
     // The first attempt is what the plan and the dependants know: done over by the winner, it counts as done.
-    stage(task, "trial", "pass", `won the trial of ${task.trial!.of}${score ? ` on score (${score})` : ""} (${now.failed.length} failed, ${stopped.length} stopped${beaten.length ? `, ${beaten.length} beaten` : ""})`)
+    stage(task, "trial", "pass", `won the trial of ${task.trial!.of}${score ? ` ${{ score: "on score", quality: "on quality", user: "as the user's pick" }[by]} (${score})` : ""} (${now.failed.length} failed, ${stopped.length} stopped${beaten.length ? `, ${beaten.length} beaten` : ""})`)
     saveJob(winner.project, job)
-    return { note: wonText(job, task, stopped, now.failed.length, undefined, score !== undefined ? { beaten, how: score } : undefined), stop }
+    return { note: wonText(job, task, stopped, now.failed.length, undefined, score !== undefined ? { beaten, how: score, by } : undefined), stop }
   }
 
   // A passed attempt of a trial decided by score: measured on the held-out cases too, committed, and held in its
@@ -1716,6 +1743,71 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
     }
   }
 
+  // A passed attempt of a trial decided by quality or by the user: committed and held in its worktree. A "best" trial
+  // opens its grace window with the first one (a share of that attempt's time) and stops the attempts that are getting
+  // nowhere; a "user" trial waits for every attempt to end, with no deadline.
+  async #holdPick(entry: Entry, job: Job, task: Task, mode: "best" | "user"): Promise<{ text: string; note?: string; parent?: string; stop?: string[] }> {
+    task.held = true
+    stage(task, "trial", "pass", mode === "user" ? "passed, waits for the user's pick" : "passed, waits for the trial to be decided by quality")
+    const head = job.tasks.find((t) => t.id === task.trial!.of) ?? task
+    const stop: string[] = []
+    if (mode === "best") {
+      if (!head.settleBy) {
+        const started = Date.parse(task.stages.find((s) => s.stage === "delegate")?.at ?? "")
+        const window = graceMs(this.#grace, Number.isFinite(started) ? Date.now() - started : 0)
+        this.#arm(entry.project, job, head, window)
+        stage(task, "trial", "pass", `first to pass: the others have ${Math.round(window / 1000)} s to finish`)
+      }
+      stop.push(...(await this.#stopIdle(job, head)))
+    }
+    saveJob(entry.project, job)
+    const settled = await this.#settleQueued(entry.project, job, head, false)
+    if (settled) this.#onSettled?.({ project: entry.project, job, parent: entry.parent, stop: [], measured: settled.measured })
+    if (settled?.winner === task) {
+      return { text: `Your attempt won the trial and is merged into ${job.integrationBranch}. Now end with your short report.`, note: settled.note, parent: entry.parent, stop: [...stop, ...settled.stop] }
+    }
+    const text = mode === "user"
+      ? "Your checks pass, and your commit waits in your worktree: the user picks one of the attempts once all of them are done. There is nothing more to do; end now with your short report, saying in a sentence what makes your version yours."
+      : "Your checks pass, and your commit waits in your worktree: once the other attempts had their grace window, the best one is merged. There is nothing more to do; end now with your short report."
+    const all = [...stop, ...(settled?.stop ?? [])]
+    return { text, ...(settled ? { note: settled.note } : {}), ...(settled || all.length ? { parent: entry.parent } : {}), ...(all.length ? { stop: all } : {}) }
+  }
+
+  // The live attempts of a trial that are getting nowhere: cancelled, their worktrees gone; their sessions to stop.
+  async #stopIdle(job: Job, head: Task): Promise<string[]> {
+    if (!this.#idle) return []
+    const sessions: string[] = []
+    for (const t of standing(job, head).live) {
+      const e = this.#entries.get(`${job.id}/${t.id}`)
+      if (!e?.session || e.ended || !this.#idle(e.session)) continue
+      moveTask(t, "cancelled")
+      stage(t, "trial", "fail", "stopped: no progress when the grace window opened")
+      sessions.push(e.session)
+      await this.#dropWorktree(e, t)
+    }
+    return sessions
+  }
+
+  // What the quality ranking knows about each passed attempt: its cases, cost and the size of its change.
+  async #quality(job: Job, held: readonly Task[]): Promise<{ q: Quality[]; diffs: Map<string, string> }> {
+    const q: Quality[] = []
+    const diffs = new Map<string, string>()
+    for (const t of held) {
+      const e = this.#entries.get(`${job.id}/${t.id}`)
+      let size = 0
+      if (e && !e.removed) {
+        const stat = await this.#exec("git", ["diff", "--numstat", `${job.integrationBranch}...HEAD`], { cwd: e.worktree })
+        for (const line of stat.stdout.split("\n")) {
+          const [add, del] = line.split("\t")
+          size += (Number(add) || 0) + (Number(del) || 0)
+        }
+        diffs.set(t.id, (await this.#exec("git", ["diff", `${job.integrationBranch}...HEAD`], { cwd: e.worktree })).stdout.slice(0, 30_000))
+      }
+      q.push({ task: t, size, ...(t.graded?.total ? { graded: t.graded.passed / t.graded.total } : {}), ...(t.usage ? { cost: t.usage.cost } : {}) })
+    }
+    return { q, diffs }
+  }
+
   // A red team that passed its checks: measured on the visible corpus without its guards (gaming them is the point),
   // never committed or merged. What it found is in its report.
   async #redteamDone(entry: Entry, job: Job, task: Task): Promise<{ text: string }> {
@@ -1734,8 +1826,8 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
   }
 
   // The trial's deadline, armed once per trial from its first held attempt; after a restart from the time it had.
-  #arm(project: string, job: Job, head: Task): void {
-    head.settleBy ??= new Date(Date.now() + this.#deadlineMs).toISOString()
+  #arm(project: string, job: Job, head: Task, ms = this.#deadlineMs): void {
+    head.settleBy ??= new Date(Date.now() + ms).toISOString()
     const k = `${job.id}/${head.id}`
     if (this.#deadlines.has(k)) return
     const timer = setTimeout(() => {
@@ -1767,6 +1859,9 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
   // machine that was busier during one attempt's measurement does not decide it. One that reached the target wins at
   // once. When the best cannot be merged (a conflict), the next is tried.
   async #settle(project: string, job: Job, head: Task, force: boolean): Promise<{ winner?: Task; note: string; stop: string[]; measured: Task[] } | undefined> {
+    const mode = pickOf(head)
+    if (mode === "best") return this.#settleBest(project, job, head, force)
+    if (mode === "user") return this.#settleUser(project, job, head)
     const c = job.contracts?.find((x) => x.id === head.contract?.id)
     const now = standing(job, head)
     if (!c || now.winner || !now.held.length) return undefined
@@ -1806,6 +1901,49 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
     }
     saveJob(project, job)
     return { note: `${HEADER} The trial of ${head.id} is decided by score, but none of its passed attempts (${order.map((t) => t.id).join(", ")}) merged onto ${job.integrationBranch}: each conflicts with what other tasks merged meanwhile. Continue the best one with the subagent tool and its sessionID to resolve the conflict.`, stop: [], measured: now.held }
+  }
+
+  // Decides a "best" trial once no attempt is at work (or force: the grace window closed): the passed attempts ranked by
+  // quality (src/trials.ts rankQuality), the best merged, the next tried when it does not merge.
+  async #settleBest(project: string, job: Job, head: Task, force: boolean): Promise<{ winner?: Task; note: string; stop: string[]; measured: Task[] } | undefined> {
+    const now = standing(job, head)
+    if (now.winner || !now.held.length) return undefined
+    if (!force && now.live.length) return undefined
+    const { q, diffs } = await this.#quality(job, now.held)
+    const review = this.#review
+      ? (a: Quality, b: Quality) => {
+          const da = diffs.get(a.task.id) ?? ""
+          const db = diffs.get(b.task.id) ?? ""
+          // Near-identical changes need no reviewer: cost and size decide.
+          if (similarity(da, db) >= 0.95) return Promise.resolve(undefined)
+          return this.#review!(head, { task: a.task, diff: da }, { task: b.task, diff: db })
+        }
+      : undefined
+    const ranking = await rankQuality(q, review)
+    const k = `${job.id}/${head.id}`
+    for (const cand of ranking.order) {
+      const e = this.#entries.get(`${job.id}/${cand.id}`)
+      if (!e || e.removed) continue
+      const merged = await this.#merge(e, job, cand)
+      if (!merged.ok) {
+        stage(cand, "trial", "fail", "ranked best but did not merge")
+        continue
+      }
+      const won = await this.#settleTrial(e, job, cand, cand === ranking.order[0] ? ranking.how : "the better ones did not merge", "quality")
+      clearTimeout(this.#deadlines.get(k))
+      this.#deadlines.delete(k)
+      saveJob(project, job)
+      return { winner: cand, note: won.note, stop: won.stop, measured: now.held }
+    }
+    saveJob(project, job)
+    return { note: `${HEADER} The trial of ${head.id} is decided, but none of its passed attempts (${ranking.order.map((t) => t.id).join(", ")}) merged onto ${job.integrationBranch}: each conflicts with what other tasks merged meanwhile. Continue the best one with the subagent tool and its sessionID to resolve the conflict.`, stop: [], measured: now.held }
+  }
+
+  // A "user" trial once no attempt is at work: the user is asked to pick (P5). Until then nothing is decided.
+  async #settleUser(_project: string, job: Job, head: Task): Promise<{ winner?: Task; note: string; stop: string[]; measured: Task[] } | undefined> {
+    const now = standing(job, head)
+    if (now.winner || !now.held.length || now.live.length) return undefined
+    return undefined
   }
 
   // The note when a trial's attempt failed: the trial's state (others still run, or all failed); undefined outside one.

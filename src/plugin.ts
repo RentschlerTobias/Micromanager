@@ -63,7 +63,7 @@ import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo } fro
 import { classOf, learnedSteps, needsTrials, outcomeOf, readOutcomes, recordOutcome } from "./outcomes.ts"
 import { heldOutDir } from "./contract.ts"
 import { heldOutProblem, markBlock, readMethod, runEvolver, specOf, startBridge, type Progress, type Running } from "./evolver.ts"
-import { DEEP, trialSize, type Assessment } from "./trials.ts"
+import { DEEP, idleAttempt, parseReview, reviewPrompt, trialSize, type Assessment } from "./trials.ts"
 import { Accountant, chargeTask, limitsOf, overBudget, overNote, sessionUsage, wrapUpNote } from "./budget.ts"
 import { seedFromJournal, Usage } from "./usage.ts"
 import { CHECKPOINT_STEPS, MAX_STEPS, Watchdog, type Signal } from "./watchdog.ts"
@@ -994,7 +994,27 @@ export default {
     }
     const native = (SHARED.native ??= new Native({
       installedSkills, planFirst: true, noGit: (dir) => noGitNote(dir), evolverReady: () => evolverReady, evolverCallCost, evolverMaxEvalSeconds: () => loadSettings().evolverMaxEvalSeconds,
-      trialDeadlineMs: settings.trialDeadline * 60_000, onSettled: (r) => void settledTrial(r).catch((err: unknown) => log("warn", `trial settle failed: ${String(err)}`)),
+      trialDeadlineMs: settings.trialDeadline * 60_000, trialPick: settings.trialPick, trialGrace: settings.trialGrace,
+      idle: (session) => idleAttempt(SHARED.watchdog.progress(session)),
+      // The pairwise review of a "best" trial: a model of a third family, in a hidden, tool-less session; none when the
+      // pool has no third family to offer.
+      review: async (task, a, b) => {
+        const families = [a.task.model, b.task.model].filter((m): m is string => Boolean(m)).map(family)
+        const choice = await chooseModel(roleById("review")!, { vision: false }, routingNow(), a.task.model, hostModels, { usage, budget: goBudget, avoidFamilies: families })
+        if (families.includes(family(choice.model))) return undefined
+        const s = await ctx.session.create({ title: `[trial] review · ${task.id}`, agent: SUMMARIZER_AGENT, model: toModel(choice.model), location: { directory: project ?? process.cwd() } })
+        await ctx.session.prompt({ sessionID: s.id, text: reviewPrompt(`${task.title}\n${task.description}`, a.diff, b.diff) })
+        await ctx.session.wait({ sessionID: s.id })
+        const verdict = parseReview(lastAssistantText(await ctx.session.context({ sessionID: s.id }).catch(() => undefined)))
+        // Its cost is the task's, like a helper's.
+        if (task.session) {
+          SHARED.helperOf.set(s.id, task.session)
+          await charge(s.id).catch(() => undefined)
+          SHARED.helperOf.delete(s.id)
+        }
+        record({ kind: "trial.review", task: task.id, a: a.task.id, b: b.task.id, model: choice.model, better: verdict?.better, why: verdict?.why })
+        return verdict
+      }, onSettled: (r) => void settledTrial(r).catch((err: unknown) => log("warn", `trial settle failed: ${String(err)}`)),
     }))
     const workerJobs = SHARED.workerJobs
     const workerDirs = SHARED.workerDirs

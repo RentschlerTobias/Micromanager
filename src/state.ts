@@ -163,8 +163,9 @@ export interface Task {
   steps?: number // its worker's steps, counted by the watchdog, as of its last end
   replacedBy?: string
   difficulty?: number // the N5 estimate at a native delegation, 0..1 (src/trials.ts)
-  // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has (src/trials.ts).
-  trial?: { of: string; n: number }
+  // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has, `pick` who
+  // decides it (src/trials.ts Pick; absent on trials from before 2026-10-28, which the first passing attempt decided).
+  trial?: { of: string; n: number; pick?: "first" | "best" | "contract" | "user" }
 }
 
 export interface Job {
