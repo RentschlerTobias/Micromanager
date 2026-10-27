@@ -179,7 +179,9 @@ function groupTrials(rows: readonly Outcome[]): TrialRow[] {
 }
 
 // export-dataset --target router: one row per task (a trial's attempts joined), with what a router sees before the
-// start, what it chose, and what came of it. Censored attempts (stopped because a sibling won) are kept as such.
+// start, what it chose, and what came of it. Censored attempts (stopped because a sibling won) are kept as such; an
+// attempt that passed and lost on quality, score or the user's pick is an observed result, and the row says which
+// model won and how it was chosen.
 export function routerRows(rows: readonly Outcome[]): Record<string, unknown>[] {
   return groupTrials(rows).map((t) => {
     const first = t.attempts[0]!
@@ -196,6 +198,8 @@ export function routerRows(rows: readonly Outcome[]): Record<string, unknown>[] 
         cost: Math.round(t.attempts.reduce((s, a) => s + (a.cost ?? 0), 0) * 1e6) / 1e6,
         seconds: Math.max(0, ...t.attempts.map((a) => a.seconds ?? 0)),
         ...(t.attempts.some((a) => a.reward !== undefined) ? { reward: Math.max(...t.attempts.map((a) => a.reward ?? 0)) } : {}),
+        ...(t.attempts.some((a) => a.chosenBy) ? { winner: t.attempts.find((a) => a.chosenBy)!.model, chosenBy: t.attempts.find((a) => a.chosenBy)!.chosenBy } : {}),
+        ...(t.attempts.some((a) => a.end.startsWith("lost_on_")) ? { lost: t.attempts.filter((a) => a.end.startsWith("lost_on_")).map((a) => a.model) } : {}),
       },
     }
   })

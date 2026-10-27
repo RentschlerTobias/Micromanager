@@ -63,6 +63,11 @@ test("the router rows join a trial's attempts and keep the stopped ones as censo
   ]
   const out = routerRows(rows)
   assert.equal(out.length, 2)
+  const picked = routerRows([
+    row({ task: "T1", trial: "T1", n: 2, model: "a/x", merged: false, end: "lost_on_pick", tokens: 1 }),
+    row({ task: "T2", trial: "T1", n: 2, model: "b/y", chosenBy: "user", tokens: 1 }),
+  ])[0]!.outcome as Record<string, unknown>
+  assert.deepEqual([picked.censored, picked.winner, picked.chosenBy, picked.lost], [0, "b/y", "user", ["a/x"]])
   assert.deepEqual(out[0], {
     key: "job-1/T1",
     cls: "code:agent:1",
