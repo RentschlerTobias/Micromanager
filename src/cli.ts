@@ -45,7 +45,12 @@ export async function main(argv: readonly string[]): Promise<number> {
       return 126
     }
     try {
-      const wrapped = await box.wrap(args.slice(sep + 1).map(quote).join(" "), rulesFor({ role: "code", writer: true, dir, worktree: dir, domains: [] }))
+      // The held-out corpus lies in the plugin's state directory, which the sandbox keeps from every worker; the
+      // evaluator measuring the best candidate on it (MM_CORPUS_DIR) may read that one directory, read-only.
+      const rules = rulesFor({ role: "code", writer: true, dir, worktree: dir, domains: [] })
+      const corpus = process.env.MM_CORPUS === "heldout" ? process.env.MM_CORPUS_DIR : undefined
+      const allowed = corpus ? { ...rules, filesystem: { ...rules.filesystem, allowRead: [...rules.filesystem.allowRead, corpus] } } : rules
+      const wrapped = await box.wrap(args.slice(sep + 1).map(quote).join(" "), allowed)
       const r = spawnSync("bash", ["-c", wrapped], { cwd: dir, stdio: "inherit", env: cleanEnv(process.env, ["MM_CORPUS", "MM_CORPUS_DIR", "MM_REPEAT"]) })
       return r.status ?? 1
     } finally {
