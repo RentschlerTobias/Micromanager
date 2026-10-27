@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
-# Install micromanager into OpenCode (a symlink, so the repo stays the source), or remove it:
+# Install micromanager into OpenCode from a checkout (a symlink, so the repo stays the source), or remove it. For a run
+# without a checkout use OpenCode's own installer, which needs nothing from this script:
+#   opencode plugin add 'github:RentschlerTobias/Micromanager#v0.1.0'
+#
 #   ./install.sh            link src/plugin.ts into ~/.config/opencode/plugins/micromanager.ts, and write the TUI
 #                           package ~/.config/opencode/micromanager-tui/ (job progress in the TUI, src/tui.tsx) into
 #                           the "plugins" of ~/.config/opencode/cli.json
 #   ./install.sh --remove   remove both
-#   ./install.sh --skills   link skills/<name> into ~/.config/opencode/skills/
+#   ./install.sh --skills   no-op: the plugin registers skills/<name> into OpenCode itself, a restart is enough
 #   ./install.sh --embedding [0.6b|4b|8b]   download Qwen3-Embedding (Q8, default 4b) and run it as the user service
 #                           micromanager-embedding.service (llama.cpp on the CPU, port 8093) for the memory's search
 #   ./install.sh --embedding-remove         stop and remove that service (the model file stays)
 # OpenCode loads plugins when it starts: restart the hub/server afterwards.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# pwd -P instead of readlink -f: BSD readlink has no -f, and this script is run on macOS too.
+REPO="$(cd "$(dirname "$0")" && pwd -P)"
 PLUGINS="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"
 LINK="$PLUGINS/micromanager.ts"
 
-SKILLS="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills"
 CLI="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/cli.json"
 # The TUI package: opencode 2.0.18 wants a package directory exporting "./tui", and a relative import out of that
 # directory does not resolve (live check: a package inside this repository importing ../src/tui.tsx never loaded),
 # so the package is written here and imports the code by its absolute path. Its entry must be named tui.tsx: the same
-# package with index.tsx was silently not loaded (live check, 2026-10-19).
+# package with index.tsx was silently not loaded (live check, 2026-10-19). A package install (`plugin add`) needs none
+# of this: package.json exports "./tui" itself.
 TUI="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/micromanager-tui"
 
 write_tui() {
@@ -49,19 +53,10 @@ cli_plugin() {
   ' "$CLI" "$TUI" "$1"
 }
 
-# --skills: link the repo's skills (skills/<name>/SKILL.md) into the user's OpenCode skills directory.
+# --skills: no-op since 2026-10-26, kept so an old command still works. The plugin registers skills/<name> through
+# ctx.skill at setup (src/skills.ts), so a checkout and a package install both need no links; a restart is enough.
 if [[ "${1:-}" == "--skills" ]]; then
-  mkdir -p "$SKILLS"
-  for dir in "$REPO"/skills/*/; do
-    name="$(basename "$dir")"
-    target="$SKILLS/$name"
-    if [[ -e "$target" && ! -L "$target" ]]; then
-      echo "$target exists and is not our link; not touching it" >&2
-      continue
-    fi
-    ln -sfn "${dir%/}" "$target"
-    echo "linked $target -> ${dir%/}"
-  done
+  echo "nothing to do: the plugin registers its skills itself; restart the OpenCode server"
   exit 0
 fi
 
@@ -124,7 +119,7 @@ fi
 mkdir -p "$PLUGINS"
 # The link's name before 2026-10-19: two links to the same plugin would load it twice.
 OLD_LINK="$PLUGINS/jev-micromanager.ts"
-if [[ -L "$OLD_LINK" && "$(readlink -f "$OLD_LINK")" == "$(readlink -f "$REPO/src/plugin.ts")" ]]; then
+if [[ -L "$OLD_LINK" && "$(realpath "$OLD_LINK")" == "$(realpath "$REPO/src/plugin.ts")" ]]; then
   rm "$OLD_LINK" && echo "removed the old link $OLD_LINK"
 fi
 if [[ -e "$LINK" && ! -L "$LINK" ]]; then

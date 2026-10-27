@@ -25,6 +25,7 @@ export interface TaskRow {
   readonly status: TaskStatus
   readonly detail: string
   readonly session?: string // the newest session that worked on it: where "open" goes
+  readonly sessions?: readonly string[] // every session of the task, oldest first (the sidebar unfolds them)
   readonly model?: string
   readonly since?: string // when its current run started (ISO), for a running task
   readonly startable: boolean // open, and every task it depends on is merged
@@ -81,6 +82,12 @@ export function resolver(jobs: readonly Job[]): Resolve {
   return (id) => all.get(id)
 }
 
+// Every session a task ever had, oldest first, without duplicates: the sidebar unfolds them under the task
+// (src/tui.tsx JobChecklist, src/switcher.ts taskSessions).
+export function allSessions(t: Pick<Task, "session" | "sessions">): readonly string[] {
+  return [...new Set([...(t.sessions ?? []), t.session].filter((id): id is string => !!id))]
+}
+
 export function view(job: Job, now = Date.now(), resolve: Resolve = () => undefined): JobView {
   const live = job.tasks.filter((t) => !t.undone)
   const ready = new Set(startable(job, resolve).map((t) => t.id))
@@ -107,6 +114,7 @@ export function view(job: Job, now = Date.now(), resolve: Resolve = () => undefi
       status: t.status,
       detail: detail(t, now),
       session: t.sessions?.at(-1) ?? t.session,
+      ...(allSessions(t).length ? { sessions: allSessions(t) } : {}),
       ...(t.model ? { model: t.model } : {}),
       ...(RUNNING.includes(t.status) && startedAt(t) ? { since: startedAt(t) } : {}),
       startable: ready.has(t.id),
@@ -149,20 +157,21 @@ export interface SidebarLine {
   readonly id: string
   readonly title: string
   readonly detail?: string // running: "glm 4m"; waiting: what it asks
-  readonly session?: string
+  readonly session?: string // the newest session that worked on it: where "open" goes
+  // Every session of the task, oldest first, so the sidebar can unfold them (src/switcher.ts taskSessions).
+  readonly sessions?: readonly string[]
 }
 
 export interface SidebarGroup {
-  readonly key: "waiting" | "running" | "stopped" | "todo" | "blocked" | "failed" | "dropped" | "done"
+  readonly key: "waiting" | "running" | "open" | "stopped" | "done" | "dropped" | "failed"
   readonly mark: Mark
   readonly name: string
   readonly count: number // tasks in this state
   readonly redone?: number // DONE: how many of them are tasks done over by another (not counted in the totals)
-  readonly lines: readonly SidebarLine[] // the ones shown: all, except TODO and BLOCKED (the first few)
+  readonly lines: readonly SidebarLine[] // the ones shown: all, except OPEN (the first few)
 }
 
-const SHOWN_TODO = 5
-const SHOWN_BLOCKED = 3
+const SHOWN_OPEN = 8
 
 // "4m", "9s", "1.2h": how long a task has been running.
 export function elapsed(since: string | undefined, now = Date.now()): string {
@@ -195,27 +204,27 @@ export function sidebarGroups(v: JobView, waiting: ReadonlyMap<string, string> =
       : mark === "open" && !r.startable && r.waitsFor.length ? `⧗ ${r.waitsFor.join(" ")}`
       : mark === "done" && r.replacedBy && !DONE.includes(r.status) ? `↻ ${r.replacedBy.split("/").pop()}`
       : undefined
-    return { mark, id: r.id, title: r.title, ...(detail ? { detail } : {}), ...(r.session ? { session: r.session } : {}) }
+    return { mark, id: r.id, title: r.title, ...(detail ? { detail } : {}), ...(r.session ? { session: r.session } : {}), ...(r.sessions?.length ? { sessions: r.sessions } : {}) }
   }
   const of = (mark: Mark) => v.rows.filter((r) => markOf(r, asking) === mark)
-  const todo = of("open").filter((r) => r.startable)
-  const blocked = of("open").filter((r) => !r.startable)
+  // Open tasks in one group: the ones that can start now, then those that wait for another task (their line says so).
+  // The user, 2026-10-26: "blocked" was the wrong word for a task that is simply next.
+  const open = [...of("open").filter((r) => r.startable), ...of("open").filter((r) => !r.startable)]
   const groups: SidebarGroup[] = [
     { key: "waiting", mark: "waiting", name: "WAITING FOR YOU", count: of("waiting").length, lines: of("waiting").map((r) => line(r, "waiting")) },
     { key: "running", mark: "running", name: "RUNNING", count: of("running").length, lines: of("running").map((r) => line(r, "running")) },
+    { key: "open", mark: "open", name: "OPEN", count: open.length, lines: open.slice(0, SHOWN_OPEN).map((r) => line(r, "open")) },
     { key: "stopped", mark: "stopped", name: "STOPPED", count: of("stopped").length, lines: of("stopped").map((r) => line(r, "stopped")) },
-    { key: "todo", mark: "open", name: "TODO", count: todo.length, lines: todo.slice(0, SHOWN_TODO).map((r) => line(r, "open")) },
-    { key: "blocked", mark: "open", name: "BLOCKED", count: blocked.length, lines: blocked.slice(0, SHOWN_BLOCKED).map((r) => line(r, "open")) },
-    { key: "failed", mark: "failed", name: "FAILED", count: of("failed").length, lines: of("failed").map((r) => line(r, "failed")) },
-    { key: "dropped", mark: "dropped", name: "DROPPED", count: of("dropped").length, lines: of("dropped").map((r) => line(r, "dropped")) },
     { key: "done", mark: "done", name: "DONE", count: of("done").length, redone: of("done").filter((r) => !DONE.includes(r.status)).length, lines: of("done").map((r) => line(r, "done")) },
+    { key: "dropped", mark: "dropped", name: "DROPPED", count: of("dropped").length, lines: of("dropped").map((r) => line(r, "dropped")) },
+    { key: "failed", mark: "failed", name: "FAILED", count: of("failed").length, lines: of("failed").map((r) => line(r, "failed")) },
   ]
   return groups.filter((g) => g.count > 0)
 }
 
-// The counts under the job's name: "[✓]8 [▸]3 [!]1 [✗]2 [ ]28".
+// The counts under the job's name: "[!]1 [▸]3 [ ]28 [✓]8 [✗]2", in the order the groups are drawn.
 export function sidebarCounts(groups: readonly SidebarGroup[]): { mark: Mark; text: string }[] {
-  const order: Mark[] = ["done", "running", "waiting", "stopped", "failed", "open"] // dropped work is not counted
+  const order: Mark[] = ["waiting", "running", "open", "stopped", "done", "failed"] // dropped work is not counted
   return order.flatMap((mark) => {
     const count = groups.filter((x) => x.mark === mark).reduce((n, g) => n + g.count - (g.redone ?? 0), 0)
     return count ? [{ mark, text: `${BOX[mark]}${count}` }] : []

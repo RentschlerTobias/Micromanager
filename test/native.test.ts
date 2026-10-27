@@ -610,6 +610,24 @@ test("a project below the repository root: the worker and its checks stay in the
   assert.match(red.text, new RegExp(`The checks ran in ${dir2.replace(/[/.]/g, "\\$&")}`))
 })
 
+test("a project directory that the commit does not contain is created in the worktree", async () => {
+  // A project folder the user just made, with no file committed yet: git does not check it out, but the worker's
+  // session is moved there, and OpenCode refuses to move a session into a missing directory (empty worker sessions).
+  const root = repo()
+  const project = join(root, "colloquium", "29_10_2026")
+  mkdirSync(project, { recursive: true })
+  const native = new Native()
+  const d = await native.delegate(project, "ses_mm", { agent: "writer", description: "outline", prompt: "Write outline.md\nFiles: outline.md\nChecks: test -f outline.md" }, MODEL)
+  assert.equal(d.job.integrationRel, "colloquium/29_10_2026")
+
+  const claimed = native.claim("ses_w", child(d.prompt))!
+  assert.equal(claimed.dir, join(d.task.worktree!, "colloquium/29_10_2026"))
+  assert.ok(existsSync(claimed.dir), "the directory a session is moved to exists even when nothing is tracked there")
+  writeFileSync(join(claimed.dir, "outline.md"), "# Outline\n")
+  assert.match((await native.finish("ses_w", "outline")).text, /^Merged/)
+  assert.ok(existsSync(join(d.job.integrationWorktree!, "colloquium/29_10_2026/outline.md")))
+})
+
 test("a reader in a worktree is moved to the project directory too, and uncommitted work is named", async () => {
   const { project } = subRepo()
   writeFileSync(join(project, "uncommitted.md"), "draft\n") // not committed: no worktree will have it

@@ -3,7 +3,10 @@
 // plugin asks git about and in which directory it runs a check.
 
 import assert from "node:assert/strict"
-import { test } from "node:test"
+import { existsSync, mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { after, test } from "node:test"
 
 import {
   changedFiles, dirtyPaths, hashFiles, IntegrationError, prepareIntegration, prepareTaskWorktree, projectRel,
@@ -30,8 +33,12 @@ function fakeGit(answers: Record<string, string>, cwd = "/p") {
   return { run, calls }
 }
 
-const TOP = "/repo"
-const PROJECT = "/repo/a/b/c"
+// A real directory: preparing a worktree now creates the project directory inside it, as git does not check out empty
+// or untracked-only folders.
+const ROOT = mkdtempSync(join(tmpdir(), "micromanager-integration-"))
+after(() => rmSync(ROOT, { recursive: true, force: true }))
+const TOP = join(ROOT, "repo")
+const PROJECT = join(TOP, "a/b/c")
 const JOB = "job-1"
 
 function answers(topLevel: string, status = ""): Record<string, string> {
@@ -63,6 +70,7 @@ test("a project that is the repository root keeps everything as it was", async (
   ])
   assert.ok(calls.every((c) => c.cwd === TOP), "every call runs in the project")
   assert.deepEqual(taskDir(i.worktree, i.rel), i.worktree)
+  assert.ok(existsSync(i.worktree), "the checkout root exists even before anything is written")
 })
 
 test("a project below the repository root records the offset git reports, asked for in the project", async () => {
@@ -75,6 +83,7 @@ test("a project below the repository root records the offset git reports, asked 
   assert.equal(i.worktree, `${PROJECT}/${DIR}/worktrees/${JOB}`)
   assert.deepEqual(calls.at(-1)!.args, ["worktree", "add", "-q", "-b", `jev/${JOB}`, i.worktree, "HEAD"])
   assert.equal(taskDir(i.worktree, i.rel), `${i.worktree}/a/b/c`, "the worker works three levels down")
+  assert.ok(existsSync(`${i.worktree}/a/b/c`), "the offset directory exists even when the commit has no files there")
 })
 
 test("an offset that leaves the repository or the worktree is refused", () => {
@@ -96,6 +105,7 @@ test("a task worktree gives the git root and the directory to work in", async ()
   assert.equal(w.worktree, `${PROJECT}/${DIR}/worktrees/${JOB}--T1`, "the git worktree root")
   assert.equal(w.dir, `${w.worktree}/a/b/c`, "where the worker and its checks run")
   assert.equal(w.rel, "a/b/c")
+  assert.ok(existsSync(w.dir), "the worker's directory is created inside the fresh worktree")
   // git is still told to add the worktree at the root, and to remove it there too.
   const add = calls.find((c) => c.args[0] === "worktree" && c.args[1] === "add")!
   assert.deepEqual([...add.args], ["worktree", "add", "-q", "-b", `jev/${JOB}--T1`, w.worktree, `jev/${JOB}`])
@@ -103,6 +113,7 @@ test("a task worktree gives the git root and the directory to work in", async ()
 
   const root = await prepareTaskWorktree(PROJECT, JOB, "T2", `jev/${JOB}`, run, undefined, "")
   assert.equal(root.dir, root.worktree, "no offset: the project is the root, as before")
+  assert.ok(existsSync(root.dir), "the checkout root exists")
 })
 
 test("the gate runs a check in the directory it is given, and in the worktree root without one", async () => {

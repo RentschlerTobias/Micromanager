@@ -24,7 +24,7 @@ import { lastOptions, loadControl, optionsOf, updateControl, type Control } from
 import { agentOptions, CLEAR, modelOptions, poolRows, RESET, shortNames, toggle, updatePicks, VISION, type CatalogModel, type PoolRow } from "./pools.ts"
 import { BOX, foldedLine, jobsFor, projectOf, resolver, sessionJobs, sidebarCounts, sidebarGroups, summaryLine, taskChoices, view, type JobView, type Mark, type SidebarGroup } from "./progress.ts"
 import { listJobs } from "./store.ts"
-import { agentRows, agentSummary, type AgentRow, type SessionFacts, type Tag } from "./switcher.ts"
+import { agentRows, agentSummary, taskSessions, type AgentRow, type Live, type SessionFacts, type Tag, type TaskSessionRow } from "./switcher.ts"
 import type { Job } from "./state.ts"
 import { seedFromJournal } from "./usage.ts"
 import { bar, foldedContext, kTokens, readMemoryStats, readStatus, type ContextStatus, type MemoryStats } from "./context/status.ts"
@@ -208,10 +208,54 @@ function JobControls(props: { context: Context; project: string; job: JobView })
 const FOLDED_AT_FIRST: readonly SidebarGroup["key"][] = ["done", "dropped"]
 
 // One job as a checklist: its header, the counts, and the groups; DONE, FAILED and DROPPED fold on a click.
-function JobChecklist(props: { context: Context; job: JobView; waiting: Map<string, string>; project?: string; own?: boolean }) {
+// One session under an unfolded task (src/switcher.ts taskSessions): what it does, how long, and the context it has
+// used. A click opens it; a session the host no longer lists is dimmed and inert.
+function SubagentRow(props: { context: Context; row: TaskSessionRow }) {
+  const colors = palette(props.context)
+  const tag = () => (props.row.known ? props.row.tag : "IDLE")
+  const open = () => { if (props.row.known) props.context.ui.router.navigate({ type: "session", sessionID: props.row.id }) }
+  return (
+    <box>
+      <box flexDirection="row" paddingLeft={2} onMouseUp={open}>
+        <text fg={colors.tag[tag()]}>{tag().padEnd(5)}</text>
+        <text fg={props.row.known ? colors.base : colors.muted}>{cut(`${props.row.agent || "worker"} ${props.row.title}`, 21).padEnd(22)}</text>
+        <box flexGrow={1} />
+        <Show when={props.row.elapsed}>
+          <text fg={colors.muted}>{props.row.elapsed}</text>
+        </Show>
+      </box>
+      <SessionContextLine context={props.context} sessionID={props.row.id} />
+    </box>
+  )
+}
+
+// The context that session has used, folded to one line: the same bar the CONTEXT section draws, here per session, so
+// an unfolded task says at a glance which worker is near its summary.
+function SessionContextLine(props: { context: Context; sessionID: string }) {
+  const colors = palette(props.context)
+  const [status, setStatus] = createSignal<ContextStatus | undefined>(readStatus(props.sessionID))
+  const timer = setInterval(() => setStatus(readStatus(props.sessionID)), POLL_MS)
+  onCleanup(() => clearInterval(timer))
+  const full = (s: ContextStatus) => s.tokens >= s.summaryAt
+  return (
+    <Show when={status()}>
+      {(s) => (
+        <box flexDirection="row" paddingLeft={2}>
+          <text fg={full(s()) ? colors.mark.waiting : colors.muted}>{bar(s().tokens, s().ceiling, s().summaryAt, 10)}</text>
+          <text fg={colors.muted}>{` ${kTokens(s().tokens)}${full(s()) ? " ⚠" : ""}`}</text>
+        </box>
+      )}
+    </Show>
+  )
+}
+
+function JobChecklist(props: { context: Context; job: JobView; waiting: Map<string, string>; facts: readonly SessionFacts[]; live: Live; project?: string; own?: boolean }) {
   const colors = palette(props.context)
   const [folded, setFolded] = createSignal(new Set<string>(FOLDED_AT_FIRST))
   const toggle = (key: string) => setFolded((was) => { const next = new Set(was); next.has(key) ? next.delete(key) : next.add(key); return next })
+  // The tasks whose sessions are unfolded, by job and task: two job cards never share one.
+  const [grown, setGrown] = createSignal(new Set<string>())
+  const grow = (key: string) => setGrown((was) => { const next = new Set(was); next.has(key) ? next.delete(key) : next.add(key); return next })
   const groups = () => sidebarGroups(props.job, props.waiting)
   const foldable = (key: string) => key === "done" || key === "failed" || key === "dropped"
   return (
@@ -243,16 +287,32 @@ function JobChecklist(props: { context: Context; job: JobView; waiting: Map<stri
                 <text fg={colors.muted}>{count()}</text>
               </box>
               <For each={shut() ? [] : group.lines}>
-                {(line) => (
-                  <box flexDirection="row">
-                    <text fg={colors.mark[line.mark]}>{BOX[line.mark]} </text>
-                    <text fg={line.mark === "open" || line.mark === "done" || line.mark === "dropped" ? colors.muted : colors.base}>{cut(`${line.id} ${line.title}`, line.detail ? 24 : 32)}</text>
-                    <box flexGrow={1} />
-                    <Show when={line.detail}>
-                      <text fg={colors.muted}>{line.detail}</text>
-                    </Show>
-                  </box>
-                )}
+                {(line) => {
+                  const key = `${props.job.id}/${line.id}`
+                  const open = () => grown().has(key)
+                  const sub = () => taskSessions(line.sessions ?? [], props.facts, props.live)
+                  return (
+                    <box>
+                      <box flexDirection="row" onMouseUp={() => line.sessions?.length && grow(key)}>
+                        <text fg={colors.mark[line.mark]}>{BOX[line.mark]} </text>
+                        <text fg={line.mark === "open" || line.mark === "done" || line.mark === "dropped" ? colors.muted : colors.base}>{cut(`${line.id} ${line.title}`, line.detail ? 24 : 32)}</text>
+                        <box flexGrow={1} />
+                        <Show when={line.detail}>
+                          <text fg={colors.muted}>{line.detail}</text>
+                        </Show>
+                        <Show when={line.sessions?.length}>
+                          <text fg={colors.muted}>{open() ? " ▾" : " ▸"}</text>
+                        </Show>
+                      </box>
+                      <Show when={open()}>
+                        <For each={sub().rows}>{(row) => <SubagentRow context={props.context} row={row} />}</For>
+                        <Show when={sub().hidden > 0}>
+                          <text fg={colors.muted}>{`    +${sub().hidden} more`}</text>
+                        </Show>
+                      </Show>
+                    </box>
+                  )
+                }}
               </For>
             </box>
           )
@@ -269,6 +329,8 @@ function Checklist(props: { context: Context; sessionID: string }) {
   const [waiting, setWaiting] = createSignal(new Map<string, string>())
   const [opened, setOpened] = createSignal(new Set<string>())
   const [asks, setAsks] = createSignal<string[]>([]) // the micromanager's own open forms: what they ask
+  const [facts, setFacts] = createSignal<readonly SessionFacts[]>([]) // the sessions, for the subagents under a task
+  const [live, setLive] = createSignal<Live>({ active: new Set(), asking: new Set() })
   const colors = palette(props.context)
   const poll = async () => {
     const forms = items(await props.context.client.form?.list({}).catch(() => undefined)) as { sessionID?: string; title?: string; fields?: { title?: string; description?: string }[] }[]
@@ -276,6 +338,10 @@ function Checklist(props: { context: Context; sessionID: string }) {
     const running = jobs().flatMap((j) => j.rows.filter((r) => ["running", "gating", "fixing", "reviewing"].includes(r.status) && r.session).map((r) => r.session!))
     const found = running.length ? await pending(props.context, running) : new Map()
     setWaiting(new Map([...found].map(([id, p]) => [id, p.what])))
+    // The sessions and their tags, read the way the workers panel reads them: an unfolded task draws what each
+    // session does from here, and an idle sidebar pays for two local calls every other poll.
+    setFacts(items(await props.context.client.session.list({ limit: 200 }).catch(() => undefined)) as SessionFacts[])
+    setLive({ active: new Set(ids(await props.context.client.session.active({}).catch(() => undefined))), asking: new Set(found.keys()) })
   }
   void poll()
   const timer = setInterval(() => void poll(), POLL_MS * 2)
@@ -292,7 +358,7 @@ function Checklist(props: { context: Context; sessionID: string }) {
           </box>
         )}
       </For>
-      <Show when={split().main}>{(main) => <JobChecklist context={props.context} job={main()} waiting={waiting()} project={projectFor(props.context, props.sessionID)} own={main().facilitator === props.sessionID} />}</Show>
+      <Show when={split().main}>{(main) => <JobChecklist context={props.context} job={main()} waiting={waiting()} facts={facts()} live={live()} project={projectFor(props.context, props.sessionID)} own={main().facilitator === props.sessionID} />}</Show>
       <For each={split().others}>
         {(job) => (
           <box paddingTop={1}>
@@ -302,7 +368,7 @@ function Checklist(props: { context: Context; sessionID: string }) {
               <text fg={colors.muted}>{opened().has(job.id) ? "▾" : "▸"}</text>
             </box>
             <Show when={opened().has(job.id)}>
-              <JobChecklist context={props.context} job={job} waiting={waiting()} />
+              <JobChecklist context={props.context} job={job} waiting={waiting()} facts={facts()} live={live()} />
             </Show>
           </box>
         )}
@@ -312,19 +378,16 @@ function Checklist(props: { context: Context; sessionID: string }) {
 }
 
 // The CONTEXT section: folded to one line; unfolded the session's context as a bar (│ marks where a summary starts),
-// what its epochs removed, a line per running worker, the memory and the notes the last request got.
+// what its epochs removed, the memory and the notes the last request got. The workers' own context lives under their
+// task in the checklist, where the worker and its subagents are unfolded.
 function ContextSection(props: { context: Context; sessionID: string }) {
   const colors = palette(props.context)
-  const jobs = useJobs(props.context, () => props.sessionID)
   const [open, setOpen] = createSignal(false)
   const [status, setStatus] = createSignal<ContextStatus | undefined>(readStatus(props.sessionID))
   const [mem, setMem] = createSignal<MemoryStats | undefined>(readMemoryStats())
-  const [workers, setWorkers] = createSignal<{ id: string; title: string; s: ContextStatus }[]>([])
   const poll = () => {
     setStatus(readStatus(props.sessionID))
     setMem(readMemoryStats())
-    const running = jobs().flatMap((j) => j.rows.filter((r) => ["running", "gating", "fixing", "reviewing"].includes(r.status) && r.session && r.session !== props.sessionID))
-    setWorkers(running.flatMap((r) => { const s = readStatus(r.session!); return s ? [{ id: r.id, title: r.title, s }] : [] }))
   }
   const timer = setInterval(poll, POLL_MS)
   onCleanup(() => clearInterval(timer))
@@ -350,16 +413,6 @@ function ContextSection(props: { context: Context; sessionID: string }) {
               </box>
             )}
           </Show>
-          <For each={workers()}>
-            {(w) => (
-              <box flexDirection="row">
-                <text fg={colors.base}>{cut(`${w.id} ${w.title}`, 16).padEnd(17)}</text>
-                <text fg={full(w.s) ? colors.mark.waiting : colors.muted}>{bar(w.s.tokens, w.s.ceiling, w.s.summaryAt, 8)}</text>
-                <box flexGrow={1} />
-                <text fg={colors.muted}>{kTokens(w.s.tokens)}{full(w.s) ? " ⚠" : ""}</text>
-              </box>
-            )}
-          </For>
           <Show when={mem()}>
             {(m) => (
               <box>

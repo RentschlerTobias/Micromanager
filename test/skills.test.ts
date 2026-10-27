@@ -1,11 +1,11 @@
 import assert from "node:assert/strict"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 
 import { combine } from "../src/profile.ts"
-import { installedSkills, SKILLS, skillsFor } from "../src/skills.ts"
+import { registerSkills, SKILLS, skillsFor, type SkillEditor } from "../src/skills.ts"
 import type { Task } from "../src/state.ts"
 
 const ALL = new Set(SKILLS.map((s) => s.name))
@@ -22,13 +22,28 @@ test("skills by rule: writers verify, P3 and red work test-first, reviewers revi
   assert.deepEqual(skillsFor("implement", profile, "P3", new Set(["tdd"])), ["tdd"], "only installed skills are named")
 })
 
-test("a skill counts as installed only when its OpenCode link points at this repo's copy", () => {
-  const repo = mkdtempSync(join(tmpdir(), "jd-skills-repo-"))
+test("the plugin registers the catalog itself, and a skill of the user's own with the same name keeps its place", async () => {
   const dir = mkdtempSync(join(tmpdir(), "jd-skills-"))
-  for (const n of ["tdd", "research"]) mkdirSync(join(repo, n))
-  symlinkSync(join(repo, "tdd"), join(dir, "tdd"))
-  mkdirSync(join(dir, "research")) // the user's own skill of the same name
-  assert.deepEqual([...installedSkills(dir, repo)], ["tdd"])
+  mkdirSync(join(dir, "tdd"))
+  writeFileSync(join(dir, "tdd", "SKILL.md"), "---\nname: tdd\n---\nours\n")
+  const added: { id: string; path: string; content: string }[] = []
+  const editor: SkillEditor = {
+    list: () => [{ id: "research", path: "/somewhere/else/.config/opencode/skills/research/SKILL.md" }],
+    add: (skill) => void added.push(skill),
+  }
+  const installed = await registerSkills({ transform: async (callback) => callback(editor) }, dir)
+  assert.deepEqual([...installed], ["tdd"], "the user's research is not ours, so tdd is the only one registered")
+  assert.deepEqual(added.map((s) => s.id), ["tdd"])
+  assert.equal(added[0].path, join(dir, "tdd", "SKILL.md"))
+  assert.match(added[0].content, /^---\nname: tdd/)
+})
+
+test("an install that lost skills/, or a server without ctx.skill, still starts: no skills, no throw", async () => {
+  assert.deepEqual([...await registerSkills(undefined)], [])
+  const missing: string[] = []
+  const empty = await registerSkills({ transform: async () => assert.fail("must not register from a missing directory") }, join(tmpdir(), "jd-skills-none"), (name) => void missing.push(name))
+  assert.deepEqual([...empty], [])
+  assert.deepEqual(missing, SKILLS.map((s) => s.name))
 })
 
 test("every catalog skill exists in skills/ with a matching name and its source in the frontmatter", () => {

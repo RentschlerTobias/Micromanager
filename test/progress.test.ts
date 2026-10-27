@@ -53,7 +53,7 @@ test("/tasks offers the way back to the micromanager from a worker, and each tas
   assert.equal(taskChoices([v], "ses_micro")[0]!.title, "✔ T1 task T1", "no way back from the micromanager itself")
 })
 
-test("the sidebar groups the job as a checklist: waiting, running, failed, next, done, each in plan order", () => {
+test("the sidebar groups the job as a checklist: waiting, running, open, done, then failed", () => {
   const now = Date.parse("2026-10-19T12:00:00Z")
   const tasks = [
     task("T1", "merged"),
@@ -70,14 +70,26 @@ test("the sidebar groups the job as a checklist: waiting, running, failed, next,
   assert.deepEqual(groups.map((g) => [g.name, g.count, g.lines.map((l) => `${l.id}${l.detail ? ` ${l.detail}` : ""}`)]), [
     ["WAITING FOR YOU", 1, ["T4 shell"]],
     ["RUNNING", 1, ["T3 glm 4m"]],
-    ["TODO", 3, ["T6", "T7", "T8"]], // can start
-    ["BLOCKED", 1, ["T5 ⧗ T3"]], // waits for T3, which runs
-    ["FAILED", 1, ["T2"]],
+    ["OPEN", 4, ["T6", "T7", "T8", "T5 ⧗ T3"]], // what can start first, then what waits for T3, which runs
     ["DONE", 2, ["T1", "T9"]],
+    ["FAILED", 1, ["T2"]],
   ])
-  assert.deepEqual(sidebarCounts(groups).map((c) => c.text), ["[✓]2", "[▸]1", "[!]1", "[✗]1", "[ ]4"])
+  assert.deepEqual(sidebarCounts(groups).map((c) => c.text), ["[!]1", "[▸]1", "[ ]4", "[✓]2", "[✗]1"], "counts in the order the groups are drawn")
   const quiet = sidebarGroups(view(job("job-1", { tasks: [task("T1", "merged")] })))
   assert.deepEqual(quiet.map((g) => g.name), ["DONE"], "an empty group is left out")
+})
+
+test("a task line carries every session that worked on it, oldest first, for the subagents under it", () => {
+  const j = job("job-1", { tasks: [
+    task("T1", "merged", { session: "ses_b", sessions: ["ses_a", "ses_b"] }),
+    task("T2", "running", { session: "ses_c" }),
+    task("T3", "pending"),
+  ] })
+  const byId = new Map(sidebarGroups(view(j)).flatMap((g) => g.lines).map((l) => [l.id, l]))
+  assert.deepEqual(byId.get("T1")!.sessions, ["ses_a", "ses_b"], "the whole history, not only the newest")
+  assert.equal(byId.get("T1")!.session, "ses_b", "and the newest stays where open goes")
+  assert.deepEqual(byId.get("T2")!.sessions, ["ses_c"], "the current session counts without being listed twice")
+  assert.equal(byId.get("T3")!.sessions, undefined, "a task nobody worked on has nothing to unfold")
 })
 
 test("a running task shows its model's family and how long it runs", () => {
@@ -100,7 +112,7 @@ test("a task done over moves to DONE once its replacement is in, and stands asid
     task("T27", "cancelled"),
     task("T28", "escalated"),
   ] })
-  assert.deepEqual(names(redone), [["FAILED", ["T28"]], ["DROPPED", ["T27"]], ["DONE", ["T19 ↻ T26", "T26"]]])
+  assert.deepEqual(names(redone), [["DONE", ["T19 ↻ T26", "T26"]], ["DROPPED", ["T27"]], ["FAILED", ["T28"]]])
   assert.equal(summaryLine(view(redone)), "job-1 · 1/2 ✔ · 1 ✖ · execute", "the replacement counts, the replaced and dropped do not")
   assert.deepEqual(sidebarCounts(sidebarGroups(view(redone))).map((c) => c.text), ["[✓]1", "[✗]1"], "the counts agree")
   const running = job("job-1", { tasks: [task("T19", "escalated", { replacedBy: "T26" }), task("T26", "running")] })

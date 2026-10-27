@@ -3,6 +3,7 @@
 // directory (no external_directory ask) and git ignores it through .git/info/exclude.
 
 import { execFile } from "node:child_process"
+import { mkdirSync } from "node:fs"
 import { join, relative, resolve, sep } from "node:path"
 
 import { measuredOf, median, parseScoreLines, type Contract, type Measured } from "./contract.ts"
@@ -90,6 +91,20 @@ export function taskDir(worktree: string, rel: string): string {
   return resolve(worktree, ...rel.split("/").filter((p) => p && p !== "."))
 }
 
+// git only checks out paths that exist in the commit, so a project directory with no tracked files (a new slide deck,
+// a folder the user will fill later) is missing from a fresh worktree. OpenCode refuses to move a session into a
+// missing directory, so the worker's first prompt would never be stored: create it before anyone is moved there.
+function materializeTaskDir(worktree: string, rel: string): string {
+  const dir = taskDir(worktree, rel)
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err)
+    throw new IntegrationError(`could not create the project directory ${dir} in the worktree: ${why}`)
+  }
+  return dir
+}
+
 // Uncommitted changes in the user's working tree, which no worktree carries: a task that depends on them can never
 // pass its checks, so the caller reports it rather than letting a worker discover it.
 export async function dirtyPaths(project: string, run: Exec = exec): Promise<{ dirty: boolean; summary: string }> {
@@ -111,6 +126,7 @@ export async function prepareIntegration(project: string, jobId: string, run: Ex
   const worktree = join(project, stateDir(project), "worktrees", jobId)
   const added = await run("git", ["worktree", "add", "-q", "-b", branch, worktree, "HEAD"], { cwd: project })
   if (added.code !== 0) throw new IntegrationError(`git worktree add failed: ${added.stderr.trim()}`)
+  materializeTaskDir(worktree, rel)
   return { branch, worktree, base: head.stdout.trim(), rel, dirty, dirtySummary: summary }
 }
 
@@ -257,7 +273,8 @@ export async function prepareTaskWorktree(project: string, jobId: string, taskId
   const { dirty, summary } = await dirtyPaths(project, run)
   const added = await run("git", ["worktree", "add", "-q", "-b", branch, worktree, from], { cwd: project })
   if (added.code !== 0) throw new IntegrationError(`git worktree add failed: ${added.stderr.trim()}`)
-  return { branch, worktree, dir: taskDir(worktree, rel), rel, dirty, dirtySummary: summary }
+  const dir = materializeTaskDir(worktree, rel)
+  return { branch, worktree, dir, rel, dirty, dirtySummary: summary }
 }
 
 // Only the worktree root and the branch: a worktree can be removed by name alone, and callers that hold no project

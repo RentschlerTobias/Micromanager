@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { newJob, type Task } from "../src/state.ts"
-import { agentRows, agentSummary, type SessionFacts } from "../src/switcher.ts"
+import { agentRows, agentSummary, taskSessions, type SessionFacts } from "../src/switcher.ts"
 
 const now = Date.parse("2026-10-19T12:00:00Z")
 const at = (iso: string) => Date.parse(iso)
@@ -41,4 +41,35 @@ test("sessions with something running come first; old idle ones drop out", () =>
   assert.equal(agentSummary(agentRows([quiet], { active: new Set(), asking: new Set() }, [], undefined, now)), "nothing running")
   const onScreen = agentRows([quiet, busy], { active: new Set(["ses_busy"]), asking: new Set() }, [], "ses_quiet", now)
   assert.equal(onScreen[0]!.id, "ses_quiet", "the session on screen leads")
+})
+
+test("a task unfolds its own sessions, and under each the subagents it started", () => {
+  const worker = s("ses_worker", { time: { created: at("2026-10-19T11:50:00Z"), updated: now } })
+  const kid = s("ses_kid", { parentID: "ses_worker", agent: "explore", time: { created: at("2026-10-19T11:55:00Z"), updated: now } })
+  const quiet = s("ses_kid2", { parentID: "ses_worker", agent: "research" })
+  const asks = s("ses_ask", { parentID: "ses_worker", agent: "general" })
+  const older = s("ses_older", { agent: "writer", outcome: "interrupted" })
+  const got = taskSessions(["ses_older", "ses_worker"], [worker, older, kid, quiet, asks], { active: new Set(["ses_worker", "ses_kid"]), asking: new Set(["ses_ask"]) }, now)
+  assert.deepEqual(got.rows.map((r) => `${r.depth} ${r.tag} ${r.id}`), [
+    "0 FAIL ses_older",
+    "0 RUN ses_worker",
+    "1 ASK ses_ask", // a subagent that waits for the user comes first
+    "1 RUN ses_kid",
+    "1 DONE ses_kid2",
+  ])
+  assert.equal(got.rows[1]!.elapsed, "10m")
+  assert.equal(got.rows[1]!.known, true)
+  assert.equal(got.hidden, 0)
+})
+
+test("a session the host no longer lists stays visible but reads as unknown", () => {
+  const got = taskSessions(["ses_gone"], [], { active: new Set(), asking: new Set() }, now)
+  assert.deepEqual(got.rows, [{ id: "ses_gone", depth: 0, tag: "IDLE", title: "ses_gone", agent: "", elapsed: "", known: false }])
+})
+
+test("a worker with more subagents than the cap shows the first ones and counts the rest", () => {
+  const kids = Array.from({ length: 10 }, (_, i) => s(`ses_k${i}`, { parentID: "ses_w" }))
+  const got = taskSessions(["ses_w"], [s("ses_w"), ...kids], { active: new Set(), asking: new Set() }, now)
+  assert.equal(got.rows.length, 1 + 8)
+  assert.equal(got.hidden, 2)
 })

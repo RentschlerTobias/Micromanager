@@ -20,26 +20,43 @@ and research [docs/plan.md](docs/plan.md). Development happens on the branch `om
 
 ## Requirements
 
-- OpenCode v2 (tested with 2.0.18) and Node.js with TypeScript type stripping (22.18 or newer; tested with 26).
-- git: workers need a repository with at least one commit (without one the micromanager asks how to go on).
-- A Jev API key, as `JEV_API_KEY` or in the keyring (`secret-tool`, service `typesafe`, key `jev`). Without one, every
-  decision goes to you.
-- For the sandbox on Linux: `bubblewrap`, `socat` and `ripgrep`. Without them commands run unwrapped, and the plugin
-  says so.
-- Optional: the local embedding service for the memory (`./install.sh --embedding`), and `uv` for the GLiNER
-  decision server in `decider/`.
+- OpenCode v2 (tested with 2.0.18). A package install needs nothing else: the plugin runs in OpenCode's own runtime.
+  Node.js with TypeScript type stripping (22.18 or newer; tested with 26) is needed only for the tests and a checkout.
+- git: workers need a repository with at least one commit (without one the micromanager asks how to go on), and
+  `opencode plugin add` clones the plugin with it.
+- A Jev API key, as `JEV_API_KEY` or, on Linux, in the keyring (`secret-tool`, service `typesafe`, key `jev`; macOS
+  has no `secret-tool`, so there the variable is the way). Without a key, every decision goes to you.
+- For the sandbox: on Linux `bubblewrap`, `socat` and `ripgrep`; on macOS nothing extra (Seatbelt). Without them
+  commands run unwrapped, and the plugin says so.
+- Optional: the local embedding service for the memory (`./install.sh --embedding`, a systemd user unit), and `uv`
+  for the GLiNER decision server in `decider/`.
 
 ## Install
+
+As an OpenCode plugin, straight from git, pinned to a tag or a commit:
+
+```bash
+opencode plugin add 'github:RentschlerTobias/Micromanager#main'
+```
+
+That fetches the package, its dependencies and the skills; `package.json` exports the server plugin as `.` and the
+TUI as `./tui`. A tag or a full commit hash pins it (`#v0.1.0`, `#<sha>`), `#main` follows the branch. The
+repository is private, so `git` needs credentials for it: a credential helper, `gh auth login`, or a token in the
+URL. To upgrade, the same command with a newer ref, or `opencode plugin update`; `opencode plugin remove micromanager`
+takes it out again.
+
+From a checkout, for development (the symlink means the running server reads your working tree):
 
 ```bash
 git clone git@github.com:RentschlerTobias/Micromanager.git micromanager
 cd micromanager
 npm install                    # the sandbox runtime
 ./install.sh                   # links src/plugin.ts into ~/.config/opencode/plugins/micromanager.ts
-./install.sh --skills          # optional: the worker skills
 ./install.sh --embedding 4b    # optional: the memory's embedding service (0.6b, 4b or 8b), see "Context and memory"
 ./install.sh --remove
 ```
+
+The worker skills need no step in either case: the plugin registers them itself (see "Skills" under "Use").
 
 Restart the OpenCode server afterwards: plugins load when it starts, so restart the server your TUI attaches to,
 not only the background service `opencode run` uses. The `plugin` record in the journal and the header of
@@ -313,7 +330,7 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "trialDeadline": 20,    // minutes a trial decided by a fitness contract waits for its last attempts
   "githubBacklog": [],    // repositories ("owner/name") whose issues labelled micromanager join the backlog
   "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // optional limits per job; none by default
-  "notify": "jobs",       // desktop notifications: "jobs", "tasks" (also per task) or "off"
+  "notify": "jobs",       // desktop notifications (notify-send on Linux, osascript on macOS): "jobs", "tasks" (also per task) or "off"
   "sandbox": true,        // worker commands in the sandbox (default); false runs them unwrapped
   "env": ["DATABASE_URL", "MYAPP_*"], // variables every job's commands keep beyond the allowlist
   "network": ["api.example.com", "*.example.com"] // hosts every job's commands may reach beyond the registries
@@ -322,9 +339,10 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
 
 Hard rules (pushes, `sudo`, system installs, deleting tracked files, …) always go to you, whatever a preset says.
 
-`./install.sh --skills` links the skills into OpenCode: `deliberate` (the facilitator's rules) and six leaf skills
-for workers, adapted from mattpocock/skills and obra/superpowers (`skills/THIRD_PARTY.md`). The plugin names a
-skill in a worker's brief only when that link is in place. The local GLiNER
+The plugin registers its skills into OpenCode at startup: `deliberate` (the facilitator's rules) and six leaf skills
+for workers, adapted from mattpocock/skills and obra/superpowers (`skills/THIRD_PARTY.md`). They come from the
+package, so a git install has them without a step; a skill of your own with the same name wins, and the plugin then
+never names that skill in a brief. The local GLiNER
 decision server (`decider/`, see its README) answers guard questions on the CPU, and `npm run bench-guards`
 measures them; the journal
 `~/.local/state/micromanager/decisions.jsonl` feeds `npm run eval` and `npm run export-dataset`.

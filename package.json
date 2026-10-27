@@ -1,9 +1,23 @@
 {
   "name": "micromanager",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "description": "An OpenCode v2 plugin that orchestrates sub-agents, with TypeSafe Jev making the decisions",
+  "exports": {
+    ".": "./src/plugin.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "files": [
+    "src",
+    "skills"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "subagents",
+    "orchestration"
+  ],
   "scripts": {
     "test": "XDG_STATE_HOME=$(mktemp -d) node --test 'test/**/*.test.ts'",
     "typecheck": "tsc -p tsconfig.json",
@@ -18,5 +32,21 @@
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.81"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.6.6",
+    "@opentui/solid": ">=0.6.6",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   }
 }

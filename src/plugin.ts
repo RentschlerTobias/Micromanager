@@ -42,12 +42,12 @@ import { accessForm, answersOf, formInput, gitForm, readForm, type Question } fr
 import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
 import { CHECK_BUG, CHECK_BUG_FLOOR, CLASSIFY, NOUL_FLOOR, OPEN_ENDED, OPEN_ENDED_FLOOR } from "./catalog.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
-import { installedSkills, SKILLS } from "./skills.ts"
+import { registerSkills, SKILLS, type SkillEditor } from "./skills.ts"
 import { backlogIgnored, listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
 import { backlogDir, backlogTool, githubIssue, githubIssues, githubRepo, goalOf, localBackend, publishForm, publishIssue, readPublish, type BacklogItem } from "./backlog.ts"
 import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "./state.ts"
 import { exec, repoRel, type Exec } from "./integration.ts"
-import { readFileSync } from "node:fs"
+import { mkdirSync, readFileSync } from "node:fs"
 import { join, relative, resolve } from "node:path"
 import {
   CHECK_CHANGE_ID, FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installCheckChangeTool, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installTools, planText,
@@ -115,6 +115,10 @@ interface Context {
     list(args: { sessionID: string }): Promise<{ id: string; action: string; resources: readonly string[] }[]>
     reply(args: { sessionID: string; requestID: string; decision: "once" | "always" | "reject"; message?: string }): Promise<unknown>
   }
+  // The skills OpenCode discovered at this location: a synchronous transform over them (opencode 2.0.18). The
+  // plugin registers its own leaf skills here (src/skills.ts), which is what lets a package install need no links in
+  // the config directory and no checkout on disk.
+  skill?: { transform(callback: (editor: SkillEditor) => void): Promise<unknown> }
   // The host's models: the only authority on which models exist (see modelAvailability). opencode 2.0.18 has no
   // ctx.catalog; the plugin read one until 2026-10-19 and so never saw a model disappear (space-bunny was renamed and
   // every role's first choice failed: "no JSON object found" from the planner, workers that never started).
@@ -274,6 +278,23 @@ function logger(ctx: Context) {
     // warn and error also go to the server's stderr, which is the one place an operator sees them without the journal.
     if (level !== "info") console.error(`[micromanager] ${message}`)
   }
+}
+
+// A desktop notification: `notify-send` on Linux, `osascript` on macOS, which has no notify-send. The command is
+// chosen here once, so the plugin installs unchanged on both (`opencode plugin add` from git). Failure is the
+// caller's business: a notification is a courtesy and never a reason a job stops.
+function notifyDesktop(title: string, body: string, failed?: (err: Error) => void): void {
+  const darwin = process.platform === "darwin"
+  const args = darwin ? ["-e", `display notification ${appleScript(body)} with title ${appleScript(title)}`] : ["-a", "micromanager", title, body]
+  execFile(darwin ? "osascript" : "notify-send", args, (err) => {
+    if (err && failed) failed(err)
+  })
+}
+
+// An AppleScript string literal: quotes and backslashes escape as in JSON. A newline would come out as a literal
+// backslash-n (AppleScript has no \n escape), so the body is folded to one line first.
+function appleScript(text: string): string {
+  return JSON.stringify(text.replace(/\s*\n\s*/g, " "))
 }
 
 // What the plugin does with a watchdog signal, and nothing else, so it can be read (and tested) apart from the server.
@@ -773,6 +794,16 @@ export default {
     const log = logger(ctx)
     const settings = loadSettings()
     const { cloudOnly, parallel, perModel, trials, budget, notify, routing, floors, decisions, allowOutside, error } = settings
+    // The leaf skills the workers load, registered into OpenCode instead of linked into its config directory: a
+    // package install has no checkout to link from, and the skills ship in this package. Read once per start, like
+    // the agents; the set is what a brief may name (src/skills.ts).
+    const installedSkills = await registerSkills(ctx.skill, undefined, (name) => log("warn", `skill ${name} is missing from this install, so no worker gets it`)).catch(
+      (err: unknown) => {
+        log("warn", `the skills could not be registered: ${String(err)}`)
+        return new Set<string>()
+      },
+    )
+    log("info", ctx.skill ? `skills for workers: ${[...installedSkills].join(", ") || "none"}` : "this server has no ctx.skill, so the workers run without the plugin's skills")
     // What the user granted a job's workers beyond the allowlist (request_env / request_network), kept in its control file.
     const jobGrants = (project: string, jobId: string): { env: readonly string[]; network: readonly string[] } => {
       const g = loadControl(project, jobId).grants
@@ -907,7 +938,7 @@ export default {
       if (r.note && r.parent) await ctx.session.synthetic({ sessionID: r.parent, text: r.note, resume: true }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
     }
     const native = (SHARED.native ??= new Native({
-      installedSkills: installedSkills(), planFirst: true, noGit: (dir) => noGitNote(dir),
+      installedSkills, planFirst: true, noGit: (dir) => noGitNote(dir),
       trialDeadlineMs: settings.trialDeadline * 60_000, onSettled: (r) => void settledTrial(r).catch((err: unknown) => log("warn", `trial settle failed: ${String(err)}`)),
     }))
     const workerJobs = SHARED.workerJobs
@@ -958,7 +989,7 @@ export default {
       const { pending, answer, fresh } = SHARED.grantRequests.open({ kind, name, why, sessionID, parent: owner.parent, task: owner.task, project: where.project, jobId, secrets: kind === "network" ? facts.secrets : [] })
       if (fresh) {
         await ctx.session.synthetic({ sessionID: owner.parent, text: grantNote(pending), resume: true }).catch((err: unknown) => log("warn", `grant note failed: ${String(err)}`))
-        if (notify !== "off") execFile("notify-send", ["-a", "micromanager", `${pending.id}: a worker waits for you`, `${kind === "env" ? "variable" : "host"} ${name}`], () => {})
+        if (notify !== "off") notifyDesktop(`${pending.id}: a worker waits for you`, `${kind === "env" ? "variable" : "host"} ${name}`)
       }
       const r = await answer
       return grantResult(kind, name, r.granted, r.by)
@@ -993,7 +1024,7 @@ export default {
       const by = route(r.kind)
       const { pending, answer } = changes.open({ ...r, sessionID, parent: here.parent, task, taskId: here.task.id, project: here.project, jobId: here.job.id })
       await ctx.session.synthetic({ sessionID: here.parent, text: changeNote(pending, by, here.task.model), resume: true }).catch((err: unknown) => log("warn", `change note failed: ${String(err)}`))
-      if (by === "user" && notify !== "off") execFile("notify-send", ["-a", "micromanager", `${pending.id}: a worker asks to change a check`, r.target.slice(0, 120)], () => {})
+      if (by === "user" && notify !== "off") notifyDesktop(`${pending.id}: a worker asks to change a check`, r.target.slice(0, 120))
       const a = await answer
       if (!a.accepted) {
         decided(pending.id, a)
@@ -1264,7 +1295,7 @@ export default {
           if (decision === "reject" && message) steering.set(sessionID, `[micromanager] Your ${action} request (${resources.join(" | ").slice(0, 160)}) was not run: ${message}`)
         })
         await ctx.session.synthetic({ sessionID: owner.parent, text: askNote(ask), resume: true }).catch((err: unknown) => log("warn", `ask note failed: ${String(err)}`))
-        if (notify !== "off") execFile("notify-send", ["-a", "micromanager", `${ask.id}: a worker waits for you`, `${action}: ${resources.join(" ").slice(0, 160)}`], () => {})
+        if (notify !== "off") notifyDesktop(`${ask.id}: a worker waits for you`, `${action}: ${resources.join(" ").slice(0, 160)}`)
       })()
       return true
     }
@@ -1560,9 +1591,7 @@ export default {
       },
       journal: record,
     })
-    // Skills are read once per start, like the agents: install.sh --skills and a restart make new ones known.
-    const installed = installedSkills()
-    log("info", `skills for workers: ${[...installed].join(", ") || "none (./install.sh --skills)"}`)
+    // Skills are read once per start, like the agents: they are registered at setup (see installedSkills above).
     // What the micromanager must do in its next turn, per session; set from the user's turn or a job update, used by
     // every provider turn of that answer (steering through a system block, Phase A1), replaced at the user's next turn.
     const steering = new Map<string, string>()
@@ -1607,7 +1636,7 @@ export default {
       synthetic: (sessionID, text, resume) => ctx.session.synthetic({ sessionID, text, resume }),
       steer: (sessionID, note) => steering.set(sessionID, note),
       desktop: (title, body) => {
-        execFile("notify-send", ["-a", "micromanager", title, body], (err) => { if (err) log("info", `no desktop notification: ${err.message}`) })
+        notifyDesktop(title, body, (err) => log("info", `no desktop notification: ${err.message}`))
       },
     })
     // Auto-continue (src/continuation.ts autoStep): the micromanager sessions whose turn end is awaited, and when the user
@@ -1694,8 +1723,8 @@ export default {
           watchdog.watch(sessionID, { maxSteps })
         },
         stopped: (sessionID) => stops.get(sessionID),
-        skills: SKILLS.filter((s) => s.asked && installed.has(s.name)),
-        installedSkills: installed,
+        skills: SKILLS.filter((s) => s.asked && installedSkills.has(s.name)),
+        installedSkills,
         waiting: (sessionID) => SHARED.asks.waiting(sessionID),
       })
     // The job queue: run_job queues, the scheduler runs in the background and the notifier reports the end.
@@ -2309,7 +2338,18 @@ export default {
         // worktree now. The move is queued ahead of this prompt and applies before any tool runs (spike).
         const claimed = native.claim(sessionID, text)
         if (!claimed) return
-        await ctx.session.move({ sessionID, directory: claimed.dir })
+        try {
+          // An empty project directory (one with no tracked files yet) is not in the fresh worktree; a session cannot
+          // be moved into a missing directory, and OpenCode would drop this first prompt and leave the worker empty.
+          mkdirSync(claimed.dir, { recursive: true })
+          await ctx.session.move({ sessionID, directory: claimed.dir })
+        } catch (err) {
+          const why = err instanceof Error ? err.message : String(err)
+          log("warn", `worker ${sessionID} could not move to ${claimed.dir}: ${why || "(no message)"}`)
+          throw new DelegationError(
+            `Not started: the worker session ${sessionID} could not move to ${claimed.dir}${why ? `: ${why}` : ""}. Its task is marked running; stop it (stop_task) and delegate it again.`,
+          )
+        }
         runnerSessions.add(sessionID)
         workerTasks.set(sessionID, claimed.task)
         workerDirs.set(sessionID, claimed.dir)

@@ -481,7 +481,10 @@ endless read loops.
     gate's cwd, and the paths a task reports. `changedFiles` resolves it away, so a declared file matches what git
     reported and a change outside the project comes back as a `..` escape that cannot. Uncommitted state in the
     user's checkout is detected at job start and reported: no worker can see it, so a task that needs it cannot pass,
-    and the micromanager is told rather than discovering it from a confused worker.
+    and the micromanager is told rather than discovering it from a confused worker. Git only checks out paths that
+    the commit contains, so the project directory is created inside each fresh worktree (2026-10-26): a new project
+    below the repository root has no committed files, and a session cannot be moved into a directory that does not
+    exist (the first live failure was an empty worker session with `DestinationNotFoundError`).
   - Writers get worktrees off the integration branch.
   - The baseline gate runs once per job.
 - **Merge train:** one branch at a time; rebase → gate → merge; roll back on failure; a conflict goes back to its
@@ -591,7 +594,9 @@ Workflow logic lives in the plugin. Workers only get leaf skills: how to do the 
   - Adapted copies go into `skills/`, with the source commit in their frontmatter and the licence checked per
     source.
   - The parts of mattpocock's skills that point to his issue-tracker setup are removed.
-  - `install.sh --skills` links them.
+  - The plugin registers them into OpenCode at setup (`ctx.skill.transform`), so a package install
+    (`opencode plugin add`) needs no links in the config directory. A skill of the user's own under the same name
+    keeps its place, and the plugin then never names that skill in a brief.
 - **Catalog:** from `ctx.skill`.
 
 ### 13.2 Caveman: terse text where no human reads it
