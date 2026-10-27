@@ -367,10 +367,16 @@ function envFileValues(text: string): { name: string; value: string }[] {
   return out
 }
 
+// Names that say what a value identifies or where it is, not that it is secret: CLAUDE_CODE_SESSION_ID matched SESSION,
+// and its UUID, part of every path of that session, turned into SECRET_4 in a live run (2026-10-27).
+const NOT_SECRET_NAME = /(_ID|_IDS|_ADDRESS|_PATH|_DIR|_HOME|_TYPE|_CLASS|_DESKTOP|_SOCK|_SOCKET|_PID|_NAME|_URL_BASE|_ENDPOINT)$/i
+
 // A variable's value worth guarding: its name says secret, or it has the shape of one (long, random). Paths, plain
-// words and URLs without credentials stay out, or every "/home/…" in a context would turn into a placeholder.
+// words, identifiers and URLs without credentials stay out, or every "/home/…" in a context would turn into a
+// placeholder.
 export function guardedValue(name: string, value: string): boolean {
   if (value.length < 8 || /^[/~.]/.test(value) || /^[a-z][\w+.-]*:\/\/(?![^/\s:@]+:[^/\s@]+@)/i.test(value)) return false
+  if (NOT_SECRET_NAME.test(name)) return false
   if (looksSecret(name)) return secretShaped(value) || (value.length >= 12 && !/^[a-z]+$/.test(value))
   return value.length >= 20 && secretShaped(value) && entropy(value) >= 3.5
 }
