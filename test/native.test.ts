@@ -1213,3 +1213,22 @@ test("a worker session is charged to its task", async () => {
   native.chargeEvolve(project, d.job.id, { tokens: 10, cost: 0.002, requests: 1 }, d.task.id)
   assert.deepEqual(native.taskOfSession("ses_w1")!.usage, { tokens: 10, cost: 0.002, requests: 1 })
 })
+
+test("a trial whose best attempts lie inside the noise band says they are tied", async () => {
+  const project = benchRepo()
+  let done!: (note: string) => void
+  const decided = new Promise<string>((resolve) => (done = resolve))
+  const native = new Native({ onSettled: (r) => { if (r.note) done(r.note) } })
+  await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "faster", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min", noise: 0.5 }] }))
+  await native.freezeContract(project, native.job(project, "ses_mm").id, "C1")
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "faster", prompt: "Make it faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt" }, MODEL, { difficulty: 0.9, trials: 2 })
+  const a2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "attempt", prompt: `Attempt: ${d.task.id} · ${d.job.id}` }, "opencode-go/kimi-k3")
+  const w1 = native.claim("ses_n1", child(d.prompt))!
+  const w2 = native.claim("ses_n2", child(a2.prompt))!
+  writeFileSync(join(w1.dir, "ms.txt"), "60\n")
+  await native.finish("ses_n1", "60")
+  writeFileSync(join(w2.dir, "ms.txt"), "70\n")
+  const r = await native.finish("ses_n2", "70")
+  const note = r.note ?? (await decided)
+  assert.match(note, /with the best score \(ms 60 \(baseline 100\), tied with T\d+ inside the noise band\)/)
+})

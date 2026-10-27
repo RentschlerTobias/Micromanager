@@ -1788,7 +1788,11 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
     for (const cand of order) {
       const e = this.#entries.get(`${job.id}/${cand.id}`)
       if (!e || e.removed) continue
-      const how = cand.score ? (corpus === "heldout" ? `held-out ${coarse(cand.score)}` : describe(c, cand.score)) : "no score"
+      const measured = cand.score ? (corpus === "heldout" ? `held-out ${coarse(cand.score)}` : describe(c, cand.score)) : "no score"
+      // Within the noise band the scores do not tell the attempts apart (live run, 2026-10-27: 9.9 against 10.9 ms at
+      // 15 %): the note says so rather than calling one the best.
+      const tied = order.filter((t) => t !== cand && t.score && cand.score && better(c, cand.score, t.score) === 0).map((t) => t.id)
+      const how = tied.length ? `${measured}, tied with ${tied.join(", ")} inside the noise band` : measured
       const merged = await this.#merge(e, job, cand)
       if (!merged.ok) {
         stage(cand, "trial", "fail", "had the best score but did not merge")
