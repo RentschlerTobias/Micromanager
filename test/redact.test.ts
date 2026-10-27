@@ -77,6 +77,10 @@ test("restore: files get every value back, other tools all but secrets, the web 
   const input = { filePath: "a.txt", edits: [{ oldString: "Hi PERSON_1", newString: "Bye PERSON_1" }] }
   mapStrings(input, (s) => v.restore(s, restoreScope("edit")))
   assert.deepEqual(input.edits[0], { oldString: "Hi Anna Weber", newString: "Bye Anna Weber" })
+  // A frozen input with nothing to restore is not written to, and one with a placeholder does not fail the call.
+  const question = Object.freeze({ questions: Object.freeze([Object.freeze({ header: "Start job", question: "Start?" })]) })
+  assert.doesNotThrow(() => mapStrings(question, (s) => v.restore(s, restoreScope("question"))))
+  assert.doesNotThrow(() => mapStrings(Object.freeze({ text: "PERSON_1" }), (s) => v.restore(s)))
 })
 
 test("a request is redacted in its text, calls and results, never in ids, types or images", () => {

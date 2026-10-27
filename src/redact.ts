@@ -301,16 +301,27 @@ export class Vault {
 // match a token pattern and come back broken).
 const SKIP = new Set(["type", "id", "name", "role", "toolCallId", "toolName", "mediaType", "mimeType", "data", "image", "providerOptions", "providerMetadata"])
 
-// Applies fn to every string in value, in place where it can; returns the new value for a top-level string.
+// Applies fn to every string in value, in place where it can; returns the new value for a top-level string. Only a
+// string that changes is written back: a tool's input can be frozen (live run, 2026-10-27: writing every field back
+// made every question form fail with "Attempted to assign to readonly property"), and one that cannot be written is
+// left as it is rather than failing the call.
 export function mapStrings(value: unknown, fn: (s: string) => string, key?: string): unknown {
   if (typeof value === "string") return key && SKIP.has(key) ? value : fn(value)
+  const put = (o: Record<string | number, unknown>, k: string | number, next: unknown) => {
+    if (next === o[k]) return
+    try {
+      o[k] = next
+    } catch {
+      // frozen: kept as it is
+    }
+  }
   if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) value[i] = mapStrings(value[i], fn)
+    for (let i = 0; i < value.length; i++) put(value as unknown as Record<number, unknown>, i, mapStrings(value[i], fn))
     return value
   }
   if (value && typeof value === "object") {
     const o = value as Record<string, unknown>
-    for (const k of Object.keys(o)) if (!SKIP.has(k)) o[k] = mapStrings(o[k], fn, k)
+    for (const k of Object.keys(o)) if (!SKIP.has(k)) put(o, k, mapStrings(o[k], fn, k))
     return value
   }
   return value
