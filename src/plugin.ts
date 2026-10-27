@@ -36,7 +36,7 @@ import { lastAssistantText } from "./brief.ts"
 import { firstInterval, nextInterval, review, signalFor } from "./checkpoint.ts"
 import { board } from "./board.ts"
 import { autoStep, nextStep, plannedLine, startable } from "./continuation.ts"
-import { cleanEnv, looksSecret, rulesFor, startSandbox, WorkerShells, type Wrapper } from "./sandbox.ts"
+import { cleanEnv, looksSecret, rulesFor, startSandbox, tempDirFor, withTemp, WorkerShells, type Wrapper } from "./sandbox.ts"
 import { addGrant, isStarted, lastOptions, loadControl, optionsOf, saveLastOptions, updateControl } from "./control.ts"
 import { badName, GRANT_FLOOR, grantNote, harmlessQuestion, grantResult, GrantRequests, grantState, triage, type GrantKind } from "./grants.ts"
 import { accessForm, answersOf, formInput, gitForm, readForm, type Question } from "./forms.ts"
@@ -1197,10 +1197,11 @@ export default {
       input.env = cleanEnv(input.env ?? process.env, [...settings.env, ...grants.env])
       const box = await sandbox
       if (!box.available) return
+      const temp = tempDirFor(found ? `${found.jobId}\0${found.writer ? found.worktree : found.dir}` : dir!)
       const rules = found
-        ? rulesFor({ role: found.role, writer: found.writer, dir: found.dir, worktree: found.worktree, domains: [...settings.network, ...grants.network], frozen: found.frozen })
-        : rulesFor({ role: "code", writer: true, dir: dir!, worktree: dir!, domains: [...settings.network] })
-      const wrapped = await box.wrap(input.command, rules)
+        ? rulesFor({ role: found.role, writer: found.writer, dir: found.dir, worktree: found.worktree, domains: [...settings.network, ...grants.network], frozen: found.frozen, temp })
+        : rulesFor({ role: "code", writer: true, dir: dir!, worktree: dir!, domains: [...settings.network], temp })
+      const wrapped = await box.wrap(withTemp(input.command, temp), rules)
       const seen = (SHARED.unwrapped ??= new Map())
       seen.set(wrapped, input.command)
       if (seen.size > 500) seen.delete(seen.keys().next().value!)

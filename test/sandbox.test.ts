@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import { heldOutRoot } from "../src/contract.ts"
-import { cleanEnv, looksSecret, neverHanded, REGISTRIES, rulesFor, startSandbox, WorkerShells } from "../src/sandbox.ts"
+import { cleanEnv, looksSecret, neverHanded, REGISTRIES, rulesFor, startSandbox, tempDirFor, withTemp, WorkerShells } from "../src/sandbox.ts"
 
 test("a worker's environment is an allowlist; the never list beats any grant", () => {
   const env = {
@@ -73,6 +73,24 @@ test("the sandbox keeps a writer in its worktree, away from the user's keys and 
     assert.match(await run(a, "sed -i s/ok/no/ frozen.test.js"), /failed/)
     assert.match(await run(a, "echo no > frozen.test.js"), /failed/)
     assert.equal(readFileSync(join(a, "frozen.test.js"), "utf8"), "ok\n")
+    // Each worker has its own temp directory as TMPDIR, which the others can neither see nor write (2026-10-27:
+    // sandbox-runtime's TMPDIR=/tmp/claude did not exist, so mktemp failed in every worker).
+    const tempA = tempDirFor(`test\0${a}`)
+    const tempB = tempDirFor(`test\0${b}`)
+    writeFileSync(join(tempB, "note"), "theirs\n")
+    const inTemp = async (command: string) => {
+      const wrapped = await sandbox.wrap(withTemp(command, tempA), rulesFor({ role: "explore", writer: false, dir: a, temp: tempA }))
+      try {
+        return execFileSync("bash", ["-c", wrapped], { cwd: a, env: cleanEnv(process.env), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
+      } catch (err) {
+        return `failed: ${String((err as { stderr?: string }).stderr ?? err).trim().split("\n").pop()}`
+      }
+    }
+    assert.equal(await inTemp('f=$(mktemp) && echo hi > "$f" && cat "$f" && test "$TMPDIR" = ' + `'${tempA}'`), "hi")
+    assert.match(await inTemp(`cat ${join(tempB, "note")}`), /failed/)
+    assert.match(await inTemp(`echo x > ${join(tempB, "w")}`), /failed/)
+    assert.match(await inTemp("echo x > own.txt"), /failed/, "a reader still writes nothing but its temp directory")
+    execFileSync("rm", ["-rf", tempA, tempB])
   } finally {
     execFileSync("rm", ["-rf", root])
     await sandbox.stop()

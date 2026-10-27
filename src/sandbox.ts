@@ -12,7 +12,9 @@
 // ~25-35 ms per command; `npm test` and `uv run pytest` (with PyPI allowed) pass; the environment is passed through
 // as it is, so cleaning it is ours. On Linux a glob in denyRead covers the files that exist when the command is wrapped.
 
-import { homedir } from "node:os"
+import { createHash } from "node:crypto"
+import { mkdirSync } from "node:fs"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 
 import type { RoleId } from "./roles.ts"
@@ -90,19 +92,41 @@ export interface RuleInput {
   readonly worktree?: string // a writer's worktree root, the one place it writes
   readonly domains?: readonly string[] // the user's "network" setting and the job's granted domains
   readonly frozen?: readonly string[] // absolute paths a writer may read and run but not change (src/native.ts)
+  readonly temp?: string // the worker's own temp directory (tempDirFor), the one place a reader writes
+}
+
+// Where the workers' temp directories live. sandbox-runtime hands every command TMPDIR=/tmp/claude, which nothing
+// creates and which every worker would share (2026-10-27: mktemp failed in every worker, and headless Chromium could
+// not make its profile); each worker gets its own instead, unreadable to the others.
+export function tempRoot(): string {
+  return join(tmpdir(), `micromanager-${process.getuid?.() ?? "user"}`)
+}
+
+// A worker's temp directory, made on first use: one per key (a job's worktree or reader directory).
+export function tempDirFor(key: string): string {
+  const dir = join(tempRoot(), createHash("sha1").update(key).digest("hex").slice(0, 16))
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  return dir
+}
+
+// The command as the sandbox runs it: with its temp directory as TMPDIR, after sandbox-runtime set its own.
+export function withTemp(command: string, temp: string | undefined): string {
+  if (!temp) return command
+  const q = `'${temp.replace(/'/g, `'\\''`)}'`
+  return `export TMPDIR=${q} TMP=${q} TEMP=${q}; ${command}`
 }
 
 // A writer writes its own worktree, a reader nothing; both have a private temp directory (never /tmp as a whole: the
 // spike's first run let worker B write into A's worktree through it). Environment files of the project stay unreadable.
 export function rulesFor(input: RuleInput): Rules {
-  const own = input.writer ? [input.worktree ?? input.dir] : []
+  const own = [...(input.writer ? [input.worktree ?? input.dir] : []), ...(input.temp ? [input.temp] : [])]
   return {
     network: { allowedDomains: [...new Set([...REGISTRIES, ...(input.domains ?? [])])], deniedDomains: [] },
     filesystem: {
       // The held-out cases of fitness contracts (src/contract.ts) live in the plugin's state directory, which DENY_READ
       // names by its default place; with XDG_STATE_HOME set it is elsewhere, so it is named by where it is.
-      denyRead: [...DENY_READ, heldOutRoot(), join(input.dir, "**/.env"), join(input.dir, "**/.env.*")],
-      allowRead: [join(input.dir, "**/.env.example")],
+      denyRead: [...DENY_READ, heldOutRoot(), tempRoot(), join(input.dir, "**/.env"), join(input.dir, "**/.env.*")],
+      allowRead: [join(input.dir, "**/.env.example"), ...(input.temp ? [input.temp] : [])],
       allowWrite: own,
       // A frozen test inside the writer's own worktree: `sed -i` must not get around what the edit tools may not do.
       denyWrite: [...(input.frozen ?? [])],
