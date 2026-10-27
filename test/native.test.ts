@@ -1268,7 +1268,7 @@ test("a best trial holds the first to pass, stops idle attempts, and merges the 
 test("a best trial is decided when its grace window closes, and the attempts still at work are stopped", async () => {
   const project = repo()
   const settledWith: { note?: string; stop: string[] }[] = []
-  const native = new Native({ trialGrace: { factor: 1, maxMs: 100 }, onSettled: (r) => settledWith.push(r) })
+  const native = new Native({ trialGrace: { factor: 1, minMs: 0, maxMs: 100 }, onSettled: (r) => settledWith.push(r) })
   const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "add add.js", prompt: "Create add.js.\nFiles: add.js\nChecks: test -f add.js" }, MODEL, { difficulty: 0.9, trials: 2 })
   const a2 = await native.delegate(project, "ses_mm", { agent: "coder", description: "T1 attempt", prompt: `Attempt: T1 · ${d.job.id}` }, "opencode-go/kimi-k3")
   const w1 = native.claim("ses_c1", child(d.prompt))!

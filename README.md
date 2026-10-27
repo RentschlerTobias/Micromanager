@@ -356,7 +356,7 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "trials": 3,            // attempts a hard writer task runs as, each on another model (1: no trials; at most 4)
   "trialDeadline": 20,    // minutes a trial decided by a fitness contract waits for its last attempts
   "trialPick": { "designer": "user", "*": "best" }, // who decides a trial, per agent: "first", "best" or "user"
-  "trialGrace": { "factor": 0.5, "maxMinutes": 10 }, // a "best" trial's grace window after its first pass
+  "trialGrace": { "factor": 0.5, "minMinutes": 2, "maxMinutes": 10 }, // a "best" trial's grace window after its first pass
   "githubBacklog": [],    // repositories ("owner/name") whose issues labelled micromanager join the backlog
   "evolver": { "maxEvalSeconds": 600 },  // the longest full measurement the evolver is still offered for
   "budget": { "tokens": 4000000, "requests": 800, "cost": 5 }, // optional limits per job; none by default
@@ -386,7 +386,7 @@ model family. Who decides it is the trial's **pick** (`"trialPick"`, or a line `
 task's prompt):
 
 - **best** (writers by default): the first attempt to pass is held, not merged, and the others get a grace window of
-  half its time, at most ten minutes (`"trialGrace"`); attempts the watchdog sees getting nowhere are stopped when the
+  half its time, at least two and at most ten minutes (`"trialGrace"`); attempts the watchdog sees getting nowhere are stopped when the
   window opens. The passed ones are ranked by the share of the checks' `MM_SCORE` cases they pass, then, on a tie, by
   a review of the two best changes by a model of a third family, then by cost and size. The note says why the winner
   won.

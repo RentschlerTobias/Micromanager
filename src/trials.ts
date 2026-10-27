@@ -47,17 +47,20 @@ export function pickOf(task: Task): Pick {
   return task.contract ? "contract" : task.trial?.pick ?? "first"
 }
 
-// The grace window of a "best" trial: the other attempts get this share of the first passing one's time, at most this
-// long. factor 0 decides at once, as "first" does.
+// The grace window of a "best" trial: the other attempts get this share of the first passing one's time, at least
+// minMs and at most maxMs. factor 0 decides at once, as "first" does. The floor exists because a share alone gave 6 s
+// when the first attempt passed after 12 (live run, 2026-10-27): the slower attempt was stopped, and speed won again.
 export interface Grace {
   readonly factor: number
+  readonly minMs: number
   readonly maxMs: number
 }
 
-export const DEFAULT_GRACE: Grace = { factor: 0.5, maxMs: 10 * 60_000 }
+export const DEFAULT_GRACE: Grace = { factor: 0.5, minMs: 2 * 60_000, maxMs: 10 * 60_000 }
 
 export function graceMs(g: Grace, elapsedMs: number): number {
-  return Math.max(0, Math.min(g.factor * elapsedMs, g.maxMs))
+  if (g.factor <= 0) return 0
+  return Math.max(0, Math.min(Math.max(g.factor * elapsedMs, g.minMs), g.maxMs))
 }
 
 // What each attempt is told about how its trial is decided.

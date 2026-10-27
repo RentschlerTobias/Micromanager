@@ -120,9 +120,10 @@ test("who decides a trial: the Pick line, else the role's setting, else best; a 
 })
 
 test("the grace window is a share of the first attempt's time, capped; an idle attempt is one going nowhere", () => {
-  assert.equal(graceMs({ factor: 0.5, maxMs: 600_000 }, 240_000), 120_000)
-  assert.equal(graceMs({ factor: 0.5, maxMs: 600_000 }, 3_600_000), 600_000)
-  assert.equal(graceMs({ factor: 0, maxMs: 600_000 }, 240_000), 0)
+  assert.equal(graceMs({ factor: 0.5, minMs: 0, maxMs: 600_000 }, 240_000), 120_000)
+  assert.equal(graceMs({ factor: 0.5, minMs: 0, maxMs: 600_000 }, 3_600_000), 600_000)
+  assert.equal(graceMs(DEFAULT_GRACE, 12_000), 120_000, "a fast first pass still leaves the others two minutes")
+  assert.equal(graceMs({ factor: 0, minMs: 120_000, maxMs: 600_000 }, 240_000), 0)
   assert.ok(idleAttempt({ calls: 30, writes: 0, callsSinceWrite: 30, recentFailures: 0 }))
   assert.ok(idleAttempt({ calls: 60, writes: 3, callsSinceWrite: 26, recentFailures: 0 }))
   assert.ok(idleAttempt({ calls: 20, writes: 2, callsSinceWrite: 3, recentFailures: 9 }))
@@ -163,7 +164,7 @@ test("settings: trialPick by agent or role id, trialGrace in minutes", () => {
   assert.deepEqual(parseTrialPick('{ "trialPick": { "coder": "first", "*": "user" } }'), { visual: "user", code: "first", "*": "user" })
   assert.throws(() => parseTrialPick('{ "trialPick": { "coder": "fast" } }'), /trialPick must be/)
   assert.throws(() => parseTrialPick('{ "trialPick": { "nobody": "best" } }'), /unknown agent/)
-  assert.deepEqual(parseTrialGrace('{ "trialGrace": { "maxMinutes": 3 } }'), { factor: 0.5, maxMs: 180_000 })
+  assert.deepEqual(parseTrialGrace('{ "trialGrace": { "maxMinutes": 3 } }'), { factor: 0.5, minMs: 120_000, maxMs: 180_000 })
   assert.deepEqual(parseTrialGrace("{}"), DEFAULT_GRACE)
   assert.throws(() => parseTrialGrace('{ "trialGrace": { "factor": -1 } }'), /trialGrace must be/)
 })

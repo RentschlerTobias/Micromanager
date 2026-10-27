@@ -225,17 +225,17 @@ export function parseTrialPick(text: string): Record<string, TrialPick> {
   return out
 }
 
-// "trialGrace": the grace window of a "best" trial: the others get factor x the first passing attempt's time, at most
-// maxMinutes. Default 0.5 and 10.
+// "trialGrace": the grace window of a "best" trial: the others get factor x the first passing attempt's time, at least
+// minMinutes and at most maxMinutes. Default 0.5, 2 and 10.
 export function parseTrialGrace(text: string): Grace {
   const raw = (JSON.parse(stripComments(text)) as { trialGrace?: unknown }).trialGrace
   if (raw === undefined) return DEFAULT_GRACE
-  const shape = 'trialGrace must be { "factor": 0.., "maxMinutes": 0.. }'
+  const shape = 'trialGrace must be { "factor": 0.., "minMinutes": 0.., "maxMinutes": 0.. }'
   if (typeof raw !== "object" || raw === null) throw new Error(shape)
-  const g = raw as { factor?: unknown; maxMinutes?: unknown }
-  if (g.factor !== undefined && (typeof g.factor !== "number" || g.factor < 0)) throw new Error(shape)
-  if (g.maxMinutes !== undefined && (typeof g.maxMinutes !== "number" || g.maxMinutes < 0)) throw new Error(shape)
-  return { factor: (g.factor as number | undefined) ?? DEFAULT_GRACE.factor, maxMs: g.maxMinutes === undefined ? DEFAULT_GRACE.maxMs : (g.maxMinutes as number) * 60_000 }
+  const g = raw as { factor?: unknown; minMinutes?: unknown; maxMinutes?: unknown }
+  for (const v of [g.factor, g.minMinutes, g.maxMinutes]) if (v !== undefined && (typeof v !== "number" || v < 0)) throw new Error(shape)
+  const minutes = (v: unknown, d: number) => (v === undefined ? d : (v as number) * 60_000)
+  return { factor: (g.factor as number | undefined) ?? DEFAULT_GRACE.factor, minMs: minutes(g.minMinutes, DEFAULT_GRACE.minMs), maxMs: minutes(g.maxMinutes, DEFAULT_GRACE.maxMs) }
 }
 
 // "cloudOnly": true (the default for now, the user's choice of 2026-10-05) routes no task to a local model and asks

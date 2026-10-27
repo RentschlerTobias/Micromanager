@@ -1244,7 +1244,8 @@ they started Chromium through the shell, and it crashed in the sandbox.
 wins) or `user`; the default comes from `trialPick` by role (writers `best`, designers `user`), a `Pick:` line
 overrides it.
 - `best`: the first passing attempt is held (`task.held`, as for a contract) and arms a grace window, `trialGrace`
-  (factor × its own time since delegation, capped). Live attempts the watchdog counts as idle (`idleAttempt`: no write
+  (factor × its own time since delegation, at least `minMinutes`, at most `maxMinutes`; the floor came from the live run:
+  a first pass after 12 s left the others 6 s). Live attempts the watchdog counts as idle (`idleAttempt`: no write
   in 20 calls, 25 calls since the last write, or 8 recent failures) are stopped at that moment. The trial is decided
   on the merge train when no attempt is at work or the window closes: `rankQuality` orders by the share of MM_SCORE
   cases passed; on a tie the two best diffs go to a pairwise review (a hidden, tool-less session on a reviewer-pool
