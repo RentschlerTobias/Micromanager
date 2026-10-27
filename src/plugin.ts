@@ -14,6 +14,7 @@ import { backstop, DELEGATION_TOOLS, delegationRole, notRouted, resultText, rewr
 import { Jev, apiKey, redact, type Question as JevQuestion } from "./jev.ts"
 import { journalPath, record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
+import { DEFAULT_LABELS, gitAuthor, knownSecrets, mapStrings, PLACEHOLDER_NOTE, requestTexts, restoreScope, scanNames, useVault, Vault, type NameSettings } from "./redact.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe, type Availability } from "./registry.ts"
 import { chooseModel, unknown as allAvailable, withPicks, type Available } from "./routing.ts"
@@ -201,6 +202,7 @@ interface Shared {
   // worker's end is seen by the instance of its worktree, the micromanager's turn by the instance of its directory.
   continuing: Map<string, string> // micromanager session -> job id
   usage?: Usage // the tasks each model got this week, for the least-used pick of a role's pool (src/usage.ts)
+  vault?: Vault // private data -> placeholders, for every session of the server (src/redact.ts)
 }
 const SHARED: Shared = ((globalThis as { __micromanager?: Shared }).__micromanager ??= {
   workerTasks: new Map(),
@@ -817,6 +819,40 @@ export default {
       if (!box.available) log("warn", `worker commands run without a sandbox: ${box.reason}`)
       return box
     }))
+    // Private data in requests to cloud models (src/redact.ts): one vault per server, so a value keeps its placeholder in
+    // every session. The git author is the user, who is no secret to their own models.
+    const redacting = settings.redact.secrets || settings.redact.pii || settings.redact.names
+    const vault = redacting
+      ? (SHARED.vault ??= new Vault({ allow: [...settings.redact.allow, ...gitAuthor()], secrets: settings.redact.secrets, pii: settings.redact.pii, journal: record }))
+      : undefined
+    useVault(vault)
+    const names: NameSettings | undefined = vault && settings.redact.names
+      ? { url: (DEFAULT_BACKENDS.urls.gliner ?? "http://127.0.0.1:8781/v1/systemone").replace(/\/v1\/systemone$/, "/v1/entities"), labels: DEFAULT_LABELS, threshold: settings.redact.threshold }
+      : undefined
+    let namesDownSince = 0
+    // Every string of the request the provider gets, and its system prompt, through the vault; names first, when on.
+    const redactRequest = async (input: SessionHookInput): Promise<void> => {
+      if (!vault) return
+      if (names) {
+        try {
+          await scanNames(vault, requestTexts(input.messages, input.system), names)
+          namesDownSince = 0
+        } catch (err) {
+          // The detector is down: the request goes on with secrets and structured data replaced, and the journal says so
+          // once every ten minutes.
+          if (Date.now() - namesDownSince > 600_000) {
+            namesDownSince = Date.now()
+            record({ kind: "redact.names-unavailable", sessionID: input.sessionID, error: String(err) })
+            log("warn", `names and addresses were not checked: ${String(err)}`)
+          }
+        }
+      }
+      if (Array.isArray(input.messages)) mapStrings(input.messages, (s) => vault.redact(s))
+      if (Array.isArray(input.system)) {
+        for (const p of input.system) if (typeof p.text === "string") p.text = vault.redact(p.text)
+        input.system.push({ type: "text", text: PLACEHOLDER_NOTE })
+      }
+    }
     // Which models the host can run, read from ctx.model and kept for a minute (see modelAvailability).
     const hostModels = modelAvailability(ctx.model)
     // A role's pool goes to its least-used model, by tasks per $ of its monthly budget (src/routing.ts). One count for
@@ -1178,6 +1214,9 @@ export default {
       return id && project ? loadJob(project, id) : undefined
     }
     await ctx.tool.hook("execute.before", async (call) => {
+      // A model writes placeholders; the tool gets the real values, as far as the tool may have them (src/redact.ts).
+      const scope = vault && restoreScope(call.tool)
+      if (vault && scope) mapStrings(call.input, (s) => vault.restore(s, scope))
       // A worker's shell: noted so the shell hook, which gets no session id, wraps this one and no other agent's.
       if (call.tool === "shell" && call.sessionID && (runnerSessions.has(call.sessionID) || native.isWorker(call.sessionID))) {
         SHARED.workerShells.expect(String(call.input.command ?? ""))
@@ -1597,8 +1636,12 @@ export default {
         micromanager: MICROMANAGER.agent,
         delegationTools: [...DELEGATION_TOOLS],
         delegationAgents: ROLES.map((role) => role.agent),
+        redact: vault ? { secrets: settings.redact.secrets, pii: settings.redact.pii, names: Boolean(names) } : "off",
       })
     }
+    // Values that are secret whatever their shape: the server's own secret variables, the project's .env files, the
+    // Jev key. After the plugin record, which stays the first thing an instance writes.
+    if (vault && settings.redact.secrets) for (const value of knownSecrets(process.env, project, [apiKey() ?? ""])) vault.add(value, "secret", "known")
     if (!project) {
       log("warn", "no project directory: the micromanager tools are not installed")
       return
@@ -1996,8 +2039,9 @@ export default {
         if (signal) stop(call.sessionID, signal)
       }
       if (!runnerSessions.has(call.sessionID)) return
-      // What a worker fetches or reads is checked before its model sees it (E2b): a page that looks like an
-      // injection is replaced, and keys and tokens are masked (no worker needs one; a cloud model must not get one).
+      // What a worker fetches is checked before its model sees it (E2b): a page that looks like an injection is
+      // replaced. Private data in results is swapped for placeholders in the request itself (the context hook), so the
+      // stored result and the TUI keep the real text; without a vault, keys and tokens are masked here as before.
       if (WEB.test(call.tool)) {
         const score = await injectionScore(decider, resultText(call.result)).catch(() => undefined)
         if (injected(score)) {
@@ -2006,7 +2050,7 @@ export default {
           return
         }
       }
-      if (rewriteResult(call.result, redact)) record({ kind: "redacted", sessionID: call.sessionID, tool: call.tool })
+      if (!vault && rewriteResult(call.result, redact)) record({ kind: "redacted", sessionID: call.sessionID, tool: call.tool })
     })
     // The sessions the plugin can see are alive: the runner's own workers and the delegated ones (native.running), minus
     // the ones it watched end. reconcileJob must never be given less than this, or it would cancel a live worker.
@@ -2621,7 +2665,7 @@ export default {
     const tail = (input: SessionHookInput, text: string) => {
       if (Array.isArray(input.messages)) (input.messages as unknown[]).push({ role: "user", content: [{ type: "text", text }] })
     }
-    await ctx.session.hook("context", async (input) => {
+    const shapeContext = async (input: SessionHookInput): Promise<void> => {
       // The tools exist for every agent; only the micromanager sees them.
       // The summarizer reads only the transcript it is given: no tools, no memory, no context management.
       if (input.agent === SUMMARIZER_AGENT) {
@@ -2745,6 +2789,11 @@ export default {
           record({ kind: "continuation", sessionID: input.sessionID, job: planned, step: step.kind, tasks: step.kind === "start" ? step.tasks.map((t) => t.id) : [] })
         }
       }
+    }
+    await ctx.session.hook("context", async (input) => {
+      await shapeContext(input)
+      // Last, so the notes the plugin added on the way are covered too.
+      await redactRequest(input)
     })
   },
 }

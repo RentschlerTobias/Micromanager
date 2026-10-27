@@ -7,7 +7,7 @@ import urllib.request
 from collections.abc import Mapping
 from http.server import ThreadingHTTPServer
 
-from decider.server import YES_NO, Abandoned, decide, make_handler, render_state
+from decider.server import YES_NO, Abandoned, decide, extract, make_handler, render_state
 
 
 class FakeClassifier:
@@ -68,6 +68,40 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(render_state('{"task": "t", "a": [1, 2]}'), "task: t\na: [1,2]")
 
 
+class FakeFinder(FakeClassifier):
+    """Finds every word of a fixed list as the first label; records the labels it was asked for."""
+
+    def __init__(self, words: Mapping[str, str]) -> None:
+        super().__init__()
+        self.words = dict(words)
+        self.asked: list[list[str]] = []
+
+    def entities(self, text: str, labels: list[str], threshold: float) -> list[dict]:
+        self.asked.append(labels)
+        out = []
+        for word, label in self.words.items():
+            at = text.find(word)
+            if at >= 0 and label in labels:
+                out.append({"label": label, "text": word, "start": at, "end": at + len(word), "score": 0.9})
+        return out
+
+
+class EntitiesTest(unittest.TestCase):
+    def test_spans_per_text_with_the_labels_as_asked(self) -> None:
+        finder = FakeFinder({"Anna Weber": "person name", "Lindenstrasse 12": "street address , postal"})
+        out = extract(finder, {"texts": ["Invoice to Anna Weber, Lindenstrasse 12.", "", "nothing here"], "labels": ["person name", "street address (postal)"]})
+        self.assertEqual(finder.asked[0], ["person name", "street address , postal"])
+        self.assertEqual(out["entities"][0][0], {"label": "person name", "text": "Anna Weber", "start": 11, "end": 21, "score": 0.9})
+        self.assertEqual(out["entities"][0][1]["label"], "street address (postal)")
+        self.assertEqual(out["entities"][1:], [[], []])
+
+    def test_bad_bodies_are_refused(self) -> None:
+        finder = FakeFinder({})
+        for body in ({"texts": "x", "labels": ["a"]}, {"texts": ["x"], "labels": []}, {"texts": ["x"], "labels": ["a"], "threshold": 2}):
+            with self.assertRaises(ValueError):
+                extract(finder, body)
+
+
 class HttpTest(unittest.TestCase):
     def test_the_wire_format_over_http(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(FakeClassifier(), "gliner"))
@@ -88,6 +122,23 @@ class HttpTest(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 urllib.request.urlopen(bad)
             self.assertEqual(ctx.exception.code, 400)
+            plain = urllib.request.Request(f"{base}/v1/entities", data=json.dumps({"texts": ["x"], "labels": ["a"]}).encode())
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(plain)
+            self.assertEqual(ctx.exception.code, 501, "a classifier without entities says so")
+        finally:
+            server.shutdown()
+
+    def test_entities_over_http(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(FakeFinder({"Anna": "person name"}), "gliner"))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/v1/entities",
+                data=json.dumps({"texts": ["hi Anna"], "labels": ["person name"], "threshold": 0.4}).encode(),
+            )
+            with urllib.request.urlopen(req) as r:
+                self.assertEqual(json.load(r)["entities"], [[{"label": "person name", "text": "Anna", "start": 3, "end": 7, "score": 0.9}]])
         finally:
             server.shutdown()
 

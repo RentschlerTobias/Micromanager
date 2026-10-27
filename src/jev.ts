@@ -4,6 +4,8 @@
 
 import { execFileSync } from "node:child_process"
 
+import { scrub } from "./redact.ts"
+
 export type Question =
   | { type: "choice"; instructions: string; criteria: Record<string, string> } // option id -> meaning
   | { type: "score"; instructions: string; criteria: string[] } // rubric levels, lowest first
@@ -46,11 +48,10 @@ export function apiKey(env: NodeJS.ProcessEnv = process.env): string | undefined
   }
 }
 
-const SECRET = /\b(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/g
-
-// Masks things that look like keys or tokens before the state leaves the machine.
+// Private data is swapped for the vault's placeholders before the state leaves the machine (src/redact.ts); with
+// redaction off, keys and tokens are still masked.
 export function redact(text: string): string {
-  return text.replace(SECRET, "<secret>")
+  return scrub(text)
 }
 
 export class Jev {

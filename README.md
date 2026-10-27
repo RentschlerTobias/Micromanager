@@ -89,6 +89,19 @@ Jev and the plugin securing every task:
 4. **Jev and the plugin secure each task:**
    - **Guards.** A check looks at each delegation, at web content and at workers' permission requests. Keys and
      tokens are masked.
+   - **Private data stays here.** Every request to a model, the micromanager's, a worker's, a helper's, the
+     summarizer's and Jev's, has its private data swapped for placeholders first: keys and tokens (some twenty
+     formats, private keys, URL passwords, secret-looking assignments, and the actual values of the server's secret
+     variables, the project's `.env` files and the Jev key), e-mail addresses, phone numbers, IBANs and card numbers
+     (checked by checksum), and, with `"redact": { "names": true }`, people's names and street addresses found by the
+     local GLiNER server (`/v1/entities`; code is read for its comments and strings only). One value always gets the
+     same placeholder (`PERSON_1`, `SECRET_2`, `email3@redacted.invalid`), so a model can still reason about it and
+     the prompt cache holds. The model's tool calls get the real values back: files all of them, so an edit keeps a
+     file's key; commands everything but secrets; web tools nothing. The vault lives in
+     `~/.local/state/micromanager/vault.json` (mode 600, out of every sandbox); OpenCode's database and the TUI keep the
+     real text, so a model's reply to you can show a placeholder. Your git name and e-mail and the values in
+     `"redact": { "allow": [...] }` are never replaced. With the GLiNER server down, names go unchecked and the
+     journal says so (`redact.names-unavailable`); `redact.new` records each new placeholder, never its value.
    - **Model and skills.** The plugin routes each role to its model and names the skills in the worker's brief.
    - **Permissions (N13).** Workers' permission requests go to Jev. What Jev is not sure about, what it says only
      you can decide, and what a hard rule sends to you is **paused, not refused**: the worker waits, and the
@@ -340,7 +353,10 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "notify": "jobs",       // desktop notifications (notify-send on Linux, osascript on macOS): "jobs", "tasks" (also per task) or "off"
   "sandbox": true,        // worker commands in the sandbox (default); false runs them unwrapped
   "env": ["DATABASE_URL", "MYAPP_*"], // variables every job's commands keep beyond the allowlist
-  "network": ["api.example.com", "*.example.com"] // hosts every job's commands may reach beyond the registries
+  "network": ["api.example.com", "*.example.com"], // hosts every job's commands may reach beyond the registries
+  // private data in requests to models: secrets and e-mail/phone/IBAN/card on by default; names and addresses
+  // through the local GLiNER server only when switched on; false turns it all off
+  "redact": { "names": false, "threshold": 0.5, "allow": ["ACME GmbH"] }
 }
 ```
 

@@ -305,6 +305,39 @@ export function parseMemory(text: string): MemorySettings {
   return { enabled: m.enabled ?? true, embedding }
 }
 
+// Private data in requests to cloud models (src/redact.ts): secrets and structured personal data (e-mail, phone, IBAN,
+// card) on by default; names and addresses through the local GLiNER server only when asked for, since that detector is
+// not calibrated yet. "allow" lists values that are never replaced; the git author is added to it at start.
+export interface RedactSettings {
+  readonly secrets: boolean
+  readonly pii: boolean
+  readonly names: boolean
+  readonly threshold: number
+  readonly allow: readonly string[]
+}
+
+export const DEFAULT_REDACT: RedactSettings = { secrets: true, pii: true, names: false, threshold: 0.5, allow: [] }
+
+export function parseRedact(text: string): RedactSettings {
+  const raw = (JSON.parse(stripComments(text)) as { redact?: unknown }).redact
+  if (raw === undefined) return DEFAULT_REDACT
+  if (raw === false) return { ...DEFAULT_REDACT, secrets: false, pii: false, names: false }
+  if (raw === true) return DEFAULT_REDACT
+  const shape = 'redact must be true, false or { "secrets": bool, "pii": bool, "names": bool, "threshold": 0..1, "allow": ["…"] }'
+  if (typeof raw !== "object" || raw === null) throw new Error(shape)
+  const r = raw as Record<string, unknown>
+  for (const k of ["secrets", "pii", "names"]) if (r[k] !== undefined && typeof r[k] !== "boolean") throw new Error(shape)
+  if (r.threshold !== undefined && (typeof r.threshold !== "number" || r.threshold <= 0 || r.threshold >= 1)) throw new Error(shape)
+  if (r.allow !== undefined && !(Array.isArray(r.allow) && r.allow.every((a) => typeof a === "string"))) throw new Error(shape)
+  return {
+    secrets: (r.secrets as boolean | undefined) ?? DEFAULT_REDACT.secrets,
+    pii: (r.pii as boolean | undefined) ?? DEFAULT_REDACT.pii,
+    names: (r.names as boolean | undefined) ?? DEFAULT_REDACT.names,
+    threshold: (r.threshold as number | undefined) ?? DEFAULT_REDACT.threshold,
+    allow: (r.allow as string[] | undefined) ?? [],
+  }
+}
+
 // With cloudOnly, local models stay in the registry (they show up in the journal's ranking) but are never routed to.
 export function cloudRegistry(registry: readonly ModelEntry[]): ModelEntry[] {
   return registry.map((m) => (m.location === "local" ? { ...m, disabled: true } : m))
@@ -329,6 +362,7 @@ export interface Settings {
   readonly env: readonly string[]
   readonly network: readonly string[]
   readonly memory: MemorySettings
+  readonly redact: RedactSettings
 }
 
 // The settings a config file that is missing or broken falls back to. One place, so the two returns below cannot drift
@@ -351,6 +385,7 @@ const DEFAULTS: Omit<Settings, "registry"> = {
   env: [],
   network: [],
   memory: DEFAULT_MEMORY,
+  redact: DEFAULT_REDACT,
 }
 
 export function loadSettings(path = configPath()): Settings & { error?: string } {
@@ -361,7 +396,7 @@ export function loadSettings(path = configPath()): Settings & { error?: string }
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY } // no file: the defaults
   }
   try {
-    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), trialDeadline: parseTrialDeadline(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), githubBacklog: parseGithubBacklog(text), evolverMaxEvalSeconds: parseEvolver(text), ...parseSandbox(text), memory: parseMemory(text) }
+    return { ...DEFAULTS, cloudOnly: parseCloudOnly(text), ...parseParallel(text), trials: parseTrials(text), trialDeadline: parseTrialDeadline(text), budget: parseBudget(text), notify: parseNotify(text), routing: parseRouting(text), floors: parseFloors(text), decisions: parseDecisions(text), registry: parseRegistry(text), allowOutside: parseAllowOutside(text), githubBacklog: parseGithubBacklog(text), evolverMaxEvalSeconds: parseEvolver(text), ...parseSandbox(text), memory: parseMemory(text), redact: parseRedact(text) }
   } catch (err) {
     return { ...DEFAULTS, registry: DEFAULT_REGISTRY, error: `${path}: ${String(err)}` }
   }

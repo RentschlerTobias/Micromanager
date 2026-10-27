@@ -1,12 +1,16 @@
 """A local decision server: GLiNER2 behind the TypeSafe Jev wire format, on the CPU (design.md §20).
 
 POST /v1/systemone {model, state, questions} -> {model, answers, latency_ms}
+POST /v1/entities {texts, labels, threshold} -> {entities: [[{label, text, start, end, score}], …], latency_ms}
 GET  /health -> {status: "ok", model}
 
 Each question is its own forward pass, so a question's scores never depend on which others ride along:
 - choice -> a single-label task over the criteria (option id -> meaning);
 - noul   -> a yes/no task; the answer is P(yes) normalised over yes and no;
 - score  -> a single-label task over the rubric levels "0", "1", …; the score is the probability-weighted level.
+
+The entity endpoint finds the spans of each label in each text (names and addresses for src/redact.ts); long texts
+are read in overlapping chunks.
 
 The classifier is injected, so tests run without torch; the real one loads GLiNER2 lazily on the first request.
 """
@@ -29,6 +33,10 @@ FIRST = ("text", "utterance", "task", "question")
 
 class Classifier(Protocol):
     def probabilities(self, text: str, task: str, labels: Mapping[str, str], instruction: str) -> dict[str, float]: ...
+
+
+class EntityFinder(Protocol):
+    def entities(self, text: str, labels: list[str], threshold: float) -> list[dict[str, Any]]: ...
 
 
 def render_state(state: Any) -> str:
@@ -105,13 +113,43 @@ def decide(classifier: Classifier, body: Mapping[str, Any], model: str, alive: C
     return {"model": model, "answers": answers, "latency_ms": (time.perf_counter() - t0) * 1000}
 
 
+def extract(finder: Any, body: Mapping[str, Any], alive: Callable[[], bool] = lambda: True) -> dict[str, Any]:
+    """The spans of each label in each text. Labels go to GLiNER2 without its marker characters and come back as asked."""
+    t0 = time.perf_counter()
+    texts = body.get("texts")
+    labels = body.get("labels")
+    threshold = body.get("threshold", 0.5)
+    if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+        raise ValueError("texts must be a list of strings")
+    if not isinstance(labels, list) or not labels or not all(isinstance(lbl, str) and lbl.strip() for lbl in labels):
+        raise ValueError("labels must be a non-empty list of strings")
+    if not isinstance(threshold, (int, float)) or not 0 < threshold < 1:
+        raise ValueError("threshold must be a number between 0 and 1")
+    asked = {safe(lbl): lbl for lbl in labels}
+    out: list[list[dict[str, Any]]] = []
+    for text in texts:
+        if not alive():
+            raise Abandoned
+        spans = finder.entities(text, list(asked), float(threshold)) if text.strip() else []
+        out.append([
+            {"label": asked.get(str(s.get("label")), str(s.get("label"))), "text": s.get("text"), "start": s.get("start"), "end": s.get("end"), "score": s.get("score")}
+            for s in spans
+        ])
+    return {"entities": out, "latency_ms": (time.perf_counter() - t0) * 1000}
+
+
 class GlinerClassifier:
     """GLiNER2 on the CPU, loaded on first use; one forward pass at a time."""
 
-    def __init__(self, model: str, threads: int | None = None) -> None:
+    def __init__(self, model: str, threads: int | None = None, entity_model: str | None = None) -> None:
         self.model_id = model
+        # The decision model is trained to classify and finds few names; an extraction checkpoint can serve the entity
+        # endpoint instead, loaded on its first request.
+        self.entity_model_id = entity_model or model
         self._threads = threads
         self._clf: Any = None
+        self._extractor: Any = None
+        self._entity_extractor: Any = None
         self._lock = threading.Lock()
 
     def preload(self) -> None:
@@ -129,6 +167,7 @@ class GlinerClassifier:
                 torch.set_num_threads(self._threads)
             extractor = AutoExtractor.from_pretrained(self.model_id)
             extractor.to("cpu")
+            self._extractor = extractor
             self._clf = GClassifier(extractor, device="cpu")
         return self._clf
 
@@ -141,6 +180,31 @@ class GlinerClassifier:
                 {"tasks": {task: {"labels": dict(labels), "min_labels": 1, "max_labels": 1, "instruction": instruction}}}
             )
             return dict(clf.classify(text, schema).probabilities(task))
+
+
+    def _load_entities(self) -> Any:
+        if self._entity_extractor is None:
+            if self.entity_model_id == self.model_id:
+                self._load()
+                self._entity_extractor = self._extractor
+            else:
+                from gliner2 import AutoExtractor
+
+                extractor = AutoExtractor.from_pretrained(self.entity_model_id)
+                extractor.to("cpu")
+                self._entity_extractor = extractor
+        return self._entity_extractor
+
+    def entities(self, text: str, labels: list[str], threshold: float) -> list[dict[str, Any]]:
+        with self._lock:
+            result = self._load_entities().extract_entities_long(text, labels, threshold=threshold, include_confidence=True, include_spans=True)
+        found = result.get("entities", {}) if isinstance(result, dict) else {}
+        return [
+            {"label": label, "text": span.get("text"), "start": span.get("start"), "end": span.get("end"), "score": span.get("confidence")}
+            for label, spans in found.items()
+            for span in spans or []
+            if isinstance(span, dict)
+        ]
 
 
 def make_handler(classifier: Classifier, model: str) -> type[BaseHTTPRequestHandler]:
@@ -160,7 +224,8 @@ def make_handler(classifier: Classifier, model: str) -> type[BaseHTTPRequestHand
                 self._send(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path.rstrip("/") not in ("/v1/systemone", "/systemone"):
+            path = self.path.rstrip("/")
+            if path not in ("/v1/systemone", "/systemone", "/v1/entities"):
                 self._send(404, {"error": "not found"})
                 return
             try:
@@ -171,8 +236,22 @@ def make_handler(classifier: Classifier, model: str) -> type[BaseHTTPRequestHand
             except ValueError as exc:
                 self._send(400, {"error": f"bad request: {exc}"})
                 return
+            alive = lambda: not client_gone(self.connection)  # noqa: E731
+            if path == "/v1/entities":
+                if not hasattr(classifier, "entities"):
+                    self._send(501, {"error": "this server finds no entities"})
+                    return
+                try:
+                    self._send(200, extract(classifier, body, alive=alive))
+                except ValueError as exc:
+                    self._send(400, {"error": f"bad request: {exc}"})
+                except (Abandoned, BrokenPipeError):
+                    return
+                except Exception as exc:  # a model error must not kill the server
+                    self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
+                return
             try:
-                self._send(200, decide(classifier, body, model, alive=lambda: not client_gone(self.connection)))
+                self._send(200, decide(classifier, body, model, alive=alive))
             except (Abandoned, BrokenPipeError):
                 return  # the client timed out and left; nobody reads the answer
             except Exception as exc:  # a model error must not kill the server
@@ -189,10 +268,11 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8781)
     parser.add_argument("--model", default="fastino/GLiNER2.5-multi-Decide", help="a model id or a fine-tuned checkpoint directory")
+    parser.add_argument("--entity-model", default=None, help="the checkpoint for /v1/entities (names and addresses); default: --model")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--no-preload", action="store_true", help="load the model on the first request instead of at start")
     args = parser.parse_args()
-    classifier = GlinerClassifier(args.model, args.threads)
+    classifier = GlinerClassifier(args.model, args.threads, args.entity_model)
     if not args.no_preload:
         classifier.preload()
     server = ThreadingHTTPServer((args.host, args.port), make_handler(classifier, "gliner"))
