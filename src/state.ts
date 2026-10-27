@@ -166,6 +166,8 @@ export interface Task {
   // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has, `pick` who
   // decides it (src/trials.ts Pick; absent on trials from before 2026-10-28, which the first passing attempt decided).
   trial?: { of: string; n: number; pick?: "first" | "best" | "contract" | "user" }
+  preview?: string // the page that shows its result, relative to its directory ("Preview:", src/pick.ts)
+  pickAsked?: string // on a "user" trial's first attempt: when the user was asked to pick
 }
 
 export interface Job {

@@ -15,6 +15,7 @@ import { Jev, apiKey, redact, type Question as JevQuestion } from "./jev.ts"
 import { journalPath, record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { look } from "./look.ts"
+import { readPick } from "./pick.ts"
 import { DEFAULT_LABELS, gitAuthor, knownSecrets, mapStrings, PLACEHOLDER_NOTE, requestTexts, restoreScope, scanNames, useVault, Vault, type NameSettings } from "./redact.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe, type Availability } from "./registry.ts"
@@ -997,6 +998,14 @@ export default {
       installedSkills, planFirst: true, noGit: (dir) => noGitNote(dir), evolverReady: () => evolverReady, evolverCallCost, evolverMaxEvalSeconds: () => loadSettings().evolverMaxEvalSeconds,
       trialDeadlineMs: settings.trialDeadline * 60_000, trialPick: settings.trialPick, trialGrace: settings.trialGrace,
       idle: (session) => idleAttempt(SHARED.watchdog.progress(session)),
+      // The picture of a "user" trial's attempt for the comparison page: its preview page, rendered like look does.
+      preview: async (dir, path) => {
+        const r = await look({ path }, dir, [])
+        return r.image ? { png: r.image.data } : { problem: `No picture: ${r.text}` }
+      },
+      notify: (title, body) => {
+        if (notify !== "off") notifyDesktop(title, body)
+      },
       // The pairwise review of a "best" trial: a model of a third family, in a hidden, tool-less session; none when the
       // pool has no third family to offer.
       review: async (task, a, b) => {
@@ -1973,6 +1982,16 @@ export default {
             : await native.roundBaseline(project, sessionID, round.id, readBaseline(at(roundHeader(found.contract, "baseline"))).decision, readBaseline(at(roundHeader(found.contract, "baseline"))).said)
         record({ kind: "contract-round", sessionID, contract: round.id, part: round.part, text: text.slice(0, 300) })
         tell(text)
+        return
+      }
+      // A trial the user decides (src/pick.ts): the version they picked, a combination, or none.
+      const picked = answers && project ? readPick(asked, answers) : undefined
+      if (picked && project) {
+        const tell = (text: string) => rewriteResult(call.result, (was) => `${was}\n[micromanager] ${text}`)
+        const r = await native.pickAnswer(project, sessionID, picked.head, picked.answer)
+        record({ kind: "trial.pick", sessionID, head: picked.head, answer: picked.answer.kind, id: picked.answer.kind === "attempt" ? picked.answer.id : undefined })
+        if (r.job) await settledTrial({ project, job: r.job, parent: sessionID, stop: r.stop, measured: r.measured })
+        tell(r.text)
         return
       }
       const form = answers && readForm(asked, answers)

@@ -1302,3 +1302,83 @@ test("a best trial tied on the checks asks for a review of the two changes, and 
   assert.equal(asked.length, 1)
   assert.match(r.note!, /T2 won the trial of T1 as the best attempt \(on review: handles strings too\)/)
 })
+
+// A "user" trial with two designers that pass and one that ends without passing.
+async function userTrial(native: Native, project: string) {
+  const d = await native.delegate(project, "ses_mm", { agent: "designer", description: "hero", prompt: "Design the hero.\nPreview: index.html\nFiles: index.html\nChecks: test -f index.html" }, MODEL, { difficulty: 0.9, trials: 3 })
+  const attempt = () => native.delegate(project, "ses_mm", { agent: "designer", description: "T1 attempt", prompt: `Attempt: T1 · ${d.job.id}` }, "opencode-go/kimi-k3")
+  const a2 = await attempt()
+  const a3 = await attempt()
+  const w1 = native.claim("ses_u1", child(d.prompt))!
+  const w2 = native.claim("ses_u2", child(a2.prompt))!
+  native.claim("ses_u3", child(a3.prompt))
+  writeFileSync(join(w1.dir, "index.html"), "<h1>bold</h1>\n")
+  const r1 = await native.finish("ses_u1", "bold version")
+  writeFileSync(join(w2.dir, "index.html"), "<h1>calm</h1>\n<p>with more air</p>\n")
+  const r2 = await native.finish("ses_u2", "calm version")
+  return { d, w1, w2, r1, r2 }
+}
+
+test("a user trial holds every passed attempt with no deadline, and asks the user once all have ended", async () => {
+  const project = repo()
+  const shots: string[] = []
+  const told: string[] = []
+  const native = new Native({ preview: async (dir, path) => (shots.push(`${dir}:${path}`), { png: Buffer.from("png") }), notify: (title) => told.push(title) })
+  const { d, w1, r1, r2 } = await userTrial(native, project)
+  assert.equal(d.task.trial?.pick, "user", "a designer's trial is the user's by default")
+  assert.equal(d.task.preview, "index.html")
+  assert.match(d.prompt, /the user picks the one they like best/)
+  assert.match(r1.text, /the user picks one of the attempts once all of them are done/)
+  assert.equal(r1.note, undefined)
+  assert.equal(r2.note, undefined, "T3 still works: nobody is asked yet")
+  let tasks = native.jobOf("ses_u1")!.job.tasks
+  assert.equal(tasks[0]!.settleBy, undefined, "no deadline picks for the user")
+  const ended = await native.ended("ses_u3", "gave up")
+  assert.equal(ended?.note, undefined, "the form goes through onSettled")
+  await new Promise((r) => setTimeout(r, 300))
+  tasks = native.jobOf("ses_u1")!.job.tasks
+  assert.ok(tasks[0]!.pickAsked)
+  assert.equal(shots.length, 2)
+  assert.deepEqual(told, ["Pick a version of T1"])
+  const page = join(project, ".micromanager", "trials", `${d.job.id}-T1.html`)
+  assert.match(readFileSync(page, "utf8"), /Pick a version of T1[\s\S]*data:image\/png;base64/)
+  assert.ok(existsSync(w1.dir), "a held attempt keeps its worktree")
+
+  assert.match((await native.pickAnswer(project, "ses_mm", "T1", { kind: "unclear", said: "hm" })).text, /"hm" is no answer/)
+  const picked = await native.pickAnswer(project, "ses_mm", "T1", { kind: "attempt", id: "T2" })
+  assert.match(picked.text, /T2 won the trial of T1 as the user's pick \(picked by the user\), ahead of T1: merged into/)
+  tasks = picked.job!.tasks
+  assert.deepEqual(tasks.map((t) => [t.id, t.status]), [["T1", "cancelled"], ["T2", "merged"], ["T3", "cancelled"]])
+  assert.equal(outcomeOf(project, picked.job!, tasks[0]!).end, "lost_on_pick")
+  assert.equal(outcomeOf(project, picked.job!, tasks[1]!).chosenBy, "user")
+  assert.match((await native.pickAnswer(project, "ses_mm", "T1", { kind: "attempt", id: "T1" })).text, /T2 already won/)
+})
+
+test("a user trial: a combination continues one version with the other's change; none drops them all", async () => {
+  const project = repo()
+  const native = new Native()
+  await userTrial(native, project)
+  await native.ended("ses_u3", "gave up")
+  await new Promise((r) => setTimeout(r, 300))
+  const combined = await native.pickAnswer(project, "ses_mm", "T1", { kind: "combine", notes: "the calm layout of T2 with the bold title of T1" })
+  assert.match(combined.text, /Continue T2 with the subagent tool: agent designer, its sessionID ses_u2/)
+  const diff = combined.text.match(/T1: (\S+\.diff)/)![1]!
+  assert.match(readFileSync(diff, "utf8"), /<h1>bold<\/h1>/)
+  let tasks = combined.job!.tasks
+  assert.deepEqual(tasks.map((t) => [t.id, t.status, t.replacedBy]), [["T1", "cancelled", "T2"], ["T2", "running", undefined], ["T3", "running", undefined]])
+  assert.equal(tasks[1]!.trial?.pick, "first")
+  const w2 = native.claim("ses_u2", child("continue"))
+  writeFileSync(join(w2?.dir ?? native.writerOf("ses_u2")!.dir, "index.html"), "<h1>bold</h1>\n<p>with more air</p>\n")
+  const r = await native.finish("ses_u2", "combined")
+  assert.match(r.text, /^Merged into/)
+
+  const other = repo()
+  const n2 = new Native()
+  await userTrial(n2, other)
+  await n2.ended("ses_u3", "gave up")
+  await new Promise((r) => setTimeout(r, 300))
+  const none = await n2.pickAnswer(other, "ses_mm", "T1", { kind: "none", notes: "too loud, both" })
+  assert.match(none.text, /none of the versions of T1: "too loud, both"[\s\S]*"replaces": \["T1"\]/)
+  tasks = none.job!.tasks
+  assert.deepEqual(tasks.slice(0, 2).map((t) => t.status), ["cancelled", "cancelled"])
+})
