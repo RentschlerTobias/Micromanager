@@ -1160,8 +1160,9 @@ committed with the project (src/backlog.ts). Items are jobs, never a job's inter
   answer "Publish it" runs `gh label create micromanager --force` and `gh issue create` with the item as body, and
   the local item keeps the issue's address (`issue:`). The plugin runs `gh` itself, outside the worker sandbox.
 
-- **Known weak spot:** a task's checks are kept as one `verify` string joined with `" && "` and split again after a
-  restart, so a check that contains `&&` itself comes back as two. The evaluator is kept out of that path.
+- **Fixed weak spot (2026-10-27):** a task's checks were kept only as one `verify` string joined with `" && "` and
+  split again after a restart, so a check that contains `&&` itself came back as two. The task now keeps them as a
+  list (`task.checks`), which a restart reads; the joined `verify` is a fallback for older job files.
 
 ## 26. The evolver (2026-10-27)
 

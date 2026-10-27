@@ -400,7 +400,8 @@ export class Native {
           branch: writer ? task.branch : undefined,
           removed: writer && !task.worktree,
           session: task.session,
-          checks: verify.flatMap((v) => v.split(" && ")).map((c) => c.trim()).filter(Boolean),
+          // The checks as given; a job written before they were kept has only the joined verify to go by.
+          checks: task.checks ?? verify.flatMap((v) => v.split(" && ")).map((c) => c.trim()).filter(Boolean),
           ...(task.contract ? { contract: task.contract.id } : {}),
           ...(task.frozen ? { frozen: new Map(Object.entries(task.frozen)) } : {}),
           ended: true,
@@ -748,6 +749,7 @@ export class Native {
       for (const e of entries) {
         e.checks = e.checks.map((c) => (normalTarget(c) === target ? next : c))
         const t = job.tasks.find((x) => x.id === e.taskId)!
+        t.checks = [...e.checks]
         job.acceptance = job.acceptance.map((a) => (t.acceptance.includes(a.id) && a.verify ? { ...a, verify: e.checks.join(" && ") } : a))
       }
       saveJob(project, job)
@@ -1119,6 +1121,7 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
     const graph = role.id === "explore" ? await this.#graphs.get(entry.dir) : undefined
     entry.graph = Boolean(graph)
     this.#entries.set(`${job.id}/${task.id}`, entry)
+    task.checks = [...checks]
     saveJob(project, job)
     // A project below the repository root and an uncommitted working tree are both invisible from the inside: the
     // worktree holds the whole repository, and no worker can see what the user has not committed.

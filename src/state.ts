@@ -154,6 +154,9 @@ export interface Task {
   frozen?: Record<string, string>
   freeze?: string[] // files its todo or delegation asked to freeze, hashed into frozen when it starts
   checkChanges?: { kind: string; accepted: boolean; by: string }[] // its request_check_change decisions (src/checkchange.ts)
+  // The checks its worker is gated by, each as given. An acceptance point's verify holds them joined with " && ", which
+  // cannot be split back when a check holds "&&" itself; a restart reads them from here (src/native.ts adopt).
+  checks?: string[]
   replacedBy?: string
   difficulty?: number // the N5 estimate at a native delegation, 0..1 (src/trials.ts)
   // One attempt of a best-of-n trial: `of` is the first attempt's id, `n` how many attempts the trial has (src/trials.ts).

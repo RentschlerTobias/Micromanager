@@ -1189,3 +1189,16 @@ test("a contract's quick stage gets a baseline of its own when the contract is s
   assert.equal(typeof c.quick!.costPerEval, "number")
   assert.equal(c.quick!.evaluator, "MM_STAGE=quick sh bench.sh")
 })
+
+test("a check that holds && itself comes back whole after a restart", async () => {
+  const project = repo()
+  const native = new Native()
+  const d = await native.delegate(project, "ses_mm", { agent: "coder", description: "a", prompt: "Write a.js.\nFiles: a.js\nChecks:\ntest -f a.js && test -s a.js\nnode -e \"require('./a.js')\"" }, MODEL)
+  assert.deepEqual(d.task.checks, ["test -f a.js && test -s a.js", "node -e \"require('./a.js')\""])
+  const w = native.claim("ses_w1", child(d.prompt))!
+  writeFileSync(join(w.dir, "a.js"), "module.exports = 1\n")
+  const again = new Native()
+  again.adopt(project)
+  const done = await again.finish("ses_w1", "a")
+  assert.match(done.text, /checks passed: test -f a\.js && test -s a\.js; node -e "require\('\.\/a\.js'\)"\./)
+})
