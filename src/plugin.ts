@@ -40,7 +40,7 @@ import { addGrant, isStarted, lastOptions, loadControl, optionsOf, saveLastOptio
 import { badName, GRANT_FLOOR, grantNote, harmlessQuestion, grantResult, GrantRequests, grantState, triage, type GrantKind } from "./grants.ts"
 import { accessForm, answersOf, formInput, gitForm, readForm, type Question } from "./forms.ts"
 import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
-import { CHECK_BUG, CHECK_BUG_FLOOR, CLASSIFY, NOUL_FLOOR, OPEN_ENDED, OPEN_ENDED_FLOOR } from "./catalog.ts"
+import { CHECK_BUG, CHECK_BUG_FLOOR, CLASSIFY, LOCAL_BLOCK, LOCAL_BLOCK_FLOOR, NOUL_FLOOR, OPEN_ENDED, OPEN_ENDED_FLOOR } from "./catalog.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { registerSkills, SKILLS, type SkillEditor } from "./skills.ts"
 import { backlogIgnored, listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
@@ -61,7 +61,7 @@ import { askAnswer, askNote, Asks, type AskDecision } from "./ask.ts"
 import { CHILD_PREFIX, DelegationError, Native, parseDelegation, parseTodo } from "./native.ts"
 import { classOf, needsTrials, outcomeOf, readOutcomes, recordOutcome } from "./outcomes.ts"
 import { heldOutDir } from "./contract.ts"
-import { heldOutProblem, markBlock, runEvolver, specOf, startBridge, type Progress, type Running } from "./evolver.ts"
+import { heldOutProblem, markBlock, readMethod, runEvolver, specOf, startBridge, type Progress, type Running } from "./evolver.ts"
 import { DEEP, trialSize, type Assessment } from "./trials.ts"
 import { Accountant, limitsOf, overBudget, overNote, sessionUsage, wrapUpNote } from "./budget.ts"
 import { seedFromJournal, Usage } from "./usage.ts"
@@ -858,16 +858,19 @@ export default {
       // One ask, two questions: whether it needs a fitness contract (src/contract.ts) costs no extra request. A
       // delegation that names its contract already is not asked.
       const named = d.contract ?? (planned ? planned.contract?.id : undefined)
-      const questions: Record<string, JevQuestion> = named ? { difficulty: CLASSIFY.difficulty! } : { difficulty: CLASSIFY.difficulty!, open_ended: OPEN_ENDED }
+      // Measured against a contract: whether the evolver could do it instead (src/evolver.ts), in the same ask.
+      const questions: Record<string, JevQuestion> = named ? { difficulty: CLASSIFY.difficulty!, local_block: LOCAL_BLOCK } : { difficulty: CLASSIFY.difficulty!, open_ended: OPEN_ENDED }
       const asked = await decider.ask("N5", { task, checks: d.checks }, questions, {}).catch(() => undefined)
       const answer = asked?.decision.answers.difficulty
       const difficulty = answer?.type === "score" ? Math.max(0, Math.min(4, answer.score)) / 4 : undefined
       const open = asked?.decision.answers.open_ended
       const openEnded = open?.type === "noul" && open.noul >= OPEN_ENDED_FLOOR
+      const block = asked?.decision.answers.local_block
+      const localBlock = block?.type === "noul" && block.noul >= LOCAL_BLOCK_FLOOR
       const learned = needsTrials(readOutcomes(), classOf(role, difficulty, task.files.length))
       const n = trialSize({ difficulty, retry, learned, setting: trials, parallel })
       record({ kind: "assess", sessionID, role, difficulty, retry, learned, trials: n, openEnded, decision: asked?.id })
-      return { difficulty, trials: n, ...(openEnded ? { openEnded } : {}) }
+      return { difficulty, trials: n, ...(openEnded ? { openEnded } : {}), ...(localBlock ? { localBlock } : {}) }
     }
     const registry = cloudOnly ? cloudRegistry(settings.registry) : settings.registry
     if (error) log("warn", `config ignored, defaults used: ${error}`)
@@ -940,8 +943,21 @@ export default {
       }
       if (r.note && r.parent) await ctx.session.synthetic({ sessionID: r.parent, text: r.note, resume: true }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
     }
+    // Whether the evolver can run here (src/evolver.ts): uv for its sidecar and a sandbox for its candidates, asked once.
+    let evolverReady = false
+    void (async () => {
+      const box = await sandbox
+      const uv = await exec("uv", ["--version"], { cwd: process.cwd(), timeoutMs: 10_000 })
+      evolverReady = box.available && uv.code === 0
+    })().catch(() => undefined)
+    // What one evolver call costs, from the runs the outcome log has; 0.004 (the live runs of 2026-10-27) before any.
+    const evolverCallCost = (): number => {
+      const runs = readOutcomes().filter((r) => r.method === "evolver" && r.evolve?.calls)
+      const calls = runs.reduce((n, r) => n + (r.evolve?.calls ?? 0), 0)
+      return calls ? runs.reduce((n, r) => n + (r.cost ?? 0), 0) / calls : 0.004
+    }
     const native = (SHARED.native ??= new Native({
-      installedSkills, planFirst: true, noGit: (dir) => noGitNote(dir),
+      installedSkills, planFirst: true, noGit: (dir) => noGitNote(dir), evolverReady: () => evolverReady, evolverCallCost,
       trialDeadlineMs: settings.trialDeadline * 60_000, onSettled: (r) => void settledTrial(r).catch((err: unknown) => log("warn", `trial settle failed: ${String(err)}`)),
     }))
     const workerJobs = SHARED.workerJobs
@@ -1855,6 +1871,22 @@ export default {
         const r = await publishIssue(project, item, repo)
         record({ kind: "backlog", sessionID, action: "publish", slug: publish.slug, url: r.url, problem: r.problem })
         tell(r.url ? `${publish.slug} is published as ${r.url}.` : `${publish.slug} was not published: ${r.problem}.`)
+        return
+      }
+      // How a task that suits the evolver is done (src/evolver.ts): the user's choice, told to the micromanager as the
+      // next step, since it is the one that starts work.
+      const method = answers && project && asked[0]?.header ? readMethod(asked[0].header, answers[0] ?? []) : undefined
+      if (method && project) {
+        const tell = (text: string) => rewriteResult(call.result, (was) => `${was}\n[micromanager] ${text}`)
+        const offer = native.takeOffer(method.id)
+        if (!offer) return
+        record({ kind: "evolver-offer", sessionID, id: method.id, method: method.method, said: method.said })
+        const json = JSON.stringify({ contract: offer.contract, file: offer.files[0], block: "<the block>", checks: offer.checks })
+        tell(method.method === "evolver"
+          ? `The user chose the evolver for "${offer.title}". Ask an explorer which function or block in ${offer.files.join(", ")} holds the work (its name, or its line range), then call evolve_task with job "${offer.jobId}" and json ${json}, the block filled in.`
+          : method.method
+            ? `The user chose ${method.method === "trial" ? "a trial" : "one worker"} for "${offer.title}". Start it again with the same prompt and an added line "Method: ${method.method}".`
+            : `"${method.said ?? ""}" is no answer to the form; ask with the same form again.`)
         return
       }
       // A contract's round (src/contractround.ts): its forms are named by the contract, and its answers move it on.

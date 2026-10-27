@@ -1200,9 +1200,23 @@ for.
   the contract, the merge train). A failure blocks the task at once: there is no session to fix it. The outcome log
   records `method: "evolver"`.
 
-**Next (E3):** the plugin offers the evolver itself. N5 asks `local_block`, and the code checks for a frozen
-contract, a measurement under 10 s and 1–2 files; the micromanager then puts "Evolver / Trial / One worker" to the
-user as a form, with the estimated cost.
+**E3: the plugin offers the evolver itself (implemented).**
+- **Jev:** a writer delegation that names a contract gets one more question in its N5 ask, `local_block` ("the
+  improvement can come from rewriting a single function or block in isolation", floor 0.7). It costs no extra
+  request.
+- **Code:** `evolverFits` requires a frozen contract, a measurement of at most 10 s (`costPerEval × repeats`), 1–2
+  files, and uv plus a sandbox on this machine.
+- **The offer:** when both agree, the writer does not start. The micromanager gets the form `Method M…`: "Evolver /
+  Trial / One worker", with the iterations (the stop rule's evaluations, 30 at most), the minutes and the cost. The
+  cost is priced per call from earlier evolver runs in the outcome log, 0.004 before any.
+- **The answer:** it tells the micromanager the next step. For the evolver: an explorer names the block, then
+  `evolve_task`. For a trial or a worker: the same delegation with `Method: trial` or `Method: worker`; a trial line
+  makes it a trial whatever its difficulty. `Method: evolver` on a delegation is refused with the way to
+  `evolve_task`.
+- **Not offered:** without a contract, for a reader, or where Jev sees no single block.
+
+**Next (E4):** the outcome log has `method` and reward per task; once there are enough rows, the router learns when the
+evolver pays and the offer can lead with what the data says.
 
 ## Sources
 - **Orchestration:**

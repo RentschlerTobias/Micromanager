@@ -21,6 +21,9 @@ export interface Assessment {
   readonly trials: number // 1: no trial
   // The task asks to improve a measurable property with no fixed end state: it needs a fitness contract to start.
   readonly openEnded?: boolean
+  // The task's gain lies in one function or block (N5's local_block): with a contract that measures fast, the evolver
+  // is offered instead of a worker (src/evolver.ts).
+  readonly localBlock?: boolean
 }
 
 // The difficulty from which a task runs as a trial: N5's "hard" and "very hard" (tierFor's deep tier).

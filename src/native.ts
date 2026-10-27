@@ -38,6 +38,7 @@ import { parseReport, sharedNote, skillLine, taskAcceptance } from "./brief.ts"
 import { settled, startable } from "./continuation.ts"
 import { isStarted, lastOptions, loadControl, optionsOf } from "./control.ts"
 import { formInput, startForm } from "./forms.ts"
+import { estimate, evolverFits, evolverForm } from "./evolver.ts"
 import { gitState } from "./nogit.ts"
 import { allFailedText, attemptBrief, attemptFailedText, attempts, fanOutText, ranked, standing, wonText, type Assessment } from "./trials.ts"
 
@@ -56,6 +57,7 @@ export interface Delegation {
   readonly contract?: string // the fitness contract its work is measured against ("Contract: C1", src/contract.ts)
   readonly frozen?: string // files it may read and run but not change, as written ("Frozen: test/a.test.js")
   readonly redteam?: { readonly contract: string; readonly job: string } // a contract's red team ("Red team: C1 · job-…")
+  readonly method?: "worker" | "trial" | "evolver" // how the user chose to have it done ("Method: trial", src/evolver.ts)
 }
 
 // The "Files:" and "Checks:" lines of a delegation, wherever they stand; the checks go on over the following lines
@@ -70,8 +72,15 @@ export function parseDelegation(prompt: string): Delegation {
   let attempt: Delegation["attempt"]
   let contract: string | undefined
   let redteam: Delegation["redteam"]
+  let method: Delegation["method"]
   let inChecks = false
   for (const line of prompt.split("\n")) {
+    const mt = line.match(/^\s*method:\s*(worker|trial|evolver)\s*$/i)
+    if (mt) {
+      method = mt[1]!.toLowerCase() as Delegation["method"]
+      inChecks = false
+      continue
+    }
     const rt = line.match(/^\s*red team:\s*(C\d+)\s*·\s*(job-[\w-]+)\s*$/i)
     if (rt) {
       redteam = { contract: rt[1]!.toUpperCase(), job: rt[2]! }
@@ -122,7 +131,7 @@ export function parseDelegation(prompt: string): Delegation {
       body.push(line)
     }
   }
-  return { body: body.join("\n").trim(), files, checks, replaces, ...(frozen ? { frozen } : {}), ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}), ...(contract ? { contract } : {}), ...(redteam ? { redteam } : {}) }
+  return { body: body.join("\n").trim(), files, checks, replaces, ...(frozen ? { frozen } : {}), ...(planned ? { planned } : {}), ...(attempt ? { attempt } : {}), ...(contract ? { contract } : {}), ...(redteam ? { redteam } : {}), ...(method ? { method } : {}) }
 }
 
 // How much two task texts are about the same thing: the share of their words they have in common (Jaccard over the
@@ -182,6 +191,10 @@ export interface NativeDeps {
   // attempt ending): the note goes to the micromanager, the sessions are interrupted. measured: the attempts that
   // waited for the decision, whose outcomes the log gets now that they are known.
   readonly onSettled?: (r: { project: string; job: Job; parent: string; note?: string; stop: string[]; measured: Task[] }) => void
+  // Whether the evolver can run here (uv and a sandbox, src/evolver.ts), and what one of its model calls costs on
+  // average: without the first it is never offered, the second prices the offer.
+  readonly evolverReady?: () => boolean
+  readonly evolverCallCost?: () => number
 }
 
 export const TRIAL_DEADLINE_MS = 20 * 60_000
@@ -282,6 +295,32 @@ export class Native {
     this.#noGit = deps.noGit
     this.#deadlineMs = deps.trialDeadlineMs ?? TRIAL_DEADLINE_MS
     this.#onSettled = deps.onSettled
+    this.#evolverReady = deps.evolverReady ?? (() => false)
+    this.#evolverCallCost = deps.evolverCallCost ?? (() => 0.004)
+  }
+
+  readonly #evolverReady: () => boolean
+  readonly #evolverCallCost: () => number
+  readonly #offers = new Map<string, { project: string; jobId: string; contract: string; files: string[]; title: string; checks: string[] }>()
+  #offered = 0
+
+  // A writer measured against a contract whose gain lies in one block (N5's local_block), with a contract that
+  // measures fast and one or two files: it does not start, and the user is asked how it should be done instead. A
+  // "Method:" line is the answer and skips the question; "Method: trial" asks for a trial whatever the difficulty.
+  #offerEvolver(project: string, job: Job, c: Contract | undefined, files: readonly string[], title: string, checks: readonly string[], d: Delegation, assess?: Assessment): void {
+    if (d.method === "evolver") throw new DelegationError("Not started: the evolver is not a worker; ask an explorer which function or block holds the work, then call evolve_task with the contract, the file, the block and the checks.")
+    if (d.method || !c || !assess?.localBlock || !this.#evolverReady() || !evolverFits(c, files)) return
+    const id = `M${++this.#offered}`
+    this.#offers.set(id, { project, jobId: job.id, contract: c.id, files: [...files], title, checks: [...checks] })
+    const form = evolverForm(id, title, files, c, estimate(c, this.#evolverCallCost()))
+    throw new DelegationError(`Not started yet: this task suits the evolver as well as a worker, and how it is done is the user's to decide (it differs in cost). Ask them with the question tool, with exactly this input (a form; its answer reaches the plugin by itself), then end your turn:\n${formInput(form)}`)
+  }
+
+  // The user's answer to an evolver offer: what it was about, once.
+  takeOffer(id: string): { project: string; jobId: string; contract: string; files: string[]; title: string; checks: string[] } | undefined {
+    const o = this.#offers.get(id)
+    this.#offers.delete(id)
+    return o
   }
 
   readonly #deadlineMs: number
@@ -442,7 +481,9 @@ export class Native {
     if (!d.body) throw new DelegationError("Not started: the prompt has no task.")
 
     const job = this.job(project, parent)
-    this.#contractFor(job, writer, d.contract, assess)
+    const c = this.#contractFor(job, writer, d.contract, assess)
+    this.#offerEvolver(project, job, c, parsed.files, input.description.trim() || d.body.split("\n")[0]!, d.checks, d, assess)
+    if (d.method === "trial") assess = { ...(assess ?? {}), trials: Math.max(2, assess?.trials ?? 1) }
     await this.#replace(project, job, d.replaces)
     const duplicate = this.#duplicate(job, role, input.description.trim(), d.body, parsed.files, d.replaces)
     if (duplicate) throw new DelegationError(duplicate)
@@ -1130,7 +1171,9 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
       if (problem) throw new DelegationError(`Not started: ${problem}`)
     }
     const contract = d.contract ?? task.contract?.id
-    this.#contractFor(job, WRITERS.has(role.id), contract, assess)
+    const c = this.#contractFor(job, WRITERS.has(role.id), contract, assess)
+    this.#offerEvolver(project, job, c, task.files, task.title, checks, d, assess)
+    if (d.method === "trial") assess = { ...(assess ?? {}), trials: Math.max(2, assess?.trials ?? 1) }
     this.#jobs.set(key(project, job.id), job)
     if (old) {
       await this.#dropWorktree(old, task)

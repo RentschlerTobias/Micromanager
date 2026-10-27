@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 
 import type { Contract } from "../src/contract.ts"
-import { heldOutProblem, markBlock, progressOf, runEvolver, specOf, startBridge } from "../src/evolver.ts"
+import { estimate, evolverFits, evolverForm, heldOutProblem, markBlock, progressOf, readMethod, runEvolver, specOf, startBridge } from "../src/evolver.ts"
 
 const contract = (extra: Partial<Contract> = {}): Contract => ({
   id: "C1", version: 2, status: "frozen", goal: "faster", evaluator: "node bench.js", timeoutMs: 60_000, repeats: 1,
@@ -88,4 +88,22 @@ test("the sidecar's run is watched through evals.jsonl and ends with its result"
   assert.equal(seen.at(-1), 2)
   const failing = runEvolver({ ...spec, output: join(dir, "out2") }, () => undefined, { uv: "/bin/false", dir })
   assert.match((await failing.done).problem!, /ended with code 1/)
+})
+
+test("the evolver is offered for a frozen contract that measures fast, on one or two files, with what it would take", () => {
+  const fast = contract({ costPerEval: 0.4 })
+  assert.equal(evolverFits(fast, ["search.js"]), true)
+  assert.equal(evolverFits(fast, ["a.js", "b.js", "c.js"]), false, "a wide change is a worker's")
+  assert.equal(evolverFits(contract({ costPerEval: 4, repeats: 3 }), ["a.js"]), false, "12 s per measurement is too slow")
+  assert.equal(evolverFits(contract({ costPerEval: 0.4, status: "draft" }), ["a.js"]), false)
+  assert.equal(evolverFits(contract(), ["a.js"]), false, "never measured")
+  assert.deepEqual(estimate(fast, 0.004), { iterations: 30, minutes: 13, cost: 0.12 })
+  assert.deepEqual(estimate(contract({ costPerEval: 0.4, stop: { evaluations: 10 } }), 0.004), { iterations: 10, minutes: 4, cost: 0.04 })
+  const form = evolverForm("M2", "faster search", ["search.js"], fast, estimate(fast, 0.004))
+  assert.equal(form[0]!.header, "Method M2")
+  assert.match(form[0]!.options[0]!.description, /about 30 variants in the sandbox, .* about 13 min and 0\.12 in model calls/)
+  assert.deepEqual(readMethod("Method M2", ["Evolver (Recommended)"]), { id: "M2", method: "evolver" })
+  assert.deepEqual(readMethod("Method M2", ["One worker"]), { id: "M2", method: "worker" })
+  assert.deepEqual(readMethod("Method M2", ["whatever"]), { id: "M2", said: "whatever" })
+  assert.equal(readMethod("Change K1", ["Trial"]), undefined)
 })

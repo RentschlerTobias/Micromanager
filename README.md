@@ -193,7 +193,7 @@ Jev and the plugin securing every task:
    | `stop_job` | stop the whole job; `run_job` resumes it |
    | `contract` | draft what "better" means for a task with no fixed end; the baseline is measured at once |
    | `contract_round` | work a draft contract out with you (preferences, red team, loopholes, baseline) and freeze it |
-   | `evolve_task` | improve one function by evolution (OpenEvolve) against a frozen contract, in the sandbox |
+   | `evolve_task` | improve one function by evolution (OpenEvolve) against a frozen contract, in the sandbox; the plugin offers it by itself where it fits ("Evolver / Trial / One worker", your choice in a form) |
    | `backlog` | list, show, add or change the project's waiting jobs in `.micromanager/backlog/` |
    | `decide_change` | accept or refuse a writer's request to change a check or a frozen test |
 

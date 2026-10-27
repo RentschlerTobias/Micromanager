@@ -85,6 +85,15 @@ export const CHECK_BUG: Question = {
 }
 export const CHECK_BUG_FLOOR = 0.2
 
+// Asked with N5's difficulty when a writer is measured against a fitness contract (src/plugin.ts assessDelegation):
+// whether the evolver could do it (src/evolver.ts). It only leads to an offer the user decides, so a wrong yes costs a
+// question, not a run.
+export const LOCAL_BLOCK: Question = {
+  type: "noul",
+  instructions: "The improvement can come from rewriting a single function or a single block of code in isolation, without changing its interface or other files.",
+}
+export const LOCAL_BLOCK_FLOOR = 0.7
+
 // N2b: which open question to ask next; the criteria are built per turn from the frontier.
 export function nextQuestionChoice(options: Record<string, string>): Question {
   return {

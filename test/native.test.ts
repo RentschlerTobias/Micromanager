@@ -1151,3 +1151,31 @@ test("an evolving task gets a worktree but no session; its best candidate goes t
   assert.equal(loadJob(project, job.id)!.tasks.find((t) => t.id === again.task!.id)!.status, "blocked")
   native.evolveFailed(project, job.id, again.task!.id, "nothing better")
 })
+
+test("a writer whose gain lies in one block, under a fast frozen contract, is offered the evolver; a Method line is the answer", async () => {
+  const project = benchRepo()
+  const ready = { on: true }
+  const native = new Native({ evolverReady: () => ready.on, evolverCallCost: () => 0.002 })
+  await native.contract(project, "ses_mm", "", JSON.stringify({ goal: "faster", evaluator: "sh bench.sh", scores: [{ name: "ms", direction: "min" }], stop: { evaluations: 10 } }))
+  const job = native.job(project, "ses_mm")
+  await native.freezeContract(project, job.id, "C1")
+  const prompt = "Make it faster.\nContract: C1\nFiles: ms.txt\nChecks: test -s ms.txt"
+  const ask = (p: string, assess: { trials: number; localBlock?: boolean }, description = "speed") => native.delegate(project, "ses_mm", { agent: "coder", description, prompt: p }, MODEL, assess)
+  const offered = await ask(prompt, { trials: 1, localBlock: true }).then(() => "started", (err: Error) => err.message)
+  assert.match(offered, /^Not started yet: this task suits the evolver as well as a worker/)
+  assert.match(offered, /"header":"Method M1".*about 10 variants.*0\.02 in model calls/s)
+  assert.deepEqual(native.takeOffer("M1"), { project, jobId: job.id, contract: "C1", files: ["ms.txt"], title: "speed", checks: ["test -s ms.txt"] })
+  assert.equal(native.takeOffer("M1"), undefined, "answered once")
+  assert.equal(job.tasks.length, 0, "nothing started while the user decides")
+
+  await assert.rejects(ask(`${prompt}\nMethod: evolver`, { trials: 1, localBlock: true }), /the evolver is not a worker; ask an explorer .* evolve_task/)
+  const worker = await ask(`${prompt}\nMethod: worker`, { trials: 1, localBlock: true })
+  assert.equal(worker.task.trial, undefined)
+  const trial = await ask("Count the hits in half the time.\nContract: C1\nFiles: hits.txt\nChecks: test -s hits.txt\nMethod: trial", { trials: 1, localBlock: true }, "hits")
+  assert.deepEqual(trial.task.trial, { of: trial.task.id, n: 2 })
+  // No offer where the evolver cannot run, or where Jev sees no single block.
+  ready.on = false
+  assert.equal((await ask("Shrink the bench output.\nContract: C1\nFiles: bench.sh\nChecks: test -s bench.sh", { trials: 1, localBlock: true }, "bench")).task.contract!.id, "C1")
+  ready.on = true
+  assert.ok((await ask("Trim the pass file.\nContract: C1\nFiles: pass.txt\nChecks: test -s pass.txt", { trials: 1 }, "pass")).task)
+})
