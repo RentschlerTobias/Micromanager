@@ -502,6 +502,11 @@ endless read loops.
 - **Branches.** Each task works in `.jev-micromanager/worktrees/<job>--<task>` on `jev/<job>--<task>`.
 - **The merge train.** Rebase, then the checks again when the job's branch moved, then a fast-forward. A conflict
   sends the task back once, from the newest commit; a second conflict goes to the user.
+- **Commit authorship (2026-10-28).** Task commits, the merge train's rebases and the first commit of a repository
+  the plugin creates (nogit) are authored and committed by the user's configured git identity (`user.name` /
+  `user.email`); the plugin no longer forces `micromanager <micromanager@localhost>`. A git identity is therefore
+  required: without one, git itself fails the commit with its author-identity error. The private memory repository
+  under the plugin's state directory is internal and unchanged.
 - **Done means merged.** A task counts as done only once it is merged.
 
 ## 12. Permissions (N13)

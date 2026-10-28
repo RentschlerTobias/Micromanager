@@ -24,7 +24,11 @@ and research [docs/plan.md](docs/plan.md). Development happens on the branch `om
 - OpenCode v2 (tested with 2.0.18). A package install needs nothing else: the plugin runs in OpenCode's own runtime.
   Node.js with TypeScript type stripping (22.18 or newer; tested with 26) is needed only for the tests and a checkout.
 - git: workers need a repository with at least one commit (without one the micromanager asks how to go on), and
-  `opencode plugin add` clones the plugin with it.
+  `opencode plugin add` clones the plugin with it. A **git identity** is required as well: task commits, rebases and
+  the first commit of a repository the plugin creates are authored and committed by your configured `user.name` /
+  `user.email` (the plugin no longer forces `micromanager <micromanager@localhost>`), so without one git fails with
+  its own author-identity error. The plugin's private memory repository under its state directory is internal and
+  unchanged.
 - A Jev API key, as `JEV_API_KEY` or, on Linux, in the keyring (`secret-tool`, service `typesafe`, key `jev`; macOS
   has no `secret-tool`, so there the variable is the way). Without a key, every decision goes to you.
 - For the sandbox: on Linux `bubblewrap`, `socat` and `ripgrep`; on macOS nothing extra (Seatbelt). Without them
@@ -169,7 +173,8 @@ Jev and the plugin securing every task:
      deletions are refused before the task or its worktree exists. A writer with no checks at all is refused as well.
    - **Checks and merge.** A writer ends by calling `finish_task`: the plugin runs the checks in the worktree; on
      a failure the worker gets the output and fixes it, on a pass the plugin commits and a merge train brings the
-     commit onto `jev/<job>` (rebased and checked again when another task got there first).
+     commit onto `jev/<job>` (rebased and checked again when another task got there first). The commit and each
+     rebase carry your git identity (`user.name` / `user.email`).
    - **Tests are frozen.** The files a writer's checks name that are not its own (`node --test test/a.test.js`), its
      contract's evaluator and corpus, and any it was given with `Frozen:` (or `"frozen"` in its todo) may be read and
      run but not changed: an edit is refused at once, the sandbox denies the write, and a changed one is put back at
@@ -222,7 +227,8 @@ Jev and the plugin securing every task:
    | `backlog` | list, show, add or change the project's waiting jobs in `.micromanager/backlog/` |
    | `decide_change` | accept or refuse a writer's request to change a check or a frozen test |
 
-6. **Checkpoints and rewind.** Every merged task is a commit `Tn: title` on `jev/<job>`, and the job remembers where
+6. **Checkpoints and rewind.** Every merged task is a commit `Tn: title` on `jev/<job>`, authored with your git
+   identity, and the job remembers where
    the branch started, so the branch is a row of checkpoints: `start`, then the state after each task. `rewind_job`
    lists them and, with your words, moves the branch back to one. It keeps the old tip as
    `refs/jev/<job>/before-rewind-<n>`, which is a checkpoint too, so a rewind is undone by rewinding to it. Tasks
