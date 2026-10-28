@@ -193,6 +193,8 @@ function repo(): { project: string; branch: string } {
   const project = mkdtempSync(join(tmpdir(), "jd-merge-"))
   const git = (...args: string[]) => execFileSync("git", ["-C", project, ...args], { encoding: "utf8" })
   git("init", "-q")
+  git("config", "user.name", "t")
+  git("config", "user.email", "t@t")
   writeFileSync(join(project, "a.txt"), "a\n")
   git("add", "-A")
   git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")

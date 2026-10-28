@@ -45,6 +45,29 @@ test("the survey leaves secrets, generated folders and huge files out of the fir
   assert.match(ignore, /^\/\.env$/m)
 })
 
+test("initRepo's first commit carries the user's identity and the plain subject", async () => {
+  const dir = folder()
+  const config = join(folder(), "gitconfig")
+  writeFileSync(config, "[user]\n\tname = N\n\temail = n@n\n")
+  const keys = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"] as const
+  const saved = keys.map((key) => [key, process.env[key]] as const)
+  process.env.GIT_CONFIG_GLOBAL = config
+  process.env.GIT_CONFIG_NOSYSTEM = "1"
+  for (const key of keys.slice(2)) delete process.env[key]
+  try {
+    writeFileSync(join(dir, "main.py"), "print('hi')\n")
+    const r = await initRepo(dir, surveyFolder(dir).excluded)
+    assert.ok(r.ok, r.text)
+    assert.equal(git(dir, "log", "-1", "--format=%an <%ae>"), "N <n@n>")
+    assert.equal(git(dir, "log", "-1", "--format=%s"), "Initial commit")
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+})
+
 test("the no-git form puts the recommended way first and reads the answer", () => {
   const form = gitForm("/home/u/notes", 12, "40 KB", "none", [".env"])
   assert.match(form[0]!.options[0]!.label, /^Without isolation \(Recommended\)$/)

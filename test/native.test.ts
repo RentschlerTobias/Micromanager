@@ -19,6 +19,8 @@ function repo(): string {
   const dir = mkdtempSync(join(tmpdir(), "jd-native-"))
   const git = (...args: string[]) => execFileSync("git", ["-C", dir, ...args])
   git("init", "-q")
+  git("config", "user.name", "t")
+  git("config", "user.email", "t@t")
   writeFileSync(join(dir, "README.md"), "demo\n")
   git("add", "-A")
   git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")

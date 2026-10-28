@@ -3,14 +3,15 @@
 // plugin asks git about and in which directory it runs a check.
 
 import assert from "node:assert/strict"
-import { existsSync, mkdtempSync, rmSync } from "node:fs"
+import { execFileSync } from "node:child_process"
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { after, test } from "node:test"
 
 import {
-  changedFiles, dirtyDeclared, dirtyPaths, hashFiles, IntegrationError, prepareIntegration, prepareTaskWorktree, projectRel,
-  revertFiles, runGate, taskDir, type Exec, type Run,
+  changedFiles, commitTask, dirtyDeclared, dirtyPaths, hashFiles, IntegrationError, prepareIntegration, prepareTaskWorktree,
+  projectRel, rebaseTask, revertFiles, runGate, taskDir, type Exec, type Run,
 } from "../src/integration.ts"
 import { DIR } from "../src/store.ts"
 
@@ -203,6 +204,100 @@ test("changed files are project-relative, the basis task.files is on", async () 
   )
   assert.equal(offset.at(-1), "../../../other/x.txt", "outside the project: an escape that climbs to the root, so it cannot match a declared file")
   assert.ok(offset.at(-1)!.startsWith(".."), "an outside change is never reported as an inside one")
+})
+
+// A real repository for the tests that need git's own identity resolution. The identity is the repository's, as a
+// user's checkout has it, never passed on the command line.
+function realRepo(prefix = "micromanager-commit-"): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  const git = (...args: string[]) => execFileSync("git", ["-C", dir, ...args])
+  git("init", "-q")
+  git("config", "user.name", "t")
+  git("config", "user.email", "t@t")
+  return dir
+}
+
+// The identity-related environment, saved and put back: a test must not leak a missing or a made-up identity.
+const IDENTITY_ENV = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"] as const
+function withoutIdentity(setup: () => void): () => void {
+  const saved = IDENTITY_ENV.map((key) => [key, process.env[key]] as const)
+  for (const key of IDENTITY_ENV) delete process.env[key]
+  setup()
+  return () => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+test("commitTask authors and commits as the repository's identity, with subject and body unchanged", async () => {
+  const dir = realRepo()
+  try {
+    writeFileSync(join(dir, "a.txt"), "a\n")
+    const sha = await commitTask(dir, "T1: add a", "Job: job-1\nWorker: role")
+    assert.ok(sha, "a commit is returned")
+    const git = (...args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trimEnd()
+    assert.equal(git("log", "-1", "--format=%an <%ae>"), "t <t@t>")
+    assert.equal(git("log", "-1", "--format=%cn <%ce>"), "t <t@t>")
+    assert.equal(git("log", "-1", "--format=%s"), "T1: add a")
+    assert.equal(git("log", "-1", "--format=%b"), "Job: job-1\nWorker: role")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("commitTask fails with git's own message when no identity is configured", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "micromanager-noidentity-"))
+  execFileSync("git", ["init", "-q", dir])
+  const restore = withoutIdentity(() => {
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null"
+    process.env.GIT_CONFIG_NOSYSTEM = "1"
+  })
+  try {
+    writeFileSync(join(dir, "a.txt"), "a\n")
+    await assert.rejects(
+      commitTask(dir, "T1: add a", "Job: job-1"),
+      (err: unknown) => err instanceof IntegrationError && /git commit failed/.test((err as Error).message),
+      "no fallback identity: the commit fails as git's does",
+    )
+  } finally {
+    restore()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("rebaseTask rewrites with the configured committer and keeps the original author", async () => {
+  const dir = realRepo()
+  try {
+    const git = (...args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim()
+    writeFileSync(join(dir, "base.txt"), "base\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    git("branch", "jev/job-1")
+    git("checkout", "-q", "-b", "jev/job-1--T1")
+    // The task's commit has another author than the identity the rebase runs as.
+    git("config", "user.name", "Original")
+    git("config", "user.email", "o@o")
+    writeFileSync(join(dir, "t.txt"), "task\n")
+    git("add", "-A")
+    git("commit", "-qm", "T1: task")
+    // The integration branch moves on, committed by the user's identity.
+    git("config", "user.name", "t")
+    git("config", "user.email", "t@t")
+    git("checkout", "-q", "jev/job-1")
+    writeFileSync(join(dir, "i.txt"), "integration\n")
+    git("add", "-A")
+    git("commit", "-qm", "T2: integration")
+    git("checkout", "-q", "jev/job-1--T1")
+
+    assert.deepEqual(await rebaseTask({ worktree: dir }, "jev/job-1"), { ok: true, moved: true })
+    assert.equal(git("log", "-1", "--format=%s"), "T1: task")
+    assert.equal(git("log", "-1", "--format=%an <%ae>"), "Original <o@o>", "the author is the one who wrote the change")
+    assert.equal(git("log", "-1", "--format=%cn <%ce>"), "t <t@t>", "the committer is the user's configured identity")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test("revertFiles and hashFiles act in the directory the paths are relative to", async () => {

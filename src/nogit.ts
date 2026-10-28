@@ -105,7 +105,8 @@ export async function initRepo(project: string, excluded: readonly string[], run
   if (add.length) writeFileSync(ignore, `${had}${had && !had.endsWith("\n") ? "\n" : ""}${had ? "\n" : ""}# left out of the first commit by micromanager\n${add.join("\n")}\n`)
   const staged = await run("git", ["add", "-A"], { cwd: project })
   if (staged.code !== 0) return { ok: false, text: `git add failed: ${staged.stderr.trim()}` }
-  const commit = await run("git", ["-c", "user.name=micromanager", "-c", "user.email=micromanager@localhost", "commit", "-qm", "Initial commit (micromanager)", "--allow-empty"], { cwd: project })
+  // The user's own identity, as git resolves it: without one the commit fails and they see git's own message.
+  const commit = await run("git", ["commit", "-qm", "Initial commit", "--allow-empty"], { cwd: project })
   if (commit.code !== 0) return { ok: false, text: `git commit failed: ${commit.stderr.trim()}` }
   return { ok: true, text: `Created a git repository in ${project} with a first commit${excluded.length ? `; left out (in .gitignore): ${excluded.join(", ")}` : ""}.` }
 }

@@ -161,10 +161,11 @@ export async function changedFiles(worktree: string, run: Exec = exec, rel = "")
 }
 
 // Commits a passed task on the job's branch. Returns the commit, or undefined when nothing changed.
+// The identity is the user's own, as git resolves it: the task's commits belong to them, not to the plugin.
 export async function commitTask(worktree: string, subject: string, body: string, run: Exec = exec): Promise<string | undefined> {
   if ((await changedFiles(worktree, run)).length === 0) return undefined
   await run("git", ["add", "-A"], { cwd: worktree })
-  const commit = await run("git", ["-c", "user.name=micromanager", "-c", "user.email=micromanager@localhost", "commit", "-q", "-m", subject, "-m", body], { cwd: worktree })
+  const commit = await run("git", ["commit", "-q", "-m", subject, "-m", body], { cwd: worktree })
   if (commit.code !== 0) throw new IntegrationError(`git commit failed: ${commit.stderr.trim()}`)
   return (await run("git", ["rev-parse", "--short", "HEAD"], { cwd: worktree })).stdout.trim()
 }
@@ -307,7 +308,7 @@ export async function rebaseTask(w: Pick<TaskWorktree, "worktree">, integrationB
   const base = (await run("git", ["merge-base", "HEAD", integrationBranch], { cwd: w.worktree })).stdout.trim()
   const tip = (await run("git", ["rev-parse", integrationBranch], { cwd: w.worktree })).stdout.trim()
   if (base === tip) return { ok: true, moved: false }
-  const rebased = await run("git", ["-c", "user.name=micromanager", "-c", "user.email=micromanager@localhost", "rebase", "-q", integrationBranch], { cwd: w.worktree })
+  const rebased = await run("git", ["rebase", "-q", integrationBranch], { cwd: w.worktree })
   if (rebased.code === 0) return { ok: true, moved: true }
   const files = (await run("git", ["diff", "--name-only", "--diff-filter=U"], { cwd: w.worktree })).stdout.trim().split("\n").filter(Boolean)
   await run("git", ["rebase", "--abort"], { cwd: w.worktree })
