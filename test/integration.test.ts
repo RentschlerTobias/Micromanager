@@ -9,7 +9,7 @@ import { join } from "node:path"
 import { after, test } from "node:test"
 
 import {
-  changedFiles, dirtyPaths, hashFiles, IntegrationError, prepareIntegration, prepareTaskWorktree, projectRel,
+  changedFiles, dirtyDeclared, dirtyPaths, hashFiles, IntegrationError, prepareIntegration, prepareTaskWorktree, projectRel,
   revertFiles, runGate, taskDir, type Exec, type Run,
 } from "../src/integration.ts"
 import { DIR } from "../src/store.ts"
@@ -46,7 +46,7 @@ function answers(topLevel: string, status = ""): Record<string, string> {
     "git rev-parse --is-inside-work-tree": "true\n",
     "git rev-parse --show-toplevel": `${topLevel}\n`,
     "git rev-parse HEAD": "abc1234def\n",
-    "git status --porcelain": status,
+    "git status --porcelain -z --untracked-files=all": status.replace(/\n/g, "\0"),
     [`git worktree add -q -b jev/${JOB} ${PROJECT}/${DIR}/worktrees/${JOB} HEAD`]: "",
   }
 }
@@ -65,7 +65,7 @@ test("a project that is the repository root keeps everything as it was", async (
     ["git", ["rev-parse", "--is-inside-work-tree"]],
     ["git", ["rev-parse", "--show-toplevel"]],
     ["git", ["rev-parse", "HEAD"]],
-    ["git", ["status", "--porcelain"]],
+    ["git", ["status", "--porcelain", "-z", "--untracked-files=all"]],
     ["git", ["worktree", "add", "-q", "-b", `jev/${JOB}`, `${TOP}/${DIR}/worktrees/${JOB}`, "HEAD"]],
   ])
   assert.ok(calls.every((c) => c.cwd === TOP), "every call runs in the project")
@@ -133,7 +133,7 @@ test("the gate runs a check in the directory it is given, and in the worktree ro
 
 test("an uncommitted working tree is reported, and a clean one is not", async () => {
   const clean = await dirtyPaths(PROJECT, fakeGit(answers(TOP, ""), PROJECT).run)
-  assert.deepEqual(clean, { dirty: false, summary: "" })
+  assert.deepEqual(clean, { dirty: false, paths: [], summary: "" })
 
   const status = " M a/b/c/references.bib\n?? a/b/c/notes.md\n M other/x.txt\n"
   const { run, calls } = fakeGit(answers(TOP, status), PROJECT)
@@ -142,10 +142,16 @@ test("an uncommitted working tree is reported, and a clean one is not", async ()
   assert.match(dirty.summary, /a\/b\/c\/references\.bib/)
   assert.match(dirty.summary, /a\/b\/c\/notes\.md/)
   assert.deepEqual(calls.map((c) => c.cwd), [PROJECT])
+  assert.deepEqual(dirtyDeclared(["references.bib", "notes.md"], "a/b/c", dirty.paths), ["a/b/c/references.bib", "a/b/c/notes.md"], "a declared file's current version cannot reach the worker")
+  assert.deepEqual(dirtyDeclared(["notes.md"], "", dirty.paths), [], "without the project offset a project file does not match the repository path")
+  assert.deepEqual(dirtyDeclared(["other/y.txt"], "", ["other/x.txt"]), [], "an unrelated dirty path does not block a clean task")
 
   const i = await prepareIntegration(PROJECT, JOB, run)
   assert.equal(i.dirty, true, "a task that needs an uncommitted file can never pass in a worktree")
   assert.match(i.dirtySummary, /a\/b\/c\/references\.bib/)
+
+  const renamed = await dirtyPaths(PROJECT, fakeGit(answers(TOP, "R  a/b/c/new.ts\0a/b/c/old.ts"), PROJECT).run)
+  assert.deepEqual(renamed.paths, ["a/b/c/new.ts", "a/b/c/old.ts"], "both sides of a rename matter")
 
   const many = Array.from({ length: 8 }, (_, n) => `?? a/b/c/f${n}.txt`).join("\n")
   assert.match((await dirtyPaths(PROJECT, fakeGit(answers(TOP, many), PROJECT).run)).summary, /\+3 more/, "a short summary, not the whole tree")

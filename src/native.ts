@@ -21,7 +21,7 @@ import { Graphs, graphBrief, queryGraph, type Graph } from "./graph.ts"
 import { HEADER } from "./hooks.ts"
 import { better, coarse, contractBrief, describe, guardViolations, heldOutDir, keepHeldOut, median, parseContract, reached, type Contract, type Measured } from "./contract.ts"
 import {
-  changedFiles, commitTask, exec as defaultExec, fastForward, frozenChanged, gradedOf, hashFiles, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree,
+  changedFiles, commitTask, dirtyDeclared, dirtyPaths, exec as defaultExec, fastForward, frozenChanged, gradedOf, hashFiles, prepareIntegration, prepareTaskWorktree, rebaseTask, removeTaskWorktree,
   repoRel, revertFiles, runEvaluator, runGate, taskDir,
   type Exec, type GateResult,
 } from "./integration.ts"
@@ -215,7 +215,7 @@ export interface NativeDeps {
   // A pairwise review of two passed attempts by a model of a third family (src/plugin.ts); undefined when none can.
   readonly review?: (task: Task, a: { task: Task; diff: string }, b: { task: Task; diff: string }) => Promise<Review | undefined>
   // A picture of an attempt's preview page for the user's comparison (src/look.ts), and a desktop notification.
-  readonly preview?: (dir: string, path: string) => Promise<{ png?: Buffer; problem?: string }>
+  readonly preview?: (dir: string, path: string, project: string, job: string) => Promise<{ png?: Buffer; problem?: string }>
   readonly notify?: (title: string, body: string) => void
   // A trial was decided by score. note and stop are set when nobody's finish_task carries them (a deadline, the last
   // attempt ending): the note goes to the micromanager, the sessions are interrupted. measured: the attempts that
@@ -539,6 +539,17 @@ export class Native {
     await this.#replace(project, job, d.replaces)
     const duplicate = this.#duplicate(job, role, input.description.trim(), d.body, parsed.files, d.replaces)
     if (duplicate) throw new DelegationError(duplicate)
+    if (WRITERS.has(role.id)) {
+      const [rel, working] = await Promise.all([repoRel(project), dirtyPaths(project)])
+      const blocked = working.dirty ? dirtyDeclared(parsed.files, rel, working.paths) : []
+      if (blocked.length > 0) {
+        throw new DelegationError(
+          `Not started: this task may change ${blocked.slice(0, 5).join(", ")}${blocked.length > 5 ? `, +${blocked.length - 5} more` : ""}, ` +
+          `whose current version is uncommitted in your checkout. A worker starts from HEAD and would not see it. ` +
+          `Commit or stash those files first, then delegate again.`,
+        )
+      }
+    }
     const rel = await this.#integrate(project, job, WRITERS.has(role.id))
     const added = addDelegated(job, { title: input.description.trim() || d.body.split("\n")[0]!, prompt: d.body, files: parsed.files, dependsOn: [], checks: d.checks })
     if (!added.task) throw new DelegationError(`Not started: ${added.errors!.join("; ")}`)
@@ -1983,7 +1994,7 @@ Its change is measured and never merged; its LOOPHOLE lines come to you when it 
         if (f) files.push(f)
       }
       const path = t.preview ?? (t.role === "visual" ? defaultPreview(e.dir) : undefined)
-      const shot: { png?: Buffer; problem?: string } | undefined = path && this.#preview ? await this.#preview(e.dir, path).catch((err: unknown) => ({ problem: `No picture: ${String(err)}` })) : undefined
+      const shot: { png?: Buffer; problem?: string } | undefined = path && this.#preview ? await this.#preview(e.dir, path, project, job.id).catch((err: unknown) => ({ problem: `No picture: ${String(err)}` })) : undefined
       candidates.push({
         id: t.id, ...(t.model ? { model: t.model } : {}), ...(t.usage ? { cost: t.usage.cost } : {}), lines: { added, removed }, files, ...(t.summary ? { summary: t.summary } : {}),
         ...(path ? { preview: { path, ...(shot?.png ? { png: shot.png } : {}), ...(shot?.problem ? { problem: shot.problem } : {}) } } : {}),

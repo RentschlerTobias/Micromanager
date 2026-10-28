@@ -82,8 +82,9 @@ Jev and the plugin securing every task:
    Git always materialises a worktree of the **repository root**, so if your project is a subdirectory of a larger
    repository the worker keeps its offset: the plugin records it as `rel` and runs the worker *and its checks* in
    `<worktree>/<rel>`, where its files are. A check naming one of your files resolves there, not at the root. The
-   job also records whether your working tree has uncommitted changes, because no worker can see them — a task that
-   needs them cannot pass, and you are told so rather than finding out from a confused worker.
+   job also records whether your working tree has uncommitted changes, because no worker can see them. A delegation
+   whose declared files are currently modified or untracked is refused before a worktree is made: commit or stash
+   those files first. Unrelated dirty paths are reported but do not block a task that cannot touch them.
 3. **Isolation fails loud.** A session that is a child of a micromanager session but is not a claimed worker has its
    write tools denied, with a journal record naming the job, session, directory and reason. Reads stay allowed so the
    situation stays diagnosable. A role agent you pick by hand in your own checkout is not a child and is untouched.
@@ -151,7 +152,8 @@ Jev and the plugin securing every task:
      picture. The plugin renders it on the host with headless Chromium (its own sandbox on, a throwaway profile), the
      directory served read-only from `127.0.0.1` without `.env` files, and a resolver that knows no other host but
      the job's. A dev server inside the sandbox cannot be reached from there, so a designer builds first and looks at
-     the output. Chromium, Chrome or Playwright's Chromium has to be installed where the plugin runs.
+     the output. A visual worker must return a real picture before it can finish; a missing browser is reported as a
+     failed visual check, not a passed one. Chromium, Chrome or Playwright's Chromium has to be installed where the plugin runs.
    - **Writers can ask.** A writer has two tools of its own: `explore` starts an explorer that reads the writer's
      directory, its uncommitted change included, and `research` starts a researcher with the web. The writer waits for
      the answer, which comes back as the tool's result. A helper is no task of the job: no worktree, no merge, no place
@@ -353,7 +355,7 @@ Optional settings in `~/.config/opencode/micromanager.jsonc`:
   "registry": [{ "id": "llamaswap/mimo", "disabled": true }],
   "parallel": 3,          // tasks of one job at the same time (1: one after another)
   "perModel": 2,          // sessions of one cloud model at the same time; a local model serves one
-  "trials": 3,            // attempts a hard writer task runs as, each on another model (1: no trials; at most 4)
+  "trials": 1,            // attempts a hard writer task runs as, each on another model (1: one worker, then retry; at most 4)
   "trialDeadline": 20,    // minutes a trial decided by a fitness contract waits for its last attempts
   "trialPick": { "designer": "user", "*": "best" }, // who decides a trial, per agent: "first", "best" or "user"
   "trialGrace": { "factor": 0.5, "minMinutes": 2, "maxMinutes": 10 }, // a "best" trial's grace window after its first pass
@@ -380,10 +382,10 @@ decision server (`decider/`, see its README) answers guard questions on the CPU,
 measures them; the journal
 `~/.local/state/micromanager/decisions.jsonl` feeds `npm run eval` and `npm run export-dataset`.
 
-A hard writer task (N5 difficulty "hard" or "very hard"), a task that does failed work over, and a task of a class
-that mostly fails on one worker run as a **trial**: `trials` attempts at once, each in its own worktree on another
-model family. Who decides it is the trial's **pick** (`"trialPick"`, or a line `Pick: me | best | first` in the
-task's prompt):
+Writers run one at a time by default: after a failed attempt, the next model gets a retry rather than two more
+worktrees starting speculatively. Set `"trials": 2`–`4`, or put `Method: trial` in the task, to run a hard writer task
+as a **trial**: attempts at once, each in its own worktree on another model family. Who decides it is the trial's
+**pick** (`"trialPick"`, or a line `Pick: me | best | first` in the task's prompt):
 
 - **best** (writers by default): the first attempt to pass is held, not merged, and the others get a grace window of
   half its time, at least two and at most ten minutes (`"trialGrace"`); attempts the watchdog sees getting nowhere are stopped when the

@@ -190,8 +190,8 @@ export function parseParallel(text: string): { parallel: number; perModel: numbe
   return { parallel: int(raw.parallel, "parallel", 3, 6), perModel: int(raw.perModel, "perModel", 2, 4) }
 }
 
-// "trials": attempts a hard writer task runs as at once, each on another model, the first to pass is merged (default 3,
-// at most 4; 1 turns trials off; src/trials.ts).
+// "trials": attempts a hard writer task runs as at once, each on another model (default 1: one worker, then a retry;
+// set 2-4 for a trial; src/trials.ts).
 export function parseTrials(text: string): number {
   const raw = (JSON.parse(stripComments(text)) as { trials?: unknown }).trials
   if (raw === undefined) return DEFAULT_TRIALS

@@ -145,7 +145,7 @@ export function parseReview(text: string): Review | undefined {
 
 // The difficulty from which a task runs as a trial: N5's "hard" and "very hard" (tierFor's deep tier).
 export const DEEP = 0.67
-export const DEFAULT_TRIALS = 3
+export const DEFAULT_TRIALS = 1
 export const MAX_TRIALS = 4
 
 // How many attempts a writer task gets. setting: the user's "trials" (1 turns trials off); parallel: tasks of the job at

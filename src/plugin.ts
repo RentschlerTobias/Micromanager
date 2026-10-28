@@ -14,7 +14,7 @@ import { backstop, DELEGATION_TOOLS, delegationRole, notRouted, resultText, rewr
 import { Jev, apiKey, redact, type Question as JevQuestion } from "./jev.ts"
 import { journalPath, record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
-import { look } from "./look.ts"
+import { look, missingVisualEvidence } from "./look.ts"
 import { readPick } from "./pick.ts"
 import { DEFAULT_LABELS, gitAuthor, knownSecrets, mapStrings, PLACEHOLDER_NOTE, requestTexts, restoreScope, scanNames, useVault, Vault, type NameSettings } from "./redact.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
@@ -195,6 +195,8 @@ interface Shared {
   // loaded an older plugin first gets one too.
   changeRequests?: ChangeRequests
   helperOf: Map<string, string> // helper session -> the writer it answers (src/helpers.ts)
+  // Visual writers that got a picture back. A visual pass without one is not verified and must not call finish_task.
+  looked: Set<string>
   // What every session of a native job used, so the job is charged only what is new (src/budget.ts), and the jobs
   // whose used-up budget the micromanager was told about already.
   accountant?: Accountant
@@ -216,6 +218,7 @@ const SHARED: Shared = ((globalThis as { __micromanager?: Shared }).__micromanag
   asks: new Asks(record),
   grantRequests: new GrantRequests(record),
   helperOf: new Map(),
+  looked: new Set(),
   continuing: new Map(),
   watchdog: new Watchdog(),
   stops: new Map(),
@@ -999,9 +1002,10 @@ export default {
       trialDeadlineMs: settings.trialDeadline * 60_000, trialPick: settings.trialPick, trialGrace: settings.trialGrace,
       idle: (session) => idleAttempt(SHARED.watchdog.progress(session)),
       // The picture of a "user" trial's attempt for the comparison page: its preview page, rendered like look does.
-      preview: async (dir, path) => {
-        const r = await look({ path }, dir, [])
-        return r.image ? { png: r.image.data } : { problem: `No picture: ${r.text}` }
+      preview: async (dir, path, project, jobID) => {
+        const allowed = [...settings.network, ...jobGrants(project, jobID).network]
+        const r = await look({ path }, dir, allowed)
+        return r.image?.mime === "image/png" ? { png: r.image.data } : { problem: r.image ? `No PNG preview: ${r.image.mime}` : `No picture: ${r.text}` }
       },
       notify: (title, body) => {
         if (notify !== "off") notifyDesktop(title, body)
@@ -1790,7 +1794,11 @@ export default {
       if (!owned) return
       const messages = await ctx.session.context({ sessionID }).catch(() => undefined)
       if (!messages) return
-      const d = accountant.charge(owned.job, sessionID, sessionUsage(messages))
+      // The facilitator existed before its job: the first time it is charged, its current usage is the baseline.
+      // Workers and helpers are created for the job and are charged in full. The watermark is persisted on the job,
+      // so restarting the server does not count the facilitator's earlier history a second time.
+      const baseline = owned.job.facilitator === sessionID && owned.job.accounted?.[sessionID] === undefined
+      const d = accountant.charge(owned.job, sessionID, sessionUsage(messages), baseline)
       if (!d.tokens && !d.cost && !d.requests) return
       // A helper's usage is its writer's task's: the helper answers that task's questions.
       const task = native.taskOfSession(sessionID) ?? native.taskOfSession(SHARED.helperOf.get(sessionID) ?? "")
@@ -2465,7 +2473,11 @@ export default {
       }
       try {
         installFinishTool(draft, async (text, tctx) => {
-          const r = await native.finish(tctx.sessionID!, text)
+          const session = tctx.sessionID!
+          if (missingVisualEvidence(native.roleOf(session), (SHARED.looked ??= new Set()).has(session))) {
+            return "This is a visual task, but no picture has been captured. Call look on the page or image first; if no browser is available, report that the visual check could not run instead of claiming it passed."
+          }
+          const r = await native.finish(session, text)
           // A trial's attempt won: the others stop (their tasks are cancelled already, their worktrees gone).
           for (const other of r.stop ?? []) {
             ended.add(other)
@@ -2492,6 +2504,7 @@ export default {
           if (!at || !where) return { text: "Only a designer of the micromanager may use this tool." }
           const allowed = [...settings.network, ...jobGrants(where.project, where.job.id).network]
           const r = await look(args, at.dir, allowed)
+          if (r.image) (SHARED.looked ??= new Set()).add(tctx.sessionID!)
           record({ kind: "look", sessionID: tctx.sessionID, path: args.path || undefined, url: args.url || undefined, image: r.image ? r.image.data.length : 0, note: r.image ? undefined : r.text.slice(0, 200) })
           return r
         }, lookAllowed)
@@ -2824,13 +2837,19 @@ export default {
         delete input.tools[FINISH_ID]
         delete input.tools[GRAPH_ID]
         delete input.tools[LOOK_ID]
+        // The micromanager delegates every file write. Leaving edit/write in its tool list only buys a denied turn when
+        // it tries to do the work itself (live Quarto run, 2026-10-27).
+        for (const id of ["edit", "write", "patch", "apply_patch", "multiedit"]) delete input.tools[id]
         for (const id of Object.values(HELPER_IDS)) delete input.tools[id]
       }
       await manageContext(input, true)
       if (input.sessionID) void charge(input.sessionID).catch((err: unknown) => log("warn", `budget count failed: ${String(err)}`))
       // A new message of the user (or a worker's report): what the memory knows about it, for this request only.
       const last = Array.isArray(input.messages) ? (input.messages as { role?: string; content?: unknown }[]).at(-1) : undefined
-      if (input.sessionID && last?.role === "user") {
+      // A worker's report already carries its task and notes; recalling general memory again costs a model round trip on
+      // every worker end and rarely changes the next scheduling decision.
+      const automatedContinuation = Boolean(input.sessionID && continuing.has(input.sessionID))
+      if (input.sessionID && !automatedContinuation && last?.role === "user") {
         const said = typeof last.content === "string" ? last.content : Array.isArray(last.content) ? (last.content as { text?: string }[]).map((p) => p.text ?? "").join(" ") : ""
         if (said.trim()) {
           const notes = await memory.recallText(said, { projectDir: project, role: "micromanager", exclude: recents.next(input.sessionID), session: input.sessionID }).catch(() => ({ text: "", ids: [] }))

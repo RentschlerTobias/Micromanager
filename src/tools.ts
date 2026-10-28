@@ -353,11 +353,11 @@ export function installLookTool(draft: ToolDraft, look: (args: Record<string, st
   const read = draft.get("read")
   const str = read?.input?.fields?.path
   if (!read?.input?.mapFields || !str) throw new Error("the built-in read tool has no input schema to build from")
-  const fields = ["path", "url", "width", "height", "full"] as const
+  const fields = ["path", "url", "width", "height", "full", "settle"] as const
   draft.add({
     id: LOOK_ID,
     name: LOOK_ID,
-    description: "See your work as a picture. path: a page (.html), an svg, an image, or a directory with an index.html, relative to your directory; or url: a page on a host this job may reach. width: the window width in px (default 1280; try 390 for a phone). height: the window height (default 800). full: false for only the first screen instead of the whole page. The page is served from your directory, so absolute paths like /assets/app.css work; build first if the project has a build step. Every field must be given: pass \"\" for the ones you do not need.",
+    description: "See your work as a picture. path: a page (.html), an svg, an image, or a directory with an index.html, relative to your directory; or url: a page on a host this job may reach. width: the window width in px (default 1280; try 390 for a phone). height: the window height (default 800). full: false for only the first screen instead of the whole page. settle: milliseconds to wait after fonts load for animations or late layout (default 300, at most 10000). A page is served from its own directory, so a built dist/ page's absolute /assets/... paths resolve correctly; build first if the project has a build step. Every field must be given: pass \"\" for the ones you do not need.",
     input: read.input.mapFields(() => Object.fromEntries(fields.map((f) => [f, str]))),
     execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
       if (!ctx?.sessionID || !allowed(ctx.sessionID)) return { content: "Only a designer of the micromanager may use this tool." }

@@ -201,7 +201,7 @@ export const PLAN_FORMAT = `Answer with one JSON object in a \`\`\`json fence, n
     "priority": 3
   }]
 }
-Rules: split the job into tasks as small as possible, each a vertical slice that can be verified on its own;
+Rules: use the fewest independently verifiable tasks—do not split one coherent artifact merely to make tasks smaller;
 every acceptance point is covered by a task; a task that changes files lists them; no dependency cycles.
 Priority is 1 (do first) to 5 (do last), 3 when nothing stands out; among ready tasks the lower number runs first.`
 

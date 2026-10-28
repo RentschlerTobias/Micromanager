@@ -289,7 +289,11 @@ const MUTATING: readonly [string, RegExp][] = [
 ]
 // git's read subcommands. Everything else (add, commit, checkout, reset, stash, push, fetch, …) writes, so an
 // unknown subcommand is a write: the list is a whitelist, not a blacklist.
-const GIT_READS = new Set(["status", "diff", "log", "show", "branch", "ls-files", "rev-parse", "blame"])
+const GIT_READS = new Set([
+  "status", "diff", "log", "show", "branch", "ls-files", "rev-parse", "blame", "ls-tree", "cat-file", "merge-base",
+  "describe", "for-each-ref", "shortlog", "rev-list", "diff-tree", "whatchanged", "name-rev", "var", "count-objects",
+  "show-ref", "check-ignore", "check-attr", "grep",
+])
 // Global git flags that carry a value: the subcommand only starts after them.
 const GIT_VALUE_FLAGS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"])
 const VERSION = /^\S+\s+(--version|-V|version)\b/
@@ -344,7 +348,10 @@ function gitSubcommand(tokens: readonly string[]): number {
 // creates one and `git remote add` writes, so a bare word behind them is a write.
 function gitReads(tokens: readonly string[], at: number): boolean {
   const sub = tokens[at] ?? ""
-  if (sub === "remote" || sub === "branch") return tokens.slice(at + 1).every((token) => token.startsWith("-"))
+  const rest = tokens.slice(at + 1)
+  if (sub === "remote" || sub === "branch") return rest.every((token) => token.startsWith("-"))
+  if (sub === "worktree") return rest[0] === "list"
+  if (sub === "reflog") return rest.length === 0 || rest[0] === "show" || rest[0]!.startsWith("-")
   return GIT_READS.has(sub)
 }
 

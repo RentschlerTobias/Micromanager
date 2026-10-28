@@ -80,12 +80,12 @@ test("the router rows join a trial's attempts and keep the stopped ones as censo
   assert.deepEqual(readOutcomes(path), rows)
 })
 
-test("the trials setting: 3 by default, 1 turns trials off, at most 4", () => {
+test("the trials setting: 1 by default, explicit 3 turns trials on, at most 4", () => {
   assert.equal(parseTrialDeadline("{}"), 20)
   assert.equal(parseTrialDeadline('{ "trialDeadline": 5 }'), 5)
   assert.throws(() => parseTrialDeadline('{ "trialDeadline": 0 }'), /minutes above 0/)
-  assert.equal(parseTrials("{}"), 3)
-  assert.equal(parseTrials('{ "trials": 1 }'), 1)
+  assert.equal(parseTrials("{}"), 1)
+  assert.equal(parseTrials('{ "trials": 3 }'), 3)
   assert.equal(parseTrials('{ "trials": 7 } // more than the cap'), 4)
   assert.throws(() => parseTrials('{ "trials": 0 }'), /whole number from 1/)
 })

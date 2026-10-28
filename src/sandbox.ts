@@ -112,8 +112,22 @@ export function tempDirFor(key: string): string {
 // The command as the sandbox runs it: with its temp directory as TMPDIR, after sandbox-runtime set its own.
 export function withTemp(command: string, temp: string | undefined): string {
   if (!temp) return command
-  const q = `'${temp.replace(/'/g, `'\\''`)}'`
-  return `export TMPDIR=${q} TMP=${q} TEMP=${q}; ${command}`
+  const dirs = {
+    tmp: temp,
+    cache: join(temp, "cache"),
+    data: join(temp, "data"),
+    state: join(temp, "state"),
+    npm: join(temp, "npm"),
+    pip: join(temp, "pip"),
+    uv: join(temp, "uv"),
+  }
+  for (const dir of Object.values(dirs)) mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const q = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+  return [
+    `export TMPDIR=${q(dirs.tmp)} TMP=${q(dirs.tmp)} TEMP=${q(dirs.tmp)}`,
+    `XDG_CACHE_HOME=${q(dirs.cache)} XDG_DATA_HOME=${q(dirs.data)} XDG_STATE_HOME=${q(dirs.state)}`,
+    `npm_config_cache=${q(dirs.npm)} PIP_CACHE_DIR=${q(dirs.pip)} UV_CACHE_DIR=${q(dirs.uv)}`,
+  ].join(" ") + `; ${command}`
 }
 
 // A writer writes its own worktree, a reader nothing; both have a private temp directory (never /tmp as a whole: the

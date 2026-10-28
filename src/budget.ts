@@ -22,14 +22,16 @@ export function sessionUsage(messages: unknown): Used {
   return { ...usage(messages), requests }
 }
 
-// What each session had used when it was last counted, so a job is charged only what is new.
+// What each session had used when it was last counted, so a job is charged only what is new. The watermark lives on
+// the job, not only in memory: a restarted server must not charge a long session's whole history to an old job again.
 export class Accountant {
-  readonly #seen = new Map<string, Used>()
-
-  // Adds what the session used since its last count to the job's counters; returns that difference.
-  charge(job: Job, sessionID: string, now: Used): Used {
-    const before = this.#seen.get(sessionID) ?? { tokens: 0, cost: 0, requests: 0 }
-    this.#seen.set(sessionID, now)
+  // Adds what the session used since its last count to the job's counters; returns that difference. baseline: the
+  // session existed before this job (the rolling micromanager does), so its current usage is the zero point, not work
+  // the job did. Workers start with the job and are charged from zero.
+  charge(job: Job, sessionID: string, now: Used, baseline = false): Used {
+    job.accounted ??= {}
+    const before = job.accounted[sessionID] ?? (baseline ? now : { tokens: 0, cost: 0, requests: 0 })
+    job.accounted[sessionID] = now
     const delta = { tokens: Math.max(0, now.tokens - before.tokens), cost: Math.max(0, now.cost - before.cost), requests: Math.max(0, now.requests - before.requests) }
     const c = job.counters
     c.tokens = (c.tokens ?? 0) + delta.tokens

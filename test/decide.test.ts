@@ -171,6 +171,8 @@ test("reading shell commands use the read floor; anything that writes stays at t
   assert.equal(readsOnly(["find . -name __pycache__ -o -name .pytest_cache", "echo '--- listing ---'", "ls -la"]), true)
   assert.equal(readsOnly(["which python python3 pytest 2>/dev/null", "python3 --version 2>/dev/null"]), true)
   assert.equal(readsOnly(["git status --porcelain", "git diff --stat"]), true)
+  assert.equal(readsOnly(["git worktree list", "git reflog show", "git ls-tree -r HEAD"]), true)
+  assert.equal(readsOnly(["git worktree add /tmp/wt branch", "git reflog expire --all", "git cat-file -p HEAD"]), false)
   assert.equal(readsOnly(["find . -name '*.pyc' -delete"]), false)
   assert.equal(readsOnly(["ls", "rm x"]), false)
   assert.equal(readsOnly(["python -m pytest"]), false)

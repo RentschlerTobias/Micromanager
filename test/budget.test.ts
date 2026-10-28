@@ -22,6 +22,29 @@ test("the accountant charges a job only what each session used since its last co
   assert.deepEqual([job.counters.tokens, job.counters.requests, +job.counters.cost!.toFixed(2)], [290, 3, 0.2])
 })
 
+test("an orchestrator's old history is the new job's baseline, and a restart does not charge it again", () => {
+  const job = newJob("job-1", "goal")
+  job.facilitator = "ses_mm"
+  const a = new Accountant()
+  const first = a.charge(job, "ses_mm", { tokens: 9000, cost: 1.2, requests: 42 }, true)
+  assert.deepEqual(first, { tokens: 0, cost: 0, requests: 0 }, "history before the job is not the job's work")
+  const delta = a.charge(job, "ses_mm", { tokens: 9100, cost: 1.25, requests: 44 })
+  assert.deepEqual([delta.tokens, +delta.cost.toFixed(2), delta.requests], [100, 0.05, 2])
+  assert.deepEqual(job.counters.tokens, 100)
+  const restarted = new Accountant()
+  assert.deepEqual(restarted.charge(job, "ses_mm", { tokens: 9100, cost: 1.25, requests: 44 }, true), { tokens: 0, cost: 0, requests: 0 })
+  assert.deepEqual([job.counters.tokens, +job.counters.cost!.toFixed(2), job.counters.requests], [100, 0.05, 2])
+})
+
+test("usage watermarks belong to one job, not to every later job of the same session", () => {
+  const one = newJob("job-1", "one")
+  const two = newJob("job-2", "two")
+  const a = new Accountant()
+  a.charge(one, "ses_w", { tokens: 100, cost: 0.1, requests: 1 })
+  a.charge(two, "ses_w", { tokens: 100, cost: 0.1, requests: 1 })
+  assert.equal(two.counters.tokens, 100, "a new job still charges its worker's full usage")
+})
+
 test("a job's limits are its own where it has them, else the config's; nothing is over without a limit", () => {
   const job = newJob("job-1", "goal")
   job.counters.tokens = 5000

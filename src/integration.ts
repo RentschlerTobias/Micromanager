@@ -107,10 +107,25 @@ function materializeTaskDir(worktree: string, rel: string): string {
 
 // Uncommitted changes in the user's working tree, which no worktree carries: a task that depends on them can never
 // pass its checks, so the caller reports it rather than letting a worker discover it.
-export async function dirtyPaths(project: string, run: Exec = exec): Promise<{ dirty: boolean; summary: string }> {
-  const status = await run("git", ["status", "--porcelain"], { cwd: project })
-  const paths = status.stdout.split("\n").filter(Boolean).map((line) => line.slice(3).trim())
-  return { dirty: paths.length > 0, summary: paths.slice(0, 5).join(", ") + (paths.length > 5 ? `, +${paths.length - 5} more` : "") }
+export async function dirtyPaths(project: string, run: Exec = exec): Promise<{ dirty: boolean; paths: string[]; summary: string }> {
+  const status = await run("git", ["status", "--porcelain", "-z", "--untracked-files=all"], { cwd: project })
+  const records = status.stdout.split("\0").filter(Boolean)
+  const paths: string[] = []
+  for (let i = 0; i < records.length; i++) {
+    paths.push(records[i]!.slice(3))
+    // A rename has its source path as a second NUL-separated record. Both matter for an overlap check.
+    if (records[i]![0] === "R" || records[i]![0] === "C") paths.push(records[++i] ?? "")
+  }
+  const clean = paths.map((path) => path.replace(/\/$/, "")).filter(Boolean)
+  return { dirty: clean.length > 0, paths: clean, summary: clean.slice(0, 5).join(", ") + (clean.length > 5 ? `, +${clean.length - 5} more` : "") }
+}
+
+// A writer starts from HEAD. Uncommitted versions of files it may change cannot reach it, so starting would either lose
+// those edits or end in a merge the user has to untangle. Find that before creating a task or worktree.
+export function dirtyDeclared(files: readonly string[], projectRel: string, dirty: readonly string[]): string[] {
+  const root = projectRel.split(sep).filter(Boolean)
+  const declared = files.map((file) => [...root, ...file.split("/").filter(Boolean)].join("/"))
+  return dirty.filter((path) => declared.some((file) => path === file || path.startsWith(`${file}/`) || file.startsWith(`${path}/`)))
 }
 
 export async function prepareIntegration(project: string, jobId: string, run: Exec = exec): Promise<Integration> {

@@ -326,9 +326,9 @@ How you work:
    measures in seconds or minutes, evolve_task can do it instead of a worker: OpenEvolve tries many small variants in the
    sandbox and the best one goes through the checks (ask an explorer first which block it is). When the plugin finds
    such a task itself, it does not start it and hands you a form for the user ("Evolver / Trial / One worker"); their
-   answer tells you the next step, and a line "Method: trial" or "Method: worker" starts the task the chosen way. The first attempt whose checks pass is
-   merged and the others stop by themselves; do not continue or restart a stopped attempt. When every attempt failed,
-   the note says what each hit: split the task into smaller todos as it says.
+   answer tells you the next step, and a line "Method: trial" or "Method: worker" starts the task the chosen way. The
+   plugin decides a best trial after its grace window, or asks the user to pick a visual draft; do not merge an attempt
+   yourself or restart a stopped one. When every attempt failed, the note says what each hit: split the task as it says.
 5. When everything is done, tell the user briefly what changed and how to merge the session branch (git merge
    jev/<job>, the notes name it) or discard it.
 

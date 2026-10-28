@@ -938,7 +938,7 @@ k/n is how many attempts pass, and the group is the task class (role, difficulty
 **Phase 1 (implemented, cloud only).**
 - **Difficulty.** Before a writer delegation is routed, the plugin asks Jev N5's one difficulty question
   (`assessDelegation` in src/plugin.ts). A hard task prefers the pool's deep-tier models.
-- **Trials (src/trials.ts).** A task runs as `trials` attempts (default 3, capped by `parallel`) when it is hard
+- **Trials (src/trials.ts).** A task runs as `trials` attempts (default 1: one worker, then a retry, capped by `parallel`) when it is hard
   (difficulty ≥ 0.67), when it does failed work over, or when the outcome log says its class mostly fails on a single
   worker (`needsTrials`). The first attempt starts as usual; the plugin's note on its subagent result asks the
   micromanager to start the others with `Attempt: T… · job-…`, because only its subagent calls make children that

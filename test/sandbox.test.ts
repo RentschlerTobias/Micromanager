@@ -87,6 +87,7 @@ test("the sandbox keeps a writer in its worktree, away from the user's keys and 
       }
     }
     assert.equal(await inTemp('f=$(mktemp) && echo hi > "$f" && cat "$f" && test "$TMPDIR" = ' + `'${tempA}'`), "hi")
+    assert.equal(await inTemp('mkdir -p "$XDG_CACHE_HOME/quarto" "$npm_config_cache/x" && echo cache > "$XDG_CACHE_HOME/quarto/ok" && cat "$XDG_CACHE_HOME/quarto/ok"'), "cache")
     assert.match(await inTemp(`cat ${join(tempB, "note")}`), /failed/)
     assert.match(await inTemp(`echo x > ${join(tempB, "w")}`), /failed/)
     assert.match(await inTemp("echo x > own.txt"), /failed/, "a reader still writes nothing but its temp directory")

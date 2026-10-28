@@ -32,7 +32,7 @@ export function badName(kind: GrantKind, name: string): string | undefined {
 }
 
 const matches = (name: string, pattern: string) => (pattern.endsWith("*") ? name.startsWith(pattern.slice(0, -1)) : name === pattern)
-const covers = (host: string, pattern: string) => host === pattern || (pattern.startsWith("*.") && host.endsWith(pattern.slice(1)))
+const covers = (host: string, pattern: string) => host === pattern || (pattern.startsWith("*.") && host.endsWith(pattern.slice(1)) && host !== pattern.slice(2))
 
 // The facts a request is decided on.
 export interface GrantFacts {

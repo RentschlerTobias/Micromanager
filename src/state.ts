@@ -202,6 +202,9 @@ export interface Job {
   // evals: evaluator runs of the job's fitness contracts (src/contract.ts), and the seconds they took: an evaluator is
   // a command, not a session, so its cost shows here and not in tokens.
   counters: { turns: number; stalls: number; replans: number; tokens?: number; requests?: number; cost?: number; evals?: number; evalSeconds?: number }
+  // Session -> what it had used when this job last counted it. Persisted with the counters so a server restart does
+  // not charge old history again (src/budget.ts).
+  accounted?: Record<string, { tokens: number; cost: number; requests: number }>
   lessons: string[]
   later?: Later[] // follow-ups that did not become tasks
   rolling?: boolean // a micromanager session's job: the orchestrator delegates tasks into it while it runs (omo-hybrid)
