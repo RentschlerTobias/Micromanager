@@ -151,7 +151,9 @@ function forbidden(rel: string): boolean {
 }
 
 // The worker's directory over http on 127.0.0.1, read-only, so absolute asset paths (/assets/x.css) resolve.
-export async function serveDir(dir: string): Promise<{ origin: string; close(): Promise<void> }> {
+// fallback: a path without a file extension and no file of its own is the single-page app's index.html, so a worker can
+// drive a route (/dashboard) that only the client router knows.
+export async function serveDir(dir: string, options: { fallback?: boolean } = {}): Promise<{ origin: string; close(): Promise<void> }> {
   const root = resolve(dir)
   const realRoot = realpathSync(root)
   const server: Server = createServer((req, res) => {
@@ -183,6 +185,18 @@ export async function serveDir(dir: string): Promise<{ origin: string; close(): 
       res.writeHead(200, { "content-type": MIME[extname(real).toLowerCase()] ?? "application/octet-stream", "cache-control": "no-store" })
       res.end(body)
     } catch {
+      if (options.fallback && !extname(path)) {
+        try {
+          const index = realpathSync(join(realRoot, "index.html"))
+          if (within(realRoot, index) && !forbidden(relative(realRoot, index).split(sep).join("/"))) {
+            res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store" })
+            res.end(readFileSync(index))
+            return
+          }
+        } catch {
+          // no index either, then
+        }
+      }
       res.writeHead(404).end()
     }
   })
@@ -357,7 +371,7 @@ export async function look(input: { path?: string; url?: string; width?: string;
   const width = clamp(Number(input.width) || 1280, 320, 2560)
   const height = input.height ? clamp(Number(input.height) || 800, 240, 4000) : 800
   const fullPage = !/^(false|no|0)$/i.test(input.full?.trim() ?? "")
-  const settleMs = input.settle === undefined ? 300 : clamp(Number(input.settle) || 0, 0, 10_000)
+  const settleMs = input.settle === undefined || input.settle === "" ? 300 : clamp(Number(input.settle) || 0, 0, 10_000)
   if (target.kind === "url") {
     const data = await screenshot(chromium, target.url, { width, height, fullPage, settleMs }, allowed)
     if (data.length > MAX_IMAGE_BYTES) return { text: `${target.url} rendered to ${data.length} bytes; a look is limited to ${MAX_IMAGE_BYTES}. Use a smaller width or full: no.` }

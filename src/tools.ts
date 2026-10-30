@@ -373,6 +373,51 @@ export function installLookTool(draft: ToolDraft, look: (args: Record<string, st
   })
 }
 
+// A visual worker's hands (src/browser.ts): a real Playwright browser on the host, driven by a list of steps, so a
+// worker can click, fill and route through the page it built and record the run. Same boundary as look: the page comes
+// from the worker's own directory, the hosts are the job's, and no worker code runs as host JavaScript.
+export const BROWSER_ID = "playwright"
+
+export interface BrowserRun {
+  readonly text: string
+  readonly images: readonly { readonly data: Buffer; readonly mime: string }[]
+  readonly artifacts: readonly string[]
+}
+
+export function installBrowserTool(draft: ToolDraft, run: (args: Record<string, string>, ctx: ToolContext) => Promise<BrowserRun>, allowed: (sessionID: string) => boolean): void {
+  const read = draft.get("read")
+  const str = read?.input?.fields?.path
+  if (!read?.input?.mapFields || !str) throw new Error("the built-in read tool has no input schema to build from")
+  const fields = ["path", "url", "steps", "video", "width", "height", "full", "settle", "timeout", "out", "device", "format"] as const
+  draft.add({
+    id: BROWSER_ID,
+    name: BROWSER_ID,
+    description:
+      "Drive your page in a real Playwright browser on the host and watch it work. Start with path: a page or a directory with an index.html in your directory (built first), or url: a host this job may reach. steps: a JSON array, one action per object, in order — " +
+      '{"goto":"/route"}, {"click":"text=Save"}, {"dblclick":sel}, {"hover":sel}, {"focus":sel}, {"fill":[sel,text]}, {"type":[sel,text]}, {"press":[sel,key]}, {"select":[sel,value]}, {"check":sel}, {"uncheck":sel}, {"upload":[sel,path]}, ' +
+      '{"waitFor":sel}, {"waitHidden":sel}, {"waitText":[sel,text]}, {"sleep":ms}, {"idle":ms}, {"scroll":[x,y]}, {"wheel":[dx,dy]}, {"scrollTo":sel}, {"viewport":[w,h]}, {"eval":"js expression"}, {"shot":"name.png"} or {"shot":[sel,"name.png"]}, {"pdf":"name.pdf"}, {"back":true}, {"forward":true}, {"reload":true}. ' +
+      "Selectors are Playwright's: css, text=Save, role=button, [data-testid=x]. video: true (or yes) records the whole run; you get keyframes, the user gets the WebM (format: mp4 converts it). " +
+      "width, height: the window (default 1280x800; 390 is a phone). full: false for only the first screen. settle: ms after each load (default 300). timeout: seconds for the whole run (default 120). " +
+      "out: a directory in your directory to keep the files (default: the job's media folder, never committed). device: a Playwright device name such as \"iPhone 13\". " +
+      "Every field must be given: pass \"\" for the ones you do not need. The tool reports console errors, failed requests, eval results and the files; screenshots and video keyframes come back as pictures.",
+    input: read.input.mapFields(() => Object.fromEntries(fields.map((f) => [f, str]))),
+    execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+      if (!ctx?.sessionID || !allowed(ctx.sessionID)) return { content: "Only a designer of the micromanager may use this tool." }
+      try {
+        const r = await run(Object.fromEntries(fields.map((f) => [f, String(args?.[f] ?? "")])), ctx)
+        const content: Record<string, unknown>[] = [{ type: "text", text: r.text }]
+        for (const image of r.images) {
+          const ext = image.mime.split("/")[1] ?? "png"
+          content.push({ type: "file", uri: `data:${image.mime};base64,${image.data.toString("base64")}`, mime: image.mime, name: `shot-${content.length}.${ext}` })
+        }
+        return { content }
+      } catch (err) {
+        return { content: `failed: ${err instanceof Error ? err.message : String(err)}` }
+      }
+    },
+  })
+}
+
 // A writer's request to have a check or a frozen test changed (src/checkchange.ts): it never changes them itself. The
 // call waits until the micromanager, a reviewer or the user decided it. The context hook hides it from every session
 // that is no native writer.

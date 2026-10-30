@@ -204,7 +204,7 @@ ${READER_SHELL}`,
   role(
     "visual",
     "UI, CSS, layouts, screenshots (has image input).",
-    "Work on the user interface. When given screenshots, describe what you see before changing anything. To see your work, use the look tool on a page, an svg or an image in your directory (build first when the project has a build step). Never start a browser or a dev server to look at it: no browser can run in your sandbox.",
+    "Work on the user interface. When given screenshots, describe what you see before changing anything. To see your work, use the look tool on a page, an svg or an image in your directory (build first when the project has a build step). When a state needs a click, a filled form or a route, or the work is a recording, use the playwright tool: it drives a real browser on the host with your page and the job's hosts, returns screenshots and video keyframes, and writes the run's files. It is Playwright behind a step list, so name the steps; it never runs code of yours. Never start a browser or a dev server yourself: no browser can run in your sandbox.",
     [...askShell, ...runAndRead, ...noWeb, ...noDelegation],
     [MODELS.qwen, MODELS.mimo, MODELS.glm],
   ),

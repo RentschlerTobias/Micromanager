@@ -158,6 +158,16 @@ Jev and the plugin securing every task:
      the job's. A dev server inside the sandbox cannot be reached from there, so a designer builds first and looks at
      the output. A visual worker must return a real picture before it can finish; a missing browser is reported as a
      failed visual check, not a passed one. Chromium, Chrome or Playwright's Chromium has to be installed where the plugin runs.
+   - **Designers can act.** `look` shows one state; `playwright` drives the page through the states that need a click, a
+     filled form or a client route, and records the run. It is the real Playwright engine on the host — the same served
+     directory and the same host allow-list, checked on every request — behind a list of steps (`click`, `fill`, `press`,
+     `waitFor`, `scroll`, `eval`, `shot`, `pdf`, …). The worker names steps; it never hands over JavaScript, because a
+     script would run with the user's rights in the plugin's process. A run reports console errors and failed requests,
+     returns its screenshots and, for a recording, keyframes (a model cannot watch an MP4) plus the file for the user.
+     Recordings go to the job's media directory unless the worker names a folder of its own, so they land in the job's
+     area and never in a commit by accident. `playwright-core` is the only dependency and no browser download is needed:
+     the system Chromium is launched by path. Recording needs ffmpeg; a system ffmpeg is linked where Playwright expects
+     it, and a machine without one is told to run `npx playwright install ffmpeg` once.
    - **Writers can ask.** A writer has two tools of its own: `explore` starts an explorer that reads the writer's
      directory, its uncommitted change included, and `research` starts a researcher with the web. The writer waits for
      the answer, which comes back as the tool's result. A helper is no task of the job: no worktree, no merge, no place

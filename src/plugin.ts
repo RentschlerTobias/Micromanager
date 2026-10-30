@@ -15,6 +15,7 @@ import { Jev, apiKey, redact, type Question as JevQuestion } from "./jev.ts"
 import { journalPath, record } from "./journal.ts"
 import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { look, missingVisualEvidence } from "./look.ts"
+import { runBrowser } from "./browser.ts"
 import { readPick } from "./pick.ts"
 import { DEFAULT_LABELS, gitAuthor, knownSecrets, mapStrings, PLACEHOLDER_NOTE, requestTexts, restoreScope, scanNames, useVault, Vault, type NameSettings } from "./redact.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
@@ -46,7 +47,7 @@ import { gitState, humanSize, initRepo, surveyFolder } from "./nogit.ts"
 import { CHECK_BUG, CHECK_BUG_FLOOR, CLASSIFY, LOCAL_BLOCK, LOCAL_BLOCK_FLOOR, NOUL_FLOOR, OPEN_ENDED, OPEN_ENDED_FLOOR } from "./catalog.ts"
 import { ending, Notifier, Scheduler, type Cancel } from "./scheduler.ts"
 import { registerSkills, SKILLS, type SkillEditor } from "./skills.ts"
-import { backlogIgnored, listJobs, loadJob, notesDir, reconcileJob, saveJob } from "./store.ts"
+import { backlogIgnored, listJobs, loadJob, notesDir, reconcileJob, saveJob, stateDir } from "./store.ts"
 import { backlogDir, backlogTool, githubIssue, githubIssues, githubRepo, goalOf, localBackend, publishForm, publishIssue, readPublish, type BacklogItem } from "./backlog.ts"
 import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "./state.ts"
 import { exec, repoRel, type Exec } from "./integration.ts"
@@ -54,7 +55,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, extname, join, relative, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import {
-  CHECK_CHANGE_ID, FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installCheckChangeTool, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installLookTool, installTools, LOOK_ID, planText,
+  BROWSER_ID, CHECK_CHANGE_ID, FINISH_ID, GRANT_IDS, GRAPH_ID, HELPER_IDS, installBrowserTool, installCheckChangeTool, installFinishTool, installGrantTools, installGraphTool, installHelperTools, installLookTool, installTools, LOOK_ID, planText,
   TOOL_IDS, type ToolDraft,
 } from "./tools.ts"
 import { readBaseline, readLoopholes, readPrefs, roundFormOf, roundHeader } from "./contractround.ts"
@@ -2512,6 +2513,21 @@ export default {
         log("error", `look not installed: ${String(err)}`)
       }
       try {
+        installBrowserTool(draft, async (args, tctx) => {
+          const at = native.writerOf(tctx.sessionID!)
+          const where = native.jobOf(tctx.sessionID!)
+          if (!at || !where) return { text: "Only a designer of the micromanager may use this tool.", images: [], artifacts: [] }
+          const allowed = [...settings.network, ...jobGrants(where.project, where.job.id).network]
+          const base = join(where.project, stateDir(where.project), "media", where.job.id)
+          const r = await runBrowser(args, at.dir, allowed, { base, label: at.label })
+          if (r.images.length) (SHARED.looked ??= new Set()).add(tctx.sessionID!)
+          record({ kind: "browser", sessionID: tctx.sessionID, path: args.path || undefined, url: args.url || undefined, images: r.images.reduce((n, i) => n + i.data.length, 0), files: r.artifacts.length, note: r.images.length ? undefined : r.text.slice(0, 200) })
+          return r
+        }, lookAllowed)
+      } catch (err) {
+        log("error", `playwright not installed: ${String(err)}`)
+      }
+      try {
         installGrantTools(draft, (kind, name, why, tctx) => requestGrant(kind, name, why, tctx.sessionID!), grantAllowed)
       } catch (err) {
         log("error", `request_env and request_network not installed: ${String(err)}`)
@@ -2776,6 +2792,7 @@ export default {
         if (input.tools) for (const kind of ["env", "network"] as const) if (!(input.sessionID && grantAllowed(kind, input.sessionID))) delete input.tools[GRANT_IDS[kind]]
         if (input.tools && !(input.sessionID && native.isWriter(input.sessionID))) delete input.tools[CHECK_CHANGE_ID]
         if (input.tools && !(input.sessionID && lookAllowed(input.sessionID))) delete input.tools[LOOK_ID]
+        if (input.tools && !(input.sessionID && lookAllowed(input.sessionID))) delete input.tools[BROWSER_ID]
         // A worker's run: its end is awaited once, then its task is settled (merged writer, reader, or unfinished).
         if (input.sessionID && (native.isWorker(input.sessionID) || SHARED.helperOf.has(input.sessionID))) void charge(input.sessionID).catch((err: unknown) => log("warn", `budget count failed: ${String(err)}`))
         if (input.sessionID && native.isWorker(input.sessionID)) {
@@ -2837,6 +2854,7 @@ export default {
         delete input.tools[FINISH_ID]
         delete input.tools[GRAPH_ID]
         delete input.tools[LOOK_ID]
+        delete input.tools[BROWSER_ID]
         // The micromanager delegates every file write. Leaving edit/write in its tool list only buys a denied turn when
         // it tries to do the work itself (live Quarto run, 2026-10-27).
         for (const id of ["edit", "write", "patch", "apply_patch", "multiedit"]) delete input.tools[id]
