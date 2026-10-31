@@ -1,6 +1,9 @@
 // The job's own branch and worktree (design.md §11): workers change files there, never in the user's checkout.
-// The worktree lives inside the project, under .jev-micromanager/worktrees/, so workers stay inside the project
+// The worktree lives inside the project, under .micromanager/worktrees/, so workers stay inside the project
 // directory (no external_directory ask) and git ignores it through .git/info/exclude.
+//
+// Branches used to be named jev/<job>. New jobs use micromanager/<job>; old job files keep their recorded branch, so
+// finished work still merges and rewinds. Reading checkpoints accepts both prefixes.
 
 import { execFile } from "node:child_process"
 import { mkdirSync } from "node:fs"
@@ -9,6 +12,19 @@ import { join, relative, resolve, sep } from "node:path"
 import { measuredOf, median, parseScoreLines, type Contract, type Measured } from "./contract.ts"
 import { stateDir } from "./store.ts"
 import type { Job, Task } from "./state.ts"
+
+export const BRANCH_PREFIX = "micromanager"
+export const LEGACY_BRANCH_PREFIX = "jev"
+
+// The job's integration branch. The job file's recorded branch wins, so a job started under the old prefix keeps
+// working; only new jobs get the new name.
+export function jobBranch(jobId: string): string {
+  return `${BRANCH_PREFIX}/${jobId}`
+}
+
+export function taskBranch(jobId: string, taskId: string): string {
+  return `${jobBranch(jobId)}--${taskId}`
+}
 
 // Git always materialises a worktree of the REPOSITORY ROOT, never of the directory the plugin asked from. A project
 // that is a subdirectory of the repository (a monorepo package) therefore has to carry its offset into every worktree,
@@ -137,7 +153,7 @@ export async function prepareIntegration(project: string, jobId: string, run: Ex
   if (head.code !== 0) throw new IntegrationError("the repository has no commit to start from")
   // Before the worktree exists: its own checkout must not be counted as the user's uncommitted work.
   const { dirty, summary } = await dirtyPaths(project, run)
-  const branch = `jev/${jobId}`
+  const branch = jobBranch(jobId)
   const worktree = join(project, stateDir(project), "worktrees", jobId)
   const added = await run("git", ["worktree", "add", "-q", "-b", branch, worktree, "HEAD"], { cwd: project })
   if (added.code !== 0) throw new IntegrationError(`git worktree add failed: ${added.stderr.trim()}`)
@@ -279,10 +295,11 @@ export interface TaskWorktree {
 }
 
 // A task of a parallel batch works in its own worktree, on a branch off the job's branch at its current commit.
-// "jev/<job>--<task>", since "jev/<job>/<task>" cannot sit next to the branch "jev/<job>" in git's refs. at: another
-// place for it (a continued worker keeps its session's directory). rel: the project's offset inside the worktree.
+// "micromanager/<job>--<task>", since "micromanager/<job>/<task>" cannot sit next to the branch "micromanager/<job>"
+// in git's refs. at: another place for it (a continued worker keeps its session's directory). rel: the project's
+// offset inside the worktree.
 export async function prepareTaskWorktree(project: string, jobId: string, taskId: string, from: string, run: Exec = exec, at?: string, rel = ""): Promise<TaskWorktree> {
-  const branch = `jev/${jobId}--${taskId}`
+  const branch = taskBranch(jobId, taskId)
   const worktree = at ?? join(project, stateDir(project), "worktrees", `${jobId}--${taskId}`)
   await removeTaskWorktree(project, { branch, worktree }, run) // a leftover of an interrupted run
   // Before the checkout exists, so the plugin never reports its own worktree as the user's uncommitted work.

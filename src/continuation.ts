@@ -7,6 +7,7 @@
 // That is the todo continuation of Sisyphus, driven by the job file rather than by the model's memory.
 
 import { HEADER } from "./hooks.ts"
+import { jobBranch } from "./integration.ts"
 import { roleById } from "./roles.ts"
 import { isDone, type Job, type Task } from "./state.ts"
 
@@ -73,7 +74,7 @@ export function nextStep(job: Job, parallel: number): Step | undefined {
     const merged = job.tasks.filter((t) => isDone(t)).length
     return {
       kind: "done",
-      text: `${HEADER} job ${job.id}: the plan is through, ${merged} of ${job.tasks.length} tasks merged on ${job.integrationBranch ?? `jev/${job.id}`}${merged < job.tasks.length ? " (the rest were cancelled)" : ""}. Tell the user briefly what changed; merge_job brings it into their checkout once they say so.`,
+      text: `${HEADER} job ${job.id}: the plan is through, ${merged} of ${job.tasks.length} tasks merged on ${job.integrationBranch ?? jobBranch(job.id)}${merged < job.tasks.length ? " (the rest were cancelled)" : ""}. Tell the user briefly what changed; merge_job brings it into their checkout once they say so.`,
     }
   }
   const stopped = left.filter((t) => !OPEN.has(t.status))

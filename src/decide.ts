@@ -13,7 +13,7 @@
 //   1. a hard rule no layer can pass: the user's keys and credential stores, their home itself, the system
 //      directories, the secret files inside ~/.config, another job's branch in the repository's own git data. The
 //      user's `allowOutside` setting is the one thing that lifts it, and only for the paths it names (below);
-//   2. the job's own area: any worktree under <project>/.jev-micromanager/worktrees/, this job's integration
+//   2. the job's own area: any worktree under <project>/.micromanager/worktrees/, this job's integration
 //      worktree included. Path-based, never a substring: `worktrees-old` is not `worktrees`;
 //   3. task-vouched: a path the task text names with its full path, for a read only (a named path is a vouch for
 //      reading it, not for changing it);

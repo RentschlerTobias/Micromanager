@@ -192,6 +192,9 @@ export class Vault {
   readonly #pii: boolean
   readonly #journal: (entry: Record<string, unknown>) => void
   readonly #scanned = new Set<string>() // hashes of texts the name detector has seen
+  // Entries kept only for restore, never for redaction again: the name detector used to call task ids, hostnames,
+  // product names and ordinary words person names, and those placeholders made the model's own text unreadable.
+  readonly #retired = new Set<string>()
   #matcher: RegExp | undefined
   #cache = new Map<string, string>()
   version = 0
@@ -204,8 +207,14 @@ export class Vault {
     this.#journal = o.journal ?? (() => {})
     if (this.#path && existsSync(this.#path)) {
       try {
-        const saved = JSON.parse(readFileSync(this.#path, "utf8")) as { entries?: Entry[]; scanned?: string[] }
-        for (const e of saved.entries ?? []) this.#remember(e)
+        const saved = JSON.parse(readFileSync(this.#path, "utf8")) as { entries?: Entry[]; scanned?: string[]; retired?: string[] }
+        for (const e of saved.entries ?? []) {
+          this.#remember(e)
+          // A file written by an older detector can carry what it wrongly called a person or an address. Keep the
+          // mapping so older text restores, but never redact that value again.
+          if ((e.kind === "person" || e.kind === "address") && !plausibleEntity(e.value, e.kind)) this.#retired.add(e.placeholder)
+        }
+        for (const p of saved.retired ?? []) this.#retired.add(p)
         for (const h of saved.scanned ?? []) this.#scanned.add(h)
       } catch {
         // a broken file starts a new vault: placeholders change once, the real values are still in OpenCode's database
@@ -229,7 +238,7 @@ export class Vault {
     try {
       mkdirSync(dirname(this.#path), { recursive: true })
       const scanned = [...this.#scanned].slice(-20_000)
-      writeFileSync(this.#path, JSON.stringify({ entries: [...this.#byValue.values()], scanned }), { mode: 0o600 })
+      writeFileSync(this.#path, JSON.stringify({ entries: [...this.#byValue.values()], scanned, retired: [...this.#retired] }), { mode: 0o600 })
       chmodSync(this.#path, 0o600)
     } catch {
       // losing the file costs new placeholders after a restart, never a leak: the values are found again
@@ -241,7 +250,16 @@ export class Vault {
     const v = value.trim()
     if (v.length < (kind === "secret" ? 8 : 3) || this.#allow.has(v) || isPlaceholder(v)) return undefined
     const known = this.#byValue.get(v)
-    if (known) return known.placeholder
+    if (known) {
+      if (!this.#retired.has(known.placeholder)) return known.placeholder
+      if (kind === "person" || kind === "address") return undefined
+      // A value retired as a name can later turn out to be a secret or structured data; that stronger finding wins.
+      this.#retired.delete(known.placeholder)
+      this.#matcher = undefined
+      this.#cache.clear()
+      this.#save()
+      return known.placeholder
+    }
     const e: Entry = { value: v, kind, placeholder: placeholder(kind, ++this.#counters[kind]) }
     this.#remember(e)
     this.#matcher = undefined
@@ -266,7 +284,7 @@ export class Vault {
 
   #regex(): RegExp | undefined {
     if (this.#matcher || !this.#byValue.size) return this.#matcher
-    const values = [...this.#byValue.values()].sort((a, b) => b.value.length - a.value.length)
+    const values = [...this.#byValue.values()].filter((e) => !this.#retired.has(e.placeholder)).sort((a, b) => b.value.length - a.value.length)
     // Words only as whole words (Anna in Annalena is not Anna); secrets wherever they occur, they have no edges.
     const parts = values.map((e) => (WORDY.has(e.kind) ? `(?<![\\p{L}\\p{N}_])${escape(e.value)}(?![\\p{L}\\p{N}_])` : escape(e.value)))
     this.#matcher = new RegExp(parts.join("|"), "gu")
@@ -288,13 +306,50 @@ export class Vault {
   }
 
   // The real values back, for the kinds `allow` lets through; a placeholder the vault does not know stays as it is.
-  restore(text: string, allow: (kind: Kind) => boolean = () => true): string {
+  // `encode` escapes a value for the container it is written into (a JSON string in a provider's response stream).
+  restore(text: string, allow: (kind: Kind) => boolean = () => true, encode: (value: string) => string = (value) => value): string {
     if (!text || !this.#byPlaceholder.size) return text
     return text.replace(PLACEHOLDER, (m) => {
       const e = this.#byPlaceholder.get(m)
-      return e && allow(e.kind) ? e.value : m
+      return e && allow(e.kind) ? encode(e.value) : m
     })
   }
+}
+
+// A provider's response as OpenCode stores and shows it: the model only ever saw placeholders, so its own text comes
+// back with them. Restore the values before OpenCode parses the body, or the user reads T11 where a task id was.
+// The last characters are held back because a placeholder can be split across network chunks; secrets stay hidden.
+const RESTORE_HOLD = 64
+const jsonValue = (value: string): string => JSON.stringify(value).slice(1, -1)
+
+export function restoreResponse(response: Response, vault: Vault, allow: (kind: Kind) => boolean = (kind) => kind !== "secret"): Response {
+  const type = response.headers.get("content-type") ?? ""
+  const encoding = response.headers.get("content-encoding")
+  if (!response.body || !/json|event-stream/i.test(type) || (encoding !== null && encoding !== "identity")) return response
+  const json = /json|event-stream/i.test(type)
+  const encoder = new TextEncoder()
+  const decoder = new TextDecoder()
+  let carry = ""
+  const body = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        carry += decoder.decode(chunk, { stream: true })
+        if (carry.length <= RESTORE_HOLD) return
+        const cut = carry.length - RESTORE_HOLD
+        const out = carry.slice(0, cut)
+        carry = carry.slice(cut)
+        controller.enqueue(encoder.encode(vault.restore(out, allow, json ? jsonValue : undefined)))
+      },
+      flush(controller) {
+        carry += decoder.decode()
+        if (carry) controller.enqueue(encoder.encode(vault.restore(carry, allow, json ? jsonValue : undefined)))
+      },
+    }),
+  )
+  const headers = new Headers(response.headers)
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  return new Response(body, { status: response.status, statusText: response.statusText, headers })
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -419,28 +474,92 @@ export interface NameSettings {
 
 export const DEFAULT_LABELS: Readonly<Record<string, Kind>> = { "person name": "person", "street address": "address" }
 
-const CODE_LINE = /(?:[;{}(]\s*$|^\s*(?:import|from|export|def|class|function|const|let|var|return|if|for|while|#include|package|fn|pub|use)\b|=>)/
+const CODE_LINE =
+  /(?:=>|^\s*(?:import|from|export|def|class|function|const|let|var|return|if|for|while|#include|package|fn|pub|use|async|await|type|interface)\b|[;{}]\s*$|^\s*[}\])],?\s*$)/
+
+// Links, paths and IPs carry no name worth redacting; a detector that reads them turns hostnames and file names into
+// people. They are removed before the entity endpoint sees a text.
+const TECHNICAL_TEXT = /\b(?:[a-z][a-z0-9+.-]*:\/\/|www\.)\S+|\B[~/][^\s"'`]+|\b\d{1,3}(?:\.\d{1,3}){3}\b/gi
+
+function plain(line: string): string {
+  return line.replace(TECHNICAL_TEXT, " ").replace(/`[^`]*`/g, " ").replace(/<[^<>]{1,200}>/g, " ").trim()
+}
 
 // What of a text the name detector reads. Code is mostly identifiers, where a model sees names that are none (class
-// Jordan, paris_timeout); its comments and string literals are where people's names and addresses live.
+// Jordan, paris_timeout); its comments and string literals are where people's names and addresses live. Every code
+// line is dropped, not only when most lines are code: one type annotation in a prose file was enough to turn its type
+// name into a person (2026-10-30).
 export function prose(text: string): string {
-  const lines = text.split("\n").map((l) => l.replace(/^\s*\d+[|:\t]\s?/, ""))
-  const code = lines.filter((l) => CODE_LINE.test(l)).length
-  if (lines.length < 4 || code / lines.length < 0.3) return text
   const kept: string[] = []
-  for (const l of lines) {
+  let fenced = false
+  for (const raw of text.split("\n")) {
+    const l = raw.replace(/^\s*\d+[|:\t]\s?/, "")
+    if (/^\s*(?:```|~~~)/.test(l)) {
+      fenced = !fenced
+      continue
+    }
+    if (fenced) continue
+    if (!CODE_LINE.test(l)) {
+      const line = plain(l)
+      if (line) kept.push(line)
+      continue
+    }
     const comment = l.match(/(?:\/\/|#|--|\/\*|^\s*\*|<!--)\s?(.*)$/)
-    if (comment?.[1]?.trim()) kept.push(comment[1])
-    for (const s of l.matchAll(/"((?:[^"\\]|\\.){3,})"|'((?:[^'\\]|\\.){3,})'|`([^`]{3,})`/g)) kept.push(s[1] ?? s[2] ?? s[3] ?? "")
+    if (comment?.[1]?.trim()) {
+      const line = plain(comment[1])
+      if (line) kept.push(line)
+    }
+    for (const s of l.matchAll(/"((?:[^"\\]|\\.){3,})"|'((?:[^'\\]|\\.){3,})'|`([^`]{3,})`/g)) {
+      const line = plain(s[1] ?? s[2] ?? s[3] ?? "")
+      if (line) kept.push(line)
+    }
   }
   return kept.join("\n")
 }
 
-// A span GLiNER called a person or an address that is worth a placeholder: not an identifier, not a placeholder.
+// Ordinary words and product names GLiNER keeps calling people. A full name of two words is still a person; a single
+// word is never one on its own.
+const NOT_NAMES = new Set([
+  "the", "this", "that", "these", "those", "there", "when", "where", "which", "while", "with", "from", "into",
+  "about", "after", "before", "because", "please", "thanks", "hello", "dear", "best", "regards", "new", "old",
+  "next", "last", "first", "second", "third", "good", "bad", "yes", "no", "not", "and", "but", "for", "you",
+  "your", "our", "their", "his", "her", "its", "open", "close", "read", "write", "run", "stop", "start", "test",
+  "code", "file", "files", "data", "text", "note", "notes", "plan", "task", "tasks", "job", "jobs", "work",
+  "worker", "report", "summary", "update", "version", "project", "plugin", "server", "client", "system",
+  "network", "security", "windows", "linux", "apple", "microsoft", "google", "amazon", "github", "gitlab",
+  "opencode", "micromanager", "deepseek", "openai", "anthropic", "qemu", "kvm", "virt", "manager", "home",
+  "private", "public", "local", "remote", "cloud", "machine", "virtual", "stealth", "host", "user", "admin",
+  "support", "team", "group", "company", "street", "avenue", "phone", "email", "name", "secret", "person",
+  "iban", "bank", "money", "invoice", "order", "product", "service", "status", "error", "warning", "info",
+  "debug", "main", "master", "branch", "commit", "merge", "issue", "pull", "request", "response", "message",
+  "session", "token", "key", "login", "account", "profile", "config", "setting", "settings", "option",
+  "options", "value", "values", "result", "results", "input", "output", "source", "target", "object", "string",
+  "number", "boolean", "array", "list", "map", "set", "null", "true", "false", "die", "der", "das", "und",
+  "oder", "nicht", "mit", "ohne", "bitte", "danke", "hallo", "gruß", "gruss", "neue", "neuer", "alt",
+])
+
+const NAME_PARTICLES = new Set(["van", "von", "de", "der", "den", "da", "del", "di", "dos", "du", "la", "le", "ten", "ter", "zu", "zur"])
+
+const ADDRESS_WORD =
+  /(?:street|st\.?|road|rd\.?|avenue|ave\.?|lane|ln\.?|drive|dr\.?|boulevard|blvd\.?|way|court|ct\.?|place|pl\.?|square|sq\.?|terrace|ter\.?|parkway|pkwy\.?|highway|hwy\.?|strasse|straße|weg|platz|gasse|allee|ring|damm|ufer|steig|pfad)\b/i
+
+// A span GLiNER called a person or an address that is worth a placeholder: not an identifier, not a placeholder, and
+// shaped like the thing it claims to be. A person is two or more capitalized words (GLiNER called vm-host a person with
+// 0.849 confidence); an address has a house number and a street word, which keeps versions and product names out.
 export function plausibleEntity(value: string, kind: Kind): boolean {
-  const v = value.trim()
+  const v = value.trim().replace(/\s+/g, " ")
   if (v.length < 3 || isPlaceholder(v) || /[_/\\=<>{}()[\]`]/.test(v)) return false
-  if (kind === "person") return /\p{Lu}/u.test(v) && !/^\p{Lu}+$/u.test(v.replace(/\s/g, "")) && !/[a-z][A-Z]/.test(v)
+  if (kind === "person") {
+    if (/\d/.test(v)) return false
+    const words = v.split(" ")
+    if (words.length < 2) return false
+    if (!words.every((w, i) => /^\p{Lu}[\p{L}'’.-]*$/u.test(w) || (i > 0 && NAME_PARTICLES.has(w.toLowerCase())))) return false
+    return !words.some((w) => NOT_NAMES.has(w.toLowerCase()))
+  }
+  if (kind === "address") {
+    if (!/\d/.test(v) || !/\p{L}/u.test(v) || v.length < 5) return false
+    return /^\d{1,5}\s+\p{L}/u.test(v) || ADDRESS_WORD.test(v)
+  }
   return true
 }
 

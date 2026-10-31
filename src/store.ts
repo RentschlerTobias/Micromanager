@@ -1,4 +1,4 @@
-// Where jobs live: <project>/.jev-micromanager/jobs/<id>.json, one file per job, written atomically.
+// Where jobs live: <project>/.micromanager/jobs/<id>.json, one file per job, written atomically.
 //
 // Inside the project, so workers can read their notes without an external_directory ask; kept out of git through
 // the repository's own .git/info/exclude, which is local and needs no .gitignore change (design.md §8.2).
@@ -61,7 +61,7 @@ function gitCommonDir(project: string): string | undefined {
   }
 }
 
-// Adds .jev-micromanager/ to the repository's local exclude file once; a directory that is no git repository is left alone.
+// Adds the state directory (.micromanager/, or the legacy .jev-micromanager/) to the repository's local exclude file once; a directory that is no git repository is left alone.
 // The job state and the project memory (.opencode/memory/, opencode-agent-memory's place) stay out of git.
 //
 // The exclude file belongs to the repository, not to the project: a project is often a subdirectory of a monorepo, where

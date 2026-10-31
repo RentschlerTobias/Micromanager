@@ -17,7 +17,7 @@ import { DEFAULT_BACKENDS, Decider, makeAskers } from "./backends.ts"
 import { look, missingVisualEvidence } from "./look.ts"
 import { runBrowser } from "./browser.ts"
 import { readPick } from "./pick.ts"
-import { DEFAULT_LABELS, gitAuthor, knownSecrets, mapStrings, PLACEHOLDER_NOTE, requestTexts, restoreScope, scanNames, useVault, Vault, type NameSettings } from "./redact.ts"
+import { DEFAULT_LABELS, gitAuthor, knownSecrets, mapStrings, PLACEHOLDER_NOTE, requestTexts, restoreResponse, restoreScope, scanNames, useVault, Vault, type NameSettings } from "./redact.ts"
 import { matchShortcut, resolvePolicy } from "./policy.ts"
 import { probe, type Availability } from "./registry.ts"
 import { chooseModel, unknown as allAvailable, withPicks, type Available } from "./routing.ts"
@@ -50,7 +50,7 @@ import { registerSkills, SKILLS, type SkillEditor } from "./skills.ts"
 import { backlogIgnored, listJobs, loadJob, notesDir, reconcileJob, saveJob, stateDir } from "./store.ts"
 import { backlogDir, backlogTool, githubIssue, githubIssues, githubRepo, goalOf, localBackend, publishForm, publishIssue, readPublish, type BacklogItem } from "./backlog.ts"
 import { moveJob, moveTask, stage, type Job, type Task, type TaskStatus } from "./state.ts"
-import { exec, repoRel, type Exec } from "./integration.ts"
+import { BRANCH_PREFIX, exec, jobBranch, LEGACY_BRANCH_PREFIX, repoRel, type Exec } from "./integration.ts"
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, extname, join, relative, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -98,6 +98,12 @@ interface SessionHookInput {
   model?: { providerID?: string; id?: string }
 }
 
+interface HttpResponseEvent {
+  readonly sessionID?: string
+  readonly kind?: string
+  response: Response
+}
+
 interface Context {
   agent: { transform(callback: (draft: AgentDraft) => void): Promise<unknown> }
   tool: {
@@ -105,6 +111,7 @@ interface Context {
     transform(callback: (draft: ToolDraft) => void): Promise<unknown>
   }
   session: SessionApi & {
+    hook(name: "http.response", callback: (event: HttpResponseEvent) => Promise<void> | void): Promise<unknown>
     hook(name: string, callback: (input: SessionHookInput) => Promise<void> | void): Promise<unknown>
     synthetic(args: { sessionID: string; text: string; resume: boolean }): Promise<unknown>
     move(args: { sessionID: string; directory: string }): Promise<unknown>
@@ -165,7 +172,7 @@ function version(): string {
 }
 
 // What the plugin knows about the sessions the runner started, shared by every instance of the plugin in one server.
-// The hub runs one instance per directory, and a worker in its worktree (.jev-micromanager/worktrees/…) is served by
+// The hub runs one instance per directory, and a worker in its worktree (.micromanager/worktrees/…) is served by
 // another instance than the one that started it (live test in the user's hub: a worker's question outside its
 // directory went to the user, because that instance did not know the session; it waited for an answer nobody saw).
 // On globalThis, so it is shared even if the server loads this module once per instance.
@@ -417,7 +424,7 @@ const done = (text: string): GitOutcome => ({ wrote: true, text })
 // checkout with uncommitted changes and a job with work left unfinished, and merges fast-forward only, so its own
 // checkout can never be left half merged, reset or behind.
 export async function mergeJobInto(project: string, job: Job, ack: string, run: Exec = exec): Promise<GitOutcome & { merge?: { from: string; to: string; at: string } }> {
-  const branch = job.integrationBranch ?? `jev/${job.id}`
+  const branch = job.integrationBranch ?? jobBranch(job.id)
   const git = (...args: string[]) => run("git", ["-C", project, ...args], { cwd: project, timeoutMs: 15_000 })
   const there = await git("rev-parse", "--verify", "--quiet", `refs/heads/${branch}`)
   if (there.code !== 0) return said(`Job ${job.id} has no branch ${branch}: there is nothing to merge.`)
@@ -448,11 +455,34 @@ export async function mergeJobInto(project: string, job: Job, ack: string, run: 
 // discard_job: the cleanup a real run left undone (six stale worktrees and branches). It never touches the user's
 // checkout or a tracked file: only worktrees under the job and the branches of its tasks.
 export async function discardJob(project: string, job: Job, ack: string, run: Exec = exec): Promise<GitOutcome> {
-  const targets: { task: string; worktree?: string; branch?: string }[] = [
-    ...job.tasks.filter((t) => t.worktree || t.branch).map((t) => ({ task: t.id, worktree: t.worktree, branch: t.branch })),
-    { task: "the job itself", worktree: job.integrationWorktree, branch: job.integrationBranch },
+  const targets: { task: string; worktree?: string; branch?: string; clear: () => void }[] = [
+    ...job.tasks
+      .filter((t) => t.worktree || t.branch)
+      .map((t) => ({
+        task: t.id,
+        worktree: t.worktree,
+        branch: t.branch,
+        clear: () => {
+          t.worktree = undefined
+          t.branch = undefined
+        },
+      })),
+    {
+      task: "the job itself",
+      worktree: job.integrationWorktree,
+      branch: job.integrationBranch,
+      clear: () => {
+        job.integrationWorktree = undefined
+        job.integrationBranch = undefined
+      },
+    },
   ].filter((t) => t.worktree || t.branch)
-  if (!targets.length) return said(`Job ${job.id} has no worktree and no branch left to discard; nothing was touched.`)
+  if (!targets.length) {
+    job.phase = "done"
+    job.rolling = false
+    job.updated = new Date().toISOString()
+    return done(`Job ${job.id} has no worktree and no branch left to discard; nothing was touched. The job is closed.`)
+  }
   const list = targets.map((t) => `- ${t.worktree ?? "-"}${t.branch ? ` (branch ${t.branch}, from ${t.task})` : ` (${t.task})`}`).join("\n")
   if (!ack.trim()) {
     return said(`discard_job would delete exactly this, and nothing else; your checkout is not touched:\n${list}\nNothing was deleted. Ask the user, and repeat their words as ack to go on.`)
@@ -460,19 +490,36 @@ export async function discardJob(project: string, job: Job, ack: string, run: Ex
   const gone: string[] = []
   const kept: string[] = []
   for (const t of targets) {
+    let ok = true
     if (t.worktree) {
       const removed = await run("git", ["-C", project, "worktree", "remove", "--force", t.worktree], { cwd: project, timeoutMs: 15_000 })
       if (removed.code === 0) gone.push(t.worktree)
-      else kept.push(`${t.worktree} (${removed.stderr.trim().split("\n").pop() ?? "could not be removed"})`)
+      else if (/not a working tree|does not exist|no such file/i.test(`${removed.stderr}${removed.stdout}`)) gone.push(`${t.worktree} (already gone)`)
+      else {
+        ok = false
+        kept.push(`${t.worktree} (${removed.stderr.trim().split("\n").pop() ?? "could not be removed"})`)
+      }
     }
     if (t.branch) {
       const deleted = await run("git", ["-C", project, "branch", "-D", t.branch], { cwd: project, timeoutMs: 15_000 })
       if (deleted.code === 0) gone.push(`branch ${t.branch}`)
-      else kept.push(`branch ${t.branch} (${deleted.stderr.trim().split("\n").pop() ?? "could not be deleted"})`)
+      else if (/not found/i.test(`${deleted.stderr}${deleted.stdout}`)) gone.push(`branch ${t.branch} (already gone)`)
+      else {
+        ok = false
+        kept.push(`branch ${t.branch} (${deleted.stderr.trim().split("\n").pop() ?? "could not be deleted"})`)
+      }
     }
+    // The record follows git: a discarded target that is really gone must stop being an "open job" of an earlier
+    // session, or every new session asks the user about it again (live run, 2026-10-30).
+    if (ok) t.clear()
+  }
+  if (!kept.length) {
+    job.phase = "done"
+    job.rolling = false
+    job.updated = new Date().toISOString()
   }
   const where = gone.length ? `Deleted:\n${gone.map((g) => `- ${g}`).join("\n")}` : "Nothing was deleted."
-  return done(`${where}${kept.length ? `\nLeft in place:\n${kept.map((k) => `- ${k}`).join("\n")}` : ""}\nThe checkout and every file in it were not touched.`)
+  return done(`${where}${kept.length ? `\nLeft in place:\n${kept.map((k) => `- ${k}`).join("\n")}` : `\nThe job is closed; a new session will not ask about it again.`}\nThe checkout and every file in it were not touched.`)
 }
 
 // --- an earlier session's open job, put to the user at the start of a new session --------------------------------
@@ -481,6 +528,15 @@ export async function discardJob(project: string, job: Job, ack: string, run: Ex
 // its branch that the checkout never got, and unfinished changes in worktrees. At the session's first turn the
 // micromanager is told about such a job and asks the user what to do with it. Nothing happens without their answer, and
 // "new" leaves everything as it is, so the next session asks again.
+function readGreeted(path: string): string[] {
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as unknown
+    return Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string").slice(-500) : []
+  } catch {
+    return []
+  }
+}
+
 export function openJobNote(job: Job, inCheckout: boolean): string {
   const merged = job.tasks.filter((t) => t.status === "merged" && !t.undone)
   const unfinished = job.tasks.filter((t) => t.worktree && t.status !== "merged")
@@ -507,7 +563,7 @@ Do what they choose before you start on their request, and do nothing of it with
 //
 // Every merged task is a commit "Tn: title" on the job branch, and the job remembers where the branch started, so the
 // branch is a row of checkpoints already: "start", then the state after each task. rewind_job moves the branch back to
-// one. Before it does, it keeps the old tip as refs/jev/<job>/before-rewind-<n>, which is a checkpoint too, so a rewind
+// one. Before it does, it keeps the old tip as refs/micromanager/<job>/before-rewind-<n>, which is a checkpoint too, so a rewind
 // is undone by rewinding to that. It never touches the user's checkout; undo_merge takes back what merge_job put there.
 
 export interface Checkpoint {
@@ -531,8 +587,11 @@ export async function checkpoints(job: Job, run: Exec = exec): Promise<Checkpoin
     if (at >= 0) out.splice(at, 1)
     out.push({ name: task, commit, what: `after ${subject}` })
   }
-  const refs = (await git("for-each-ref", "--sort=refname", "--format=%(refname)%09%(objectname)", `refs/jev/${job.id}/`)).stdout
-  for (const line of refs.split("\n").filter(Boolean)) {
+  const [current, legacy] = await Promise.all([
+    git("for-each-ref", "--sort=refname", "--format=%(refname)%09%(objectname)", `refs/${BRANCH_PREFIX}/${job.id}/`),
+    git("for-each-ref", "--sort=refname", "--format=%(refname)%09%(objectname)", `refs/${LEGACY_BRANCH_PREFIX}/${job.id}/`),
+  ])
+  for (const line of `${current.stdout}${legacy.stdout}`.split("\n").filter(Boolean)) {
     const [ref = "", commit = ""] = line.split("\t")
     out.push({ name: ref.split("/").pop()!, commit, what: "the branch as it was before a rewind" })
   }
@@ -583,7 +642,7 @@ export async function rewindJob(
   const dirty = (await git("status", "--porcelain")).stdout.trim()
   if (dirty) return said(`Not rewound: the job's own worktree ${wt} has uncommitted changes, which a worker left there. Nothing was changed.\n${dirty}`)
   const n = points.filter((c) => c.name.startsWith("before-rewind-")).length + 1
-  const keep = await git("update-ref", `refs/jev/${job.id}/before-rewind-${n}`, tip)
+  const keep = await git("update-ref", `refs/${BRANCH_PREFIX}/${job.id}/before-rewind-${n}`, tip)
   if (keep.code !== 0) return said(`Not rewound: the current tip could not be kept (${keep.stderr.trim()}). Nothing was changed.`)
   const reset = await git("reset", "--hard", target.commit)
   if (reset.code !== 0) return said(`Not rewound: ${reset.stderr.trim()}. The old tip is kept as before-rewind-${n}.`)
@@ -832,6 +891,11 @@ export default {
       ? (SHARED.vault ??= new Vault({ allow: [...settings.redact.allow, ...gitAuthor()], secrets: settings.redact.secrets, pii: settings.redact.pii, journal: record }))
       : undefined
     useVault(vault)
+    // Text the plugin sends or shows itself: the model only knew placeholders, so any it wrote into a job, a note or a
+    // report would otherwise reach the user as T11. Secrets stay as placeholders.
+    const visible = (text: string): string => (vault ? vault.restore(text, (kind) => kind !== "secret") : text)
+    const synthetic = ctx.session.synthetic.bind(ctx.session)
+    const say = (args: { sessionID: string; text: string; resume: boolean }) => synthetic({ ...args, text: visible(args.text) })
     const names: NameSettings | undefined = vault && settings.redact.names
       ? { url: (DEFAULT_BACKENDS.urls.gliner ?? "http://127.0.0.1:8781/v1/systemone").replace(/\/v1\/systemone$/, "/v1/entities"), labels: DEFAULT_LABELS, threshold: settings.redact.threshold }
       : undefined
@@ -853,8 +917,13 @@ export default {
           }
         }
       }
+      // Old messages and tool results can still carry placeholders the model wrote before the response hook existed,
+      // or placeholders for values the vault has since retired. Show the model the real text first; the redaction
+      // below puts the still-active values back, so nothing private leaves and no stale PERSON_n confuses it.
+      if (Array.isArray(input.messages)) mapStrings(input.messages, (s) => vault.restore(s, (kind) => kind !== "secret"))
       if (Array.isArray(input.messages)) mapStrings(input.messages, (s) => vault.redact(s))
       if (Array.isArray(input.system)) {
+        for (const p of input.system) if (typeof p.text === "string") p.text = vault.restore(p.text, (kind) => kind !== "secret")
         for (const p of input.system) if (typeof p.text === "string") p.text = vault.redact(p.text)
         input.system.push({ type: "text", text: PLACEHOLDER_NOTE })
       }
@@ -983,7 +1052,7 @@ export default {
         const messages = t.session ? await ctx.session.context({ sessionID: t.session }).catch(() => undefined) : undefined
         recordOutcome(outcomeOf(r.project, r.job, t, messages ? sessionUsage(messages) : undefined))
       }
-      if (r.note && r.parent) await ctx.session.synthetic({ sessionID: r.parent, text: r.note, resume: true }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
+      if (r.note && r.parent) await say({ sessionID: r.parent, text: r.note, resume: true }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
     }
     // Whether the evolver can run here (src/evolver.ts): uv for its sidecar and a sandbox for its candidates, asked once.
     let evolverReady = false
@@ -1080,7 +1149,7 @@ export default {
       }
       const { pending, answer, fresh } = SHARED.grantRequests.open({ kind, name, why, sessionID, parent: owner.parent, task: owner.task, project: where.project, jobId, secrets: kind === "network" ? facts.secrets : [] })
       if (fresh) {
-        await ctx.session.synthetic({ sessionID: owner.parent, text: grantNote(pending), resume: true }).catch((err: unknown) => log("warn", `grant note failed: ${String(err)}`))
+        await say({ sessionID: owner.parent, text: grantNote(pending), resume: true }).catch((err: unknown) => log("warn", `grant note failed: ${String(err)}`))
         if (notify !== "off") notifyDesktop(`${pending.id}: a worker waits for you`, `${kind === "env" ? "variable" : "host"} ${name}`)
       }
       const r = await answer
@@ -1115,7 +1184,7 @@ export default {
       }
       const by = route(r.kind)
       const { pending, answer } = changes.open({ ...r, sessionID, parent: here.parent, task, taskId: here.task.id, project: here.project, jobId: here.job.id })
-      await ctx.session.synthetic({ sessionID: here.parent, text: changeNote(pending, by, here.task.model), resume: true }).catch((err: unknown) => log("warn", `change note failed: ${String(err)}`))
+      await say({ sessionID: here.parent, text: changeNote(pending, by, here.task.model), resume: true }).catch((err: unknown) => log("warn", `change note failed: ${String(err)}`))
       if (by === "user" && notify !== "off") notifyDesktop(`${pending.id}: a worker asks to change a check`, r.target.slice(0, 120))
       const a = await answer
       if (!a.accepted) {
@@ -1126,7 +1195,7 @@ export default {
       if (!applied.ok) {
         const failed: ChangeAnswer = { accepted: false, by: a.by, note: `accepted, but ${applied.text}` }
         native.recordChange(here.project, here.job.id, here.task.id, r.kind, failed, pending.id, r.target)
-        void ctx.session.synthetic({ sessionID: here.parent, text: `[micromanager] ${pending.id} was accepted, but the plugin could not apply it: ${applied.text}. The worker is told; correct the task with steer_task if the change is still needed.`, resume: false }).catch(() => undefined)
+        void say({ sessionID: here.parent, text: `[micromanager] ${pending.id} was accepted, but the plugin could not apply it: ${applied.text}. The worker is told; correct the task with steer_task if the change is still needed.`, resume: false }).catch(() => undefined)
         return `${pending.id} was accepted, but the plugin could not apply it: ${applied.text}. Nothing changed; make the work pass the checks as they are, or say so in your report.`
       }
       decided(pending.id, a)
@@ -1193,7 +1262,7 @@ export default {
       void run.done.then(async ({ result, problem }) => {
         evolving.delete(`${job.id}/${task.id}`)
         await bridge.close()
-        const tell = (text: string) => ctx.session.synthetic({ sessionID: parent, text, resume: true }).catch((err: unknown) => log("warn", `evolve note failed: ${String(err)}`))
+        const tell = (text: string) => say({ sessionID: parent, text, resume: true }).catch((err: unknown) => log("warn", `evolve note failed: ${String(err)}`))
         const why = problem ?? (result ? heldOutProblem(contract, result.heldOut) : "no result")
         if (!result || why) {
           native.noteEvolve(proj, job.id, task.id, state(last, "failed"))
@@ -1253,8 +1322,10 @@ export default {
     }
     await ctx.tool.hook("execute.before", async (call) => {
       // A model writes placeholders; the tool gets the real values, as far as the tool may have them (src/redact.ts).
+      // Redact first: the http.response hook restores placeholders in the model's answer, so a tool call can arrive with
+      // real values already. Redacting again keeps a name out of a web search and a secret out of a shell command.
       const scope = vault && restoreScope(call.tool)
-      if (vault && scope) mapStrings(call.input, (s) => vault.restore(s, scope))
+      if (vault) mapStrings(call.input, (s) => (scope ? vault.restore(vault.redact(s), scope) : vault.redact(s)))
       // A worker's shell: noted so the shell hook, which gets no session id, wraps this one and no other agent's.
       if (call.tool === "shell" && call.sessionID && (runnerSessions.has(call.sessionID) || native.isWorker(call.sessionID))) {
         SHARED.workerShells.expect(String(call.input.command ?? ""))
@@ -1467,7 +1538,7 @@ export default {
           // 2026-10-13). The message also goes in as a note at the worker's next turn.
           if (decision === "reject" && message) steering.set(sessionID, `[micromanager] Your ${action} request (${resources.join(" | ").slice(0, 160)}) was not run: ${message}`)
         })
-        await ctx.session.synthetic({ sessionID: owner.parent, text: askNote(ask), resume: true }).catch((err: unknown) => log("warn", `ask note failed: ${String(err)}`))
+        await say({ sessionID: owner.parent, text: askNote(ask), resume: true }).catch((err: unknown) => log("warn", `ask note failed: ${String(err)}`))
         if (notify !== "off") notifyDesktop(`${ask.id}: a worker waits for you`, `${action}: ${resources.join(" ").slice(0, 160)}`)
       })()
       return true
@@ -1491,7 +1562,7 @@ export default {
       const byParent = new Map<string, string[]>()
       for (const ask of dropped) byParent.set(ask.parent, [...(byParent.get(ask.parent) ?? []), ask.id])
       for (const [parent, ids] of byParent) {
-        await ctx.session.synthetic({ sessionID: parent, text: `[micromanager] ${ids.join(", ")} ${ids.length > 1 ? "are" : "is"} void: ${why}. If you put ${ids.length > 1 ? "them" : "it"} to the user, tell them no answer is needed.`, resume: false }).catch(() => undefined)
+        await say({ sessionID: parent, text: `[micromanager] ${ids.join(", ")} ${ids.length > 1 ? "are" : "is"} void: ${why}. If you put ${ids.length > 1 ? "them" : "it"} to the user, tell them no answer is needed.`, resume: false }).catch(() => undefined)
       }
     }
 
@@ -1816,12 +1887,12 @@ export default {
       for (const w of running) steering.set(w.session, wrapUpNote(why))
       record({ kind: "budget", job: owned.job.id, why, running: running.map((w) => w.task) })
       log("warn", `job ${owned.job.id}: ${why}`)
-      if (owned.job.facilitator) await ctx.session.synthetic({ sessionID: owned.job.facilitator, text: overNote(owned.job, why, running.map((w) => w.task)), resume: true }).catch((err: unknown) => log("warn", `budget note failed: ${String(err)}`))
+      if (owned.job.facilitator) await say({ sessionID: owned.job.facilitator, text: overNote(owned.job, why, running.map((w) => w.task)), resume: true }).catch((err: unknown) => log("warn", `budget note failed: ${String(err)}`))
     }
     const continuing = (SHARED.continuing ??= new Map()) // a server that loaded an older version of this module has none
     const notifier = new Notifier({
       mode: notify,
-      synthetic: (sessionID, text, resume) => ctx.session.synthetic({ sessionID, text, resume }),
+      synthetic: (sessionID, text, resume) => say({ sessionID, text, resume }),
       steer: (sessionID, note) => steering.set(sessionID, note),
       desktop: (title, body) => {
         notifyDesktop(title, body, (err) => log("info", `no desktop notification: ${err.message}`))
@@ -1856,7 +1927,7 @@ export default {
       // Done: the micromanager's own last turn already told the user (live run, 2026-10-20: a wake for the summary made
       // it say everything twice), so auto-continue only goes off.
       if (step.kind === "done") return
-      await ctx.session.synthetic({ sessionID, text: step.text, resume: true }).catch((err: unknown) => log("warn", `auto-continue failed: ${String(err)}`))
+      await say({ sessionID, text: step.text, resume: true }).catch((err: unknown) => log("warn", `auto-continue failed: ${String(err)}`))
     }
     const awaitTurn = (sessionID: string): void => {
       if (awaiting.has(sessionID)) return
@@ -2071,6 +2142,9 @@ export default {
 
     await ctx.tool.hook("execute.after", async (call) => {
       if (!call.sessionID) return
+      // The plugin's own tools and worker reports can carry placeholders the model wrote into a job (a task title,
+      // a plan, a note). The user reads tool results, so put the values back there too; secrets stay hidden.
+      if (vault) rewriteResult(call.result, visible)
       // The user's answer to one of the plugin's forms (src/forms.ts): workers may not ask, so this is the micromanager.
       if (call.tool === "question") {
         lastForm.set(call.sessionID, Date.now())
@@ -2085,7 +2159,7 @@ export default {
           const id = String(call.input.prompt ?? "").match(/^\[micromanager\] task (T\d+) · job (\S+) ·/)
           // A trial's first attempt: the micromanager starts the others now (src/trials.ts fanOutText).
           const fan = id && project ? native.trialNote(project, id[2]!, id[1]!) : undefined
-          if (id) rewriteResult(call.result, (text) => `${text}\n[micromanager] This worker is task ${id[1]} of job ${id[2]}${/· role (code|test|visual|write|debug) ·/.test(String(call.input.prompt)) ? `; its change is merged into jev/${id[2]} when its checks pass` : ""}.${fan ? `\n${fan}` : ""}`)
+          if (id) rewriteResult(call.result, (text) => `${text}\n[micromanager] This worker is task ${id[1]} of job ${id[2]}${/· role (code|test|visual|write|debug) ·/.test(String(call.input.prompt)) ? `; its change is merged into ${jobBranch(id[2])} when its checks pass` : ""}.${fan ? `\n${fan}` : ""}`)
         }
         return
       }
@@ -2159,7 +2233,7 @@ export default {
               // A reader's report is its result, so the whole note (up to a limit) comes back.
               return `${taskReport(job, task)}${note ? `\n\n${note.slice(-15000)}` : ""}`
             }
-            return [`job ${job.id} on branch ${job.integrationBranch ?? `jev/${job.id}`}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}${t.session ? ` · session ${t.session}` : ""}`),
+            return [`job ${job.id} on branch ${job.integrationBranch ?? jobBranch(job.id)}:`, ...job.tasks.map((t) => `- ${t.id} ${t.title}: ${t.status}${t.priority !== 3 ? ` · priority ${t.priority}` : ""}${t.dependsOn.length ? ` · after ${t.dependsOn.join(", ")}` : ""}${t.session ? ` · session ${t.session}` : ""}`),
               "The user can watch a task's worker with: opencode -s <session>",
               // The per-task controls, named here where the orchestrator already looks: the system prompt (src/roles.ts)
               // lists only stop_job and plan_job, and a control it does not know about is one it will not reach for.
@@ -2430,6 +2504,7 @@ export default {
             if (!found) return "No job to discard. plan_job or start a worker first."
             if (scheduler.snapshot().running === found.id) return `Job ${found.id} is still running; discard it when it is done, or stop_job first.`
             const out = await discardJob(project, found, ack, exec)
+            if (out.wrote) saveJob(project, found)
             record({ kind: "discard", sessionID: tctx.sessionID, job: found.id, deleted: out.wrote, text: out.text.slice(-500) })
             return out.wrote ? `${out.text}${draftsText(native.backlog(project, found, false), project)}` : out.text
           },
@@ -2486,7 +2561,7 @@ export default {
             await release(other, "another attempt of its trial won")
           }
           // The merge, as a quiet note in the micromanager's session; OpenCode's notification with the report follows.
-          if (r.note && r.parent) await ctx.session.synthetic({ sessionID: r.parent, text: r.note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
+          if (r.note && r.parent) await say({ sessionID: r.parent, text: r.note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
           record({ kind: "finish", sessionID: tctx.sessionID, merged: Boolean(r.note), text: r.text.slice(0, 300) })
           return r.text
         }, (sessionID) => native.isWriter(sessionID))
@@ -2649,7 +2724,7 @@ export default {
       }
       // The first turn of a micromanager session that has no job yet: an earlier session's open work is put to the user.
       if (!runnerSessions.has(sessionID) && !greeted.has(sessionID)) {
-        greeted.add(sessionID)
+        greet(sessionID)
         const agent = input.agent ?? ((await ctx.session.get({ sessionID }).catch(() => undefined)) as SessionRecord | undefined)?.agent
         if (agent === MICROMANAGER.agent && !native.hasJob(project, sessionID)) {
           const open = native.openJobs(project, sessionID).slice(-3)
@@ -2698,8 +2773,18 @@ export default {
       }
     })
 
-    // Micromanager sessions whose first turn was looked at for an earlier session's open work.
-    const greeted = new Set<string>()
+    // Micromanager sessions whose first turn was looked at for an earlier session's open work. Persisted: a server
+    // restart used to make an old session ask about the same job again (live run, 2026-10-30).
+    const greetedPath = join(dirname(journalPath()), "greeted.json")
+    const greeted = new Set<string>(readGreeted(greetedPath))
+    const greet = (sessionID: string) => {
+      greeted.add(sessionID)
+      try {
+        writeFileSync(greetedPath, JSON.stringify([...greeted].slice(-500)), { mode: 0o600 })
+      } catch {
+        // The greeting is a nicety; never fail a prompt because its marker could not be written.
+      }
+    }
     // Jev drops old tool results a session no longer needs (src/compact.ts): any result of the micromanager's, the
     // reads and web results of every other session. It only decides; the context manager applies the decisions together
     // with its own rules in epochs, so the prompt's prefix stays byte-identical between them (src/context/manager.ts).
@@ -2815,10 +2900,10 @@ export default {
               native.noteFollowUps(worker, report)
               // A contract's red team: its loopholes move the contract's round on (src/contractround.ts).
               const loopholes = await native.noteLoopholes(worker, report)
-              if (loopholes) await ctx.session.synthetic({ sessionID: parent, text: loopholes, resume: true }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
+              if (loopholes) await say({ sessionID: parent, text: loopholes, resume: true }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
               for (const line of learnedLines(report).slice(0, 5)) await memory.capture({ text: line, source: `LEARNED ${worker}` }, project)
             })().catch((err: unknown) => log("warn", `memory capture failed: ${String(err)}`))
-            if (note) void ctx.session.synthetic({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
+            if (note) void say({ sessionID: parent, text: note, resume: false }).catch((err: unknown) => log("warn", `note failed: ${String(err)}`))
             // A planned job goes on by itself: the next ready tasks, or that it is done or stuck, at the micromanager's
             // next turn, which the worker's report starts (src/continuation.ts).
             const owned = native.jobOf(worker)
@@ -2876,7 +2961,12 @@ export default {
         }
       }
       const note = input.sessionID ? steering.get(input.sessionID) : undefined
-      if (note) tail(input, note)
+      if (note) {
+        tail(input, note)
+        // One turn only. The worker branch above deletes its note for the same reason: a note that survives every
+        // request makes the micromanager answer the same old report again and again (live run, 2026-10-30).
+        steering.delete(input.sessionID!)
+      }
       if (input.sessionID) awaitTurn(input.sessionID)
       // A stopped job: the micromanager may still be woken (OpenCode reports the cancelled workers), but starts nothing.
       const held = input.sessionID ? autoJob(input.sessionID) : undefined
@@ -2906,5 +2996,16 @@ export default {
       // Last, so the notes the plugin added on the way are covered too.
       await redactRequest(input)
     })
+    // The model only saw placeholders, so its own answer comes back with them. Restore the real values before OpenCode
+    // parses and stores the response: the user reads a name, not T11. Secrets stay placeholders.
+    try {
+      await ctx.session.hook("http.response", (event) => {
+        if (vault) event.response = restoreResponse(event.response, vault)
+      })
+    } catch (err) {
+      // An OpenCode build without the response hook still redacts outgoing requests; it only cannot put the real
+      // values back into the model's own answer.
+      log("warn", `response restore hook unavailable: ${String(err)}`)
+    }
   },
 }

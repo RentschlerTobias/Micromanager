@@ -2,7 +2,7 @@
 // tree-sitter AST without an LLM, so its call and import edges need no checking. `graphify update` re-extracts only
 // what changed, so a later explorer of the same session waits seconds at most (jev-tutor, 92 files: 3.6 s cold).
 //
-// The worktree lives under .jev-micromanager/, which the user's checkout already ignores; a .gitignore inside
+// The worktree lives under .micromanager/, which the user's checkout already ignores; a .gitignore inside
 // graphify-out/ keeps it out of the worktree's own git status too, so no commit of the session picks it up.
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs"
